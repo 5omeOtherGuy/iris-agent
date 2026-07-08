@@ -18,6 +18,7 @@
 //! rollback/accept.
 
 mod git_menu;
+mod jj_menu;
 mod tree_menu;
 
 use std::path::PathBuf;
@@ -29,6 +30,7 @@ use crate::git::status::GitStatus;
 use crate::ui::palette;
 
 pub(crate) use git_menu::GitMenu;
+pub(crate) use jj_menu::JjMenu;
 pub(crate) use tree_menu::TreeMenu;
 
 #[cfg(test)]
@@ -130,6 +132,7 @@ pub(crate) enum MenuOutcome {
 pub(crate) enum SessionMenu {
     Tree(TreeMenu),
     Git(Box<GitMenu>),
+    Jj(JjMenu),
 }
 
 impl SessionMenu {
@@ -146,6 +149,7 @@ impl SessionMenu {
     ) -> Vec<Line<'static>> {
         match self {
             SessionMenu::Git(menu) => menu.render_lines(width, max_rows, readonly),
+            SessionMenu::Jj(menu) => menu.render_lines(width, max_rows, readonly),
             SessionMenu::Tree(menu) => {
                 menu.render_lines(width, max_rows, readonly, git, referenced)
             }
@@ -157,6 +161,7 @@ impl SessionMenu {
     pub(crate) fn handle_key(&mut self, key: MenuKey, readonly: bool) -> MenuOutcome {
         match self {
             SessionMenu::Git(menu) => menu.handle_key(key, readonly),
+            SessionMenu::Jj(menu) => menu.handle_key(key, readonly),
             SessionMenu::Tree(menu) => menu.handle_key(key, readonly),
         }
     }
@@ -166,6 +171,7 @@ impl SessionMenu {
     pub(crate) fn click_line(&mut self, line: usize, readonly: bool) -> MenuOutcome {
         match self {
             SessionMenu::Git(menu) => menu.click_line(line, readonly),
+            SessionMenu::Jj(menu) => menu.click_line(line, readonly),
             SessionMenu::Tree(menu) => menu.click_line(line, readonly),
         }
     }

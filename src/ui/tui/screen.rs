@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use ratatui_textarea::{TextArea, WrapMode};
 
-use crate::git::status::GitStatus;
+use crate::git::status::{GitStatus, JjStatus, VcsStatus};
 #[cfg(test)]
 use crate::mimir::model_catalog;
 use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
@@ -213,11 +213,11 @@ struct Footer {
     context: Option<String>,
     /// Working directory, home-relativized to `~` where possible.
     cwd: String,
-    /// Last-known git status snapshot for the session bar's git segment and
-    /// the dropdowns (`None` = not a git repo / not yet captured). Painted
+    /// Last-known VCS status snapshot for the session bar's VCS segment and
+    /// dropdown (`None` = not a VCS repo / not yet captured). Painted
     /// last-known; the loop refreshes it from the async [`crate::git::status`]
     /// cache.
-    git: Option<GitStatus>,
+    vcs: Option<VcsStatus>,
     /// Latest provider-reported usage, if the provider surfaced it. Cleared at
     /// turn start so the working indicator's per-turn token readout resets.
     usage: Option<ProviderUsage>,
@@ -1035,19 +1035,48 @@ impl Screen {
         self.spinner.active
     }
 
-    /// Update the last-known git snapshot (and an open git dropdown's copy).
-    pub(crate) fn set_footer_git(&mut self, git: Option<GitStatus>) {
-        if let (Some(SessionMenu::Git(menu)), Some(status)) = (&mut self.session_menu, &git) {
-            menu.set_status(status.clone());
+    /// Update the last-known VCS snapshot (and an open VCS dropdown's copy).
+    pub(crate) fn set_footer_vcs(&mut self, vcs: Option<VcsStatus>) {
+        let Some(vcs) = vcs else {
+            return;
+        };
+        if let Some(SessionMenu::Git(menu)) = &mut self.session_menu {
+            match &vcs {
+                VcsStatus::Git(status) => menu.set_status(status.clone()),
+                _ => self.session_menu = None,
+            }
+        } else if let Some(SessionMenu::Jj(menu)) = &mut self.session_menu {
+            match &vcs {
+                VcsStatus::Jj(status) => menu.set_status(status.clone()),
+                _ => self.session_menu = None,
+            }
         }
         if let Some(footer) = &mut self.footer {
-            footer.git = git;
+            footer.vcs = Some(vcs);
         }
+    }
+
+    /// Update the last-known git snapshot (and an open git dropdown's copy).
+    #[cfg(test)]
+    pub(crate) fn set_footer_git(&mut self, git: Option<GitStatus>) {
+        self.set_footer_vcs(git.map(VcsStatus::Git));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_footer_jj(&mut self, jj: Option<JjStatus>) {
+        self.set_footer_vcs(jj.map(VcsStatus::Jj));
     }
 
     /// The last-known git snapshot, if any.
     pub(crate) fn footer_git(&self) -> Option<&GitStatus> {
-        self.footer.as_ref().and_then(|footer| footer.git.as_ref())
+        self.footer
+            .as_ref()
+            .and_then(|footer| footer.vcs.as_ref())
+            .and_then(VcsStatus::as_git)
+    }
+
+    pub(crate) fn footer_vcs(&self) -> Option<&VcsStatus> {
+        self.footer.as_ref().and_then(|footer| footer.vcs.as_ref())
     }
 
     /// Close the active picker and restore the editor.
@@ -1351,9 +1380,9 @@ impl Screen {
         let context_used_tokens = same_context
             .then(|| prev.and_then(|footer| footer.context_used_tokens))
             .flatten();
-        // The git snapshot is orthogonal to the model/context identity: always
+        // The VCS snapshot is orthogonal to the model/context identity: always
         // carried across a footer rebuild (the loop refreshes it separately).
-        let git = self.footer.as_mut().and_then(|footer| footer.git.take());
+        let vcs = self.footer.as_mut().and_then(|footer| footer.vcs.take());
         // Mirror the meter's context cap into the transcript so tool-footer
         // diagnostics can scale their `ctx` growth delta against it.
         self.transcript
@@ -1363,7 +1392,7 @@ impl Screen {
             effort,
             context,
             cwd,
-            git,
+            vcs,
             usage,
             context_used_tokens,
         });
@@ -1935,15 +1964,19 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
     ];
 
     let git_open = matches!(screen.session_menu, Some(SessionMenu::Git(_)));
+    let jj_open = matches!(screen.session_menu, Some(SessionMenu::Jj(_)));
     let tree_open = matches!(screen.session_menu, Some(SessionMenu::Tree(_)));
-    // Git segment candidates, fullest first (level 0 = full state cluster,
-    // 1 = counts reduced to `±`, 2 = no counts, 3 = base `git <branch>` only).
-    let git_levels: Vec<Vec<Span<'static>>> = footer
-        .git
+    // VCS segment candidates, fullest first. Git keeps its existing
+    // degradation levels; jj drops description, then counts, then base.
+    let vcs_levels: Vec<Vec<Span<'static>>> = footer
+        .vcs
         .as_ref()
         .map(|status| {
             (0..5u8)
-                .map(|level| git_segment_spans(status, level, git_open))
+                .map(|level| match status {
+                    VcsStatus::Git(git) => git_segment_spans(git, level, git_open),
+                    VcsStatus::Jj(jj) => jj_segment_spans(jj, level, jj_open),
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -1952,10 +1985,10 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
     // lower-priority segment is dropped instead.
     const CWD_MIN: usize = 12;
 
-    // Drop order: meter → `/<cap>` → counts (`±2 ◇3` → `±`) → `WT` tag →
-    // whole git segment → hard cwd truncation. Minimum form: cwd alone.
+    // Drop order: meter → `/<cap>` → VCS counts/details → whole VCS segment →
+    // hard cwd truncation. Minimum form: cwd alone.
     let mut candidates: Vec<(Option<usize>, Option<usize>)> = Vec::new();
-    if git_levels.is_empty() {
+    if vcs_levels.is_empty() {
         candidates.extend([(Some(0), None), (Some(1), None), (Some(2), None)]);
     } else {
         // Git level 0 = the explicit task badge; it is held while the right side
@@ -1978,15 +2011,15 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
     let prefix_w = if tree_open { 2 } else { 0 };
     for (right_idx, git_idx) in candidates {
         let right = right_idx.map(|index| &right_candidates[index]);
-        let git_spans: Vec<Span<'static>> = git_idx
-            .map(|index| git_levels[index].clone())
+        let vcs_spans: Vec<Span<'static>> = git_idx
+            .map(|index| vcs_levels[index].clone())
             .unwrap_or_default();
         let right_w = right.map(|spans| spans_width(spans)).unwrap_or(0);
         let gap = if right_w > 0 { 2 } else { 0 };
         let avail_cwd = width
             .saturating_sub(right_w)
             .saturating_sub(gap)
-            .saturating_sub(spans_width(&git_spans))
+            .saturating_sub(spans_width(&vcs_spans))
             .saturating_sub(prefix_w);
         if right.is_some() && avail_cwd < CWD_MIN.min(display_width(&cwd)) {
             continue;
@@ -2003,7 +2036,7 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
             spans.push(prefix);
         }
         spans.push(Span::styled(shown_cwd.clone(), Style::default()));
-        spans.extend(git_spans);
+        spans.extend(vcs_spans);
         if let Some(right) = right {
             let left_w = spans_width(&spans);
             let fill = width.saturating_sub(left_w).saturating_sub(right_w);
@@ -2110,6 +2143,40 @@ fn git_segment_spans(status: &GitStatus, level: u8, open: bool) -> Vec<Span<'sta
     spans
 }
 
+fn jj_segment_spans(status: &JjStatus, level: u8, open: bool) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        format!(" {} ", crate::ui::symbols::SEP),
+        dim_style(),
+    )];
+    if open {
+        spans.push(Span::styled(
+            format!("{} ", crate::ui::symbols::EXPANDED),
+            dim_style(),
+        ));
+    }
+    spans.push(Span::styled("jj ".to_string(), dim_style()));
+    spans.push(Span::styled(status.change_id.clone(), dim_style()));
+    if level == 0 && !status.description.is_empty() {
+        spans.push(Span::styled(" \"".to_string(), dim_style()));
+        spans.push(Span::styled(status.description.clone(), dim_style()));
+        spans.push(Span::styled("\"".to_string(), dim_style()));
+    }
+    if level <= 1 {
+        if status.conflicted > 0 {
+            spans.push(Span::styled(
+                format!(" {}{}", crate::ui::symbols::REVIEW, status.conflicted),
+                prompt_style(),
+            ));
+        } else if status.total_changed > 0 {
+            spans.push(Span::styled(
+                format!(" {}{}", crate::ui::symbols::DIRTY, status.total_changed),
+                prompt_style(),
+            ));
+        }
+    }
+    spans
+}
+
 /// Which half of the session bar a click at display column `x` hits: the cwd
 /// (tree dropdown target) or the git segment (git dropdown target). `None`
 /// for the right-side context readout / empty fill.
@@ -2119,19 +2186,27 @@ pub(crate) fn session_bar_hit(screen: &Screen, width: u16, x: u16) -> Option<Bar
     let bar = session_bar(screen, content_width)?;
     let x = usize::from(x.checked_sub(inset)?);
     let text = line_text(&bar);
-    let sep = format!(" {} git", crate::ui::symbols::SEP);
-    let git_at = text.find(&sep).map(|at| display_width(&text[..at]));
-    let left_end = match git_at {
+    let git_sep = format!(" {} git", crate::ui::symbols::SEP);
+    let jj_sep = format!(" {} jj", crate::ui::symbols::SEP);
+    let vcs_at = text
+        .find(&git_sep)
+        .or_else(|| text.find(&jj_sep))
+        .map(|at| display_width(&text[..at]));
+    let left_end = match vcs_at {
         Some(at) => at,
         None => display_width(text.trim_end()),
     };
     if x < left_end {
         return Some(BarSegment::Cwd);
     }
-    if let Some(at) = git_at {
+    if let Some(at) = vcs_at {
         // The git segment runs to the start of the right-side fill (two or
         // more spaces) or the end of the text.
-        let seg_text = &text[text.find(&sep).unwrap_or(0)..];
+        let seg_start = text
+            .find(&git_sep)
+            .or_else(|| text.find(&jj_sep))
+            .unwrap_or(0);
+        let seg_text = &text[seg_start..];
         let seg_len = seg_text
             .find("  ")
             .map_or(display_width(seg_text.trim_end()), |end| {
@@ -2543,6 +2618,25 @@ mod tests {
         screen
     }
 
+    fn jj_status(change: &str) -> crate::git::status::JjStatus {
+        crate::git::status::JjStatus {
+            change_id: change.to_string(),
+            description: "draft status work".to_string(),
+            total_changed: 3,
+            log: vec![crate::git::status::JjLogEntry {
+                change_id: change.to_string(),
+                description: "draft status work".to_string(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn jj_screen(cwd: &str, status: crate::git::status::JjStatus) -> Screen {
+        let mut screen = footer_screen(cwd);
+        screen.set_footer_jj(Some(status));
+        screen
+    }
+
     fn bar_text(screen: &Screen, width: u16) -> String {
         session_bar(screen, width)
             .map(|l| line_text(&l))
@@ -2756,6 +2850,61 @@ mod tests {
     }
 
     #[test]
+    fn session_bar_renders_jj_status_and_degrades_without_overflow() {
+        let screen = jj_screen("~/repo", jj_status("abcdefgh"));
+        let full = bar_text(&screen, 100);
+        assert!(
+            full.contains("┊ jj abcdefgh \"draft status work\" ±3"),
+            "{full:?}"
+        );
+        assert!(full.contains("CTX 0/300k ○○○○○○○○○○"), "{full:?}");
+
+        let mut saw_description = false;
+        let mut saw_count = false;
+        let mut saw_base = false;
+        for width in 1..=100u16 {
+            let Some(line) = session_bar(&screen, width) else {
+                continue;
+            };
+            let text = line_text(&line);
+            assert!(
+                display_width(&text) <= usize::from(width),
+                "width {width}: {text:?}"
+            );
+            if text.contains("\"draft status work\"") {
+                saw_description = true;
+            }
+            if text.contains("±3") && !text.contains("\"draft status work\"") {
+                saw_count = true;
+            }
+            if text.contains("jj abcdefgh") && !text.contains('±') {
+                saw_base = true;
+            }
+        }
+        assert!(saw_description);
+        assert!(saw_count);
+        assert!(saw_base);
+    }
+
+    #[test]
+    fn session_bar_renders_jj_conflict_before_dirty_count() {
+        let screen = jj_screen(
+            "~/repo",
+            crate::git::status::JjStatus {
+                conflicted: 2,
+                total_changed: 4,
+                ..jj_status("abcdefgh")
+            },
+        );
+        let bar = bar_text(&screen, 100);
+        assert!(
+            bar.contains("jj abcdefgh \"draft status work\" ▲2"),
+            "{bar:?}"
+        );
+        assert!(!bar.contains("±4"), "{bar:?}");
+    }
+
+    #[test]
     fn session_bar_marks_open_dropdown_with_disclosure_prefix() {
         use crate::ui::tui::session_menu::{GitMenu, SessionMenu, TreeMenu};
         let mut screen = git_screen("~/repo", git_status("main"));
@@ -2776,6 +2925,17 @@ mod tests {
         let bar = bar_text(&screen, 80);
         assert!(bar.starts_with("▾ ~/repo"), "{bar:?}");
         assert!(!bar.contains("▾ git"), "{bar:?}");
+    }
+
+    #[test]
+    fn session_bar_marks_open_jj_dropdown_with_disclosure_prefix() {
+        use crate::ui::tui::session_menu::{JjMenu, SessionMenu};
+        let status = jj_status("abcdefgh");
+        let mut screen = jj_screen("~/repo", status.clone());
+        screen.open_session_menu(SessionMenu::Jj(JjMenu::new(status)));
+        let bar = bar_text(&screen, 80);
+        assert!(bar.contains("┊ ▾ jj abcdefgh"), "{bar:?}");
+        assert!(!bar.starts_with("▾"), "{bar:?}");
     }
 
     #[test]
@@ -2805,6 +2965,45 @@ mod tests {
         // Opening the dropdown changes the bar block → stable prefix resets.
         let rendered = render_document_with_hints(&mut screen, size);
         assert_eq!(rendered.stable_prefix, 0);
+    }
+
+    #[test]
+    fn jj_dropdown_renders_between_bar_and_hairline() {
+        use super::{render_document_with_hints, session_bar_lines};
+        use crate::ui::tui::session_menu::{JjMenu, SessionMenu};
+        use ratatui::layout::Size;
+
+        let status = jj_status("abcdefgh");
+        let mut screen = jj_screen("~/repo", status.clone());
+        screen.commit_user("hello");
+        screen.open_session_menu(SessionMenu::Jj(JjMenu::new(status)));
+        let lines = session_bar_lines(&screen, 80, 24);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("RECENT"), "{text}");
+        assert!(text.contains("read-only"), "{text}");
+        assert!(
+            line_text(lines.last().unwrap())
+                .trim_start()
+                .starts_with('─')
+        );
+        assert_eq!(
+            render_document_with_hints(&mut screen, Size::new(80, 24)).stable_prefix,
+            0
+        );
+    }
+
+    #[test]
+    fn transient_missing_vcs_snapshot_keeps_open_jj_dropdown() {
+        use crate::ui::tui::session_menu::{JjMenu, SessionMenu};
+        let status = jj_status("abcdefgh");
+        let mut screen = jj_screen("~/repo", status.clone());
+        screen.open_session_menu(SessionMenu::Jj(JjMenu::new(status)));
+
+        screen.set_footer_vcs(None);
+
+        assert!(matches!(screen.session_menu, Some(SessionMenu::Jj(_))));
+        let bar = bar_text(&screen, 80);
+        assert!(bar.contains("┊ ▾ jj abcdefgh"), "{bar:?}");
     }
 
     #[test]
@@ -2843,6 +3042,19 @@ mod tests {
         );
         // The right-side context readout is neither target.
         assert_eq!(session_bar_hit(&screen, 80, 74), None);
+    }
+
+    #[test]
+    fn session_bar_hit_maps_jj_segment() {
+        use super::{BarSegment, session_bar_hit};
+        let screen = jj_screen("~/repo", jj_status("abcdefgh"));
+        assert_eq!(session_bar_hit(&screen, 80, 4), Some(BarSegment::Cwd));
+        let bar = bar_text(&screen, 76);
+        let jj_col = bar.find("jj").map(|at| display_width(&bar[..at])).unwrap();
+        assert_eq!(
+            session_bar_hit(&screen, 80, jj_col as u16 + 3),
+            Some(BarSegment::Git)
+        );
     }
 
     #[test]
