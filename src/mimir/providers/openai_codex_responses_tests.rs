@@ -721,6 +721,23 @@ fn reasoning_continuity_replay_requests_encrypted_reasoning() {
 }
 
 #[test]
+fn completed_reasoning_summary_overrides_output_item_placeholder() -> Result<()> {
+    let stream = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Answer\"}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"**Planning**\\n\\n<!-- -->\"}]}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"enc\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"**Planning**\\n\\nReal summary.\"}]}]}}\n\n",
+    );
+
+    let turn = parse_response_stream(stream)?;
+
+    assert_eq!(turn.reasoning[0].text, "**Planning**\n\nReal summary.");
+    Ok(())
+}
+
+#[test]
 fn parses_usage_response_id_and_encrypted_reasoning_from_stream() -> Result<()> {
     let stream = concat!(
         "event: response.output_text.delta\n",
