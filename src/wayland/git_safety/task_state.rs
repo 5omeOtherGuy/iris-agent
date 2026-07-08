@@ -35,6 +35,11 @@ pub(super) const DEFAULT_EXPIRY: Duration = Duration::from_secs(30 * 24 * 60 * 6
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct PersistedTask {
     pub(super) task_id: String,
+    /// Backend that wrote the record (`git` default for older records, `jj`
+    /// for jj-native tasks). Recovery uses this to avoid interpreting jj
+    /// operation anchors as git checkpoint refs.
+    #[serde(default = "default_backend")]
+    pub(super) backend: String,
     /// Canonicalized workspace root, so a repo-dir scan can rebuild absolute
     /// ledger paths.
     pub(super) workspace: String,
@@ -76,6 +81,16 @@ pub(super) struct PersistedTask {
     /// record deserializes to an empty vec.
     #[serde(default)]
     pub(super) sessions: Vec<String>,
+    /// jj operation before Iris first mutated this task.
+    #[serde(default)]
+    pub(super) jj_base_op: Option<String>,
+    /// Latest jj operation Iris observed after snapshotting its own mutation.
+    #[serde(default)]
+    pub(super) jj_last_op: Option<String>,
+}
+
+fn default_backend() -> String {
+    "git".to_string()
 }
 
 impl PersistedTask {

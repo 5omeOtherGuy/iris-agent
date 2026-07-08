@@ -81,6 +81,30 @@ fn git_stdout(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn jj_available() -> bool {
+    Command::new("jj")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn run_jj(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("jj")
+        .args(["--no-pager", "--color", "never"])
+        .args(args)
+        .current_dir(dir)
+        .env("JJ_USER", "Test")
+        .env("JJ_EMAIL", "test@example.com")
+        .output()
+        .expect("spawn jj");
+    assert!(
+        output.status.success(),
+        "jj {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 /// A git repo with one committed file (`committed.txt`) so `HEAD` exists.
 fn init_repo() -> TempDir {
     let dir = temp_dir();
@@ -91,6 +115,17 @@ fn init_repo() -> TempDir {
     run_git(&dir.path, &["add", "committed.txt"]);
     run_git(&dir.path, &["commit", "-q", "-m", "init"]);
     dir
+}
+
+fn init_jj_repo() -> Option<TempDir> {
+    if !jj_available() {
+        eprintln!("skipping jj test: jj binary is not installed");
+        return None;
+    }
+    let repo = init_repo();
+    run_jj(&repo.path, &["git", "init", "--colocate"]);
+    run_jj(&repo.path, &["status"]);
+    Some(repo)
 }
 
 fn guard(dir: &Path) -> GitSafety {
@@ -562,6 +597,179 @@ fn jj_workspace_degrades() {
         guard
             .unapproved_protected(&[repo.path.join("committed.txt")])
             .is_empty()
+    );
+}
+
+#[test]
+fn jj_workspace_uses_native_guard_when_available() {
+    let Some(repo) = init_jj_repo() else {
+        return;
+    };
+    fs::write(repo.path.join("committed.txt"), "dirty\n").unwrap();
+
+    let guard = guard(&repo.path);
+    let summary = guard.note_mutation().expect("jj dirty baseline summary");
+    assert!(summary.contains("dirty"), "summary: {summary}");
+    assert!(
+        !guard
+            .unapproved_protected(&[repo.path.join("committed.txt")])
+            .is_empty(),
+        "jj dirty file is protected instead of silently degraded"
+    );
+}
+
+#[test]
+fn jj_approved_edit_is_recorded_and_accept_keeps_history() {
+    let Some(repo) = init_jj_repo() else {
+        return;
+    };
+    let target = repo.path.join("committed.txt");
+    fs::write(&target, "dirty\n").unwrap();
+
+    let guard = guard(&repo.path);
+    guard.note_mutation();
+    guard.approve(std::slice::from_ref(&target), false);
+    let before_ops = run_jj(&repo.path, &["op", "log", "--limit", "20", "--no-graph"]);
+
+    guard.before_exec(std::slice::from_ref(&target));
+    fs::write(&target, "iris edit\n").unwrap();
+    let violations = guard.after_exec(
+        std::slice::from_ref(&target),
+        Some(&crate::tools::content_hash(b"iris edit\n")),
+    );
+    assert!(violations.is_empty());
+    assert_eq!(guard.ledger_len(), 1, "jj Iris edit is ledgered");
+
+    let settlement = guard.accept().expect("jj task accepted");
+    assert!(settlement.summary.contains("accepted"));
+    let after_ops = run_jj(&repo.path, &["op", "log", "--limit", "20", "--no-graph"]);
+    assert!(
+        after_ops.len() >= before_ops.len(),
+        "accept closes Iris metadata without erasing jj operation history"
+    );
+}
+
+#[test]
+fn jj_rollback_restores_from_recorded_operation() {
+    let Some(repo) = init_jj_repo() else {
+        return;
+    };
+    let target = repo.path.join("committed.txt");
+    fs::write(&target, "dirty\n").unwrap();
+
+    let guard = guard(&repo.path);
+    guard.note_mutation();
+    guard.approve(std::slice::from_ref(&target), false);
+    guard.before_exec(std::slice::from_ref(&target));
+    fs::write(&target, "iris edit\n").unwrap();
+    let violations = guard.after_exec(
+        std::slice::from_ref(&target),
+        Some(&crate::tools::content_hash(b"iris edit\n")),
+    );
+    assert!(violations.is_empty());
+
+    guard.rollback(0).unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "dirty\n");
+}
+
+#[test]
+fn jj_recovery_finds_unsettled_task() {
+    let Some(repo) = init_jj_repo() else {
+        return;
+    };
+    let target = repo.path.join("new.txt");
+    {
+        let guard = guard(&repo.path);
+        guard.note_mutation();
+        guard.before_exec(std::slice::from_ref(&target));
+        fs::write(&target, "iris\n").unwrap();
+        let violations = guard.after_exec(
+            std::slice::from_ref(&target),
+            Some(&crate::tools::content_hash(b"iris\n")),
+        );
+        assert!(violations.is_empty());
+    }
+
+    let recovered = guard(&repo.path).recoverable_tasks();
+    assert_eq!(recovered.len(), 1, "jj task record is recoverable");
+}
+
+#[test]
+fn jj_external_operation_after_task_is_a_violation() {
+    let Some(repo) = init_jj_repo() else {
+        return;
+    };
+    let target = repo.path.join("new.txt");
+    let guard = guard(&repo.path);
+    guard.note_mutation();
+    guard.before_exec(std::slice::from_ref(&target));
+    fs::write(&target, "iris\n").unwrap();
+    let violations = guard.after_exec(
+        std::slice::from_ref(&target),
+        Some(&crate::tools::content_hash(b"iris\n")),
+    );
+    assert!(violations.is_empty());
+
+    run_jj(&repo.path, &["describe", "-m", "external operation"]);
+    guard.before_exec(std::slice::from_ref(&target));
+    fs::write(&target, "second iris\n").unwrap();
+    let violations = guard.after_exec(
+        std::slice::from_ref(&target),
+        Some(&crate::tools::content_hash(b"second iris\n")),
+    );
+    assert!(
+        !violations.is_empty(),
+        "external jj operation must not silently advance the task baseline"
+    );
+}
+
+#[test]
+fn forced_deleted_linked_worktree_with_unreviewed_changes_is_not_swept() {
+    let repo = init_repo();
+    let linked = temp_dir();
+    fs::remove_dir(&linked.path).unwrap();
+    run_git(
+        &repo.path,
+        &[
+            "worktree",
+            "add",
+            linked.path.to_str().unwrap(),
+            "-b",
+            "linked-task",
+        ],
+    );
+    let linked_git_dir = task_state::git_dir(&linked.path).expect("linked git dir");
+
+    let linked_guard = guard(&linked.path);
+    let target = linked.path.join("iris.txt");
+    linked_guard.note_mutation();
+    linked_guard.before_exec(std::slice::from_ref(&target));
+    fs::write(&target, "iris\n").unwrap();
+    let violations = linked_guard.after_exec(
+        std::slice::from_ref(&target),
+        Some(&crate::tools::content_hash(b"iris\n")),
+    );
+    assert!(violations.is_empty());
+    let task_id = linked_guard.current_task_id().expect("active task id");
+    drop(linked_guard);
+    assert_eq!(task_state::load_all(&linked_git_dir).len(), 1);
+
+    fs::remove_dir_all(&linked.path).unwrap();
+    let main_guard = guard(&repo.path);
+    let _ = main_guard.recover_and_expire();
+
+    assert_eq!(
+        task_state::load_all(&linked_git_dir).len(),
+        1,
+        "deleted worktree admin record remains recoverable"
+    );
+    assert!(
+        git_stdout(
+            &repo.path,
+            &["for-each-ref", &format!("refs/iris/checkpoints/{task_id}")]
+        )
+        .contains(&task_id),
+        "checkpoint refs for unreviewed deleted-worktree task must not be swept"
     );
 }
 

@@ -31,6 +31,7 @@
 mod baseline;
 mod checkpoint;
 pub(crate) mod git;
+mod jj;
 mod ledger;
 mod lock;
 mod net_diff;
@@ -108,6 +109,8 @@ pub(crate) struct RollbackOutcome {
 enum Mode {
     /// A git working tree: full baseline + gating.
     Git,
+    /// A jj workspace: use jj snapshots and operation ids for recovery anchors.
+    Jj(jj::Workspace),
     /// Non-git, `.jj/`, or a capture failure: no gating, honest notice. The
     /// string is the one-line reason surfaced once at the first mutation.
     Degraded(String),
@@ -117,6 +120,7 @@ enum Mode {
 /// or plain content snapshots for a degraded (non-git / jj) workspace.
 enum Chain {
     Git(CheckpointChain),
+    Jj(FallbackStore),
     Fallback(FallbackStore),
 }
 
@@ -156,6 +160,14 @@ struct Task {
     /// admin dir and `.git` file both disappear during cleanup, any leftover
     /// files are orphaned, not protected worktree state to resurrect.
     linked_worktree: bool,
+    /// jj operation recorded before Iris's first mutation in this task.
+    jj_base_op: Option<String>,
+    /// Latest jj operation Iris recorded after snapshotting its own mutation.
+    jj_last_op: Option<String>,
+    /// Set when another jj operation advanced the workspace after Iris's last
+    /// recorded snapshot. The next mutation returns a violation instead of
+    /// silently rebasing the task baseline.
+    jj_external_op: bool,
     /// When this task first opened (epoch millis), for the expiry sweep.
     created_ms: u64,
     /// The per-task advisory `flock` lease, held for the task's lifetime
@@ -201,6 +213,9 @@ impl Task {
             chain: Chain::Git(chain),
             git_dir,
             linked_worktree,
+            jj_base_op: None,
+            jj_last_op: None,
+            jj_external_op: false,
             created_ms: task_state::now_ms(),
             _lease: lease,
             body: None,
@@ -229,6 +244,9 @@ impl Task {
             chain: Chain::Fallback(FallbackStore::default()),
             git_dir,
             linked_worktree,
+            jj_base_op: None,
+            jj_last_op: None,
+            jj_external_op: false,
             created_ms: task_state::now_ms(),
             _lease: None,
             body: None,
@@ -257,11 +275,46 @@ impl Task {
             chain: Chain::Fallback(FallbackStore::default()),
             git_dir: None,
             linked_worktree: false,
+            jj_base_op: None,
+            jj_last_op: None,
+            jj_external_op: false,
             created_ms: task_state::now_ms(),
             _lease: None,
             body: None,
             sessions: Vec::new(),
             external_settlement_blocked_while_clean: false,
+        }
+    }
+
+    fn jj(
+        task_id: String,
+        baseline: Baseline,
+        state_dir: PathBuf,
+        base_op: String,
+        lease: Option<lock::FlockGuard>,
+    ) -> Self {
+        Self {
+            durable: true,
+            degraded: false,
+            task_id,
+            baseline,
+            ledger: Ledger::default(),
+            approved: BTreeSet::new(),
+            all_dirty_approved: false,
+            snapshot: Snapshot::default(),
+            pre_modes: BTreeMap::new(),
+            turn: 0,
+            chain: Chain::Jj(FallbackStore::default()),
+            git_dir: Some(state_dir),
+            linked_worktree: false,
+            created_ms: task_state::now_ms(),
+            _lease: lease,
+            body: None,
+            sessions: Vec::new(),
+            external_settlement_blocked_while_clean: false,
+            jj_base_op: Some(base_op.clone()),
+            jj_last_op: Some(base_op),
+            jj_external_op: false,
         }
     }
 }
@@ -345,14 +398,18 @@ impl GitSafety {
     /// this does not probe leases or branch on task metadata; it only projects
     /// the opaque ADR-0031 `sessions` payload for UI markers.
     pub(crate) fn task_linked_session_ids(&self) -> BTreeSet<String> {
-        if !self.workflow_enabled || !matches!(self.mode, Mode::Git) {
+        if !self.workflow_enabled || matches!(self.mode, Mode::Degraded(_)) {
             return BTreeSet::new();
         }
-        let Some(git_dir) = task_state::git_dir(&self.workspace) else {
+        let Some(state_dir) = (match &self.mode {
+            Mode::Git => task_state::git_dir(&self.workspace),
+            Mode::Jj(workspace) => Some(workspace.state_dir.clone()),
+            Mode::Degraded(_) => None,
+        }) else {
             return BTreeSet::new();
         };
         let workspace = self.workspace.to_string_lossy().into_owned();
-        task_state::load_all(&git_dir)
+        task_state::load_all(&state_dir)
             .into_iter()
             .filter(|task| task.workspace == workspace)
             .flat_map(|task| task.sessions)
@@ -485,13 +542,16 @@ impl GitSafety {
                 push_recent_path(&mut paths, path);
             }
         }
-        if paths.is_empty()
-            && let Chain::Git(chain) = &task.chain
-        {
-            for path in chain.ledger_paths() {
-                if let Some(path) = self.workspace_compaction_path(path) {
-                    push_recent_path(&mut paths, path);
+        if paths.is_empty() {
+            match &task.chain {
+                Chain::Git(chain) => {
+                    for path in chain.ledger_paths() {
+                        if let Some(path) = self.workspace_compaction_path(path) {
+                            push_recent_path(&mut paths, path);
+                        }
+                    }
                 }
+                Chain::Jj(_) | Chain::Fallback(_) => {}
             }
         }
         if paths.len() > max_paths {
@@ -641,18 +701,28 @@ impl GitSafety {
                 // As in `after_exec`, these per-task ref writes are single-writer
                 // under the held lease and need no mutation lock; the shared
                 // record write in `persist_task` is the serialized one.
-                if !touched.is_empty()
-                    && let Chain::Git(chain) = &mut task.chain
-                {
-                    for path in &touched {
-                        let pre = checkpoint::committed_blob(&self.workspace, path);
-                        if let Err(error) = chain.note_before(path, pre) {
-                            tracing::warn!(error = %format!("{error:#}"), "bash checkpoint pre-image capture failed");
+                if !touched.is_empty() {
+                    match &mut task.chain {
+                        Chain::Git(chain) => {
+                            for path in &touched {
+                                let pre = checkpoint::committed_blob(&self.workspace, path);
+                                if let Err(error) = chain.note_before(path, pre) {
+                                    tracing::warn!(error = %format!("{error:#}"), "bash checkpoint pre-image capture failed");
+                                }
+                            }
+                            let turn = task.turn;
+                            if let Err(error) =
+                                chain.checkpoint(turn, None, "bash change".to_string())
+                            {
+                                tracing::warn!(error = %format!("{error:#}"), "bash checkpoint create failed");
+                            }
                         }
-                    }
-                    let turn = task.turn;
-                    if let Err(error) = chain.checkpoint(turn, None, "bash change".to_string()) {
-                        tracing::warn!(error = %format!("{error:#}"), "bash checkpoint create failed");
+                        Chain::Jj(store) | Chain::Fallback(store) => {
+                            for path in &touched {
+                                store.note_before(path, std::fs::read(path).ok());
+                            }
+                            store.checkpoint("bash change".to_string());
+                        }
                     }
                 }
                 self.persist_task(task);
@@ -721,7 +791,7 @@ impl GitSafety {
     }
 
     fn persisted_paths_clean_in_git(&self, task: &task_state::PersistedTask) -> bool {
-        if task.expected.is_empty() || !matches!(self.mode, Mode::Git) {
+        if task.expected.is_empty() || task.backend != "git" || !matches!(self.mode, Mode::Git) {
             return false;
         }
         self.ledger_paths_clean_in_git(task.expected.keys().map(|path| Path::new(path.as_str())))
@@ -774,7 +844,7 @@ impl GitSafety {
                     tracing::warn!(error = %format!("{error:#}"), "checkpoint teardown on settlement failed");
                 }
             }
-            Chain::Fallback(_) => {}
+            Chain::Jj(_) | Chain::Fallback(_) => {}
         };
         // Serialize the ref teardown + record removal against concurrent processes
         // (ADR-0030): one short mutation-lock hold around the shared writes.
@@ -801,7 +871,7 @@ impl GitSafety {
         };
         let tip_seq = match &task.chain {
             Chain::Git(chain) => chain.len() as u64,
-            Chain::Fallback(store) => store.len() as u64,
+            Chain::Jj(store) | Chain::Fallback(store) => store.len() as u64,
         };
         // Expected on-disk state = the latest recorded content hash per ledger
         // path (later entries win), for resume-time divergence detection.
@@ -814,6 +884,11 @@ impl GitSafety {
         }
         let record = task_state::PersistedTask {
             task_id: task.task_id.clone(),
+            backend: match &self.mode {
+                Mode::Git => "git".to_string(),
+                Mode::Jj(_) => "jj".to_string(),
+                Mode::Degraded(_) => "degraded".to_string(),
+            },
             workspace: self.workspace.to_string_lossy().into_owned(),
             created_ms: task.created_ms,
             updated_ms: task_state::now_ms(),
@@ -826,6 +901,8 @@ impl GitSafety {
             // any enforcement/recovery path.
             body: task.body.clone(),
             sessions: task.sessions.clone(),
+            jj_base_op: task.jj_base_op.clone(),
+            jj_last_op: task.jj_last_op.clone(),
         };
         // Serialize the record write against concurrent processes (ADR-0030).
         if let Err(error) = lock::with_mutation_lock(git_dir, || task_state::save(git_dir, &record))
@@ -835,15 +912,15 @@ impl GitSafety {
     }
 }
 
-/// Detect the guard mode for a canonicalized workspace. A `.jj/` colocated
-/// workspace degrades like non-git (jj owns the working-copy lifecycle,
-/// ADR-0028 interop note); a missing git binary or non-repo also degrades.
+/// Detect the guard mode for a canonicalized workspace. jj wins when available
+/// because jj owns the working-copy lifecycle; git remains the default backend
+/// for normal git worktrees.
 fn detect_mode(workspace: &Path) -> Mode {
+    if let Some(jj_workspace) = jj::detect(workspace) {
+        return Mode::Jj(jj_workspace);
+    }
     if workspace.join(".jj").exists() {
-        return Mode::Degraded(
-            "jj workspace detected: dirty-tree gating is disabled (jj owns the working copy)"
-                .to_string(),
-        );
+        return Mode::Degraded("jj workspace detected but `jj` is unavailable or unusable; dirty-tree safety runs in degraded mode".to_string());
     }
     if git::is_git_worktree(workspace) {
         Mode::Git
@@ -954,6 +1031,7 @@ fn attribution_scan(
     workspace: PathBuf,
     baseline_paths: BTreeSet<PathBuf>,
     turn: u64,
+    jj_backend: bool,
 ) -> Vec<LedgerEntry> {
     let normalize = |path: &Path| -> PathBuf {
         let absolute = if path.is_absolute() {
@@ -963,7 +1041,12 @@ fn attribution_scan(
         };
         absolute.canonicalize().unwrap_or(absolute)
     };
-    let Ok(current) = baseline::capture(&workspace, normalize) else {
+    let current = if jj_backend {
+        jj::capture_baseline(&workspace, normalize)
+    } else {
+        baseline::capture(&workspace, normalize)
+    };
+    let Ok(current) = current else {
         return Vec::new();
     };
     let now = SystemTime::now();
@@ -1030,6 +1113,80 @@ impl MutationGuard for GitSafety {
                 }
                 state.task = Some(task);
                 Some(reason.clone())
+            }
+            Mode::Jj(jj_workspace) => {
+                match jj::capture_baseline(&self.workspace, |path| self.normalize(path)) {
+                    Ok(baseline) => {
+                        let base_op = match jj::current_operation_id(&self.workspace) {
+                            Ok(op) => op,
+                            Err(error) => {
+                                tracing::warn!(error = %format!("{error:#}"), "jj operation capture failed; degrading dirty-tree safety this task");
+                                let mut task = Task::degraded(task_id, self.workflow_enabled);
+                                task.body = body;
+                                if let Some(id) = session_id {
+                                    push_session_deduped(&mut task.sessions, &id);
+                                }
+                                state.task = Some(task);
+                                return Some(format!(
+                                    "could not read jj operation id ({error:#}); dirty-tree gating disabled this task"
+                                ));
+                            }
+                        };
+                        let announce = baseline.dirty_count > 0 || baseline.untracked_count > 0;
+                        let summary = announce.then(|| {
+                            let mut summary = format!(
+                                "{} dirty and {} untracked file(s) present before this change",
+                                baseline.dirty_count, baseline.untracked_count
+                            );
+                            let protected = self.protected_path_summary(&baseline, 5);
+                            if !protected.is_empty() {
+                                summary.push_str(": ");
+                                summary.push_str(&protected);
+                            }
+                            summary
+                        });
+                        if !self.workflow_enabled {
+                            state.task = Some(Task::guard_only(task_id, baseline, None, false));
+                            return summary;
+                        }
+                        let lease = match lock::try_exclusive(&lock::lease_path(
+                            &jj_workspace.state_dir,
+                            &task_id,
+                        )) {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                tracing::warn!(error = %error, "could not acquire jj task lease; recovery liveness unprotected this task");
+                                None
+                            }
+                        };
+                        let mut task = Task::jj(
+                            task_id,
+                            baseline,
+                            jj_workspace.state_dir.clone(),
+                            base_op,
+                            lease,
+                        );
+                        task.body = body;
+                        if let Some(id) = session_id {
+                            push_session_deduped(&mut task.sessions, &id);
+                        }
+                        self.persist_task(&task);
+                        state.task = Some(task);
+                        summary
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "jj baseline capture failed; degrading dirty-tree safety this task");
+                        let mut task = Task::degraded(task_id, self.workflow_enabled);
+                        task.body = body;
+                        if let Some(id) = session_id {
+                            push_session_deduped(&mut task.sessions, &id);
+                        }
+                        state.task = Some(task);
+                        Some(format!(
+                            "could not read jj status ({error:#}); dirty-tree gating disabled this task"
+                        ))
+                    }
+                }
             }
             Mode::Git => match baseline::capture(&self.workspace, |path| self.normalize(path)) {
                 Ok(baseline) => {
@@ -1158,6 +1315,13 @@ impl MutationGuard for GitSafety {
             .map(|path| (path.clone(), FileMode::of(path)))
             .collect();
         task.snapshot = Snapshot::capture(capture);
+        if let Mode::Jj(_) = &self.mode
+            && let Ok(op) = jj::current_operation_id(&self.workspace)
+            && let Some(last) = task.jj_last_op.as_deref()
+            && op != last
+        {
+            task.jj_external_op = true;
+        }
     }
 
     fn after_exec(&self, approved: &[PathBuf], expected_after: Option<&str>) -> Vec<PathBuf> {
@@ -1193,6 +1357,24 @@ impl MutationGuard for GitSafety {
                 // guarantees, ADR-0028 Alternative 3).
                 self.checkpoint_degraded(task, approved);
                 return Vec::new();
+            }
+            if task.jj_external_op {
+                task.jj_external_op = false;
+                return approved
+                    .iter()
+                    .map(|path| self.normalize(path))
+                    .chain(std::iter::once(self.workspace.clone()))
+                    .collect();
+            }
+            if matches!(self.mode, Mode::Jj(_))
+                && let Err(error) = jj::snapshot(&self.workspace)
+            {
+                tracing::warn!(error = %format!("{error:#}"), "jj post-mutation snapshot failed");
+                return approved
+                    .iter()
+                    .map(|path| self.normalize(path))
+                    .chain(std::iter::once(self.workspace.clone()))
+                    .collect();
             }
             let approved_set: BTreeSet<PathBuf> =
                 approved.iter().map(|path| self.normalize(path)).collect();
@@ -1267,14 +1449,30 @@ impl MutationGuard for GitSafety {
             if !iris_changes.is_empty() {
                 let turn = task.turn;
                 let label = checkpoint_label(&iris_changes);
-                if let Chain::Git(chain) = &mut task.chain {
-                    for (path, pre) in &iris_changes {
-                        if let Err(error) = chain.note_before(path, pre.clone()) {
-                            tracing::warn!(error = %format!("{error:#}"), "checkpoint pre-image capture failed");
+                match &mut task.chain {
+                    Chain::Git(chain) => {
+                        for (path, pre) in &iris_changes {
+                            if let Err(error) = chain.note_before(path, pre.clone()) {
+                                tracing::warn!(error = %format!("{error:#}"), "checkpoint pre-image capture failed");
+                            }
+                        }
+                        if let Err(error) = chain.checkpoint(turn, None, label) {
+                            tracing::warn!(error = %format!("{error:#}"), "checkpoint create failed");
                         }
                     }
-                    if let Err(error) = chain.checkpoint(turn, None, label) {
-                        tracing::warn!(error = %format!("{error:#}"), "checkpoint create failed");
+                    Chain::Jj(store) | Chain::Fallback(store) => {
+                        for (path, pre) in &iris_changes {
+                            store.note_before(path, pre.as_ref().map(|(bytes, _)| bytes.clone()));
+                        }
+                        store.checkpoint(label);
+                    }
+                }
+                if matches!(self.mode, Mode::Jj(_)) {
+                    match jj::current_operation_id(&self.workspace) {
+                        Ok(op) => task.jj_last_op = Some(op),
+                        Err(error) => {
+                            tracing::warn!(error = %format!("{error:#}"), "jj operation update failed")
+                        }
                     }
                 }
                 self.persist_task(task);
@@ -1282,7 +1480,7 @@ impl MutationGuard for GitSafety {
             // Async attribution only for the non-targeted (bash-like) path: a
             // command with no statically-known target may have changed other
             // files. A targeted edit/write is already accounted for above.
-            if matches!(self.mode, Mode::Git) && approved.is_empty() {
+            if matches!(self.mode, Mode::Git | Mode::Jj(_)) && approved.is_empty() {
                 let baseline_paths: BTreeSet<PathBuf> =
                     task.baseline.protected.keys().cloned().collect();
                 scan_input = Some((baseline_paths, task.turn));
@@ -1292,8 +1490,10 @@ impl MutationGuard for GitSafety {
         if let Some((baseline_paths, turn)) = scan_input {
             self.join_attribution_scan();
             let workspace = self.workspace.clone();
-            let handle =
-                std::thread::spawn(move || attribution_scan(workspace, baseline_paths, turn));
+            let jj_backend = matches!(self.mode, Mode::Jj(_));
+            let handle = std::thread::spawn(move || {
+                attribution_scan(workspace, baseline_paths, turn, jj_backend)
+            });
             *self.scan.lock().unwrap() = Some(handle);
         }
         violations
