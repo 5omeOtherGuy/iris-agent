@@ -148,9 +148,14 @@ struct Task {
     turn: u64,
     /// Rollback store (git chain or content-snapshot fallback).
     chain: Chain,
-    /// Resolved git directory for the persisted recovery record (`None` in
-    /// degraded mode).
+    /// Resolved git directory for task-local metadata. Durable workflow tasks
+    /// persist recovery records here; guard-only tasks keep it only to detect a
+    /// linked worktree that was later removed from Git's registry.
     git_dir: Option<PathBuf>,
+    /// Whether this task opened in a linked Git worktree. If that worktree's
+    /// admin dir and `.git` file both disappear during cleanup, any leftover
+    /// files are orphaned, not protected worktree state to resurrect.
+    linked_worktree: bool,
     /// When this task first opened (epoch millis), for the expiry sweep.
     created_ms: u64,
     /// The per-task advisory `flock` lease, held for the task's lifetime
@@ -179,6 +184,7 @@ impl Task {
         baseline: Baseline,
         chain: CheckpointChain,
         git_dir: Option<PathBuf>,
+        linked_worktree: bool,
         lease: Option<lock::FlockGuard>,
     ) -> Self {
         Self {
@@ -194,6 +200,7 @@ impl Task {
             turn: 0,
             chain: Chain::Git(chain),
             git_dir,
+            linked_worktree,
             created_ms: task_state::now_ms(),
             _lease: lease,
             body: None,
@@ -202,7 +209,12 @@ impl Task {
         }
     }
 
-    fn guard_only(task_id: String, baseline: Baseline) -> Self {
+    fn guard_only(
+        task_id: String,
+        baseline: Baseline,
+        git_dir: Option<PathBuf>,
+        linked_worktree: bool,
+    ) -> Self {
         Self {
             durable: false,
             degraded: false,
@@ -215,7 +227,8 @@ impl Task {
             pre_modes: BTreeMap::new(),
             turn: 0,
             chain: Chain::Fallback(FallbackStore::default()),
-            git_dir: None,
+            git_dir,
+            linked_worktree,
             created_ms: task_state::now_ms(),
             _lease: None,
             body: None,
@@ -243,6 +256,7 @@ impl Task {
             turn: 0,
             chain: Chain::Fallback(FallbackStore::default()),
             git_dir: None,
+            linked_worktree: false,
             created_ms: task_state::now_ms(),
             _lease: None,
             body: None,
@@ -676,11 +690,7 @@ impl GitSafety {
         let paths = {
             let state = self.state.lock().unwrap();
             let task = state.task.as_ref()?;
-            if !task.durable
-                || task.degraded
-                || task.ledger.entries.is_empty()
-                || !matches!(self.mode, Mode::Git)
-            {
+            if task.degraded || task.ledger.entries.is_empty() || !matches!(self.mode, Mode::Git) {
                 return None;
             }
             task.ledger
@@ -705,8 +715,9 @@ impl GitSafety {
             return None;
         }
         let task = state.task.take()?;
+        let durable = task.durable;
         drop(state);
-        Some(self.destroy_settled_task(task, EXTERNAL_SETTLEMENT_NOTICE.to_string()))
+        durable.then(|| self.destroy_settled_task(task, EXTERNAL_SETTLEMENT_NOTICE.to_string()))
     }
 
     fn persisted_paths_clean_in_git(&self, task: &task_state::PersistedTask) -> bool {
@@ -842,6 +853,26 @@ fn detect_mode(workspace: &Path) -> Mode {
                 .to_string(),
         )
     }
+}
+
+fn canonical_or_self(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn is_linked_worktree(workspace: &Path, git_dir: Option<&Path>) -> bool {
+    let Some(git_dir) = git_dir else {
+        return false;
+    };
+    let Some(common_dir) = task_state::git_common_dir(workspace) else {
+        return false;
+    };
+    canonical_or_self(git_dir) != canonical_or_self(&common_dir)
+}
+
+fn orphaned_linked_worktree(workspace: &Path, task: &Task) -> bool {
+    task.linked_worktree
+        && task.git_dir.as_ref().is_some_and(|dir| !dir.exists())
+        && !workspace.join(".git").exists()
 }
 
 /// Read-only display payload of the active (live, unsettled) task, surfaced to
@@ -1015,11 +1046,17 @@ impl MutationGuard for GitSafety {
                         }
                         summary
                     });
+                    let git_dir = task_state::git_dir(&self.workspace);
+                    let linked_worktree = is_linked_worktree(&self.workspace, git_dir.as_deref());
                     if !self.workflow_enabled {
-                        state.task = Some(Task::guard_only(task_id, baseline));
+                        state.task = Some(Task::guard_only(
+                            task_id,
+                            baseline,
+                            git_dir,
+                            linked_worktree,
+                        ));
                         return summary;
                     }
-                    let git_dir = task_state::git_dir(&self.workspace);
                     // Acquire the per-task lease for the task's lifetime: it
                     // proves this process owns and is live on the task, so
                     // recovery in another process skips it (ADR-0030). A brand-new
@@ -1035,7 +1072,8 @@ impl MutationGuard for GitSafety {
                         }
                     });
                     let chain = CheckpointChain::new(self.workspace.clone(), task_id.clone());
-                    let mut task = Task::active(task_id, baseline, chain, git_dir, lease);
+                    let mut task =
+                        Task::active(task_id, baseline, chain, git_dir, linked_worktree, lease);
                     task.body = body;
                     if let Some(id) = session_id {
                         push_session_deduped(&mut task.sessions, &id);
@@ -1127,6 +1165,18 @@ impl MutationGuard for GitSafety {
         let mut scan_input = None;
         {
             let mut state = self.state.lock().unwrap();
+            if state
+                .task
+                .as_ref()
+                .is_some_and(|task| orphaned_linked_worktree(&self.workspace, task))
+            {
+                tracing::info!(
+                    workspace = %self.workspace.display(),
+                    "linked worktree disappeared during cleanup; dropping guard without restoring orphaned files"
+                );
+                state.task = None;
+                return Vec::new();
+            }
             let Some(task) = state.task.as_mut() else {
                 return Vec::new();
             };

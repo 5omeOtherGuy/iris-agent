@@ -97,6 +97,15 @@ fn guard(dir: &Path) -> GitSafety {
     GitSafety::new(dir)
 }
 
+fn record_iris_write(guard: &GitSafety, path: &Path, content: &[u8]) {
+    let target = path.to_path_buf();
+    guard.before_exec(std::slice::from_ref(&target));
+    fs::write(path, content).unwrap();
+    let hash = crate::tools::content_hash(content);
+    let violations = guard.after_exec(std::slice::from_ref(&target), Some(&hash));
+    assert!(violations.is_empty(), "iris write should be ledgered");
+}
+
 // --- guard-level unit tests ---------------------------------------------
 
 // Test 6: clean-tree fast path -- lazy (no baseline until first mutation) and
@@ -120,6 +129,90 @@ fn clean_tree_is_lazy_and_ungated() {
         guard
             .unapproved_protected(&[repo.path.join("committed.txt")])
             .is_empty()
+    );
+}
+
+#[test]
+fn guard_only_external_commit_drops_in_memory_task_without_notice() {
+    let repo = init_repo();
+    let guard = GitSafety::new_with_workflow(&repo.path, false);
+    let target = repo.path.join("committed.txt");
+
+    guard.note_mutation();
+    record_iris_write(&guard, &target, b"iris edit\n");
+    assert!(
+        guard.has_task(),
+        "guard-only task is open after Iris writes"
+    );
+
+    run_git(&repo.path, &["add", "committed.txt"]);
+    run_git(&repo.path, &["commit", "-q", "-m", "accept iris work"]);
+
+    let settlements = guard.drain_external_settlements();
+    assert!(
+        settlements.is_empty(),
+        "workflow-off guard settlement is internal, not a user-facing task notice"
+    );
+    assert!(
+        !guard.has_task(),
+        "a user commit clears the in-memory guard-only task"
+    );
+}
+
+#[test]
+fn removed_linked_worktree_does_not_restore_orphaned_files() {
+    for (workflow_enabled, label) in [(false, "guard-only"), (true, "durable")] {
+        removed_linked_worktree_does_not_restore_orphaned_files_case(workflow_enabled, label);
+    }
+}
+
+fn removed_linked_worktree_does_not_restore_orphaned_files_case(
+    workflow_enabled: bool,
+    label: &str,
+) {
+    let parent = temp_dir();
+    let primary = parent.path.join("primary");
+    let primary_arg = primary.to_str().unwrap();
+    run_git(&parent.path, &["init", "-q", "-b", "main", primary_arg]);
+    run_git(&primary, &["config", "user.email", "test@example.com"]);
+    run_git(&primary, &["config", "user.name", "Test"]);
+    fs::write(primary.join("committed.txt"), "base\n").unwrap();
+    run_git(&primary, &["add", "committed.txt"]);
+    run_git(&primary, &["commit", "-q", "-m", "init"]);
+
+    let linked = parent.path.join("linked");
+    let linked_arg = linked.to_str().unwrap();
+    run_git(
+        &primary,
+        &["worktree", "add", "-q", "-b", "feature", linked_arg],
+    );
+
+    let guard = GitSafety::new_with_workflow(&linked, workflow_enabled);
+    let target = linked.join("committed.txt");
+    guard.note_mutation();
+    record_iris_write(&guard, &target, b"iris edit\n");
+    run_git(&linked, &["add", "committed.txt"]);
+    run_git(&linked, &["commit", "-q", "-m", "accept iris work"]);
+    assert!(
+        guard.has_task(),
+        "{label}: task remains open until the next barrier"
+    );
+
+    guard.before_exec(&[]);
+    run_git(&primary, &["worktree", "remove", linked_arg]);
+    let violations = guard.after_exec(&[], None);
+
+    assert!(
+        violations.is_empty(),
+        "{label}: removed linked worktree files are orphaned cleanup, not restored violations"
+    );
+    assert!(
+        !linked.exists(),
+        "{label}: the linked worktree stays removed"
+    );
+    assert!(
+        !guard.has_task(),
+        "{label}: orphaned linked-worktree cleanup drops the guard state"
     );
 }
 
