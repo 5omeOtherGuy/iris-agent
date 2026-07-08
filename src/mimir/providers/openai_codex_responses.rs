@@ -29,7 +29,6 @@ use crate::nexus::{
 // every provider adapter.
 const PROVIDER_ID: &str = "openai-codex";
 const API_ID: &str = "openai-codex-responses";
-const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH: usize = 64;
 
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiCodexResponsesProvider {
@@ -277,7 +276,7 @@ fn build_codex_request(
         "text": { "verbosity": "low" },
     });
     if cache_retention.caching_enabled() {
-        if let Some(key) = prompt_cache_key.and_then(clamp_openai_prompt_cache_key) {
+        if let Some(key) = prompt_cache_key.and_then(super::clamp_openai_prompt_cache_key) {
             body["prompt_cache_key"] = json!(key);
         }
         // Long retention opts into the 24h prompt-cache lifetime (pi-mono
@@ -385,19 +384,6 @@ fn codex_input_item(message: &Message, current_origin: &ModelOrigin) -> Option<V
         }
     };
     Some(item)
-}
-
-fn clamp_openai_prompt_cache_key(key: &str) -> Option<String> {
-    let trimmed = key.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(
-        trimmed
-            .chars()
-            .take(OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH)
-            .collect(),
-    )
 }
 
 fn openai_origin(model: &str) -> ModelOrigin {
