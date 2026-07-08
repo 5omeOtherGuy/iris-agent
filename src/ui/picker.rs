@@ -361,6 +361,10 @@ fn settings_snapshot<P: ChatProvider>(
             .unwrap_or_else(|| "strict".to_string()),
         skip_permissions: harness.skip_permissions(),
         context_token_budget: settings.context_token_budget(),
+        compaction_summarizer: settings
+            .compaction_summarizer
+            .clone()
+            .unwrap_or_else(|| "provider".to_string()),
         microcompaction: settings.microcompaction(),
         bash_tool_mode: settings.bash_tool_mode(),
         max_tool_roundtrips: settings.max_tool_roundtrips(),
@@ -396,6 +400,9 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
         Field::DefaultApproval => config::save_default_approval(value.unwrap_or("strict")),
         Field::ContextTokenBudget => {
             config::save_context_token_budget(value.unwrap_or("0").parse()?)
+        }
+        Field::CompactionSummarizer => {
+            config::save_compaction_summarizer(value.unwrap_or("provider"))
         }
         Field::Microcompaction => config::save_microcompaction(parse_bool(value)),
         Field::BashToolMode => config::save_bash_tool_mode(parse_bool(value)),

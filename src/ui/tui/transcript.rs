@@ -2182,6 +2182,24 @@ impl Transcript {
                     ),
                 );
             }
+            UiEvent::CompactionLifecycle {
+                state,
+                covered_messages,
+                original_tokens_estimate,
+                message,
+                ..
+            } => {
+                self.finish_stream();
+                let detail = message.unwrap_or_else(|| {
+                    format!(
+                        "Background compaction {} — {} message(s), ~{} tokens",
+                        state.as_str(),
+                        covered_messages,
+                        super::screen::compact_count(original_tokens_estimate),
+                    )
+                });
+                self.push_notice_row(crate::ui::symbols::SEP, dim_style(), &detail);
+            }
             UiEvent::FoldApplied {
                 folds,
                 reclaimed_tokens_estimate,

@@ -89,6 +89,7 @@ pub(crate) enum Field {
     Theme,
     DefaultApproval,
     ContextTokenBudget,
+    CompactionSummarizer,
     Microcompaction,
     BashToolMode,
     MaxToolRoundtrips,
@@ -123,6 +124,7 @@ impl Field {
             }
             Field::DefaultApproval => Category::Approvals,
             Field::ContextTokenBudget
+            | Field::CompactionSummarizer
             | Field::Microcompaction
             | Field::BashToolMode
             | Field::MaxToolRoundtrips
@@ -140,6 +142,7 @@ impl Field {
             Field::Theme => "Theme",
             Field::DefaultApproval => "Default approval",
             Field::ContextTokenBudget => "Context token budget",
+            Field::CompactionSummarizer => "Compaction summarizer",
             Field::Microcompaction => "Microcompaction",
             Field::BashToolMode => "Bash tool mode",
             Field::MaxToolRoundtrips => "Max tool round-trips",
@@ -160,6 +163,9 @@ impl Field {
             },
             Field::PromptCacheRetention => FieldKind::Enum {
                 options: &["none", "short", "long"],
+            },
+            Field::CompactionSummarizer => FieldKind::Enum {
+                options: &["excerpts", "provider", "subagent"],
             },
             Field::Theme => FieldKind::Enum {
                 options: crate::ui::theme::available(),
@@ -204,6 +210,7 @@ pub(crate) struct Snapshot {
     pub(crate) default_approval: String,
     pub(crate) skip_permissions: bool,
     pub(crate) context_token_budget: u64,
+    pub(crate) compaction_summarizer: String,
     pub(crate) microcompaction: bool,
     pub(crate) bash_tool_mode: bool,
     pub(crate) max_tool_roundtrips: Option<usize>,
@@ -225,6 +232,7 @@ impl Snapshot {
             Field::Theme => self.theme.clone(),
             Field::DefaultApproval => self.default_approval.clone(),
             Field::ContextTokenBudget => self.context_token_budget.to_string(),
+            Field::CompactionSummarizer => self.compaction_summarizer.clone(),
             Field::Microcompaction => on_off(self.microcompaction),
             Field::BashToolMode => on_off(self.bash_tool_mode),
             Field::MaxToolRoundtrips => match self.max_tool_roundtrips {
@@ -356,6 +364,7 @@ fn rows_for(category: Category, snapshot: &Snapshot) -> Vec<Row> {
         ],
         Category::Runtime => vec![
             field_row(Field::ContextTokenBudget, snapshot),
+            field_row(Field::CompactionSummarizer, snapshot),
             field_row(Field::Microcompaction, snapshot),
             field_row(Field::BashToolMode, snapshot),
             field_row(Field::MaxToolRoundtrips, snapshot),
@@ -713,6 +722,7 @@ mod tests {
             default_approval: "strict".to_string(),
             skip_permissions: false,
             context_token_budget: 128_000,
+            compaction_summarizer: "provider".to_string(),
             microcompaction: false,
             bash_tool_mode: false,
             max_tool_roundtrips: None,

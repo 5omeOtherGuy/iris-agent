@@ -399,6 +399,30 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             | UiEvent::OutputHandleStored { .. }
             | UiEvent::CompactionApplied { .. }
             | UiEvent::FoldApplied { .. } => {}
+            UiEvent::CompactionLifecycle {
+                state,
+                covered_messages,
+                original_tokens_estimate,
+                message,
+                ..
+            } => {
+                self.finish_assistant_stream()?;
+                self.in_tool_block = false;
+                self.exploring_open = false;
+                let detail = message.unwrap_or_else(|| {
+                    format!(
+                        "background compaction {} ({} message(s), ~{} tokens)",
+                        state.as_str(),
+                        covered_messages,
+                        original_tokens_estimate
+                    )
+                });
+                writeln!(
+                    self.out,
+                    "{}",
+                    sgr(self.ansi, "2", &format!("note: {detail}"))
+                )?;
+            }
             UiEvent::SessionStarted => {
                 self.finish_assistant_stream()?;
                 self.in_tool_block = false;

@@ -1,8 +1,8 @@
 use std::cell::RefCell;
 use std::io::IsTerminal;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -31,6 +31,10 @@ pub(crate) struct ModelSwitch<'a, P> {
     pub(crate) selection: ModelSelection,
     system_prompt: String,
     build: &'a dyn Fn(&ModelSelection, &str) -> Result<P>,
+    /// Shared active selection cell read by the background compaction provider
+    /// factory. Text/TUI model switches update it at the same boundary as the
+    /// foreground provider swap; tests and generic harnesses leave it unset.
+    background_selection: Option<Arc<Mutex<ModelSelection>>>,
     /// Ordered `provider/model` ids that scope Ctrl+P cycling, or `None` to cycle
     /// every authenticated model. Seeded from `settings.enabled_models` and edited
     /// by `/scoped-models`; only the picker's Ctrl+S persists it back to settings.
@@ -48,8 +52,13 @@ impl<'a, P> ModelSwitch<'a, P> {
             selection,
             system_prompt,
             build,
+            background_selection: None,
             scoped,
         }
+    }
+
+    pub(crate) fn set_background_selection_cell(&mut self, cell: Arc<Mutex<ModelSelection>>) {
+        self.background_selection = Some(cell);
     }
 
     /// The active resolved selection (provider/model/base-url/reasoning).
@@ -104,15 +113,38 @@ pub(crate) enum SessionSource {
 pub(crate) struct SessionIdGuard {
     cell: Rc<RefCell<String>>,
     previous: String,
+    background: Option<(Arc<Mutex<String>>, String)>,
     committed: bool,
 }
 
 impl SessionIdGuard {
+    #[cfg(test)]
     pub(crate) fn swap(cell: Rc<RefCell<String>>, next: String) -> Self {
         let previous = cell.replace(next);
         Self {
             cell,
             previous,
+            background: None,
+            committed: false,
+        }
+    }
+
+    pub(crate) fn swap_with_background(
+        cell: Rc<RefCell<String>>,
+        background: Arc<Mutex<String>>,
+        next: String,
+    ) -> Self {
+        let previous = cell.replace(next.clone());
+        let previous_background = {
+            let mut id = background
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            std::mem::replace(&mut *id, next)
+        };
+        Self {
+            cell,
+            previous,
+            background: Some((background, previous_background)),
             committed: false,
         }
     }
@@ -126,6 +158,11 @@ impl Drop for SessionIdGuard {
     fn drop(&mut self) {
         if !self.committed {
             let _ = self.cell.replace(self.previous.clone());
+            if let Some((background, previous)) = &self.background {
+                *background
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = previous.clone();
+            }
         }
     }
 }
@@ -598,6 +635,9 @@ pub(crate) fn apply_selection<P: ChatProvider>(
         harness.context_budget(),
         &candidate.model,
     );
+    if let Some(cell) = &switch.background_selection {
+        *cell.lock().unwrap_or_else(|poison| poison.into_inner()) = candidate.clone();
+    }
     switch.selection = candidate;
     let mut lines = vec![confirm];
     lines.extend(advisory);
@@ -1230,6 +1270,52 @@ mod tests {
             guard.commit();
         }
         assert_eq!(&*cell.borrow(), "committed");
+    }
+
+    #[test]
+    fn session_id_guard_keeps_background_factory_cell_transactional() {
+        let cell = Rc::new(RefCell::new("old".to_string()));
+        let background = Arc::new(Mutex::new("old".to_string()));
+        {
+            let _guard = SessionIdGuard::swap_with_background(
+                cell.clone(),
+                background.clone(),
+                "new".to_string(),
+            );
+            assert_eq!(&*cell.borrow(), "new");
+            assert_eq!(
+                background
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .as_str(),
+                "new"
+            );
+        }
+        assert_eq!(&*cell.borrow(), "old");
+        assert_eq!(
+            background
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_str(),
+            "old"
+        );
+
+        {
+            let mut guard = SessionIdGuard::swap_with_background(
+                cell.clone(),
+                background.clone(),
+                "committed".to_string(),
+            );
+            guard.commit();
+        }
+        assert_eq!(&*cell.borrow(), "committed");
+        assert_eq!(
+            background
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_str(),
+            "committed"
+        );
     }
 
     #[test]

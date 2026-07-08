@@ -516,7 +516,7 @@ fn run_scenario(summarizer: SummarizerKind) -> ArmResult {
     // falls back to excerpts (provider summary failed or failed to shrink)
     // would otherwise pass as an excerpts-vs-excerpts comparison.
     match summarizer {
-        SummarizerKind::Provider => {
+        SummarizerKind::Provider | SummarizerKind::Subagent => {
             assert!(
                 summary_calls >= 1,
                 "provider arm did not invoke the provider summarizer (summary_calls=0); it \
@@ -635,7 +635,7 @@ fn each_arm_clears_the_minimum_reduction_bar() {
         let result = run_scenario(arm);
         let class = match arm {
             SummarizerKind::Excerpts => "compaction/excerpts",
-            SummarizerKind::Provider => "compaction/provider",
+            SummarizerKind::Provider | SummarizerKind::Subagent => "compaction/provider",
         };
         assert_min_reduction(
             class,

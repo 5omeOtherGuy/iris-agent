@@ -1,16 +1,15 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Issue 460 implementation notes</title></head>
+<head><meta charset="utf-8"><title>Issue 472 implementation notes</title></head>
 <body>
-<h1>Issue 460 implementation notes</h1>
+<h1>Issue 472 implementation notes</h1>
 <ul>
-  <li>The primary checkout was dirty and behind <code>origin/main</code>; implementation is in fresh worktree <code>../iris-subagents-readonly-460</code> from <code>origin/main</code>.</li>
-  <li>The read-only MVP keeps subagent orchestration in Wayland. Nexus changes are limited to a provider-neutral tool-registry filter so declaration and execution use the same reduced registry.</li>
-  <li>Read-only filtering uses each tool's self-classification: tools are retained only when they are not mutating and do not require approval. This intentionally excludes <code>bash</code> for the MVP even if a specific shell command might be read-only, because the current bash tool classifies itself as workspace-mutating.</li>
-  <li>The MVP handle API stores workers in memory and runs the child on <code>wait</code>. The worker table uses interior mutability so <code>cancel</code> can flip the shared token while <code>wait</code> is awaiting the child. Durable/background recovery is deferred to later subagent slices.</li>
-  <li>Tool allowlists are applied after the read-only capability filter. An allowlist can narrow read-only tools but cannot re-add a mutating or approval-gated tool.</li>
-  <li>Explicit <code>cwd</code> is supported only inside the parent workspace for this read-only slice. Worktree isolation remains rejected until the mutable/worktree issues implement it.</li>
-  <li><code>max_output_bytes</code> limits the structured result summary returned by this MVP. It is not a provider context-window budget.</li>
+  <li>Implementation is in worktree <code>../iris-issue-472</code> on branch <code>issue-472-bg-compaction</code>.</li>
+  <li>Wayland now schedules automatic provider/subagent compaction as a background read-only summarizer when Tier 3 installs a worker provider factory. Harnesses without that factory keep the legacy foreground provider/excerpts path.</li>
+  <li>The worker returns text only. The parent harness revalidates the planned durable entry-id range, derives carry/task state, registers recall, enforces shrink, appends the compaction entry, rebuilds live context, and emits the applied event.</li>
+  <li>Stale worker results are discarded after parent revalidation. Worker errors fall back to deterministic excerpts only if the original durable range is still valid.</li>
+  <li>The <code>subagent</code> summarizer setting uses the existing Wayland subagent backend with read-only tools and a bounded tool-roundtrip/output budget.</li>
+  <li>Lifecycle events are metadata only: job id, state, covered message count, token estimate, and a short status message. Summary text and covered transcript content are not sent through lifecycle events.</li>
 </ul>
 </body>
 </html>

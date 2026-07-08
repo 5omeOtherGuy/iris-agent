@@ -356,6 +356,18 @@ pub(crate) enum AgentEvent {
         /// when the covered range had no in-workspace tool targets.
         carried_paths: usize,
     },
+    /// Background compaction worker lifecycle (issue #472). Metadata only: the
+    /// worker id, state, covered-count/token estimate, and a short status
+    /// message. The generated summary text and covered transcript never ride
+    /// this event; the parent emits [`CompactionApplied`] only after durable
+    /// validation/persistence succeeds.
+    CompactionLifecycle {
+        job_id: String,
+        state: CompactionLifecycleState,
+        covered_messages: usize,
+        original_tokens_estimate: u64,
+        message: Option<String>,
+    },
     /// The harness flushed a batch of microcompaction folds at a safe turn
     /// boundary (ADR-0048, issue #400). Counts and estimates only, tagged with
     /// the trigger class that released the batch; never carries folded content.
@@ -477,6 +489,25 @@ pub(crate) enum AgentEvent {
         restored: bool,
     },
     TurnComplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionLifecycleState {
+    Running,
+    Discarded,
+    Failed,
+    Cancelled,
+}
+
+impl CompactionLifecycleState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Discarded => "discarded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
