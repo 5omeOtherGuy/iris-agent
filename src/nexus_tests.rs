@@ -526,6 +526,16 @@ fn reasoning_delta_texts(events: &[AgentEvent]) -> Vec<String> {
         .collect()
 }
 
+fn raw_reasoning_delta_texts(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::AssistantRawReasoningDelta(delta) => Some(delta.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn persisted_reasoning_rows<P: ChatProvider>(harness: &Harness<P>) -> usize {
     harness
         .agent
@@ -570,6 +580,37 @@ fn streamed_reasoning_suppresses_final_display_but_persists_once() -> Result<()>
         1,
         "reasoning still persisted exactly once"
     );
+    Ok(())
+}
+
+#[test]
+fn streamed_raw_reasoning_uses_distinct_event_and_suppresses_duplicate_block() -> Result<()> {
+    let workspace = test_workspace()?;
+    let mut turn = AssistantTurn::text("Answer");
+    turn.reasoning = vec![ReasoningBlock::new(
+        "Raw thought",
+        Some("enc"),
+        false,
+        test_origin(),
+    )];
+    let provider = ScriptedStreamProvider::new(vec![
+        ProviderEvent::ReasoningDelta("Summary".to_string()),
+        ProviderEvent::RawReasoningDelta("Raw thought".to_string()),
+        ProviderEvent::Completed(turn),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let events = frontend.events.borrow();
+    assert_eq!(reasoning_delta_texts(&events), vec!["Summary"]);
+    assert_eq!(raw_reasoning_delta_texts(&events), vec!["Raw thought"]);
+    assert!(
+        reasoning_display_events(&events).is_empty(),
+        "any streamed reasoning channel must suppress the duplicate terminal display event"
+    );
+    assert_eq!(persisted_reasoning_rows(&harness), 1);
     Ok(())
 }
 

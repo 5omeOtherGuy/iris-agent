@@ -204,14 +204,18 @@ pub(crate) enum UiEvent {
         text: String,
         redacted: bool,
     },
-    /// One incremental chunk of the model's reasoning *summary*, streamed while
-    /// the provider is still thinking (before the answer). Display-only; only
-    /// the human-readable summary is carried (never raw or redacted reasoning).
+    /// One incremental chunk of the model's reasoning text, streamed while the
+    /// provider is still thinking (before the answer). Display-only; redacted
+    /// reasoning is never reconstructed here.
     /// See [`AgentEvent::AssistantReasoningDelta`].
     AssistantReasoningDelta(String),
     /// A boundary between two reasoning-summary parts (a blank line in the live
     /// thinking trace). Display-only; carries no text.
     AssistantReasoningSectionBreak,
+    /// One incremental chunk of raw model reasoning. Display-only and separate
+    /// from summary deltas so provenance is preserved through the UI bridge.
+    /// See [`AgentEvent::AssistantRawReasoningDelta`].
+    AssistantRawReasoningDelta(String),
     /// One incremental fragment of a *freeform/custom* tool call's input, streamed
     /// while the model is still constructing the call (ADR-0039). Display-only and
     /// inert: it never affects approval, execution, or transcript state. No
@@ -394,6 +398,9 @@ impl UiEvent {
             }
             AgentEvent::AssistantReasoningDelta(delta) => UiEvent::AssistantReasoningDelta(delta),
             AgentEvent::AssistantReasoningSectionBreak => UiEvent::AssistantReasoningSectionBreak,
+            AgentEvent::AssistantRawReasoningDelta(delta) => {
+                UiEvent::AssistantRawReasoningDelta(delta)
+            }
             AgentEvent::ToolInputDelta { call_id, delta } => {
                 UiEvent::ToolInputDelta { call_id, delta }
             }

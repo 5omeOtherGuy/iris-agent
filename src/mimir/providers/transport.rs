@@ -111,8 +111,16 @@ pub(super) trait TurnSink {
 
     /// Forward one reasoning-*summary* delta (display-only; never raw
     /// chain-of-thought or encrypted content). Default no-op so providers and
-    /// test sinks that do not stream reasoning are unaffected.
+    /// test sinks that do not stream reasoning summaries are unaffected.
     fn on_reasoning_delta(&mut self, _delta: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Forward one raw reasoning delta on the explicit raw channel. Display-only;
+    /// never encrypted continuity and never reclassified as a summary delta.
+    /// Default no-op so providers and test sinks that do not stream raw reasoning
+    /// are unaffected.
+    fn on_raw_reasoning_delta(&mut self, _delta: &str) -> Result<()> {
         Ok(())
     }
 
@@ -152,6 +160,12 @@ impl TurnSink for ChannelSink {
     fn on_reasoning_delta(&mut self, delta: &str) -> Result<()> {
         self.tx
             .unbounded_send(Ok(ProviderEvent::ReasoningDelta(delta.to_string())))
+            .map_err(|_| anyhow!("response stream dropped by consumer"))
+    }
+
+    fn on_raw_reasoning_delta(&mut self, delta: &str) -> Result<()> {
+        self.tx
+            .unbounded_send(Ok(ProviderEvent::RawReasoningDelta(delta.to_string())))
             .map_err(|_| anyhow!("response stream dropped by consumer"))
     }
 

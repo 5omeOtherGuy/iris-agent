@@ -31,15 +31,13 @@ instead of) the persisted reasoning row and the terminal block-level event.
   Mimir OpenAI adapter maps `reasoning_summary_text.delta` -> `ReasoningDelta`
   and `reasoning_summary_part.added` -> `ReasoningSectionBreak`. The contract
   degrades to today's block rail for any provider that emits no deltas.
-- **Summary only, never raw chain-of-thought.** Only
-  `response.reasoning_summary_text.delta` is forwarded. `response.reasoning_text.delta`
-  (raw reasoning content) is deliberately not mapped. Summary deltas are never
-  accumulated into the stored reasoning text or the assistant answer; the
-  persisted block still comes from the completed turn. The completion fallback
-  is summary-only too: `extract_reasoning_text` reads the `summary` parts only,
-  so raw `content` never reaches display or storage on any path (it is normally
-  absent under Iris's encrypted-reasoning request, which carries the raw
-  reasoning as opaque continuity).
+- **Raw reasoning uses a separate channel.**
+  `response.reasoning_summary_text.delta` maps to `ReasoningDelta`.
+  `response.reasoning_text.delta` maps only to `RawReasoningDelta`, with matching
+  Nexus/UI events. Raw deltas are display-only and explicit; they are never
+  accumulated into stored reasoning text, assistant text, or continuity replay.
+  The completion fallback remains summary-only: `extract_reasoning_text` reads
+  the `summary` parts, so raw `content` does not enter storage on that path.
 - **Storage is untouched (ADR-0016).** The `Role::AssistantReasoning` row, its
   `continuity`, `redacted` flag, and `ModelOrigin` are written exactly as before,
   exactly once. Emission stays additive.
@@ -76,12 +74,12 @@ instead of) the persisted reasoning row and the terminal block-level event.
   already detect (any non-reasoning event ends the trace).
 - **Why not**: The idempotent finalize guard covers every path with less surface.
 
-### Stream raw reasoning content (`reasoning_text.delta`)
-- **Pros**: Shows the model's full reasoning, not just the summary.
-- **Cons**: Raw chain-of-thought is more sensitive and larger; Iris requests
-  encrypted continuity, so it is normally absent anyway.
-- **Why not**: The summary is the display-safe surface; raw content stays
-  storage/continuity only.
+### Reuse the summary delta channel for raw reasoning
+- **Pros**: Fewer event variants.
+- **Cons**: Loses provenance, weakens the summary-safe contract, and can merge
+  summary and raw text without a source marker.
+- **Why not**: Raw content is larger and more sensitive. It must stay explicit
+  through the provider, runtime, and UI contracts.
 
 ## Consequences
 

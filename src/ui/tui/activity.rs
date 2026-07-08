@@ -78,9 +78,9 @@ impl WorkPhase {
     pub(crate) fn on_event(event: &UiEvent) -> Option<WorkPhase> {
         match event {
             UiEvent::ProviderTurnStarted { .. } => Some(WorkPhase::WaitingProvider),
-            UiEvent::AssistantReasoningDelta(_) | UiEvent::AssistantReasoningSectionBreak => {
-                Some(WorkPhase::Thinking)
-            }
+            UiEvent::AssistantReasoningDelta(_)
+            | UiEvent::AssistantReasoningSectionBreak
+            | UiEvent::AssistantRawReasoningDelta(_) => Some(WorkPhase::Thinking),
             UiEvent::AssistantText(_) | UiEvent::AssistantTextDelta(_) => {
                 Some(WorkPhase::Answering)
             }

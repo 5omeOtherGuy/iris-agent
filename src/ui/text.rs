@@ -468,7 +468,8 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
             }
             UiEvent::AssistantReasoning { .. }
             | UiEvent::AssistantReasoningDelta(_)
-            | UiEvent::AssistantReasoningSectionBreak => {
+            | UiEvent::AssistantReasoningSectionBreak
+            | UiEvent::AssistantRawReasoningDelta(_) => {
                 // The non-interactive text fallback intentionally does not render
                 // reasoning/thinking blocks (block or streamed): that is a TUI
                 // surface. Ignored here so the fallback's output is unchanged.
