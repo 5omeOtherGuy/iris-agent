@@ -47,11 +47,16 @@ pub(crate) struct Settings {
     pub(crate) default_model: Option<String>,
     /// Base URL override for the active provider's API endpoint.
     pub(crate) base_url: Option<String>,
-    /// Context token budget threshold. The Tier-2 harness reads it to decide
-    /// when to auto-compact: when the rebuilt/current context token total
-    /// exceeds this, the harness compacts at a safe turn boundary. Absent ->
-    /// [`Settings::context_token_budget`] default.
+    /// Auto-compaction threshold. The Tier-2 harness reads it to decide when to
+    /// auto-compact: when the rebuilt/current context token total exceeds this,
+    /// the harness compacts at a safe turn boundary. Absent ->
+    /// [`Settings::context_token_budget`] default. Kept on the legacy
+    /// `contextTokenBudget` key for settings-file compatibility.
     pub(crate) context_token_budget: Option<u64>,
+    /// Microcompaction watermark. When microcompaction is enabled, detected fold
+    /// plans flush once provider-visible context reaches this independent token
+    /// threshold. Absent -> [`Settings::microcompaction_watermark`] default.
+    pub(crate) microcompaction_watermark: Option<u64>,
     /// Default reasoning/thinking effort (`off|minimal|low|medium|high|xhigh`),
     /// parsed into a normalized level by `mimir::selection`. Absent -> no
     /// preference, so adapters omit all reasoning fields (today's wire). Not a
@@ -228,6 +233,10 @@ pub(crate) struct RetrySettings {
 /// that fits common model context windows; it is only surfaced through
 /// [`Settings::context_token_budget`] and triggers nothing yet.
 const DEFAULT_CONTEXT_TOKEN_BUDGET: u64 = 128_000;
+/// Default independent microcompaction flush threshold. This matches the old
+/// default `contextTokenBudget / 2` behavior without coupling future budget edits
+/// to microcompaction.
+const DEFAULT_MICROCOMPACTION_WATERMARK: u64 = 64_000;
 
 /// Default verification attempts when a `verify` block sets no `maxAttempts`.
 /// One initial run plus a couple of fix-and-retry rounds is enough to catch and
@@ -268,6 +277,9 @@ impl Settings {
             // base-url), so a project may tune it; fall back to global, then the
             // built-in default via the accessor.
             context_token_budget: project.context_token_budget.or(self.context_token_budget),
+            microcompaction_watermark: project
+                .microcompaction_watermark
+                .or(self.microcompaction_watermark),
             // Reasoning effort is likewise not a security redirect, so a project
             // may override it; fall back to global.
             default_reasoning: project.default_reasoning.or(self.default_reasoning),
@@ -388,6 +400,13 @@ impl Settings {
             .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET)
     }
 
+    /// Configured independent microcompaction watermark, or the built-in default
+    /// when unset. The fold scheduler uses this as its Class C flush backstop.
+    pub(crate) fn microcompaction_watermark(&self) -> u64 {
+        self.microcompaction_watermark
+            .unwrap_or(DEFAULT_MICROCOMPACTION_WATERMARK)
+    }
+
     /// Configured compaction summarizer, defaulting to the read-only subagent
     /// worker path (issue #472). `provider` and `excerpts` remain fallback modes.
     /// An unknown value falls back to the default rather than erroring, matching
@@ -506,6 +525,13 @@ pub(crate) fn save_compaction_summarizer(mode: &str) -> Result<()> {
 pub(crate) fn save_context_token_budget(budget: u64) -> Result<()> {
     let budget = budget.clamp(MIN_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET);
     update_global(&[("contextTokenBudget", Value::from(budget))])
+}
+
+/// Persist the microcompaction watermark in the global settings file, clamped to
+/// the same sane positive token range as the auto-compaction threshold.
+pub(crate) fn save_microcompaction_watermark(watermark: u64) -> Result<()> {
+    let watermark = watermark.clamp(MIN_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET);
+    update_global(&[("microcompactionWatermark", Value::from(watermark))])
 }
 
 /// Persist the opt-in microcompaction toggle in the global settings file
@@ -1033,6 +1059,32 @@ mod tests {
     }
 
     #[test]
+    fn microcompaction_watermark_defaults_independently_and_parses_when_present() {
+        let dir = temp_dir();
+        let defaulted = Settings::load_from(
+            Some(&dir.path.join("none.json")),
+            &dir.path.join("none.json"),
+        )
+        .unwrap();
+        assert_eq!(defaulted.microcompaction_watermark, None);
+        assert_eq!(
+            defaulted.microcompaction_watermark(),
+            DEFAULT_MICROCOMPACTION_WATERMARK
+        );
+
+        let project = dir.path.join("project.json");
+        fs::write(
+            &project,
+            r#"{ "contextTokenBudget": 200000, "microcompactionWatermark": 12000 }"#,
+        )
+        .unwrap();
+        let configured = Settings::load_from(None, &project).unwrap();
+        assert_eq!(configured.context_token_budget(), 200_000);
+        assert_eq!(configured.microcompaction_watermark, Some(12_000));
+        assert_eq!(configured.microcompaction_watermark(), 12_000);
+    }
+
+    #[test]
     fn compaction_summarizer_defaults_to_subagent_and_accepts_explicit_modes() {
         let dir = temp_dir();
         let defaulted = Settings::load_from(
@@ -1439,6 +1491,7 @@ mod tests {
         save_prompt_cache_retention("long").unwrap();
         // Clamp: below/above the sane range is pulled into it.
         save_context_token_budget(1).unwrap();
+        save_microcompaction_watermark(999_999_999).unwrap();
         save_max_tool_roundtrips(Some(99_999)).unwrap();
         save_worktree_root(Some("  ../trees  ")).unwrap();
         // Nested block saves preserve sibling + unknown nested keys.
@@ -1455,6 +1508,10 @@ mod tests {
             Some(&Value::String("auto".into()))
         );
         assert_eq!(object.get("contextTokenBudget"), Some(&Value::from(1_000)));
+        assert_eq!(
+            object.get("microcompactionWatermark"),
+            Some(&Value::from(100_000_000))
+        );
         assert_eq!(object.get("maxToolRoundtrips"), Some(&Value::from(1_000)));
         assert_eq!(
             object.get("worktreeRoot"),

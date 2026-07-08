@@ -327,6 +327,7 @@ mod tests {
             default_model: model.map(str::to_string),
             base_url: base_url.map(str::to_string),
             context_token_budget: None,
+            microcompaction_watermark: None,
             default_reasoning: None,
             compaction_summarizer: None,
             microcompaction: None,

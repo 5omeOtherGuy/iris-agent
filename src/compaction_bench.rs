@@ -910,6 +910,7 @@ fn run_seeded_with(
     );
     harness.set_summarizer(summarizer);
     harness.set_microcompaction(micro);
+    harness.set_microcompaction_watermark(budget / 2);
     prepare(&mut harness);
 
     let counter = CompactionCounter::new();
@@ -2084,6 +2085,7 @@ fn run_inferred_cold_arm(micro: bool) -> SeededArm {
     );
     harness.set_summarizer(SummarizerKind::Provider);
     harness.set_microcompaction(micro);
+    harness.set_microcompaction_watermark(budget / 2);
 
     let counter = CompactionCounter::new();
     let gate = NoToolGate;

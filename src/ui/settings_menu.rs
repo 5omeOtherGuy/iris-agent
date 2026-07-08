@@ -91,6 +91,7 @@ pub(crate) enum Field {
     ContextTokenBudget,
     CompactionSummarizer,
     Microcompaction,
+    MicrocompactionWatermark,
     BashToolMode,
     MaxToolRoundtrips,
     PromptCacheRetention,
@@ -126,6 +127,7 @@ impl Field {
             Field::ContextTokenBudget
             | Field::CompactionSummarizer
             | Field::Microcompaction
+            | Field::MicrocompactionWatermark
             | Field::BashToolMode
             | Field::MaxToolRoundtrips
             | Field::PromptCacheRetention => Category::Runtime,
@@ -141,9 +143,10 @@ impl Field {
             Field::ReducedMotion => "Reduced motion",
             Field::Theme => "Theme",
             Field::DefaultApproval => "Default approval",
-            Field::ContextTokenBudget => "Context token budget",
+            Field::ContextTokenBudget => "Auto-compaction threshold",
             Field::CompactionSummarizer => "Compaction summarizer",
             Field::Microcompaction => "Microcompaction",
+            Field::MicrocompactionWatermark => "Microcompaction watermark",
             Field::BashToolMode => "Bash tool mode",
             Field::MaxToolRoundtrips => "Max tool round-trips",
             Field::PromptCacheRetention => "Prompt cache retention",
@@ -175,7 +178,7 @@ impl Field {
                 max: 100,
                 allow_empty: false,
             },
-            Field::ContextTokenBudget => FieldKind::Numeric {
+            Field::ContextTokenBudget | Field::MicrocompactionWatermark => FieldKind::Numeric {
                 min: 1_000,
                 max: 100_000_000,
                 allow_empty: false,
@@ -212,6 +215,7 @@ pub(crate) struct Snapshot {
     pub(crate) context_token_budget: u64,
     pub(crate) compaction_summarizer: String,
     pub(crate) microcompaction: bool,
+    pub(crate) microcompaction_watermark: u64,
     pub(crate) bash_tool_mode: bool,
     pub(crate) max_tool_roundtrips: Option<usize>,
     pub(crate) prompt_cache_retention: String,
@@ -233,11 +237,8 @@ impl Snapshot {
             Field::DefaultApproval => self.default_approval.clone(),
             Field::ContextTokenBudget => self.context_token_budget.to_string(),
             Field::CompactionSummarizer => self.compaction_summarizer.clone(),
-            Field::Microcompaction => format!(
-                "{} · folds around {} tokens",
-                on_off(self.microcompaction),
-                self.context_token_budget / 2
-            ),
+            Field::Microcompaction => on_off(self.microcompaction),
+            Field::MicrocompactionWatermark => self.microcompaction_watermark.to_string(),
             Field::BashToolMode => on_off(self.bash_tool_mode),
             Field::MaxToolRoundtrips => match self.max_tool_roundtrips {
                 Some(cap) => cap.to_string(),
@@ -262,6 +263,7 @@ impl Snapshot {
         match field {
             Field::ScrollSpeed => self.scroll_speed.to_string(),
             Field::ContextTokenBudget => self.context_token_budget.to_string(),
+            Field::MicrocompactionWatermark => self.microcompaction_watermark.to_string(),
             Field::MaxToolRoundtrips => self
                 .max_tool_roundtrips
                 .map(|c| c.to_string())
@@ -370,6 +372,7 @@ fn rows_for(category: Category, snapshot: &Snapshot) -> Vec<Row> {
             field_row(Field::ContextTokenBudget, snapshot),
             field_row(Field::CompactionSummarizer, snapshot),
             field_row(Field::Microcompaction, snapshot),
+            field_row(Field::MicrocompactionWatermark, snapshot),
             field_row(Field::BashToolMode, snapshot),
             field_row(Field::MaxToolRoundtrips, snapshot),
             field_row(Field::PromptCacheRetention, snapshot),
@@ -728,6 +731,7 @@ mod tests {
             context_token_budget: 128_000,
             compaction_summarizer: "subagent".to_string(),
             microcompaction: false,
+            microcompaction_watermark: 64_000,
             bash_tool_mode: false,
             max_tool_roundtrips: None,
             prompt_cache_retention: "short".to_string(),
@@ -945,30 +949,37 @@ mod tests {
     }
 
     #[test]
-    fn runtime_menu_wires_microcompaction_and_budget_together() {
+    fn runtime_menu_exposes_independent_compaction_thresholds() {
         let mut snap = snapshot();
-        snap.context_token_budget = 64_000;
+        snap.context_token_budget = 96_000;
         snap.microcompaction = true;
+        snap.microcompaction_watermark = 12_000;
         let rows = rows_for(Category::Runtime, &snap);
 
         assert!(rows.iter().any(|row| matches!(
             &row.action,
             ModalAction::OpenSettingsEntry(Field::ContextTokenBudget)
-        )));
+        ) && row.item.label == "Auto-compaction threshold"));
         let micro = rows
             .iter()
             .find(|row| row.item.id == Field::Microcompaction.label())
             .expect("runtime menu includes microcompaction");
-        assert_eq!(
-            micro.item.detail.as_deref(),
-            Some("on · folds around 32000 tokens")
-        );
+        assert_eq!(micro.item.detail.as_deref(), Some("on"));
         assert_eq!(
             micro.action,
             ModalAction::SaveSetting {
                 field: Field::Microcompaction,
                 value: Some("false".to_string()),
             }
+        );
+        let watermark = rows
+            .iter()
+            .find(|row| row.item.id == Field::MicrocompactionWatermark.label())
+            .expect("runtime menu includes microcompaction watermark");
+        assert_eq!(watermark.item.detail.as_deref(), Some("12000"));
+        assert_eq!(
+            watermark.action,
+            ModalAction::OpenSettingsEntry(Field::MicrocompactionWatermark)
         );
     }
 
@@ -985,6 +996,7 @@ mod tests {
             Field::ContextTokenBudget,
             Field::CompactionSummarizer,
             Field::Microcompaction,
+            Field::MicrocompactionWatermark,
             Field::BashToolMode,
             Field::MaxToolRoundtrips,
             Field::PromptCacheRetention,

@@ -159,6 +159,9 @@ fn resume(
         budget,
     );
     harness.set_microcompaction(microcompaction);
+    if let Some(budget) = budget {
+        harness.set_microcompaction_watermark(budget / 2);
+    }
     harness
 }
 
@@ -188,7 +191,7 @@ fn no_fold_below_the_micro_watermark_and_a_fold_at_or_above_it() {
     assert!(total > 0);
     drop(probe);
 
-    // Budget so high the micro-watermark (budget/2) sits ABOVE the current total:
+    // Watermark set high enough to sit ABOVE the current total:
     // the batch must not run (no per-turn folding below the watermark).
     let high_budget = Some(total.saturating_mul(4));
     let mut below = resume(&root.path, &workspace.path, &path, high_budget, true);
@@ -201,7 +204,7 @@ fn no_fold_below_the_micro_watermark_and_a_fold_at_or_above_it() {
     );
     drop(below);
 
-    // Budget low enough that the watermark (budget/2) is at/below the total: the
+    // Watermark set low enough to sit at/below the total: the
     // batch runs and folds the superseded read.
     let low_budget = Some(total);
     let mut above = resume(&root.path, &workspace.path, &path, low_budget, true);
@@ -241,7 +244,7 @@ fn microcompaction_off_writes_no_folds_even_above_the_watermark() {
     let total = probe.context_token_estimate();
     drop(probe);
 
-    // Opt-in OFF: even with the budget low enough that the watermark is crossed,
+    // Opt-in OFF: even with the watermark crossed,
     // no fold is written and the in-memory needle survives.
     let mut off = resume(&root.path, &workspace.path, &path, Some(total), false);
     let applied = off.maybe_microcompact(&NullObserver).unwrap();
