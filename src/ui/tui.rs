@@ -529,8 +529,12 @@ impl TuiUi {
 
     pub(crate) fn reset_screen(&mut self) {
         let pager_active = self.screen.pager_active;
+        // The run meter survives a session swap: the exit receipt's scope is
+        // the process run, so `/new` must not restart its clock or counters.
+        let meter = self.screen.take_session_meter();
         self.screen = Screen::new();
         self.screen.pager_active = pager_active;
+        self.screen.restore_session_meter(meter);
     }
 }
 
@@ -4135,7 +4139,10 @@ mod tests {
         });
         // While the group is open the live block stays expanded.
         let rendered = rendered_text(&mut screen, 100, 16);
-        assert!(rendered.contains("Read"), "open group shows its ops: {rendered}");
+        assert!(
+            rendered.contains("Read"),
+            "open group shows its ops: {rendered}"
+        );
 
         // The next top-level block closes the group: compact by default, the
         // settled explore collapses to header + footer.
@@ -6620,6 +6627,37 @@ mod tests {
         assert!(receipt.contains(" ┊ ↑60k ↓3k ┊ "), "{receipt}");
         // 54k cached of 60k sent = 90%.
         assert!(receipt.ends_with(" ┊ cache 90%"), "{receipt}");
+    }
+
+    #[test]
+    fn session_receipt_survives_a_session_swap() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 5_000,
+                output_tokens: 100,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 5_100,
+                cache_creation: None,
+            }),
+        });
+        screen.end_turn();
+
+        // `/new` swaps to a fresh screen; the run meter rides across, so the
+        // exit receipt still covers the whole process run.
+        let meter = screen.take_session_meter();
+        let mut fresh = Screen::new();
+        fresh.restore_session_meter(meter);
+        let receipt = fresh.session_receipt().expect("receipt after swap");
+        assert!(receipt.contains("1 turn"), "{receipt}");
+        assert!(receipt.contains("↑5k ↓100"), "{receipt}");
     }
 
     #[test]

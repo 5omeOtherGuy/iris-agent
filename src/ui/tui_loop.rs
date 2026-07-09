@@ -642,6 +642,11 @@ fn perform_swap<P: ChatProvider>(
     tui.screen.apply(UiEvent::SessionStarted);
     tui.screen
         .set_approval_policy(effective_approval_policy(harness));
+    // The fresh Screen starts with disarmed detents (startup rule); this swap
+    // IS the swapped session's startup, so re-arm once its chrome is settled —
+    // the loop's trailing refresh_footer sets the first footer (never a
+    // flash), and later changes announce themselves again.
+    tui.screen.arm_detents();
     let notice = match source {
         SessionSource::Fresh => "Started a new session.".to_string(),
         SessionSource::Resume(_) => {

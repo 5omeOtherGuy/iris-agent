@@ -810,8 +810,10 @@ own to read as a distinct region.
 - **Numbers are honest.** Token telemetry (`↑177k ↓5.7k`), durations (`7.6s`,
   `1:27`), counts — shown compactly and only when real. Never assert savings the
   runtime hasn't measured.
-- **Brevity.** Hints are short and inline (`↵ to send • shift+↵ for new line • /
-  for commands`). Placeholders use exact product casing.
+- **Brevity.** Hints are short and inline (`↵ to send · shift+↵ for new line · /
+  for commands`), `·`-joined — `•` stays the markdown bullet's alone (§5). At a
+  narrow width a hint row drops whole trailing fields, never clipping one
+  mid-word: a printed control either fits or is omitted. Placeholders use exact product casing.
 - **Emoji: none, ever.** State is carried by the glyph vocabulary.
 - **Progressive disclosure.** Minimal at a glance; complete and structured on
   demand (`ctrl+o`). Nothing important is hidden; nothing trivial is shouted.

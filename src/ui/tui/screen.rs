@@ -1141,6 +1141,19 @@ impl Screen {
         self.session_meter.receipt()
     }
 
+    /// Take the cumulative run meter out of this screen (session swap). The
+    /// receipt's scope is the whole PROCESS run, not one logical session, so
+    /// `/new`/resume swaps carry the meter into the fresh screen instead of
+    /// restarting the clock and undercounting the printed record.
+    pub(crate) fn take_session_meter(&mut self) -> SessionMeter {
+        std::mem::take(&mut self.session_meter)
+    }
+
+    /// Restore a carried run meter into this (fresh) screen.
+    pub(crate) fn restore_session_meter(&mut self, meter: SessionMeter) {
+        self.session_meter = meter;
+    }
+
     /// Arm the detent flashes. Called by the loop once startup initialization
     /// has settled (right before the first draw): from here on, a changed
     /// statusline segment or newly lit meter LED flashes its acknowledgment.
@@ -1581,8 +1594,7 @@ impl Screen {
         // Detent acknowledgment: a *changed* model or effort flashes its
         // statusline segment. Only against a previous footer — the first
         // footer of a session is initialization, not a change.
-        let model_changed =
-            prev.is_some_and(|footer| !footer.model.eq_ignore_ascii_case(&model));
+        let model_changed = prev.is_some_and(|footer| !footer.model.eq_ignore_ascii_case(&model));
         let effort_changed = prev.is_some_and(|footer| {
             !label_eq_ignore_case(footer.effort.as_deref(), effort.as_deref())
         });
@@ -2932,10 +2944,7 @@ mod tests {
         }
     }
 
-    fn statusline_span_style(
-        screen: &Screen,
-        content: &str,
-    ) -> ratatui::style::Style {
+    fn statusline_span_style(screen: &Screen, content: &str) -> ratatui::style::Style {
         composer_statusline(screen, 80)
             .expect("statusline")
             .spans
@@ -3046,8 +3055,7 @@ mod tests {
                 .expect("bar")
                 .spans
                 .iter()
-                .filter(|span| span.content.as_ref() == crate::ui::symbols::RUNNING)
-                .last()
+                .rfind(|span| span.content.as_ref() == crate::ui::symbols::RUNNING)
                 .expect("a lit meter dot")
                 .style
         };
@@ -3056,19 +3064,25 @@ mod tests {
         // 90k of 300k lights dot 3 (from 0 lit): the fresh edge flashes bold.
         screen.apply(provider_turn(90_000));
         assert!(
-            edge_dot_style(&screen).add_modifier.contains(Modifier::BOLD),
+            edge_dot_style(&screen)
+                .add_modifier
+                .contains(Modifier::BOLD),
             "newly lit LED flashes"
         );
         screen.tick();
         screen.tick();
         assert!(
-            !edge_dot_style(&screen).add_modifier.contains(Modifier::BOLD),
+            !edge_dot_style(&screen)
+                .add_modifier
+                .contains(Modifier::BOLD),
             "LED settles"
         );
         // A usage update within the already-lit dot lights no new LED: no flash.
         screen.apply(provider_turn(89_000));
         assert!(
-            !edge_dot_style(&screen).add_modifier.contains(Modifier::BOLD),
+            !edge_dot_style(&screen)
+                .add_modifier
+                .contains(Modifier::BOLD),
             "no new LED, no flash"
         );
     }

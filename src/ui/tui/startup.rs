@@ -492,7 +492,10 @@ mod tests {
         };
         assert_eq!(first.len(), settled_height);
         assert_eq!(line_text(&first[0]).matches('●').count(), 0, "strip dark");
-        assert!(line_text(&first[1]).contains(WORDMARK), "silkscreen printed");
+        assert!(
+            line_text(&first[1]).contains(WORDMARK),
+            "silkscreen printed"
+        );
         for row in &first[3..] {
             assert!(line_text(row).trim().is_empty(), "menu hidden during boot");
         }

@@ -509,9 +509,7 @@ impl SubMenu {
         crate::ui::tui::overlay_menu(
             Some(self.category.title()),
             rows,
-            Some(
-                "\u{2191}\u{2193} move \u{00b7} \u{21b5} select \u{00b7} \u{2190}/esc back",
-            ),
+            Some("\u{2191}\u{2193} move \u{00b7} \u{21b5} select \u{00b7} \u{2190}/esc back"),
             usize::from(width),
         )
     }
