@@ -90,6 +90,10 @@ pub(crate) enum ModalAction {
     /// Settings panel: the reasoning switch clicked to a new detent. Applies to
     /// the live session AND persists as the default; the panel stays open.
     AdjustEffort(ReasoningEffort),
+    /// Settings panel: the model row clicked ←/→ — cycle through the scoped
+    /// models exactly like Ctrl+P. The loop rebuilds the panel on the new
+    /// model (the catalog lives beyond the panel's snapshot).
+    CycleModel { forward: bool },
     /// Persist a settings field to the user-global file (`None` clears the key).
     /// The loop maps the field to its `config::save_*`; the panel stays open
     /// and keeps its own display state (it already clicked the detent).
@@ -592,16 +596,41 @@ impl ModelPicker {
                 false,
             ));
         }
-        let footer = format!(
-            "↑↓ move · ←→ effort ({}) · ↵ select · s session · esc cancel",
-            self.display_effort_label()
-        );
+        // The mini-faceplate reasoning switch (§10.1): the selected model's
+        // levels as a printed detent track on the panel grid, live-updating
+        // as ↑/↓ moves and ←/→ clicks — the same control the settings panel
+        // renders, through the same function, so the two cannot drift.
+        if let Some(model) = self.selected_model() {
+            let levels = model_capabilities::level_options(model.provider, &model.id);
+            let options: Vec<&str> = levels.iter().map(|option| option.label).collect();
+            let effort = self.display_effort();
+            let pos = levels.iter().position(|option| option.level == effort);
+            let mut spans = vec![Span::styled(
+                format!(
+                    "  {:<label_w$}",
+                    "reasoning",
+                    label_w = crate::ui::settings_menu::LABEL_W
+                ),
+                dim(),
+            )];
+            spans.extend(crate::ui::settings_menu::switch_spans(
+                &options,
+                pos,
+                self.display_effort_label(),
+                false,
+                false,
+                false,
+                usize::from(width).saturating_sub(crate::ui::settings_menu::LABEL_W + 2),
+            ));
+            rows.push((Line::default(), false));
+            rows.push((Line::from(spans), false));
+        }
         // ONE selector for the adjacent pair: rows pick the model, ←→ clicks
         // the reasoning detent. `/model` and a bare `/reasoning` both open it.
         crate::ui::tui::overlay_menu(
             Some("Model & reasoning"),
             rows,
-            Some(&footer),
+            Some("↑↓ model · ←→ reasoning · ↵ select · s session · esc cancel"),
             usize::from(width),
         )
     }
@@ -1822,8 +1851,13 @@ mod tests {
         assert!(text.contains("◉ GPT 5.5"), "{text}");
         assert!(text.contains("OpenAI"), "{text}");
         assert!(text.contains("default"), "{text}");
-        // Footer: honest key hints incl. the inline effort adjust.
-        assert!(text.contains("←→ effort (high)"), "{text}");
+        // The reasoning detent track (the panel's switch control) prints the
+        // selected model's levels with the live position lit.
+        assert!(text.contains("reasoning"), "{text}");
+        assert!(text.contains("◉ high"), "{text}");
+        assert!(text.contains("○ medium"), "{text}");
+        // Footer: honest key hints for the two axes.
+        assert!(text.contains("←→ reasoning"), "{text}");
         assert!(text.contains("↵ select"), "{text}");
         assert!(text.contains("s session"), "{text}");
         assert!(text.contains("esc cancel"), "{text}");
@@ -1894,7 +1928,7 @@ mod tests {
         assert!(text.contains("GPT 5.5"), "{text}");
         assert!(text.contains("Anthropic"), "{text}");
         assert!(text.contains("OpenAI"), "{text}");
-        assert!(text.contains("←→ effort (max)"), "{text}");
+        assert!(text.contains("◉ max"), "{text}");
         assert!(!text.contains("Only showing models"), "{text}");
         assert!(!text.contains("claude-opus-4-8"), "{text}");
         assert!(!text.contains("GPT-5.5"), "{text}");
@@ -1908,11 +1942,11 @@ mod tests {
             "openai-codex/gpt-5.5",
             ReasoningEffort::Medium,
         );
-        assert!(render_text(&picker).contains("effort (medium)"));
+        assert!(render_text(&picker).contains("◉ medium"));
         picker.handle_key(ModalKey::Right);
-        assert!(render_text(&picker).contains("effort (high)"));
+        assert!(render_text(&picker).contains("◉ high"));
         picker.handle_key(ModalKey::Left);
-        assert!(render_text(&picker).contains("effort (medium)"));
+        assert!(render_text(&picker).contains("◉ medium"));
     }
 
     #[test]
@@ -1930,11 +1964,11 @@ mod tests {
             "openai-codex/gpt-5.5",
             ReasoningEffort::XHigh,
         );
-        assert!(render_text(&picker).contains("effort (xhigh)"));
+        assert!(render_text(&picker).contains("◉ xhigh"));
         picker.handle_key(ModalKey::Down); // onto gemini (caps at high)
-        assert!(render_text(&picker).contains("effort (high)"));
+        assert!(render_text(&picker).contains("◉ high"));
         picker.handle_key(ModalKey::Up); // back to gpt-5.5
-        assert!(render_text(&picker).contains("effort (xhigh)"));
+        assert!(render_text(&picker).contains("◉ xhigh"));
     }
 
     #[test]

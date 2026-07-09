@@ -49,7 +49,9 @@ const REV: &str = env!("CARGO_PKG_VERSION");
 
 /// Label column width: two-cell indent + label, control column after. Wide
 /// enough that the longest label (`microcompaction`, 15) keeps a real gutter.
-const LABEL_W: usize = 18;
+/// Shared with the model picker's reasoning track so the two surfaces sit on
+/// one grid.
+pub(crate) const LABEL_W: usize = 18;
 
 /// Detent-flash duration in loop ticks (the §6 two-tick acknowledgment).
 const FLASH_TICKS: u8 = 2;
@@ -462,6 +464,13 @@ impl SettingsPanel {
         }
     }
 
+    /// Arm the flash from outside: the loop rebuilds the panel after a model
+    /// cycle (the model list lives beyond the snapshot) and still owes the
+    /// row its mechanical acknowledgment.
+    pub(crate) fn flash_selected(&mut self) {
+        self.arm_flash();
+    }
+
     /// Paste into an active edit (the loop routes `Event::Paste` here).
     /// Registers are single-line controls: interior line breaks collapse to
     /// spaces so a multi-line paste can never embed a newline in a saved value.
@@ -508,6 +517,10 @@ impl SettingsPanel {
     /// (the switch is already against its stop).
     fn adjust(&mut self, forward: bool) -> ModalOutcome {
         match self.selected() {
+            // The model row is a port AND a rotary: ←/→ cycles the scoped
+            // models exactly like Ctrl+P (the loop rebuilds the panel on the
+            // new model); ↵ still opens the full picker.
+            RowId::Model => ModalOutcome::Emit(ModalAction::CycleModel { forward }),
             RowId::Reasoning => {
                 let levels = &self.snap.reasoning_levels;
                 let pos = levels
@@ -878,12 +891,19 @@ impl SettingsPanel {
                     .iter()
                     .position(|(level, _)| *level == self.snap.reasoning);
                 let current = pos.map(|p| options[p]).unwrap_or("");
-                push_switch(spans, &options, pos, current, flashing, false, false, avail);
+                spans.extend(switch_spans(
+                    &options,
+                    pos,
+                    current,
+                    flashing,
+                    false,
+                    false,
+                    avail.saturating_sub(LABEL_W + 2),
+                ));
             }
             RowId::SkipApprovals => {
                 let pos = usize::from(self.snap.skip_permissions);
-                push_switch(
-                    spans,
+                spans.extend(switch_spans(
                     &["off", "on"],
                     Some(pos),
                     if self.snap.skip_permissions {
@@ -894,8 +914,8 @@ impl SettingsPanel {
                     flashing,
                     self.snap.skip_permissions,
                     false,
-                    avail,
-                );
+                    avail.saturating_sub(LABEL_W + 2),
+                ));
                 // Caution silkscreen: printed under the guard switch, always
                 // visible, `┊`-joined metadata (never key-hint `·`).
                 spans.push(Span::styled(
@@ -908,7 +928,15 @@ impl SettingsPanel {
                     let options = self.snap.switch_options(field);
                     let current = self.snap.switch_value(field);
                     let pos = options.iter().position(|o| *o == current);
-                    push_switch(spans, options, pos, &current, flashing, false, inert, avail);
+                    spans.extend(switch_spans(
+                        options,
+                        pos,
+                        &current,
+                        flashing,
+                        false,
+                        inert,
+                        avail.saturating_sub(LABEL_W + 2),
+                    ));
                 }
                 Archetype::Dial => {
                     let value = self.snap.dial_value(field);
@@ -947,11 +975,16 @@ impl SettingsPanel {
                 "\u{21b5} save \u{00b7} esc cancel \u{00b7} empty clears".to_string()
             };
         }
-        let verbs = match archetype(self.selected()) {
-            Archetype::Switch => "\u{2190}\u{2192} set",
-            Archetype::Dial => "\u{2190}\u{2192} adjust \u{00b7} \u{21b5} type",
-            Archetype::Register => "\u{21b5} edit",
-            Archetype::Port => "\u{21b5} open",
+        let verbs = if self.selected() == RowId::Model {
+            // The hybrid row: rotary cycle + port open.
+            "\u{2190}\u{2192} cycle \u{00b7} \u{21b5} open"
+        } else {
+            match archetype(self.selected()) {
+                Archetype::Switch => "\u{2190}\u{2192} set",
+                Archetype::Dial => "\u{2190}\u{2192} adjust \u{00b7} \u{21b5} type",
+                Archetype::Register => "\u{21b5} edit",
+                Archetype::Port => "\u{21b5} open",
+            }
         };
         format!("\u{2191}\u{2193} select \u{00b7} {verbs} \u{00b7} esc close")
     }
@@ -997,25 +1030,30 @@ fn nearest_position(ladder: &[u64], value: u64) -> usize {
 }
 
 /// A labeled detent track (`○ strict  ◉ auto  ○ never`), or its rotary form
-/// (`○○◉  auto`) when the track does not fit `avail`. `danger` paints the
-/// selected mark red (the guarded switch); `inert` dims the whole control.
+/// (`○○◉  auto`) when the track does not fit `track_avail` (the row width
+/// left after the caller's label column). `danger` paints the selected mark
+/// red (the guarded switch); `inert` dims the whole control.
 ///
 /// `pos: None` = a hand-edited value outside the vocabulary: the switch sits
 /// BETWEEN detents — no position lights, and the raw `current` value is
 /// printed after the track so the display never claims a position the config
 /// does not hold (numbers/positions are honest). The first `←`/`→` snaps it
 /// into the scale.
+///
+/// `pub(crate)` because the switch IS the house multi-option control: the
+/// model picker prints its reasoning track through this same function so the
+/// two surfaces cannot drift.
 #[allow(clippy::too_many_arguments)]
-fn push_switch(
-    spans: &mut Vec<Span<'static>>,
+pub(crate) fn switch_spans(
     options: &[&str],
     pos: Option<usize>,
     current: &str,
     flashing: bool,
     danger: bool,
     inert: bool,
-    avail: usize,
-) {
+    track_avail: usize,
+) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
     let selected_color = if danger {
         crate::ui::palette::red()
     } else {
@@ -1038,7 +1076,7 @@ fn push_switch(
         .map(|option| option.chars().count() + 2)
         .sum::<usize>()
         + options.len().saturating_sub(1) * 2;
-    if LABEL_W + 2 + track <= avail {
+    if track <= track_avail {
         for (i, option) in options.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::raw("  "));
@@ -1073,6 +1111,7 @@ fn push_switch(
         spans.push(Span::raw("  "));
         spans.push(Span::styled(current.to_string(), label_style));
     }
+    spans
 }
 
 /// A 10-detent LED fader (the house meter: filled `●`, orange edge, dim `○`)
@@ -1362,6 +1401,24 @@ mod tests {
     }
 
     #[test]
+    fn the_model_row_is_a_rotary_port_hybrid() {
+        // ←/→ cycles the scoped models like Ctrl+P; ↵ opens the full picker.
+        let mut panel = panel();
+        select(&mut panel, RowId::Model);
+        assert_eq!(
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::CycleModel { forward: true })
+        );
+        assert_eq!(
+            panel.handle_key(ModalKey::Left),
+            ModalOutcome::Emit(ModalAction::CycleModel { forward: false })
+        );
+        // The footer names both verbs (keymap honesty for the hybrid).
+        assert!(panel.footer().contains("\u{2190}\u{2192} cycle"));
+        assert!(panel.footer().contains("\u{21b5} open"));
+    }
+
+    #[test]
     fn ports_open_their_surfaces() {
         let mut panel = panel();
         select(&mut panel, RowId::Model);
@@ -1384,7 +1441,8 @@ mod tests {
             panel.handle_key(ModalKey::Enter),
             ModalOutcome::Emit(ModalAction::OpenTrustMenu)
         );
-        // Ports never respond to ←→ (nothing to slide).
+        // Pure ports never respond to ←→ (nothing to slide) — the model
+        // row's cycling is the deliberate hybrid exception.
         assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
     }
 

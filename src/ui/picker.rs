@@ -570,6 +570,39 @@ pub(crate) fn apply_action<P: ChatProvider>(
             };
             ActionResult::Replace(Box::new(open_trust(harness)), lines)
         }
+        ModalAction::CycleModel { forward } => {
+            // The panel's model row clicked ←/→: cycle the scoped models
+            // exactly like Ctrl+P. A large-context advisory replaces the
+            // panel with the confirm prompt (the loop returns home after);
+            // a completed click rebuilds the panel on the fresh snapshot so
+            // the row shows the new engine, and flashes it.
+            let before = current_qualified(switch);
+            match cycle_model(forward, harness, switch) {
+                ModelCommand::Open(modal) => ActionResult::Replace(Box::new(modal), Vec::new()),
+                ModelCommand::Lines(lines) => {
+                    if current_qualified(switch) == before {
+                        // Nothing cycled ("Only one model available", empty
+                        // scope): the status line is the honest feedback.
+                        ActionResult::Keep(lines)
+                    } else {
+                        let mut panel = SettingsPanel::with_selected(
+                            settings_snapshot(harness, switch),
+                            settings_menu::RowId::Model,
+                        );
+                        panel.flash_selected();
+                        // The row itself reports the switch; only a failed
+                        // persist is worth a transcript line.
+                        ActionResult::Replace(
+                            Box::new(Modal::Settings(Box::new(panel))),
+                            lines
+                                .into_iter()
+                                .filter(|line| line.contains("not saved"))
+                                .collect(),
+                        )
+                    }
+                }
+            }
+        }
         ModalAction::AdjustEffort(level) => {
             // The panel's reasoning switch: apply to the live session and
             // persist as the default, exactly like the model picker's inline

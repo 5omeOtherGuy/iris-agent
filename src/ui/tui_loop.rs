@@ -2090,17 +2090,7 @@ async fn run_modal_phase<P: ChatProvider>(
     // (model picker, scoped models, trust, login) re-opens the panel on that
     // port row instead of dropping back to the editor.
     let mut settings_return: Option<crate::ui::settings_menu::RowId> = None;
-    loop {
-        if tui.screen.focus() != FocusTarget::Modal {
-            let (Some(row), Some(sw)) = (settings_return.take(), switch.as_mut()) else {
-                break;
-            };
-            tui.screen
-                .open_modal(picker::open_settings_at(harness, sw, row));
-            refresh_footer(tui, switch);
-            tui.draw()?;
-            continue;
-        }
+    while tui.screen.focus() == FocusTarget::Modal {
         tokio::select! {
             maybe = input_rx.recv() => {
                 let Some(event) = maybe else {
@@ -2154,6 +2144,20 @@ async fn run_modal_phase<P: ChatProvider>(
                 if requested.is_some() {
                     return Ok(requested);
                 }
+                // Settings is home: when a surface a panel port opened has
+                // closed, re-open the panel on that port row BEFORE drawing,
+                // so the dock never collapses for a frame on the way back.
+                if tui.screen.focus() != FocusTarget::Modal
+                    && let Some(row) = settings_return.take()
+                    && let Some(sw) = switch.as_mut()
+                {
+                    tui.screen
+                        .open_modal(picker::open_settings_at(harness, sw, row));
+                }
+                // Once the panel itself is in front again, nothing is pending.
+                if matches!(tui.screen.modal, Some(Modal::Settings(_))) {
+                    settings_return = None;
+                }
                 // The picker may have switched model/effort; refresh the
                 // footer before drawing so it never shows a stale model.
                 refresh_footer(tui, switch);
@@ -2178,6 +2182,10 @@ fn settings_return_row(action: &ModalAction) -> Option<crate::ui::settings_menu:
     use crate::ui::settings_menu::RowId;
     match action {
         ModalAction::OpenModelPicker => Some(RowId::Model),
+        // A model cycle usually lands straight back on a rebuilt panel (the
+        // pending return clears once it is in front); arming it here covers
+        // the large-context advisory that replaces the panel mid-cycle.
+        ModalAction::CycleModel { .. } => Some(RowId::Model),
         ModalAction::OpenScopedModels => Some(RowId::Scope),
         ModalAction::OpenLoginMethod => Some(RowId::Providers),
         ModalAction::OpenTrustMenu => Some(RowId::Permissions),

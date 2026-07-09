@@ -760,8 +760,23 @@ fn global_path() -> Option<PathBuf> {
     if let Ok(path) = env::var("IRIS_CONFIG_PATH") {
         return Some(PathBuf::from(path));
     }
-    let home = env::var("HOME").ok().filter(|home| !home.is_empty())?;
-    Some(Path::new(&home).join(".iris/settings.json"))
+    // A test that has not opted into a real path via `ConfigPathGuard` /
+    // `IRIS_CONFIG_PATH` must NEVER be ABLE to touch the developer's real
+    // settings file: persisting code paths (model-switch defaults, login,
+    // scoped saves) run inside unit tests, and without a guard they would
+    // fall through to the real `$HOME` — silently rewriting the settings of
+    // whoever runs the suite. Unguarded reads and writes land in a
+    // process-scoped scratch file instead; tests asserting on file content
+    // keep opting in through the guard.
+    #[cfg(test)]
+    {
+        Some(std::env::temp_dir().join(format!("iris-test-settings-{}.json", std::process::id())))
+    }
+    #[cfg(not(test))]
+    {
+        let home = env::var("HOME").ok().filter(|home| !home.is_empty())?;
+        Some(Path::new(&home).join(".iris/settings.json"))
+    }
 }
 
 fn project_path(cwd: &Path) -> PathBuf {

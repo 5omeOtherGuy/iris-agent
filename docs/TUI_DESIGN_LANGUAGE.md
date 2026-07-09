@@ -797,10 +797,13 @@ own to read as a distinct region.
 - **Picker** — model switcher, scoped-models, **tasks**, resume, login provider
   list. Rows: `[◉ if active] label … meta hint`. **Adjacent things share one
   picker:** the model switcher IS the reasoning switcher (`Model & reasoning` —
-  rows pick the model, `←`/`→` clicks the effort detent); `/model` and a bare
-  `/reasoning` both open it, and the typed forms (`/model <id>`,
-  `/reasoning <level>`) stay as the fast path. Never a second bespoke list for
-  a sibling of an existing surface.
+  rows pick the model on one axis, `←`/`→` clicks the effort detent on the
+  other, and the selected model's levels print as a live §10.1 **detent
+  track** above the footer, rendered through the settings panel's own switch
+  function so the two surfaces cannot drift); `/model` and a bare `/reasoning`
+  both open it, and the typed forms (`/model <id>`, `/reasoning <level>`)
+  stay as the fast path. Never a second bespoke list for a sibling of an
+  existing surface.
 - **Settings panel** — the faceplate (§10.1). Not a category tree.
 - **HelpOverlay** — the `?` cheatsheet: grouped key→action rows (keys in ink,
   actions muted, quiet uppercase group headings). No color, no icons.
@@ -863,7 +866,11 @@ Never invent a fifth:
 - **port** — a `▸` row that opens a deeper surface (model picker, scoped
   models, project permissions, login). **Settings is home:** when that
   surface closes — selected or cancelled — the panel re-opens on the port row
-  that launched it, snapshot refreshed.
+  that launched it, snapshot refreshed, in the same frame (the dock never
+  collapses on the way back). The **model row is a rotary–port hybrid**: `←`/
+  `→` cycles the scoped models exactly like Ctrl+P (the row rebuilds on the
+  new engine and flashes), `↵` opens the full picker; its footer names both
+  verbs (`←→ cycle · ↵ open`).
 
 **Mechanics.** `↑`/`↓` move over controls (wrapping; headers and blanks are
 skipped — silkscreen is not selectable). Every adjustment **saves
