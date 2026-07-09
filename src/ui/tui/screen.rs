@@ -85,6 +85,124 @@ impl TurnDivider {
     }
 }
 
+/// Cumulative session meter behind the exit receipt: wall time, user turns,
+/// and the token totals every completed provider turn reports. Honest by
+/// construction — sums only measured [`ProviderUsage`], never estimates. The
+/// turn divider stays per-task; this is the whole run.
+pub(crate) struct SessionMeter {
+    started: Instant,
+    turns: u32,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+}
+
+impl Default for SessionMeter {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            turns: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+        }
+    }
+}
+
+impl SessionMeter {
+    fn observe(&mut self, event: &UiEvent) {
+        if let UiEvent::ProviderTurnCompleted {
+            usage: Some(usage), ..
+        } = event
+        {
+            self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+            self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+            self.cache_read_tokens = self
+                .cache_read_tokens
+                .saturating_add(usage.cache_read_input_tokens);
+        }
+    }
+
+    /// The one-line exit receipt, or `None` for a session with no turns (a
+    /// receipt for nothing is noise). Every field is measured: wall time, turn
+    /// count, tokens sent/received across all provider turns, and — only when
+    /// cache reads were reported — the share of sent tokens served from cache.
+    fn receipt(&self) -> Option<String> {
+        if self.turns == 0 {
+            return None;
+        }
+        let sep = crate::ui::symbols::SEP;
+        let mut fields = vec![
+            format!("iris {}", env!("CARGO_PKG_VERSION")),
+            super::format_elapsed_compact(self.started.elapsed()),
+            if self.turns == 1 {
+                "1 turn".to_string()
+            } else {
+                format!("{} turns", self.turns)
+            },
+        ];
+        if self.input_tokens > 0 || self.output_tokens > 0 {
+            fields.push(format!(
+                "↑{} ↓{}",
+                compact_count(self.input_tokens),
+                compact_count(self.output_tokens)
+            ));
+        }
+        if self.cache_read_tokens > 0 && self.input_tokens > 0 {
+            // Same rounding as `cache_read_percent`: integer half-up, capped.
+            let percent = (self
+                .cache_read_tokens
+                .saturating_mul(100)
+                .saturating_add(self.input_tokens / 2)
+                / self.input_tokens)
+                .min(100);
+            fields.push(format!("cache {percent}%"));
+        }
+        Some(fields.join(&format!(" {sep} ")))
+    }
+}
+
+/// Loop ticks a detent flash stays bright (~200ms at the 100ms tick cadence).
+const FLASH_TICKS: u8 = 2;
+
+/// Tick-counted "detent" flashes — the mechanical acknowledgment that a
+/// control clicked into a new position. When a statusline segment changes
+/// (model, effort, approval policy) or the context meter lights a new LED,
+/// the changed element alone renders bright for [`FLASH_TICKS`] loop ticks,
+/// then settles back; quantized, like every Iris motion. Starts **disarmed**
+/// so startup initialization (footer, policy, a restored meter) can never
+/// flash — the loop arms it right before the first frame. Reduced motion
+/// never flashes (triggers are no-ops).
+#[derive(Default)]
+struct Detents {
+    armed: bool,
+    model: u8,
+    effort: u8,
+    policy: u8,
+    meter: u8,
+}
+
+impl Detents {
+    /// Decay every live flash by one tick. Returns whether any flash was live
+    /// this tick — including the tick it expires on, so the settled state
+    /// repaints once.
+    fn tick(&mut self) -> bool {
+        let mut live = false;
+        for slot in [
+            &mut self.model,
+            &mut self.effort,
+            &mut self.policy,
+            &mut self.meter,
+        ] {
+            if *slot > 0 {
+                *slot -= 1;
+                live = true;
+            }
+        }
+        live
+    }
+}
+
 impl Spinner {
     fn start(&mut self) {
         self.active = true;
@@ -653,6 +771,10 @@ pub(crate) struct Screen {
     terminal_focused: bool,
     /// Effective approval-policy posture for the bottom statusline.
     approval_policy: ApprovalPolicy,
+    /// Cumulative wall-time / turn / token meter behind the exit receipt.
+    session_meter: SessionMeter,
+    /// Live detent flashes for changed statusline segments / meter LEDs.
+    detents: Detents,
     /// The start page (IrisMark + launcher), shown before the first session
     /// activity when Iris launched interactively with no task/resume target.
     pub(crate) start_page: Option<StartPage>,
@@ -775,6 +897,8 @@ impl Screen {
             phase: WorkPhase::default(),
             terminal_focused: true,
             approval_policy: ApprovalPolicy::OnRequest,
+            session_meter: SessionMeter::default(),
+            detents: Detents::default(),
             start_page: None,
             session_menu: None,
             last_session_bar: None,
@@ -982,8 +1106,37 @@ impl Screen {
         self.start_page.is_some()
     }
 
+    /// The one-line exit receipt (`iris <rev> ┊ elapsed ┊ turns ┊ ↑↓ tokens ┊
+    /// cache %`), or `None` when the session ran no turns. Printed by the loop
+    /// after terminal teardown, so the record lands in normal-screen
+    /// scrollback in both screen modes — the instrument's printed slip.
+    pub(crate) fn session_receipt(&self) -> Option<String> {
+        self.session_meter.receipt()
+    }
+
+    /// Arm the detent flashes. Called by the loop once startup initialization
+    /// has settled (right before the first draw): from here on, a changed
+    /// statusline segment or newly lit meter LED flashes its acknowledgment.
+    pub(crate) fn arm_detents(&mut self) {
+        self.detents.armed = true;
+    }
+
+    /// Light one detent flash, if armed and motion is allowed.
+    fn flash_detent(slot: &mut u8, armed: bool, reduced_motion: bool) {
+        if armed && !reduced_motion {
+            *slot = FLASH_TICKS;
+        }
+    }
+
     /// Set the effective approval-policy posture shown on the bottom statusline.
     pub(crate) fn set_approval_policy(&mut self, policy: ApprovalPolicy) {
+        if self.approval_policy != policy {
+            Self::flash_detent(
+                &mut self.detents.policy,
+                self.detents.armed,
+                self.reduced_motion,
+            );
+        }
         self.approval_policy = policy;
     }
 
@@ -1124,11 +1277,22 @@ impl Screen {
         if self.spinner.active {
             self.turn_divider.observe(&event);
         }
+        self.session_meter.observe(&event);
         if let UiEvent::ProviderTurnCompleted {
             usage: Some(usage), ..
         } = &event
             && let Some(footer) = &mut self.footer
         {
+            // Detent acknowledgment: when this update lights a NEW meter LED,
+            // the fresh edge dot flashes once — the relay click of another 10%
+            // of the window committed.
+            let cap = footer.context.as_deref().and_then(parse_context_window);
+            let advanced = cap.is_some_and(|cap| {
+                let before = footer
+                    .context_used_tokens
+                    .map_or(0, |used| context_meter_filled(used, cap));
+                context_meter_filled(usage.total_tokens, cap) > before
+            });
             // `total_tokens` (prompt + completion) is the full conversation size
             // after this turn, which matches what the harness measures for
             // auto-compaction (`context_tokens` = sum of all message estimates).
@@ -1137,6 +1301,13 @@ impl Screen {
             // total.
             footer.context_used_tokens = Some(usage.total_tokens);
             footer.usage = Some(usage.clone());
+            if advanced {
+                Self::flash_detent(
+                    &mut self.detents.meter,
+                    self.detents.armed,
+                    self.reduced_motion,
+                );
+            }
         }
         // Accumulate the session-scoped reduction accounting for `/context`
         // (issue #400): fold batches with their trigger tags, and compaction
@@ -1380,6 +1551,28 @@ impl Screen {
         let context_used_tokens = same_context
             .then(|| prev.and_then(|footer| footer.context_used_tokens))
             .flatten();
+        // Detent acknowledgment: a *changed* model or effort flashes its
+        // statusline segment. Only against a previous footer — the first
+        // footer of a session is initialization, not a change.
+        let model_changed =
+            prev.is_some_and(|footer| !footer.model.eq_ignore_ascii_case(&model));
+        let effort_changed = prev.is_some_and(|footer| {
+            !label_eq_ignore_case(footer.effort.as_deref(), effort.as_deref())
+        });
+        if model_changed {
+            Self::flash_detent(
+                &mut self.detents.model,
+                self.detents.armed,
+                self.reduced_motion,
+            );
+        }
+        if effort_changed {
+            Self::flash_detent(
+                &mut self.detents.effort,
+                self.detents.armed,
+                self.reduced_motion,
+            );
+        }
         // The VCS snapshot is orthogonal to the model/context identity: always
         // carried across a footer rebuild (the loop refreshes it separately).
         let vcs = self.footer.as_mut().and_then(|footer| footer.vcs.take());
@@ -1426,6 +1619,7 @@ impl Screen {
 
     pub(crate) fn end_turn(&mut self) {
         self.queued = 0;
+        self.session_meter.turns = self.session_meter.turns.saturating_add(1);
         self.turn_divider.elapsed = self.spinner.elapsed();
         self.transcript.push_turn_divider(
             self.turn_divider.had_work,
@@ -1444,14 +1638,19 @@ impl Screen {
         if self.awaiting_approval {
             return false;
         }
+        // Detent flashes decay on the same quantized cadence as everything
+        // else; a live flash forces the redraws that let it settle.
+        let settling = self.detents.tick();
         // The start page's IrisMark reuses the spinner tick machinery and holds
         // still under reduced motion (StartPage::tick handles both cadence and
         // freeze). It must keep ticking even in an inactive terminal pane: tmux
         // users can see adjacent panes, and a frozen Iris pane reads as stalled.
-        if let Some(page) = &mut self.start_page {
-            return page.tick();
-        }
-        self.spinner.tick()
+        let animated = if let Some(page) = &mut self.start_page {
+            page.tick()
+        } else {
+            self.spinner.tick()
+        };
+        animated || settling
     }
 
     /// Drive one paced assistant-stream commit tick: migrate newly-stable
@@ -1790,13 +1989,20 @@ fn meter_used_style() -> Style {
 
 /// Render the 10-dot context meter as styled spans: muted filled dots, an orange
 /// edge dot at the current usage boundary, and dim empty dots for the remainder.
-fn context_meter_spans(filled: u64) -> Vec<Span<'static>> {
+/// While the edge LED's detent flash is live (`flash`), the freshly lit dot
+/// renders bold — one quantized blink acknowledging the newly committed 10%.
+fn context_meter_spans(filled: u64, flash: bool) -> Vec<Span<'static>> {
     (1..=CONTEXT_METER_DOTS)
         .map(|dot| {
             if filled == 0 || dot > filled {
                 Span::styled(crate::ui::symbols::EMPTY.to_string(), dim_style())
             } else if dot == filled {
-                Span::styled(crate::ui::symbols::RUNNING.to_string(), prompt_style())
+                let style = if flash {
+                    prompt_style().add_modifier(Modifier::BOLD)
+                } else {
+                    prompt_style()
+                };
+                Span::styled(crate::ui::symbols::RUNNING.to_string(), style)
             } else {
                 Span::styled(crate::ui::symbols::RUNNING.to_string(), meter_used_style())
             }
@@ -1840,25 +2046,38 @@ pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Lin
         ]
     };
     // The model name is the model-picker button: underlined, per the spec.
+    // A live detent flash renders the changed segment bright for two ticks —
+    // the switch's mechanical acknowledgment — then it settles back.
     let model_span = || {
-        Span::styled(
-            model.clone(),
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        )
+        let mut style = Style::default().add_modifier(Modifier::UNDERLINED);
+        if screen.detents.model > 0 {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        Span::styled(model.clone(), style)
+    };
+    let effort_style = if screen.detents.effort > 0 {
+        Style::default()
+    } else {
+        dim_style()
     };
     let model_with_effort = || match &effort {
         Some(effort) => vec![
             model_span(),
-            Span::styled(format!(" {effort}"), dim_style()),
+            Span::styled(format!(" {effort}"), effort_style),
         ],
         None => vec![model_span()],
     };
     let model_only = || vec![model_span()];
     let policy = screen.approval_policy;
+    let policy_label_style = if screen.detents.policy > 0 {
+        Style::default()
+    } else {
+        dim_style()
+    };
     let policy_seg = || {
         vec![
             Span::styled(format!("{} ", policy.symbol()), policy.symbol_style()),
-            Span::styled(policy.label().to_string(), dim_style()),
+            Span::styled(policy.label().to_string(), policy_label_style),
         ]
     };
     // Pager-only state hint while mouse reporting is toggled off (Ctrl+T):
@@ -1953,7 +2172,7 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
         }
         if with_meter && let Some(filled) = meter_filled {
             spans.push(Span::raw(" "));
-            spans.extend(context_meter_spans(filled));
+            spans.extend(context_meter_spans(filled, screen.detents.meter > 0));
         }
         spans
     };
@@ -2661,6 +2880,167 @@ mod tests {
         assert!(!screen.sticky_prompt_expanded);
         assert!(screen.toggle_sticky_prompt_at_screen_row(sticky_row));
         assert!(screen.sticky_prompt_expanded);
+    }
+
+    /// A completed provider turn with `total` conversation tokens (drives the
+    /// context meter against the footer's window).
+    fn provider_turn(total: u64) -> UiEvent {
+        UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_detent".to_string(),
+            response_id: None,
+            usage: Some(crate::nexus::ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: total.saturating_sub(100),
+                output_tokens: 100,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: total,
+                cache_creation: None,
+            }),
+        }
+    }
+
+    fn statusline_span_style(
+        screen: &Screen,
+        content: &str,
+    ) -> ratatui::style::Style {
+        composer_statusline(screen, 80)
+            .expect("statusline")
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref().trim() == content)
+            .unwrap_or_else(|| panic!("span {content:?} in statusline"))
+            .style
+    }
+
+    #[test]
+    fn detent_flash_acknowledges_a_model_switch_then_settles() {
+        use ratatui::style::Modifier;
+        let mut screen = footer_screen("~/repo");
+        screen.arm_detents();
+
+        // Re-setting the SAME model/effort is initialization traffic, not a
+        // change: nothing flashes.
+        screen.set_footer_with_context(
+            "gpt-5.5".to_string(),
+            Some("high".to_string()),
+            Some("300k".to_string()),
+            "~/repo".to_string(),
+        );
+        assert!(
+            !statusline_span_style(&screen, "GPT-5.5")
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "unchanged model must not flash"
+        );
+
+        // A real switch flashes the model and effort segments bright…
+        screen.set_footer_with_context(
+            "opus-4.8".to_string(),
+            Some("xhigh".to_string()),
+            Some("200k".to_string()),
+            "~/repo".to_string(),
+        );
+        assert!(
+            statusline_span_style(&screen, "OPUS-4.8")
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "changed model flashes bold"
+        );
+        assert_eq!(
+            statusline_span_style(&screen, "XHIGH").fg,
+            None,
+            "changed effort flashes ink (loses the dim fg)"
+        );
+
+        // …and the flash settles back after its ticks decay.
+        assert!(screen.tick(), "a live flash forces the settle redraws");
+        assert!(screen.tick());
+        assert!(
+            !statusline_span_style(&screen, "OPUS-4.8")
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "flash settles"
+        );
+        assert!(
+            statusline_span_style(&screen, "XHIGH").fg.is_some(),
+            "effort settles back to dim"
+        );
+    }
+
+    #[test]
+    fn detents_stay_dark_before_the_loop_arms_them() {
+        use ratatui::style::Modifier;
+        let mut screen = footer_screen("~/repo");
+        // No arm_detents(): startup initialization must never flash.
+        screen.set_footer_with_context(
+            "opus-4.8".to_string(),
+            Some("xhigh".to_string()),
+            Some("200k".to_string()),
+            "~/repo".to_string(),
+        );
+        screen.set_approval_policy(ApprovalPolicy::ReadOnly);
+        assert!(
+            !statusline_span_style(&screen, "OPUS-4.8")
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(statusline_span_style(&screen, "read-only").fg.is_some());
+    }
+
+    #[test]
+    fn approval_policy_change_flashes_its_label_then_settles() {
+        let mut screen = footer_screen("~/repo");
+        screen.arm_detents();
+        screen.set_approval_policy(ApprovalPolicy::ReadOnly);
+        assert_eq!(
+            statusline_span_style(&screen, "read-only").fg,
+            None,
+            "changed policy label flashes ink"
+        );
+        screen.tick();
+        screen.tick();
+        assert!(
+            statusline_span_style(&screen, "read-only").fg.is_some(),
+            "policy label settles back to dim"
+        );
+    }
+
+    #[test]
+    fn newly_lit_meter_dot_flashes_then_settles() {
+        use ratatui::style::Modifier;
+        let edge_dot_style = |screen: &Screen| {
+            session_bar(screen, 100)
+                .expect("bar")
+                .spans
+                .iter()
+                .filter(|span| span.content.as_ref() == crate::ui::symbols::RUNNING)
+                .last()
+                .expect("a lit meter dot")
+                .style
+        };
+        let mut screen = footer_screen("~/repo");
+        screen.arm_detents();
+        // 90k of 300k lights dot 3 (from 0 lit): the fresh edge flashes bold.
+        screen.apply(provider_turn(90_000));
+        assert!(
+            edge_dot_style(&screen).add_modifier.contains(Modifier::BOLD),
+            "newly lit LED flashes"
+        );
+        screen.tick();
+        screen.tick();
+        assert!(
+            !edge_dot_style(&screen).add_modifier.contains(Modifier::BOLD),
+            "LED settles"
+        );
+        // A usage update within the already-lit dot lights no new LED: no flash.
+        screen.apply(provider_turn(89_000));
+        assert!(
+            !edge_dot_style(&screen).add_modifier.contains(Modifier::BOLD),
+            "no new LED, no flash"
+        );
     }
 
     #[test]

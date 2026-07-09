@@ -200,7 +200,19 @@ pub(crate) fn run<P: ChatProvider>(
         start_page,
         resumed_session.as_deref(),
     ));
+    let receipt = tui.screen.session_receipt();
     tui.shutdown();
+    // The exit receipt: one dim, measured line printed AFTER teardown so it
+    // lands on the normal screen in both modes — in pager mode it is the only
+    // trace of the run left in scrollback; inline it closes the transcript.
+    if let Some(receipt) = receipt {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            println!("\x1b[2m{receipt}\x1b[0m");
+        } else {
+            println!("{receipt}");
+        }
+    }
     result
 }
 
@@ -360,6 +372,10 @@ async fn session_loop<P: ChatProvider>(
     if let Some(modal) = startup_modal {
         tui.screen.open_modal(modal);
     }
+    // Startup initialization is settled: arm the detent flashes so that from
+    // the first frame on, a changed statusline segment / meter LED announces
+    // itself with one quantized blink.
+    tui.screen.arm_detents();
     tui.draw()?;
     // Draw once before starting the blocking input reader so the banner/picker
     // is visible immediately and the terminal surface has its initial dimensions.
@@ -2716,6 +2732,13 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
         && scrollback_focus_key(screen, key.code, ctrl, alt)
     {
         return IdleKey::Continue;
+    }
+
+    // Any key completes the start page's power-on lamp test instantly — the
+    // panel is an instrument, never an obstacle. The key still performs its
+    // normal action below.
+    if let Some(page) = screen.start_page.as_mut() {
+        page.skip_boot();
     }
 
     // Start-page launcher routing: the listed ctrl-chords activate directly,

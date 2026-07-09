@@ -3309,6 +3309,8 @@ mod tests {
         }));
         screen.apply(UiEvent::SessionStarted);
         screen.show_start_page(0);
+        // Settle the power-on lamp test; this test pins the settled page.
+        screen.start_page.as_mut().expect("start page").skip_boot();
 
         let height = 24u16;
         let lines = rendered_lines(&mut screen, 80, height);
@@ -3321,7 +3323,8 @@ mod tests {
             texts[0].trim_end().ends_with("CTX 0/300k ○○○○○○○○○○"),
             "{texts:?}"
         );
-        // The IrisMark LED strip sits above the launcher menu.
+        // The IrisMark LED strip sits above the launcher menu, with the
+        // silkscreen identity row (wordmark + rev) printed directly beneath it.
         let mark_idx = texts
             .iter()
             .position(|line| line.contains('●') && line.contains('○') && !line.contains("CTX"))
@@ -3331,6 +3334,11 @@ mod tests {
             .position(|line| line.contains("New session"))
             .expect("launcher menu");
         assert!(mark_idx < menu_idx, "{texts:?}");
+        assert!(
+            texts[mark_idx + 1].contains("I R I S")
+                && texts[mark_idx + 1].contains(env!("CARGO_PKG_VERSION")),
+            "silkscreen under the strip: {texts:?}"
+        );
         // All five rows, in order, with their key hints and the house idiom:
         // ◉ marker on the selected row, dotted leaders, no hairline dividers.
         assert!(texts[menu_idx].contains("◉ New session"), "{texts:?}");
@@ -6456,6 +6464,74 @@ mod tests {
         let idx = lines.iter().position(|line| line == divider).unwrap();
         assert_eq!(lines[idx - 1].trim(), "", "{lines:?}");
         assert_eq!(lines[idx + 1].trim(), "", "{lines:?}");
+    }
+
+    #[test]
+    fn session_receipt_sums_every_provider_turn_and_reports_cache_share() {
+        let usage = |input: u64, output: u64, cached: u64| ProviderUsage {
+            provider: "anthropic".to_string(),
+            model: "opus-4.8".to_string(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: cached,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: input + output,
+            cache_creation: None,
+        };
+        let mut screen = Screen::new();
+        // Before any turn: no receipt — a receipt for nothing is noise.
+        assert_eq!(screen.session_receipt(), None);
+
+        // One task spanning two provider turns (a tool loop), then a second
+        // task: the receipt sums ALL provider turns, unlike the per-task
+        // divider, and reports the cached share of sent tokens.
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(usage(10_000, 500, 8_000)),
+        });
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_2".to_string(),
+            response_id: None,
+            usage: Some(usage(20_000, 1_500, 19_000)),
+        });
+        screen.end_turn();
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_3".to_string(),
+            response_id: None,
+            usage: Some(usage(30_000, 1_000, 27_000)),
+        });
+        screen.end_turn();
+
+        let receipt = screen.session_receipt().expect("receipt after turns");
+        assert!(
+            receipt.starts_with(&format!("iris {} ┊ ", env!("CARGO_PKG_VERSION"))),
+            "{receipt}"
+        );
+        assert!(receipt.contains(" ┊ 2 turns ┊ "), "{receipt}");
+        assert!(receipt.contains(" ┊ ↑60k ↓3k ┊ "), "{receipt}");
+        // 54k cached of 60k sent = 90%.
+        assert!(receipt.ends_with(" ┊ cache 90%"), "{receipt}");
+    }
+
+    #[test]
+    fn session_receipt_omits_unmeasured_fields() {
+        let mut screen = Screen::new();
+        // A turn that reported no usage at all (e.g. provider error): the
+        // receipt still records time + turns but claims nothing unmeasured.
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnError {
+            turn_id: "turn_1".to_string(),
+            message: "rate limited".to_string(),
+        });
+        screen.end_turn();
+        let receipt = screen.session_receipt().expect("receipt after a turn");
+        assert!(receipt.contains(" ┊ 1 turn"), "{receipt}");
+        assert!(!receipt.contains('↑'), "no token claim: {receipt}");
+        assert!(!receipt.contains("cache"), "no cache claim: {receipt}");
     }
 
     #[test]
