@@ -77,9 +77,8 @@ fn block_footer_row(
 }
 
 /// One reasoning-trace row on the muted left rail: the dim `┊ ` rail prefix plus
-/// the line, word-wrapped with the rail carried onto continuation rows, and
-/// hidden until the block is expanded. A plain (chromeless) row — reasoning gets
-/// no box.
+/// the line, word-wrapped with the rail carried onto continuation rows. A plain
+/// (chromeless) row — reasoning gets no box.
 fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
     line.spans.insert(
         0,
@@ -274,12 +273,16 @@ pub(super) struct Transcript {
     /// its opening separator). A late `AssistantReasoning` block is spliced here
     /// so reasoning renders above an already-committed answer.
     stream_answer_start: Option<usize>,
-    /// Accumulated live reasoning text for the current turn, shown as
-    /// a transient thinking preview while the provider is still thinking and
-    /// before the answer streams. Committed to scrollback as a thinking block by
+    /// Accumulated live reasoning summary for the current turn, shown as a
+    /// transient thinking preview while the provider is still thinking and
+    /// before the answer streams. Committed as the collapsed thinking body by
     /// [`Self::finish_live_reasoning_if_any`] on the first non-reasoning event.
-    /// `None` when no reasoning is streaming (block-level fallback path).
-    live_reasoning: Option<String>,
+    /// `None` when no reasoning summary is streaming.
+    live_reasoning_summary: Option<String>,
+    /// Accumulated live raw reasoning for the current turn. Committed as the
+    /// expanded thinking body; never used as the collapsed body while a summary
+    /// is available.
+    live_reasoning_raw: Option<String>,
     /// The open live exec cell, if a streaming tool is running.
     active_exec: Option<ActiveExec>,
     active_explorations: Vec<ActiveExploration>,
@@ -399,17 +402,34 @@ impl Transcript {
         }
     }
 
+    fn reasoning_groups(&self, text: &str) -> Vec<Vec<Line<'static>>> {
+        let theme = MarkdownTheme::thinking()
+            .with_code_highlighting()
+            .with_hyperlinks();
+        let width = self.markdown_content_width();
+        let mut groups: Vec<Vec<Line<'static>>> = Vec::new();
+        let mut current: Vec<Line<'static>> = Vec::new();
+        for line in render_markdown_themed(text, &theme, width) {
+            if line_text(&line).trim().is_empty() {
+                if !current.is_empty() {
+                    groups.push(std::mem::take(&mut current));
+                }
+            } else {
+                current.push(line);
+            }
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
+        groups
+    }
+
     /// Render a model reasoning ("thinking") trace as a chromeless, foldable
-    /// left-rail block (the `ThinkingBlock` design-system component): reasoning
-    /// is internal, verbose, and secondary, so it gets **no box** — only a muted
-    /// `┊` rail on its body and a `THINKING` label with honest telemetry.
-    /// Progressive disclosure uses the SAME binary `▾`/`▸` whole-block
-    /// disclosure as tool blocks: it always carries the indicator, arrives
-    /// collapsed to the single header line, and reveals its whole body on
-    /// `ctrl+o` / click (`toggle_latest_panel`). A `redacted` block has no
-    /// recoverable text, so a placeholder is shown and the original reasoning is
-    /// never rendered.
-    fn push_thinking_block(&mut self, text: &str, redacted: bool) {
+    /// left-rail block (the `ThinkingBlock` design-system component): collapsed
+    /// state shows the provider summary; expanded state reveals raw reasoning
+    /// when available. Reasoning gets **no box** — only a muted `┊` rail on its
+    /// body and a `THINKING` label with honest telemetry.
+    fn push_thinking_block(&mut self, summary: &str, raw: Option<&str>, redacted: bool) {
         // Reasoning is emitted at completion, after the answer's text deltas.
         // Some of the answer may already have been paced into scrollback, so the
         // rail block is spliced ABOVE the current turn's answer rows (tracked by
@@ -418,39 +438,30 @@ impl Transcript {
         let elapsed = self
             .provider_turn_started
             .map(|started| format_elapsed_compact(started.elapsed()));
-        // Paragraph groups: rendered markdown lines split at blank lines. The
-        // first group is the collapsed preview; the rest hides behind the fold.
-        let groups: Vec<Vec<Line<'static>>> = if redacted {
+        let collapsed_text = if summary.trim().is_empty() {
+            raw.unwrap_or_default()
+        } else {
+            summary
+        };
+        let expanded_text = raw
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or(collapsed_text);
+        let collapsed_groups: Vec<Vec<Line<'static>>> = if redacted {
             vec![vec![Line::from(Span::styled(
                 REDACTED_THINKING_BODY,
                 dim_style(),
             ))]]
         } else {
-            let theme = MarkdownTheme::thinking()
-                .with_code_highlighting()
-                .with_hyperlinks();
-            let width = self.markdown_content_width();
-            let mut groups: Vec<Vec<Line<'static>>> = Vec::new();
-            let mut current: Vec<Line<'static>> = Vec::new();
-            for line in render_markdown_themed(text, &theme, width) {
-                if line_text(&line).trim().is_empty() {
-                    if !current.is_empty() {
-                        groups.push(std::mem::take(&mut current));
-                    }
-                } else {
-                    current.push(line);
-                }
-            }
-            if !current.is_empty() {
-                groups.push(current);
-            }
-            groups
+            self.reasoning_groups(collapsed_text)
         };
-        // Reasoning folds with the SAME binary whole-block disclosure as tool
-        // blocks (the design's one disclosure grammar): it always carries the
-        // `▾`/`▸` indicator, arrives collapsed to a single header line, and
-        // reveals its whole body on toggle (`ctrl+o` / click). No bespoke
-        // first-paragraph preview, no `… N more paragraphs` affordance.
+        let expanded_groups: Vec<Vec<Line<'static>>> = if redacted {
+            vec![vec![Line::from(Span::styled(
+                REDACTED_THINKING_BODY,
+                dim_style(),
+            ))]]
+        } else {
+            self.reasoning_groups(expanded_text)
+        };
         self.thinking_elapsed = elapsed.clone();
         // Build the rail rows into a detached block; the header is always at
         // local index 0.
@@ -461,7 +472,15 @@ impl Transcript {
             right: elapsed.unwrap_or_default(),
             foldable: true,
         }));
-        for (index, group) in groups.into_iter().enumerate() {
+        for (index, group) in collapsed_groups.into_iter().enumerate() {
+            if index > 0 {
+                block.push(rail_body_row(Line::default()).with_fold(FoldVis::WhenCollapsed));
+            }
+            for line in group {
+                block.push(rail_body_row(line).with_fold(FoldVis::WhenCollapsed));
+            }
+        }
+        for (index, group) in expanded_groups.into_iter().enumerate() {
             if index > 0 {
                 block.push(rail_body_row(Line::default()).with_fold(FoldVis::WhenExpanded));
             }
@@ -494,17 +513,29 @@ impl Transcript {
         }
     }
 
-    /// Append one live reasoning delta to the transient thinking preview.
+    /// Append one live reasoning-summary delta to the transient thinking preview
+    /// and collapsed thinking body.
     /// Display-only: never committed to `rows` until finalize, never stored.
     fn push_reasoning_delta(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
         }
-        self.live_reasoning
+        self.live_reasoning_summary
             .get_or_insert_with(String::new)
             .push_str(delta);
-        // The preview is re-derived from `live_reasoning`; drop the memo so the
+        // The preview is re-derived from live reasoning; drop the memo so the
         // next frame re-renders with the appended text.
+        self.streaming_render = None;
+    }
+
+    /// Append one live raw reasoning delta to the expanded thinking body.
+    fn push_raw_reasoning_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.live_reasoning_raw
+            .get_or_insert_with(String::new)
+            .push_str(delta);
         self.streaming_render = None;
     }
 
@@ -512,11 +543,11 @@ impl Transcript {
     /// reasoning has streamed or when the buffer already ends with a break.
     fn push_reasoning_section_break(&mut self) {
         let append = self
-            .live_reasoning
+            .live_reasoning_summary
             .as_deref()
             .is_some_and(|buf| !buf.is_empty() && !buf.ends_with("\n\n"));
         if append {
-            self.live_reasoning
+            self.live_reasoning_summary
                 .as_mut()
                 .expect("checked non-empty above")
                 .push_str("\n\n");
@@ -530,15 +561,18 @@ impl Transcript {
     /// streamed. `stream_answer_start` is `None` here (reasoning precedes the
     /// answer), so `push_thinking_block` appends rather than splices.
     fn finish_live_reasoning_if_any(&mut self) {
-        let Some(text) = self.live_reasoning.take() else {
+        let summary = self.live_reasoning_summary.take().unwrap_or_default();
+        let raw = self.live_reasoning_raw.take().unwrap_or_default();
+        if summary.is_empty() && raw.is_empty() {
             return;
         };
         // Drop the transient reasoning-preview memo; the block below is committed
         // through the wrap cache instead.
         self.streaming_render = None;
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            self.push_thinking_block(trimmed, false);
+        let summary = summary.trim();
+        let raw = raw.trim();
+        if !summary.is_empty() || !raw.is_empty() {
+            self.push_thinking_block(summary, (!raw.is_empty()).then_some(raw), false);
         }
     }
 
@@ -2132,9 +2166,11 @@ impl Transcript {
             self.finish_live_reasoning_if_any();
         }
         match event {
-            UiEvent::AssistantReasoningDelta(delta)
-            | UiEvent::AssistantRawReasoningDelta(delta) => {
+            UiEvent::AssistantReasoningDelta(delta) => {
                 self.push_reasoning_delta(&delta);
+            }
+            UiEvent::AssistantRawReasoningDelta(delta) => {
+                self.push_raw_reasoning_delta(&delta);
             }
             UiEvent::AssistantReasoningSectionBreak => {
                 self.push_reasoning_section_break();
@@ -2276,7 +2312,7 @@ impl Transcript {
                 // afterwards), so the thinking block renders above the answer
                 // without finishing/duplicating the stream here.
                 if redacted || !text.is_empty() {
-                    self.push_thinking_block(&text, redacted);
+                    self.push_thinking_block(&text, None, redacted);
                 }
             }
             UiEvent::SessionStarted => {
@@ -2712,17 +2748,11 @@ impl Transcript {
         })
     }
 
-    /// Case-insensitive substring search over the CANONICAL transcript
-    /// content -- the full body of every panel, whether it is currently
-    /// folded or expanded ("search what is said, not what is shown"). The
-    /// collapsed-preview rows (`FoldVis::WhenCollapsed`: the head/tail excerpt
-    /// plus the `... N more lines` affordance) are skipped so a collapsed
-    /// panel does not double-count its preview against its full body; the
-    /// fold affordance hints (`ctrl+o to expand`/`collapse`) are control
-    /// chrome (`searchable == false`) and are also skipped so a query never
-    /// matches hidden UI or auto-expands a panel for non-content text. Every
-    /// other row (`Always` + `WhenExpanded`) is real transcript text and is
-    /// searched even when a fold hides it. The cache is refreshed at its
+    /// Case-insensitive substring search over searchable transcript content,
+    /// including folded-away panel bodies and visible collapsed rows. Control
+    /// chrome such as fold affordance hints is marked `searchable == false`
+    /// and skipped so a query never matches hidden UI. The cache is
+    /// refreshed at its
     /// current width first, so appends and fold changes since the last frame
     /// are searched and stale lines are not. Returns matches in ascending
     /// (row, sub-line) order, each identified by the logical row that owns it
@@ -2743,10 +2773,7 @@ impl Transcript {
         let mut out = Vec::new();
         for (row_idx, layout) in self.wrapped_cache.rows.iter().enumerate() {
             let row = &self.rows[row_idx];
-            // Skip collapsed-preview excerpts (searched via the full body) and
-            // control chrome such as the `ctrl+o to expand`/`collapse` fold
-            // hints, which are UI, not transcript content.
-            if row.fold == FoldVis::WhenCollapsed || !row.searchable {
+            if !row.searchable {
                 continue;
             }
             for (sub, line) in self.wrapped_cache.lines[layout.lines.clone()]
@@ -2951,14 +2978,22 @@ impl Transcript {
             }
             return;
         }
-        if let Some(text) = self
-            .live_reasoning
+        let preview_text = self
+            .live_reasoning_summary
             .as_deref()
             .filter(|text| !text.trim().is_empty())
-        {
-            // Key on the summary length: the trace only grows, so a longer
-            // buffer means new content to re-render.
-            let key = (usize::MAX, text.len());
+            .or_else(|| {
+                self.live_reasoning_raw
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+            });
+        if let Some(text) = preview_text {
+            // Key on both buffers: either stream can grow, so a longer buffer
+            // means new content to re-render.
+            let key = (
+                self.live_reasoning_summary.as_deref().map_or(0, str::len),
+                self.live_reasoning_raw.as_deref().map_or(0, str::len),
+            );
             let fresh = self
                 .streaming_render
                 .as_ref()
