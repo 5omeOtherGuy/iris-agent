@@ -1146,6 +1146,7 @@ impl Screen {
                 folds,
                 reclaimed_tokens_estimate,
                 trigger,
+                ..
             } => self.context_accounting.fold_batches.push((
                 trigger.code(),
                 *folds,
@@ -3177,6 +3178,8 @@ mod tests {
 
         screen.apply(UiEvent::FoldApplied {
             folds: 2,
+            semantic_dedupe_folds: 2,
+            tool_clearing_folds: 0,
             reclaimed_tokens_estimate: 8_000,
             trigger: crate::nexus::FoldTrigger::SelectionSwitch,
         });

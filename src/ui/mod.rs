@@ -191,6 +191,8 @@ pub(crate) enum UiEvent {
     /// and estimates only, tagged with the trigger class that released it.
     FoldApplied {
         folds: usize,
+        semantic_dedupe_folds: usize,
+        tool_clearing_folds: usize,
         reclaimed_tokens_estimate: u64,
         trigger: crate::nexus::FoldTrigger,
     },
@@ -383,10 +385,14 @@ impl UiEvent {
             },
             AgentEvent::FoldApplied {
                 folds,
+                semantic_dedupe_folds,
+                tool_clearing_folds,
                 reclaimed_tokens_estimate,
                 trigger,
             } => UiEvent::FoldApplied {
                 folds,
+                semantic_dedupe_folds,
+                tool_clearing_folds,
                 reclaimed_tokens_estimate,
                 trigger,
             },

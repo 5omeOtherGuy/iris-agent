@@ -491,6 +491,13 @@ mod tests {
             reasoning,
             cache_retention: PromptCacheRetention::Short,
             context_management: ContextManagement::default(),
+            legacy_context_management: ContextManagement::default(),
+            tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
+            configured_tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
             retry_policy: crate::mimir::retry::RetryPolicy::default(),
             open_ai_compatible: crate::mimir::selection::OpenAiCompatibleConfig::default(),
         }
@@ -655,6 +662,13 @@ mod tests {
                 reasoning: Some(ReasoningEffort::XHigh),
                 cache_retention: PromptCacheRetention::Short,
                 context_management: ContextManagement::default(),
+                legacy_context_management: ContextManagement::default(),
+                tool_result_compaction: crate::config::Settings::default()
+                    .tool_result_compaction()
+                    .unwrap(),
+                configured_tool_result_compaction: crate::config::Settings::default()
+                    .tool_result_compaction()
+                    .unwrap(),
                 retry_policy: crate::mimir::retry::RetryPolicy::default(),
                 open_ai_compatible: crate::mimir::selection::OpenAiCompatibleConfig::default(),
             };

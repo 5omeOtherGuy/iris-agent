@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Issue 472 implementation notes</title></head>
+<head><meta charset="utf-8"><title>Iris implementation notes</title></head>
 <body>
 <h1>Issue 472 implementation notes</h1>
 <ul>
@@ -10,6 +10,21 @@
   <li>Stale worker results are discarded after parent revalidation. Worker errors fall back to deterministic excerpts only if the original durable range is still valid.</li>
   <li>The <code>subagent</code> summarizer setting uses the existing Wayland subagent backend with read-only tools and a bounded tool-roundtrip/output budget.</li>
   <li>Lifecycle events are metadata only: job id, state, covered message count, token estimate, and a short status message. Summary text and covered transcript content are not sent through lifecycle events.</li>
+</ul>
+<h1>Configurable tool-result compaction</h1>
+<ul>
+  <li>The structured setting resolves presets as defaults, then applies explicit nested overrides. <code>conservative</code> preserves legacy superseded-read folding; <code>balanced</code> also clears older replayable local results; <code>aggressive</code> also clears older locally recoverable results; <code>custom</code> enables only reducers selected in nested settings.</li>
+  <li>Where the task did not prescribe nested defaults, presets protect 2,000 recent tokens; balanced/aggressive also protect four recent results. Local clearing keeps eight eligible uses (four for aggressive), requires 1,000 reclaimable tokens, and excludes <code>edit</code>, <code>write</code>, <code>recall</code>, and <code>read_output</code> unless explicitly overridden.</li>
+  <li>Shared recency guards apply before semantic dedupe and local clearing. <code>excludedTools</code> wins over mode and eligibility. Local clearing treats a missing or non-true result envelope as a failure and keeps it unless <code>includeFailures</code> is explicit.</li>
+  <li>Project settings may override local policy and scheduling. A project cannot select <code>anthropicNative</code> or <code>auto</code>, or alter a global native policy; those provider-side request controls remain global-only.</li>
+  <li>Anthropic public documentation was checked on 2026-07-09. It documents <code>exclude_tools</code> and <code>clear_tool_inputs</code> for <code>clear_tool_uses_20250919</code>; Iris maps both. Native clearing keeps tool inputs by default so local transcript recovery retains the original call and result.</li>
+  <li>Native and local reducers may coexist only when their candidate tool sets are provably disjoint. Semantic dedupe has candidates <code>read</code> and <code>ls</code>; native clearing must exclude both when semantic dedupe remains enabled.</li>
+  <li>Anthropic exposes no success/failure selector for native clearing. Explicit <code>anthropicNative</code> therefore requires <code>includeFailures=true</code>; <code>auto</code> falls back to local clearing when that consent or reducer disjointness is absent.</li>
+  <li>Native inclusion modes are translated to <code>exclude_tools</code> over Iris's current built-in tool surface. Provider telemetry for exact cleared call ids is deferred because the response reports aggregate counts/tokens, not the cleared ids.</li>
+  <li>Tool-call-id recovery scans the existing session JSONL. No new blob store or folded-body copy is added; normal tool-output offload still handles an oversized recall response.</li>
+  <li><code>/settings</code> edits enabled, aggressiveness, cache timing, trigger tokens, semantic retain-per-path, and clearing keep-recent counts. Tool-name arrays, mode, backend, failure inclusion, and native input clearing remain settings-file-only because the current menu has no safe list editor.</li>
+  <li>The repository's named <code>documentation-codemap-specialist</code> skill was unavailable in this environment. Affected codemap rows were updated manually; no generated codemap tooling was available to run.</li>
+  <li>No new ADR was added. These decisions directly extend ADR-0048's durable fold/recovery model, ADR-0051's flush scheduler, and ADR-0022's provider-native boundary; their dated addenda are the authoritative record.</li>
 </ul>
 </body>
 </html>

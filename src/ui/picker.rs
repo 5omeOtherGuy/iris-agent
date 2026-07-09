@@ -376,6 +376,11 @@ fn settings_snapshot<P: ChatProvider>(
         .unwrap_or_default();
     let tui = settings.tui_settings();
     let selection = switch.selection();
+    let compaction = settings.tool_result_compaction().unwrap_or_else(|_| {
+        crate::config::Settings::default()
+            .tool_result_compaction()
+            .unwrap()
+    });
     let default_reasoning = settings
         .default_reasoning
         .as_deref()
@@ -402,8 +407,12 @@ fn settings_snapshot<P: ChatProvider>(
             .compaction_summarizer
             .clone()
             .unwrap_or_else(|| "subagent".to_string()),
-        microcompaction: settings.microcompaction(),
-        microcompaction_watermark: settings.microcompaction_watermark(),
+        microcompaction: compaction.enabled,
+        microcompaction_watermark: compaction.trigger_tokens,
+        compaction_aggressiveness: compaction.aggressiveness.as_str().to_string(),
+        compaction_cache_timing: compaction.cache_timing.as_str().to_string(),
+        semantic_retain_per_path: compaction.semantic_dedupe.retain_per_path,
+        tool_clearing_keep_recent: compaction.tool_clearing.keep_recent_tool_uses,
         bash_tool_mode: settings.bash_tool_mode(),
         max_tool_roundtrips: settings.max_tool_roundtrips(),
         prompt_cache_retention: settings
@@ -442,9 +451,21 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
         Field::CompactionSummarizer => {
             config::save_compaction_summarizer(value.unwrap_or("provider"))
         }
-        Field::Microcompaction => config::save_microcompaction(parse_bool(value)),
+        Field::Microcompaction => config::save_tool_result_compaction_enabled(parse_bool(value)),
         Field::MicrocompactionWatermark => {
-            config::save_microcompaction_watermark(value.unwrap_or("0").parse()?)
+            config::save_tool_result_compaction_trigger_tokens(value.unwrap_or("0").parse()?)
+        }
+        Field::CompactionAggressiveness => {
+            config::save_tool_result_compaction_aggressiveness(value.unwrap_or("conservative"))
+        }
+        Field::CompactionCacheTiming => {
+            config::save_tool_result_compaction_cache_timing(value.unwrap_or("cacheAware"))
+        }
+        Field::SemanticRetainPerPath => {
+            config::save_tool_result_compaction_retain_per_path(value.unwrap_or("1").parse()?)
+        }
+        Field::ToolClearingKeepRecent => {
+            config::save_tool_result_compaction_keep_recent_tool_uses(value.unwrap_or("1").parse()?)
         }
         Field::BashToolMode => config::save_bash_tool_mode(parse_bool(value)),
         Field::MaxToolRoundtrips => config::save_max_tool_roundtrips(match value {
@@ -610,13 +631,26 @@ pub(crate) fn apply_action<P: ChatProvider>(
                         if let Some(mode) = value.as_deref().and_then(PermissionMode::parse) {
                             cli::set_permission_mode(harness, mode);
                         }
-                    } else if field == settings_menu::Field::Microcompaction {
-                        harness.set_microcompaction(value.as_deref() == Some("true"));
-                    } else if field == settings_menu::Field::MicrocompactionWatermark
-                        && let Some(value) = value.as_deref()
-                        && let Ok(value) = value.parse()
+                    } else if matches!(
+                        field,
+                        settings_menu::Field::Microcompaction
+                            | settings_menu::Field::MicrocompactionWatermark
+                            | settings_menu::Field::CompactionAggressiveness
+                            | settings_menu::Field::CompactionCacheTiming
+                            | settings_menu::Field::SemanticRetainPerPath
+                            | settings_menu::Field::ToolClearingKeepRecent
+                    ) && let Ok(settings) = config::Settings::load(harness.workspace())
+                        && let Ok(policy) = settings.tool_result_compaction()
+                        && let Err(error) =
+                            cli::apply_tool_result_compaction(policy, harness, switch)
                     {
-                        harness.set_microcompaction_watermark(value);
+                        return ActionResult::Replace(
+                            Box::new(Modal::SettingsSub(settings_menu::SubMenu::new(
+                                field.category(),
+                                &settings_snapshot(harness, switch),
+                            ))),
+                            vec![format!("could not apply setting: {error:#}")],
+                        );
                     }
                     Vec::new()
                 }

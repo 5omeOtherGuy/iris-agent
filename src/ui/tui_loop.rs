@@ -3469,11 +3469,15 @@ mod tests {
         let mut screen = Screen::new();
         screen.apply(crate::ui::UiEvent::FoldApplied {
             folds: 2,
+            semantic_dedupe_folds: 2,
+            tool_clearing_folds: 0,
             reclaimed_tokens_estimate: 900,
             trigger: crate::nexus::FoldTrigger::SelectionSwitch,
         });
         screen.apply(crate::ui::UiEvent::FoldApplied {
             folds: 1,
+            semantic_dedupe_folds: 0,
+            tool_clearing_folds: 1,
             reclaimed_tokens_estimate: 300,
             trigger: crate::nexus::FoldTrigger::Watermark,
         });

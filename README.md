@@ -207,16 +207,57 @@ file (`~/.iris/settings.json`, or `IRIS_CONFIG_PATH`):
 Supported provider ids are `openai-codex`, `anthropic`, and `antigravity`.
 Recognized settings keys are `defaultProvider`, `defaultModel`, `baseUrl`,
 `contextTokenBudget`, `defaultReasoning`, `promptCacheRetention`,
-`anthropicContextManagement`, and `enabledModels`.
+`anthropicContextManagement`, `toolResultCompaction`, and `enabledModels`.
 
 If unset, `promptCacheRetention` defaults to `short`; set it to `none` to omit
 provider-native prompt-cache hints.
 
+Tool-result compaction is opt-in. This example enables stale-read dedupe and
+older replayable-result clearing locally:
+
+```json
+{
+  "toolResultCompaction": {
+    "enabled": true,
+    "aggressiveness": "custom",
+    "cacheTiming": "cacheAware",
+    "triggerTokens": 64000,
+    "semanticDedupe": {
+      "enabled": true,
+      "retainPerPath": 1,
+      "protectRecentToolResults": 4,
+      "protectRecentTokens": 2000
+    },
+    "toolClearing": {
+      "enabled": true,
+      "backend": "local",
+      "mode": "replayable",
+      "keepRecentToolUses": 8,
+      "clearAtLeastTokens": 1000,
+      "eligibleTools": [],
+      "excludedTools": ["edit", "write", "recall", "read_output"],
+      "includeFailures": false,
+      "clearToolInputs": false
+    }
+  }
+}
+```
+
+`aggressiveness` accepts `conservative`, `balanced`, `aggressive`, or `custom`.
+`cacheTiming` accepts `breakOnly`, `cacheAware`, `pressureOnly`, or `immediate`.
+`backend` accepts `local`, `anthropicNative`, or `auto`. Anthropic-native
+clearing is global-only and must be disjoint from local reducers. The legacy
+`microcompaction=true` setting remains a conservative alias with the independent
+`microcompactionWatermark` default of 64,000 tokens. Folded originals remain in
+the local session transcript and can be retrieved with
+`recall(tool_call_id="...")`.
+
 Project settings (`<cwd>/.iris/settings.json`) are deliberately limited to
-`defaultModel`, `defaultReasoning`, and `contextTokenBudget`; a cloned repo
-cannot choose your provider, scoped model cycle, provider-side cache retention,
-Anthropic server-side context-management behavior, or redirect OAuth bearer
-tokens with `baseUrl`.
+local model/runtime preferences, including local tool-result reducers and cache
+timing. A cloned repo cannot choose your provider, scoped model cycle,
+provider-side cache retention, Anthropic server-side context-management
+behavior, select a native compaction backend, or redirect OAuth bearer tokens
+with `baseUrl`.
 
 ### Project permissions (`/trust`)
 

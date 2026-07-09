@@ -331,6 +331,7 @@ mod tests {
             default_reasoning: None,
             compaction_summarizer: None,
             microcompaction: None,
+            tool_result_compaction: None,
             tasks: None,
             bash_tool_mode: None,
             prompt_cache_retention: None,

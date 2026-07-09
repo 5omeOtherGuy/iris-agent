@@ -584,6 +584,9 @@ pub(crate) fn candidate_for(
         reasoning,
         cache_retention: current.cache_retention,
         context_management: current.context_management.clone(),
+        legacy_context_management: current.legacy_context_management.clone(),
+        tool_result_compaction: current.tool_result_compaction.clone(),
+        configured_tool_result_compaction: current.configured_tool_result_compaction.clone(),
         // A runtime model switch keeps the configured retry policy and custom
         // endpoint metadata.
         retry_policy: current.retry_policy,
@@ -670,10 +673,13 @@ pub(crate) fn switch_context_advisory_for<P>(
 /// the audit event. Any failure (unsupported reasoning, build/auth error) leaves
 /// the active selection and provider untouched.
 pub(crate) fn apply_selection<P: ChatProvider>(
-    candidate: ModelSelection,
+    mut candidate: ModelSelection,
     harness: &mut Harness<P>,
     switch: &mut ModelSwitch<'_, P>,
 ) -> Vec<String> {
+    if let Err(error) = candidate.resolve_context_management_for_provider() {
+        return vec![format!("{error:#}")];
+    }
     if let Err(error) = model_capabilities::validate(&candidate) {
         return vec![format!("{error:#}")];
     }
@@ -687,6 +693,7 @@ pub(crate) fn apply_selection<P: ChatProvider>(
     // #400) before recording the switch, so the A2/A3 break is scheduled
     // against the profile of the lane the next request actually uses.
     harness.set_cache_profile(crate::mimir::selection::cache_profile(&candidate));
+    harness.set_tool_result_compaction(candidate.tool_result_compaction.clone());
     let reasoning = candidate.reasoning.map(ReasoningEffort::as_str);
     if let Err(error) =
         harness.record_selection_event(candidate.provider.as_str(), &candidate.model, reasoning)
@@ -716,6 +723,27 @@ pub(crate) fn apply_selection<P: ChatProvider>(
     let mut lines = vec![confirm];
     lines.extend(advisory);
     lines
+}
+
+/// Apply a saved compaction policy to the active session. Rebuilds the provider
+/// because an Anthropic-native backend changes request JSON; local-only edits
+/// use the same path so selection state cannot drift and revert on `/model`.
+pub(crate) fn apply_tool_result_compaction<P: ChatProvider>(
+    policy: crate::config::ToolResultCompactionPolicy,
+    harness: &mut Harness<P>,
+    switch: &mut ModelSwitch<'_, P>,
+) -> Result<()> {
+    let mut candidate = switch.selection.clone();
+    candidate.configured_tool_result_compaction = policy;
+    candidate.resolve_context_management_for_provider()?;
+    let provider = (switch.build)(&candidate, &switch.system_prompt)?;
+    harness.replace_provider(provider);
+    harness.set_tool_result_compaction(candidate.tool_result_compaction.clone());
+    if let Some(cell) = &switch.background_selection {
+        *cell.lock().unwrap_or_else(|poison| poison.into_inner()) = candidate.clone();
+    }
+    switch.selection = candidate;
+    Ok(())
 }
 
 /// Slash commands that require the interactive TUI (pickers/modals, or --
@@ -1358,6 +1386,13 @@ mod tests {
             reasoning: None,
             cache_retention: selection::PromptCacheRetention::Short,
             context_management: selection::ContextManagement::default(),
+            legacy_context_management: selection::ContextManagement::default(),
+            tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
+            configured_tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
             retry_policy: crate::mimir::retry::RetryPolicy::default(),
             open_ai_compatible: selection::OpenAiCompatibleConfig::default(),
         }

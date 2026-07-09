@@ -273,6 +273,7 @@ impl SessionLog {
     /// class code (issue #400, e.g. `"C"` for the watermark backstop):
     /// additive-optional audit metadata -- rebuild ignores it, and entries
     /// written before it existed simply lack the field.
+    #[cfg(test)]
     pub(crate) fn append_fold(
         &mut self,
         target_id: &str,
@@ -280,8 +281,19 @@ impl SessionLog {
         token_estimate: Option<u64>,
         trigger: &str,
     ) -> Result<String> {
+        self.append_fold_with_reasons(target_id, stub, token_estimate, trigger, &[])
+    }
+
+    pub(crate) fn append_fold_with_reasons(
+        &mut self,
+        target_id: &str,
+        stub: &str,
+        token_estimate: Option<u64>,
+        trigger: &str,
+        reasons: &[&str],
+    ) -> Result<String> {
         let id = self.next_id();
-        let entry = json!({
+        let mut entry = json!({
             "type": "fold",
             "id": id,
             "parentId": self.last_id.as_deref(),
@@ -292,6 +304,9 @@ impl SessionLog {
             "tokenEstimate": token_estimate,
             "trigger": trigger,
         });
+        if !reasons.is_empty() {
+            entry["reasons"] = json!(reasons);
+        }
         write_line(&mut self.file, &entry)
             .with_context(|| format!("failed to append fold to session {}", self.path.display()))?;
         self.last_id = Some(id.clone());
@@ -1257,6 +1272,25 @@ pub(crate) fn read_span(path: &Path, from: u64, to: u64) -> Result<Vec<(Option<S
         .collect())
 }
 
+/// Read the ORIGINAL assistant tool-call and tool-result rows for one provider
+/// tool-call id. Fold and compaction entries are ignored: raw message entries
+/// remain the recovery source even after their provider-visible rendering was
+/// replaced.
+pub(crate) fn read_tool_call(
+    path: &Path,
+    tool_call_id: &str,
+) -> Result<Vec<(Option<String>, Message)>> {
+    let (entries, _compactions, _folds) = read_entries(path)?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| {
+            entry.message.tool_call_id.as_deref() == Some(tool_call_id)
+                && matches!(entry.message.role, Role::AssistantToolCall | Role::Tool)
+        })
+        .map(|entry| (entry.id, entry.message))
+        .collect())
+}
+
 /// Parse a session transcript's raw `message` and `compaction` entries in order,
 /// applying the same per-line leniency the read path needs (a truncated or
 /// garbled line is skipped, not fatal). Shared by the rebuild read path
@@ -2192,6 +2226,37 @@ mod tests {
         let span = read_span(&path, target_num, target_num).unwrap();
         assert_eq!(span.len(), 1);
         assert!(span[0].1.content.contains("fn load_bearing_NEEDLE() {}"));
+    }
+
+    #[test]
+    fn tool_call_id_reader_returns_original_call_and_result_after_fold() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let call = crate::nexus::ToolCall {
+            id: "call-recover".to_string(),
+            name: "read".to_string(),
+            arguments: json!({"path":"src/lib.rs"}),
+            thought_signature: None,
+        };
+        log.append(&Message::assistant_tool_call(&call)).unwrap();
+        let result_id = log
+            .append(&read_result(
+                "call-recover",
+                "src/lib.rs",
+                "ORIGINAL-CALL-ID-NEEDLE",
+            ))
+            .unwrap();
+        log.append_fold(&result_id, "[folded] replacement", None, "C")
+            .unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        let recovered = read_tool_call(&path, "call-recover").unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].1.role, Role::AssistantToolCall);
+        assert_eq!(recovered[1].1.role, Role::Tool);
+        assert!(recovered[1].1.content.contains("ORIGINAL-CALL-ID-NEEDLE"));
+        assert!(read_tool_call(&path, "missing").unwrap().is_empty());
     }
 
     #[test]

@@ -123,6 +123,19 @@
   `anthropicContextManagement` supports the public clear-tool-use and
   clear-thinking edits; provider-side compact is rejected until Iris can persist
   and replay compaction blocks safely. [Partial]
+- **Recoverable tool-result compaction** — default-off
+  `toolResultCompaction` composes retain-N stale-read dedupe with local
+  age/count clearing. Shared count/token guards protect the recent working set;
+  durable fold entries preserve provider tool-pair invariants; originals remain
+  recoverable from session JSONL with `recall(tool_call_id="...")`. Four cache
+  timing policies choose explicit breaks, inferred-cold windows, pressure, or
+  immediate safe boundaries. The legacy `microcompaction` setting resolves to
+  the conservative policy. [Implemented]
+- **Anthropic-native tool clearing** — explicit `anthropicNative` or `auto`
+  backends map the public `clear_tool_uses_20250919` trigger, keep, minimum,
+  excluded-tool, and tool-input controls. Provider selection rejects overlapping
+  local/native tool sets; `auto` falls back to local when native clearing is
+  unsupported or cannot honor the configured safety policy. [Implemented]
 - **Runtime model and reasoning switching** — `/model`, `/reasoning`, TUI
   provider/model/effort pickers, Ctrl+P/Shift+Ctrl+P model cycling,
   Shift+Tab effort cycling, `/settings`, `/scoped-models`, and session-local or

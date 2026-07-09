@@ -1,13 +1,11 @@
-//! Tests for the microcompaction fold engine (ADR-0048, issue #378): superseded
-//! -read detection (latest-read-wins), the retained-tail and error-classified
-//! guards, the workspace-relative security floor, and the deterministic stub.
+//! Focused local tool-result compaction planner tests.
 
-use super::{FoldPlan, V1_POLICIES, plan_folds, superseded_read_stub};
+use super::{FoldPlan, FoldReason, plan_folds};
+use crate::config::{Settings, ToolClearingBackend, ToolClearingMode};
 use crate::nexus::Message;
 use crate::tools::test_support::{root_of, temp_dir};
 use serde_json::json;
 
-/// A successful path-bearing tool result (ADR-0021 envelope + ADR-0044 target).
 fn ok_result(call: &str, name: &str, target: &str, body: &str) -> Message {
     Message::tool_result(
         call,
@@ -21,184 +19,264 @@ fn ok_result(call: &str, name: &str, target: &str, body: &str) -> Message {
     )
 }
 
-/// An error-classified result (ADR-0040): `ok:false`, no target.
-fn err_result(call: &str, name: &str) -> Message {
-    Message::tool_result(
-        call,
-        name,
-        &json!({
-            "ok": false,
-            "error": "not found",
-            "metadata": { "class": "not-found" }
-        })
-        .to_string(),
-    )
+fn plain_result(call: &str, name: &str, ok: bool, body: &str) -> Message {
+    Message::tool_result(call, name, &json!({"ok": ok, "content": body}).to_string())
 }
 
-/// Durable ids for every message (all coverable), so id-availability never
-/// masks a policy decision under test.
 fn ids(n: usize) -> Vec<Option<String>> {
     (0..n).map(|i| Some(format!("{i:08x}"))).collect()
 }
 
+fn policy() -> crate::config::ToolResultCompactionPolicy {
+    let mut policy = Settings {
+        microcompaction: Some(true),
+        ..Settings::default()
+    }
+    .tool_result_compaction()
+    .unwrap();
+    policy.semantic_dedupe.protect_recent_tool_results = 0;
+    policy.semantic_dedupe.protect_recent_tokens = 0;
+    policy
+}
+
 #[test]
-fn superseded_read_is_folded_and_the_stub_names_the_path() {
+fn retain_per_path_keeps_latest_n_even_when_bodies_are_duplicated() {
     let dir = temp_dir();
     let root = root_of(&dir);
     let messages = [
-        ok_result("c1", "read", "a.rs", "FIRST-NEEDLE body"),
-        ok_result("c2", "read", "a.rs", "second body"),
+        ok_result("c1", "read", "a.rs", "same"),
+        ok_result("c2", "read", "a.rs", "same"),
+        ok_result("c3", "read", "a.rs", "same"),
+        ok_result("c4", "read", "a.rs", "same"),
     ];
-    let entry_ids = ids(messages.len());
-    // tail_start past the end: nothing is in the retained tail.
-    let plans = plan_folds(&messages, &entry_ids, messages.len(), &root, V1_POLICIES);
-    assert_eq!(plans.len(), 1, "the earlier read is superseded and folds");
+    let mut policy = policy();
+    policy.semantic_dedupe.retain_per_path = 2;
+    let plans = plan_folds(
+        &messages,
+        &ids(messages.len()),
+        messages.len(),
+        &root,
+        &policy,
+    );
+    assert_eq!(
+        plans.iter().map(|plan| plan.index).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+
+#[test]
+fn later_edit_supersedes_prior_reads_for_the_same_path() {
+    let dir = temp_dir();
+    let root = root_of(&dir);
+    let messages = [
+        ok_result("c1", "read", "src/lib.rs", "old one"),
+        ok_result("c2", "read", "src/lib.rs", "old two"),
+        ok_result("c3", "edit", "src/lib.rs", "changed"),
+    ];
+    let mut policy = policy();
+    policy.semantic_dedupe.retain_per_path = 9;
+    let plans = plan_folds(
+        &messages,
+        &ids(messages.len()),
+        messages.len(),
+        &root,
+        &policy,
+    );
+    assert_eq!(
+        plans.iter().map(|plan| plan.index).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+
+#[test]
+fn local_clearing_folds_older_eligible_results_and_keeps_recent_uses() {
+    let dir = temp_dir();
+    let root = root_of(&dir);
+    let messages = [
+        plain_result("c1", "grep", true, &"old ".repeat(40)),
+        plain_result("c2", "grep", true, &"middle ".repeat(40)),
+        plain_result("c3", "grep", true, &"recent ".repeat(40)),
+    ];
+    let mut policy = policy();
+    policy.semantic_dedupe.enabled = false;
+    policy.tool_clearing.enabled = true;
+    policy.tool_clearing.backend = ToolClearingBackend::Local;
+    policy.tool_clearing.mode = ToolClearingMode::Selected;
+    policy.tool_clearing.eligible_tools = vec!["grep".to_string()];
+    policy.tool_clearing.keep_recent_tool_uses = 1;
+    policy.tool_clearing.clear_at_least_tokens = 1;
+    let plans = plan_folds(
+        &messages,
+        &ids(messages.len()),
+        messages.len(),
+        &root,
+        &policy,
+    );
+    assert_eq!(
+        plans.iter().map(|plan| plan.index).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert!(
+        plans
+            .iter()
+            .all(|plan| plan.has_reason(FoldReason::ToolClearing))
+    );
+}
+
+#[test]
+fn exclusions_and_failures_default_off_are_hard_guards() {
+    let dir = temp_dir();
+    let root = root_of(&dir);
+    let messages = [
+        plain_result("c1", "bash", true, &"success ".repeat(40)),
+        plain_result("c2", "bash", false, &"failure ".repeat(40)),
+        plain_result("c3", "bash", true, &"recent ".repeat(40)),
+    ];
+    let mut policy = policy();
+    policy.semantic_dedupe.enabled = false;
+    policy.tool_clearing.enabled = true;
+    policy.tool_clearing.mode = ToolClearingMode::Selected;
+    policy.tool_clearing.eligible_tools = vec!["bash".to_string()];
+    policy.tool_clearing.keep_recent_tool_uses = 1;
+    policy.tool_clearing.clear_at_least_tokens = 1;
+    policy.tool_clearing.excluded_tools = vec!["bash".to_string()];
+    assert!(
+        plan_folds(
+            &messages,
+            &ids(messages.len()),
+            messages.len(),
+            &root,
+            &policy
+        )
+        .is_empty()
+    );
+
+    policy.tool_clearing.excluded_tools.clear();
+    let plans = plan_folds(
+        &messages,
+        &ids(messages.len()),
+        messages.len(),
+        &root,
+        &policy,
+    );
+    assert_eq!(
+        plans.iter().map(|plan| plan.index).collect::<Vec<_>>(),
+        vec![0]
+    );
+    policy.tool_clearing.include_failures = true;
+    let plans = plan_folds(
+        &messages,
+        &ids(messages.len()),
+        messages.len(),
+        &root,
+        &policy,
+    );
+    assert_eq!(
+        plans.iter().map(|plan| plan.index).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+
+#[test]
+fn token_and_result_recency_guards_win_over_both_reducers() {
+    let dir = temp_dir();
+    let root = root_of(&dir);
+    let messages = [
+        ok_result("c1", "read", "a.rs", &"old ".repeat(40)),
+        ok_result("c2", "read", "a.rs", &"new ".repeat(40)),
+    ];
+    let mut policy = policy();
+    policy.tool_clearing.enabled = true;
+    policy.tool_clearing.keep_recent_tool_uses = 1;
+    policy.tool_clearing.clear_at_least_tokens = 1;
+    policy.semantic_dedupe.protect_recent_tool_results = 2;
+    assert!(
+        plan_folds(
+            &messages,
+            &ids(messages.len()),
+            messages.len(),
+            &root,
+            &policy
+        )
+        .is_empty()
+    );
+    policy.semantic_dedupe.protect_recent_tool_results = 0;
+    assert!(
+        plan_folds(&messages, &ids(messages.len()), 0, &root, &policy).is_empty(),
+        "token tail protects every message"
+    );
+}
+
+#[test]
+fn overlapping_b_and_c_write_one_fold_with_combined_reasons_and_recovery_id() {
+    let dir = temp_dir();
+    let root = root_of(&dir);
+    let messages = [
+        ok_result("call-old", "read", "a.rs", &"old ".repeat(40)),
+        ok_result("call-new", "read", "a.rs", &"new ".repeat(40)),
+    ];
+    let mut policy = policy();
+    policy.tool_clearing.enabled = true;
+    policy.tool_clearing.keep_recent_tool_uses = 1;
+    policy.tool_clearing.clear_at_least_tokens = 1;
+    let plans = plan_folds(
+        &messages,
+        &ids(messages.len()),
+        messages.len(),
+        &root,
+        &policy,
+    );
+    assert_eq!(plans.len(), 1);
     let plan = &plans[0];
-    assert_eq!(plan.index, 0);
-    assert_eq!(plan.entry_id, "00000000");
-    // The stub names the workspace-relative path so it stays recoverable.
-    assert!(plan.stub.contains("a.rs"));
-    assert!(!plan.stub.contains("FIRST-NEEDLE"));
-}
-
-#[test]
-fn a_read_that_is_never_re_touched_is_not_folded() {
-    let dir = temp_dir();
-    let root = root_of(&dir);
-    let messages = [
-        ok_result("c1", "read", "a.rs", "body a"),
-        ok_result("c2", "read", "b.rs", "body b"),
-    ];
-    let entry_ids = ids(messages.len());
-    let plans = plan_folds(&messages, &entry_ids, messages.len(), &root, V1_POLICIES);
-    assert!(plans.is_empty(), "distinct paths, nothing superseded");
-}
-
-#[test]
-fn ls_superseded_by_a_later_edit_of_the_same_path_folds() {
-    let dir = temp_dir();
-    let root = root_of(&dir);
-    let messages = [
-        ok_result("c1", "ls", "src", "old listing"),
-        ok_result("c2", "ls", "src", "new listing"),
-    ];
-    let entry_ids = ids(messages.len());
-    let plans = plan_folds(&messages, &entry_ids, messages.len(), &root, V1_POLICIES);
-    assert_eq!(plans.len(), 1);
-    assert_eq!(plans[0].index, 0);
-}
-
-#[test]
-fn the_retained_tail_never_folds() {
-    let dir = temp_dir();
-    let root = root_of(&dir);
-    // Two reads of a.rs: the first (index 0) is superseded. With tail_start=0
-    // EVERY message is in the retained tail, so nothing folds even though the
-    // supersede relationship exists.
-    let messages = [
-        ok_result("c1", "read", "a.rs", "first"),
-        ok_result("c2", "read", "a.rs", "second"),
-    ];
-    let entry_ids = ids(messages.len());
-    let plans = plan_folds(&messages, &entry_ids, 0, &root, V1_POLICIES);
-    assert!(plans.is_empty(), "tail is protected");
-
-    // Move the boundary so only index 0 is foldable (index 1 stays in the tail).
-    let plans = plan_folds(&messages, &entry_ids, 1, &root, V1_POLICIES);
-    assert_eq!(plans.len(), 1);
-    assert_eq!(plans[0].index, 0);
-}
-
-#[test]
-fn an_error_classified_read_never_folds_even_when_a_path_repeats() {
-    let dir = temp_dir();
-    let root = root_of(&dir);
-    // An earlier ERROR read of a.rs (ok:false, no target) then a later success:
-    // the failure is not a candidate (no target), and the later success is not
-    // superseded by anything, so nothing folds.
-    let messages = [
-        err_result("c1", "read"),
-        ok_result("c2", "read", "a.rs", "recovered body"),
-    ];
-    let entry_ids = ids(messages.len());
-    let plans = plan_folds(&messages, &entry_ids, messages.len(), &root, V1_POLICIES);
+    assert!(plan.has_reason(FoldReason::SemanticDedupe));
+    assert!(plan.has_reason(FoldReason::ToolClearing));
+    assert!(plan.stub.contains("semantic stale-read dedupe"));
+    assert!(plan.stub.contains("local age/count"));
+    assert!(plan.stub.contains("Durable entry id: `00000000`"));
+    assert!(plan.stub.contains("tool_call_id: \"call-old\""));
+    assert!(plan.stub.contains("recall(tool_call_id=\"call-old\")"));
     assert!(
-        plans.is_empty(),
-        "an error-classified read is never a fold candidate"
-    );
-
-    // A successful read followed by a LATER error read of the same path is NOT
-    // superseded: the failure carries no target, so it never retires an earlier
-    // success (guards against folding a still-valid read behind a failed retry).
-    let messages = [
-        ok_result("c1", "read", "a.rs", "still-valid body"),
-        err_result("c2", "read"),
-    ];
-    let plans = plan_folds(&messages, &entry_ids, messages.len(), &root, V1_POLICIES);
-    assert!(
-        plans.is_empty(),
-        "a failed re-read does not supersede a good read"
+        !plan.stub.contains("old old"),
+        "folded content never leaks into stub"
     );
 }
 
 #[test]
-fn a_path_outside_the_workspace_is_never_folded() {
-    let dir = temp_dir();
-    let root = root_of(&dir);
-    // Absolute and traversal targets are dropped by the workspace-relative floor,
-    // so neither becomes a candidate nor a superseder -- no fold names a path
-    // outside the workspace.
-    let messages = [
-        ok_result("c1", "read", "/etc/passwd", "leak"),
-        ok_result("c2", "read", "/etc/passwd", "leak again"),
-        ok_result("c3", "read", "../../secret", "escape"),
-        ok_result("c4", "read", "../../secret", "escape again"),
-    ];
-    let entry_ids = ids(messages.len());
-    let plans = plan_folds(&messages, &entry_ids, messages.len(), &root, V1_POLICIES);
-    assert!(plans.is_empty());
-}
-
-#[test]
-fn only_coverable_results_with_a_durable_id_fold() {
+fn only_durable_in_workspace_results_fold_and_plans_stay_ordered() {
     let dir = temp_dir();
     let root = root_of(&dir);
     let messages = [
-        ok_result("c1", "read", "a.rs", "first"),
-        ok_result("c2", "read", "a.rs", "second"),
+        ok_result("c1", "read", "/etc/passwd", "outside"),
+        ok_result("c2", "read", "/etc/passwd", "outside again"),
+        ok_result("c3", "read", "b.rs", "b1"),
+        ok_result("c4", "read", "a.rs", "a1"),
+        ok_result("c5", "read", "b.rs", "b2"),
+        ok_result("c6", "read", "a.rs", "a2"),
     ];
-    // The superseded read (index 0) has no durable id, so it cannot carry a fold
-    // entry and is skipped.
-    let entry_ids = vec![None, Some("00000001".to_string())];
-    let plans = plan_folds(&messages, &entry_ids, messages.len(), &root, V1_POLICIES);
-    assert!(plans.is_empty(), "an id-less result cannot be folded");
+    let mut entry_ids = ids(messages.len());
+    entry_ids[2] = None;
+    let plans = plan_folds(&messages, &entry_ids, messages.len(), &root, &policy());
+    let indices: Vec<usize> = plans.iter().map(|plan: &FoldPlan| plan.index).collect();
+    assert_eq!(indices, vec![3]);
 }
 
 #[test]
-fn superseded_read_stub_is_deterministic_and_reproducible() {
-    // Pure function of (tool, path): the same fold reproduces byte-for-byte, so
-    // live and resumed rebuilds agree.
-    let a = superseded_read_stub("read", "src/lib.rs");
-    let b = superseded_read_stub("read", "src/lib.rs");
-    assert_eq!(a, b);
-    assert!(a.contains("src/lib.rs"));
-    assert!(a.contains("recall"));
-}
-
-#[test]
-fn plans_are_ordered_by_index() {
+fn stub_json_quotes_untrusted_call_ids_and_paths() {
     let dir = temp_dir();
     let root = root_of(&dir);
-    // a.rs read at 0 and 2, b.rs read at 1 and 3: indices 0 and 1 both fold, in
-    // index order.
     let messages = [
-        ok_result("c1", "read", "a.rs", "a1"),
-        ok_result("c2", "read", "b.rs", "b1"),
-        ok_result("c3", "read", "a.rs", "a2"),
-        ok_result("c4", "read", "b.rs", "b2"),
+        ok_result("call\nold", "read", "odd\npath.rs", "old"),
+        ok_result("new", "read", "odd\npath.rs", "new"),
     ];
-    let entry_ids = ids(messages.len());
-    let plans = plan_folds(&messages, &entry_ids, messages.len(), &root, V1_POLICIES);
-    let indices: Vec<usize> = plans.iter().map(|p: &FoldPlan| p.index).collect();
-    assert_eq!(indices, vec![0, 1]);
+    let plans = plan_folds(
+        &messages,
+        &ids(messages.len()),
+        messages.len(),
+        &root,
+        &policy(),
+    );
+    assert_eq!(plans.len(), 1);
+    assert!(plans[0].stub.contains("call\\nold"));
+    assert!(plans[0].stub.contains("odd\\npath.rs"));
+    assert!(!plans[0].stub.contains("call\nold"));
 }

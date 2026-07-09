@@ -335,6 +335,8 @@ pub(crate) struct ClearToolUses {
     pub(crate) trigger_input_tokens: Option<u64>,
     pub(crate) keep_tool_uses: Option<u64>,
     pub(crate) clear_at_least_input_tokens: Option<u64>,
+    pub(crate) exclude_tools: Option<Vec<String>>,
+    pub(crate) clear_tool_inputs: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
@@ -367,29 +369,6 @@ impl ContextManagement {
         if self.compact.is_some() {
             return Err(UsageError::new(
                 "anthropicContextManagement.compact is not supported yet; compact responses require transcript replay support",
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    /// Reject server-side tool-result clearing combined with local
-    /// microcompaction (issue #400, ADR-0022 addendum): `clear_tool_uses`
-    /// makes the server drop tool results Iris still models as present, so
-    /// context estimates diverge and fold plans target content already gone
-    /// -- two reducers fighting over the same mass. `clear_thinking` stays
-    /// allowed: folds never touch thinking blocks and recall reads Iris's
-    /// own log, unaffected by server-side thinking clears.
-    pub(crate) fn validate_compatible_with_microcompaction(
-        &self,
-        microcompaction: bool,
-    ) -> Result<()> {
-        if microcompaction && self.clear_tool_uses.is_some() {
-            return Err(UsageError::new(
-                "anthropicContextManagement.clearToolUses and microcompaction cannot be enabled \
-                 together: the server drops tool results Iris still models as present, so \
-                 context accounting and fold plans diverge. Disable one of them \
-                 (clearThinking remains compatible with microcompaction).",
             )
             .into());
         }
@@ -430,6 +409,15 @@ pub(crate) struct ModelSelection {
     /// Anthropic-only context-management opt-in; empty/default for other
     /// providers and when unconfigured.
     pub(crate) context_management: ContextManagement,
+    /// Raw legacy advanced block retained so runtime provider switches can
+    /// rebuild the provider-specific edit without losing `clearThinking`.
+    pub(crate) legacy_context_management: ContextManagement,
+    /// Provider-resolved local policy installed into Wayland. Native B is
+    /// disabled here while semantic C may remain local when disjoint.
+    pub(crate) tool_result_compaction: crate::config::ToolResultCompactionPolicy,
+    /// Configured policy before provider resolution. Retained for `/model`
+    /// switches, especially `auto` fallback.
+    pub(crate) configured_tool_result_compaction: crate::config::ToolResultCompactionPolicy,
     /// Shared provider retry/backoff policy, resolved from settings with
     /// pi-mono-aligned defaults. Every provider adapter uses this single
     /// definition instead of its own retry constants.
@@ -471,7 +459,7 @@ impl ModelSelection {
             Some(value) => PromptCacheRetention::parse(value)?,
             None => PromptCacheRetention::DEFAULT,
         };
-        let context_management = match &settings.anthropic_context_management {
+        let legacy_context_management = match &settings.anthropic_context_management {
             Some(value) => {
                 serde_json::from_value::<ContextManagement>(value.clone()).map_err(|error| {
                     UsageError::new(format!(
@@ -481,23 +469,210 @@ impl ModelSelection {
             }
             None => ContextManagement::default(),
         };
-        context_management.validate_supported()?;
-        context_management.validate_compatible_with_microcompaction(settings.microcompaction())?;
+        legacy_context_management.validate_supported()?;
+        let configured_tool_result_compaction = settings.tool_result_compaction()?;
         let retry_policy =
             crate::mimir::retry::RetryPolicy::from_settings(&settings.retry_settings());
         let open_ai_compatible =
             OpenAiCompatibleConfig::from_settings(settings.open_ai_compatible.as_ref());
-        Ok(ModelSelection {
+        let mut selection = ModelSelection {
             provider,
             model,
             base_url,
             reasoning,
             cache_retention,
-            context_management,
+            context_management: ContextManagement::default(),
+            legacy_context_management,
+            tool_result_compaction: configured_tool_result_compaction.clone(),
+            configured_tool_result_compaction,
             retry_policy,
             open_ai_compatible,
-        })
+        };
+        selection.resolve_context_management_for_provider()?;
+        Ok(selection)
     }
+
+    /// Re-resolve local/native tool-result compaction for the current provider.
+    /// Called at startup and immediately before a runtime provider switch.
+    pub(crate) fn resolve_context_management_for_provider(&mut self) -> Result<()> {
+        let mut context_management = self.legacy_context_management.clone();
+        context_management.validate_supported()?;
+        let mut local = self.configured_tool_result_compaction.clone();
+        let configured = &local.tool_clearing;
+        let structured_native = local.enabled
+            && configured.enabled
+            && match configured.backend {
+                crate::config::ToolClearingBackend::AnthropicNative => {
+                    if self.provider != ProviderId::Anthropic {
+                        return Err(UsageError::new(format!(
+                            "toolResultCompaction.toolClearing.backend=anthropicNative is not supported by provider {}; use backend=auto to fall back to local",
+                            self.provider.as_str()
+                        ))
+                        .into());
+                    }
+                    true
+                }
+                crate::config::ToolClearingBackend::Auto => {
+                    self.provider == ProviderId::Anthropic
+                        && native_is_disjoint_from_semantic(&local)
+                }
+                crate::config::ToolClearingBackend::Local => false,
+            };
+
+        if context_management.clear_tool_uses.is_some() && self.provider != ProviderId::Anthropic {
+            return Err(UsageError::new(format!(
+                "anthropicContextManagement.clearToolUses is not supported by provider {}",
+                self.provider.as_str()
+            ))
+            .into());
+        }
+        if structured_native {
+            if !configured.include_failures {
+                return Err(UsageError::new(
+                    "toolResultCompaction.toolClearing.backend=anthropicNative cannot enforce includeFailures=false because Anthropic exposes no result-status filter; set includeFailures=true explicitly or use backend=local/auto",
+                )
+                .into());
+            }
+            if context_management.clear_tool_uses.is_some() {
+                return Err(UsageError::new(
+                    "toolResultCompaction.toolClearing and anthropicContextManagement.clearToolUses both configure Anthropic-native tool clearing; configure only one",
+                )
+                .into());
+            }
+            let native_excluded = native_excluded_tools(&local);
+            let mut local_after_delegation = local.clone();
+            local_after_delegation.tool_clearing.enabled = false;
+            validate_native_disjoint(&local_after_delegation, &native_excluded)?;
+            context_management.clear_tool_uses = Some(ClearToolUses {
+                trigger_input_tokens: Some(local.trigger_tokens),
+                keep_tool_uses: Some(configured.keep_recent_tool_uses),
+                clear_at_least_input_tokens: Some(configured.clear_at_least_tokens),
+                exclude_tools: Some(native_excluded),
+                clear_tool_inputs: Some(configured.clear_tool_inputs),
+            });
+            local.tool_clearing.enabled = false;
+        } else if let Some(native) = &context_management.clear_tool_uses {
+            validate_native_disjoint(&local, native.exclude_tools.as_deref().unwrap_or_default())?;
+        }
+        self.context_management = context_management;
+        self.tool_result_compaction = local;
+        Ok(())
+    }
+}
+
+const BUILT_IN_TOOL_NAMES: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "grep",
+    "find",
+    "ls",
+    "read_output",
+    "recall",
+];
+
+fn local_candidate_tools(policy: &crate::config::ToolResultCompactionPolicy) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if policy.enabled && policy.semantic_dedupe.enabled {
+        candidates.extend(["read".to_string(), "ls".to_string()]);
+    }
+    let clearing = &policy.tool_clearing;
+    if policy.enabled
+        && clearing.enabled
+        && matches!(
+            clearing.backend,
+            crate::config::ToolClearingBackend::Local | crate::config::ToolClearingBackend::Auto
+        )
+    {
+        let base: Vec<&str> = match clearing.mode {
+            crate::config::ToolClearingMode::Replayable => {
+                vec!["read", "ls", "grep", "find"]
+            }
+            crate::config::ToolClearingMode::Selected => {
+                clearing.eligible_tools.iter().map(String::as_str).collect()
+            }
+            crate::config::ToolClearingMode::AllRecoverable => BUILT_IN_TOOL_NAMES.to_vec(),
+        };
+        candidates.extend(
+            base.into_iter()
+                .filter(|name| {
+                    !clearing
+                        .excluded_tools
+                        .iter()
+                        .any(|excluded| excluded == name)
+                        && (clearing.eligible_tools.is_empty()
+                            || clearing.mode == crate::config::ToolClearingMode::Selected
+                            || clearing
+                                .eligible_tools
+                                .iter()
+                                .any(|eligible| eligible == name))
+                })
+                .map(str::to_owned),
+        );
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn native_is_disjoint_from_semantic(policy: &crate::config::ToolResultCompactionPolicy) -> bool {
+    policy.tool_clearing.include_failures
+        && (!policy.semantic_dedupe.enabled
+            || ["read", "ls"].iter().all(|name| {
+                native_excluded_tools(policy)
+                    .iter()
+                    .any(|excluded| excluded == name)
+            }))
+}
+
+fn native_excluded_tools(policy: &crate::config::ToolResultCompactionPolicy) -> Vec<String> {
+    let clearing = &policy.tool_clearing;
+    let mut excluded = clearing.excluded_tools.clone();
+    let eligible: Vec<&str> = match clearing.mode {
+        crate::config::ToolClearingMode::Replayable => vec!["read", "ls", "grep", "find"],
+        crate::config::ToolClearingMode::Selected => {
+            clearing.eligible_tools.iter().map(String::as_str).collect()
+        }
+        crate::config::ToolClearingMode::AllRecoverable => BUILT_IN_TOOL_NAMES.to_vec(),
+    };
+    for name in BUILT_IN_TOOL_NAMES {
+        if !eligible.contains(name)
+            || (!clearing.eligible_tools.is_empty()
+                && !clearing
+                    .eligible_tools
+                    .iter()
+                    .any(|eligible| eligible == name))
+        {
+            excluded.push((*name).to_string());
+        }
+    }
+    excluded.sort();
+    excluded.dedup();
+    excluded
+}
+
+fn validate_native_disjoint(
+    local: &crate::config::ToolResultCompactionPolicy,
+    native_excluded: &[String],
+) -> Result<()> {
+    let overlap: Vec<String> = local_candidate_tools(local)
+        .into_iter()
+        .filter(|name| !native_excluded.iter().any(|excluded| excluded == name))
+        .collect();
+    if !overlap.is_empty() {
+        let local_setting = if local.legacy_alias {
+            "microcompaction (legacy alias for toolResultCompaction)"
+        } else {
+            "toolResultCompaction"
+        };
+        return Err(UsageError::new(format!(
+            "local {local_setting} reducers overlap Anthropic-native clearToolUses for tools [{}]; add them to excludeTools or disable the overlapping local reducer",
+            overlap.join(", ")
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 fn default_provider_from_env() -> ProviderId {
@@ -571,6 +746,7 @@ mod tests {
             default_reasoning: reasoning.map(str::to_string),
             compaction_summarizer: None,
             microcompaction: None,
+            tool_result_compaction: None,
             tasks: None,
             bash_tool_mode: None,
             prompt_cache_retention: None,
@@ -587,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_tool_uses_and_microcompaction_are_mutually_exclusive() {
+    fn clear_tool_uses_and_microcompaction_must_be_disjoint() {
         // Both enabled -> rejected, naming both settings (issue #400,
         // ADR-0022 addendum).
         let mut s = settings(Some("anthropic"), None, None, None);
@@ -612,6 +788,12 @@ mod tests {
         micro_only.microcompaction = Some(true);
         assert!(ModelSelection::resolve(&micro_only).is_ok());
 
+        let mut disjoint = micro_only.clone();
+        disjoint.anthropic_context_management = Some(serde_json::json!({
+            "clearToolUses": {"excludeTools": ["read", "ls"]}
+        }));
+        assert!(ModelSelection::resolve(&disjoint).is_ok());
+
         // clear_thinking is orthogonal: folds never touch thinking blocks.
         let mut thinking = settings(Some("anthropic"), None, None, None);
         thinking.anthropic_context_management = Some(serde_json::json!({
@@ -619,6 +801,100 @@ mod tests {
         }));
         thinking.microcompaction = Some(true);
         assert!(ModelSelection::resolve(&thinking).is_ok());
+    }
+
+    #[test]
+    fn structured_native_clearing_maps_only_when_disjoint_and_supported() {
+        let base = serde_json::json!({
+            "defaultProvider": "anthropic",
+            "toolResultCompaction": {
+                "enabled": true,
+                "aggressiveness": "custom",
+                "triggerTokens": 42000,
+                "semanticDedupe": {
+                    "enabled": true,
+                    "protectRecentTokens": 2000
+                },
+                "toolClearing": {
+                    "enabled": true,
+                    "backend": "anthropicNative",
+                    "mode": "allRecoverable",
+                    "keepRecentToolUses": 5,
+                    "clearAtLeastTokens": 7000,
+                    "excludedTools": ["read", "ls", "edit", "write", "recall", "read_output"],
+                    "includeFailures": true,
+                    "clearToolInputs": true
+                }
+            }
+        });
+        let settings: Settings = serde_json::from_value(base.clone()).unwrap();
+        let selection = ModelSelection::resolve(&settings).unwrap();
+        assert!(selection.tool_result_compaction.semantic_dedupe.enabled);
+        assert!(!selection.tool_result_compaction.tool_clearing.enabled);
+        let native = selection
+            .context_management
+            .clear_tool_uses
+            .expect("native clearing mapped");
+        assert_eq!(native.trigger_input_tokens, Some(42_000));
+        assert_eq!(native.keep_tool_uses, Some(5));
+        assert_eq!(native.clear_at_least_input_tokens, Some(7_000));
+        assert_eq!(native.clear_tool_inputs, Some(true));
+        assert!(
+            native
+                .exclude_tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| tool == "read"))
+        );
+
+        let mut overlap = base;
+        overlap["toolResultCompaction"]["toolClearing"]["excludedTools"] =
+            serde_json::json!(["edit", "write", "recall", "read_output"]);
+        let settings: Settings = serde_json::from_value(overlap).unwrap();
+        let error = format!("{:#}", ModelSelection::resolve(&settings).unwrap_err());
+        assert!(error.contains("overlap"), "{error}");
+        assert!(error.contains("read"), "{error}");
+
+        let mut unsupported = settings;
+        unsupported.default_provider = Some("openai-codex".to_string());
+        let error = format!("{:#}", ModelSelection::resolve(&unsupported).unwrap_err());
+        assert!(error.contains("anthropicNative"), "{error}");
+        assert!(error.contains("backend=auto"), "{error}");
+    }
+
+    #[test]
+    fn auto_backend_falls_back_to_local_on_unsupported_or_overlapping_lanes() {
+        for provider in ["openai-codex", "anthropic"] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "defaultProvider": provider,
+                "toolResultCompaction": {
+                    "enabled": true,
+                    "aggressiveness": "balanced",
+                    "toolClearing": {"backend": "auto"}
+                }
+            }))
+            .unwrap();
+            let selection = ModelSelection::resolve(&settings).unwrap();
+            assert!(selection.tool_result_compaction.tool_clearing.enabled);
+            assert!(selection.context_management.clear_tool_uses.is_none());
+        }
+
+        let native_ready: Settings = serde_json::from_value(serde_json::json!({
+            "defaultProvider": "anthropic",
+            "toolResultCompaction": {
+                "enabled": true,
+                "aggressiveness": "custom",
+                "semanticDedupe": {"enabled": false},
+                "toolClearing": {
+                    "enabled": true,
+                    "backend": "auto",
+                    "includeFailures": true
+                }
+            }
+        }))
+        .unwrap();
+        let selection = ModelSelection::resolve(&native_ready).unwrap();
+        assert!(!selection.tool_result_compaction.tool_clearing.enabled);
+        assert!(selection.context_management.clear_tool_uses.is_some());
     }
 
     /// A selection literal for the cache-profile table tests, bypassing
@@ -635,6 +911,13 @@ mod tests {
             reasoning: None,
             cache_retention: retention,
             context_management: ContextManagement::default(),
+            legacy_context_management: ContextManagement::default(),
+            tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
+            configured_tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
             retry_policy: crate::mimir::retry::RetryPolicy::default(),
             open_ai_compatible: OpenAiCompatibleConfig::default(),
         }
@@ -867,8 +1150,14 @@ mod tests {
             "unconfigured context management stays disabled"
         );
 
+        s.default_provider = Some("anthropic".to_string());
         s.anthropic_context_management = Some(serde_json::json!({
-            "clearToolUses": { "triggerInputTokens": 100000, "keepToolUses": 3 },
+            "clearToolUses": {
+                "triggerInputTokens": 100000,
+                "keepToolUses": 3,
+                "excludeTools": ["read", "ls"],
+                "clearToolInputs": false
+            },
             "clearThinking": { "triggerInputTokens": 90000, "keepThinkingTurns": 2 },
         }));
         let cm = ModelSelection::resolve(&s).unwrap().context_management;
@@ -876,6 +1165,11 @@ mod tests {
         let clear = cm.clear_tool_uses.expect("clear_tool_uses");
         assert_eq!(clear.trigger_input_tokens, Some(100000));
         assert_eq!(clear.keep_tool_uses, Some(3));
+        assert_eq!(
+            clear.exclude_tools,
+            Some(vec!["read".to_string(), "ls".to_string()])
+        );
+        assert_eq!(clear.clear_tool_inputs, Some(false));
         let thinking = cm.clear_thinking.expect("clear_thinking");
         assert_eq!(thinking.trigger_input_tokens, Some(90000));
         assert_eq!(thinking.keep_thinking_turns, Some(2));
