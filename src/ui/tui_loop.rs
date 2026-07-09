@@ -222,6 +222,8 @@ enum IdleOutcome {
     Exit,
     /// Ctrl+L: open the model picker.
     OpenModelPicker,
+    /// `$`: open the Codex-compatible skill mention picker.
+    OpenSkillPicker,
     /// Ctrl+P (forward) / Shift+Ctrl+P (backward): cycle the model.
     CycleModel(bool),
     /// Shift+Tab: cycle the thinking/effort level.
@@ -250,6 +252,7 @@ enum IdleKey {
     Submit(String),
     Exit,
     OpenModelPicker,
+    OpenSkillPicker,
     CycleModel(bool),
     CycleEffort,
     OpenResumePicker,
@@ -433,6 +436,16 @@ async fn session_loop<P: ChatProvider>(
                             );
                         }
                     }
+                }
+            }
+            IdleOutcome::OpenSkillPicker => {
+                if harness.skills().is_empty() {
+                    apply_notices(tui, vec!["No skills are installed.".to_string()]);
+                } else {
+                    tui.screen
+                        .open_modal(Modal::Skills(crate::ui::modal::SkillPicker::new(
+                            harness.skills(),
+                        )));
                 }
             }
             IdleOutcome::CycleModel(forward) => {
@@ -1419,6 +1432,18 @@ fn route_command<P: ChatProvider>(
             tui.screen.open_modal(picker::open_settings(sw));
             Ok(RouteOutcome::Consumed)
         }
+        "/skills" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            if harness.skills().is_empty() {
+                apply_notices(tui, vec!["No skills are installed.".to_string()]);
+            } else {
+                tui.screen
+                    .open_modal(Modal::Skills(crate::ui::modal::SkillPicker::new(
+                        harness.skills(),
+                    )));
+            }
+            Ok(RouteOutcome::Consumed)
+        }
         "/approval" => {
             // Permission mode (ADR-0032 + ADR-0049). Changing it at this
             // inter-turn boundary is safe: the harness forwards it to Nexus,
@@ -1767,6 +1792,7 @@ async fn idle_phase(
                         IdleKey::Submit(text) => return Ok(IdleOutcome::Submit(text)),
                         IdleKey::Exit => return Ok(IdleOutcome::Exit),
                         IdleKey::OpenModelPicker => return Ok(IdleOutcome::OpenModelPicker),
+                        IdleKey::OpenSkillPicker => return Ok(IdleOutcome::OpenSkillPicker),
                         IdleKey::CycleModel(forward) => return Ok(IdleOutcome::CycleModel(forward)),
                         IdleKey::CycleEffort => return Ok(IdleOutcome::CycleEffort),
                         IdleKey::OpenResumePicker => return Ok(IdleOutcome::OpenResumePicker),
@@ -2334,6 +2360,13 @@ async fn dispatch_action<P: ChatProvider>(
             apply_notices(tui, lines);
             tui.screen.close_modal();
         }
+        ModalAction::InsertSkillMention { name, path } => {
+            tui.screen.close_modal();
+            tui.screen
+                .editor
+                .insert_str(format!("[${name}](skill://{path}) "));
+            tui.screen.sync_palette();
+        }
         // Model / scoped / effort / settings actions.
         other => {
             let Some(sw) = switch.as_mut() else {
@@ -2877,6 +2910,10 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
         KeyCode::Char('@') if !ctrl && !alt && screen.editor_is_empty() => {
             return IdleKey::ToggleTreeMenu(true);
         }
+        // Codex skill-mention idiom: `$` opens the searchable picker instead of
+        // inserting a literal sigil. Selecting a row inserts a path-qualified
+        // mention at the current cursor.
+        KeyCode::Char('$') if !ctrl && !alt => return IdleKey::OpenSkillPicker,
         // Everything else is pure text editing, shared with the running phase so
         // the composer behaves identically whether or not a turn is in flight.
         code => {
@@ -4849,6 +4886,12 @@ mod tests {
     #[test]
     fn idle_chords_open_picker_and_cycle() {
         let mut screen = Screen::new();
+        // `$` opens the skill mention picker and does not enter the editor.
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Char('$'))),
+            IdleKey::OpenSkillPicker
+        ));
+        assert!(screen.editor_is_empty());
         // Ctrl+L opens the model picker.
         assert!(matches!(
             handle_idle_event(

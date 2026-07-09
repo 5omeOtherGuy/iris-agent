@@ -1463,15 +1463,33 @@ impl<P: ChatProvider> Agent<P> {
         token: &CancellationToken,
         steer: Option<&dyn SteeringSource>,
     ) -> Result<()> {
+        self.submit_turn_with_context(TurnInput::new(prompt), obs, gate, env, token, steer)
+            .await
+    }
+
+    /// Submit one visible user prompt with hidden provider-context messages
+    /// immediately before it. Wayland uses this neutral seam for dynamic
+    /// context such as the available-skills catalog and selected skill bodies;
+    /// Nexus neither identifies nor interprets those messages.
+    pub(crate) async fn submit_turn_with_context(
+        &mut self,
+        input: TurnInput<'_>,
+        obs: &dyn AgentObserver,
+        gate: &dyn ApprovalGate,
+        env: &ToolEnv<'_>,
+        token: &CancellationToken,
+        steer: Option<&dyn SteeringSource>,
+    ) -> Result<()> {
         // Reset the per-turn mutation signal so the harness's post-change
         // verification trigger (issue #265) reflects only this turn: a pure Q&A
         // turn stays `false` and runs no verification. A retry turn resets it too,
         // so "did the model make further changes" is measured fresh each attempt.
         self.mutated_this_turn = false;
-        // Index of the just-pushed prompt: the start of the unanswered user run
-        // a cancellation before any provider answer truncates back to.
+        // Start of the contextual-message + visible-prompt run. A cancellation
+        // before any provider answer truncates the entire unanswered input.
         let unanswered_start = self.messages.len();
-        self.messages.push(Message::user(prompt));
+        self.messages.extend(input.context);
+        self.messages.push(Message::user(input.prompt));
         // The bare agent does no persistence: the harness diffs `messages()`
         // onto its session store after the turn returns (even on error).
         self.complete_turn(unanswered_start, obs, gate, env, token, steer)
@@ -2851,9 +2869,34 @@ pub(crate) struct Message {
     pub(crate) origin: Option<ModelOrigin>,
 }
 
+/// One visible user prompt plus optional hidden provider-context messages.
+/// Wayland constructs this at a turn boundary; Nexus preserves ordering and
+/// persistence without interpreting the context payload.
+pub(crate) struct TurnInput<'a> {
+    prompt: &'a str,
+    context: Vec<Message>,
+}
+
+impl<'a> TurnInput<'a> {
+    pub(crate) fn new(prompt: &'a str) -> Self {
+        Self {
+            prompt,
+            context: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_context(prompt: &'a str, context: Vec<Message>) -> Self {
+        Self { prompt, context }
+    }
+}
+
 impl Message {
     pub(crate) fn user(content: &str) -> Self {
         Self::new(Role::User, content)
+    }
+
+    pub(crate) fn developer(content: &str) -> Self {
+        Self::new(Role::Developer, content)
     }
 
     pub(crate) fn assistant(content: &str) -> Self {
@@ -2937,6 +2980,7 @@ impl Message {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {
+    Developer,
     User,
     Assistant,
     AssistantReasoning,
@@ -2947,6 +2991,7 @@ pub(crate) enum Role {
 impl Role {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::Developer => "developer",
             Self::User => "user",
             Self::Assistant => "assistant",
             Self::AssistantReasoning => "assistant_reasoning",
@@ -2960,6 +3005,7 @@ impl Role {
     /// reading a transcript. `None` for an unknown role.
     pub(crate) fn from_wire(role: &str) -> Option<Self> {
         match role {
+            "developer" => Some(Self::Developer),
             "user" => Some(Self::User),
             "assistant" => Some(Self::Assistant),
             "assistant_reasoning" => Some(Self::AssistantReasoning),
@@ -3008,7 +3054,7 @@ fn repair_dangling_tool_call(messages: &mut Vec<Message>) {
                     pending.remove(pos);
                 }
             }
-            Role::User | Role::Assistant | Role::AssistantReasoning => {}
+            Role::Developer | Role::User | Role::Assistant | Role::AssistantReasoning => {}
         }
     }
     for (call_id, name, provider_turn_id) in pending {

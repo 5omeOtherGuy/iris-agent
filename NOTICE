@@ -23,3 +23,13 @@ SPDX-License-Identifier header and a note describing what changed:
   - src/ui/tui/streaming/controller.rs
       derived from codex-rs/tui/src/streaming/controller.rs and
       codex-rs/tui/src/streaming/commit_tick.rs
+  - src/wayland/skills/model.rs
+      derived from codex-rs/core-skills/src/model.rs
+  - src/wayland/skills/loader.rs
+      derived from codex-rs/core-skills/src/loader.rs
+  - src/wayland/skills/render.rs
+      derived from codex-rs/core-skills/src/render.rs
+  - src/wayland/skills/injection.rs
+      derived from codex-rs/core-skills/src/injection.rs
+  - src/wayland/skills/mod.rs
+      derived from codex-rs/core-skills/src/manager.rs and injection.rs

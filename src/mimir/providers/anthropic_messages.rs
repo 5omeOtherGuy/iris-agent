@@ -1045,6 +1045,9 @@ fn build_messages(messages: &[Message], current_origin: &ModelOrigin) -> Vec<Val
     let mut out: Vec<Value> = Vec::new();
     for message in messages {
         let mapped = match message.role {
+            // Anthropic has no interleaved developer-message role. Preserve the
+            // lower-than-system contextual instruction as a user text block.
+            Role::Developer => Some(("user", json!({ "type": "text", "text": message.content }))),
             Role::User => Some(("user", json!({ "type": "text", "text": message.content }))),
             Role::Assistant => Some((
                 "assistant",
@@ -3318,5 +3321,18 @@ data: {{\"type\":\"message_stop\"}}
         assert!(rendered.contains("open_reasoning_blocks=0"));
         assert!(rendered.contains("open_block_indexes=2"));
         assert!(rendered.contains("last_event=message_stop"));
+    }
+
+    #[test]
+    fn developer_context_maps_to_a_user_text_block() {
+        let messages = build_messages(
+            &[Message::developer("skill catalog"), Message::user("task")],
+            &anthropic_origin("m"),
+        );
+
+        assert_eq!(messages.len(), 1, "consecutive user blocks coalesce");
+        assert_eq!(messages[0]["role"], json!("user"));
+        assert_eq!(messages[0]["content"][0]["text"], json!("skill catalog"));
+        assert_eq!(messages[0]["content"][1]["text"], json!("task"));
     }
 }

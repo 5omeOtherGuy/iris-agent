@@ -9,11 +9,16 @@
 
 mod fold;
 pub(crate) mod git_safety;
+pub(crate) mod skills;
 pub(crate) mod subagents;
 pub(crate) mod system_prompt;
 pub(crate) mod trust;
 
+#[cfg(test)]
+mod skills_tests;
+
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -34,7 +39,7 @@ use crate::nexus::ToolOutputStore;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, CompactionLifecycleState,
     FoldTrigger, Message, ProviderEvent, Role, SessionSpanReader, SteeringSource, ToolEnv, Tools,
-    VerificationOutcome, VerifyRun,
+    TurnInput, VerificationOutcome, VerifyRun,
 };
 use crate::session::{
     CompactionTaskState, SessionLog, estimate_tokens, message_token_estimate, preview_line,
@@ -241,6 +246,12 @@ pub(crate) struct Harness<P> {
     // Context token budget that triggers auto-compaction, or `None` to disable
     // it (in-memory loop tests). The Tier-3 app passes the configured budget.
     budget: Option<u64>,
+    // Codex-compatible skill discovery and progressive-disclosure state.
+    // The catalog refreshes at every turn boundary; the nested option
+    // distinguishes "not injected yet" from "injected with no skills".
+    skills: skills::SkillCatalog,
+    last_skills_instructions: Option<Option<String>>,
+    reported_skill_warnings: HashSet<String>,
     // Out-of-context store for oversized tool outputs (issue #61). Present only
     // when a transcript log is attached, since handles live beside the session
     // file; an in-memory session keeps every output inline.
@@ -370,6 +381,10 @@ impl<P: ChatProvider> Harness<P> {
             .as_ref()
             .map(|log| HandleStore::for_session(log.path()));
         let git_safety = git_safety::GitSafety::new(&workspace);
+        let skills = skills::SkillCatalog::load(&workspace, budget);
+        let mut state = state;
+        state.skill_read_roots = skills.resource_roots();
+        let last_skills_instructions = last_skills_instructions(agent.messages());
         // Prior activity of a resumed transcript (issue #400 trigger A4);
         // `None` for a freshly created log or an in-memory session.
         let resume_last_activity_ms = session
@@ -389,6 +404,9 @@ impl<P: ChatProvider> Harness<P> {
             persisted,
             entry_ids,
             budget,
+            skills,
+            last_skills_instructions,
+            reported_skill_warnings: HashSet::new(),
             output_store,
             steering: None,
             git_safety,
@@ -604,6 +622,7 @@ impl<P: ChatProvider> Harness<P> {
         if let Some(log) = self.session.as_ref() {
             self.git_safety.set_session_id(log.id().to_string());
         }
+        self.last_skills_instructions = last_skills_instructions(&messages);
         self.agent.reset_session(messages);
         // A session swap (`/new`, `/resume`) is a PASSIVE boundary: ADR-0028
         // forbids passive actions from finishing a task (accept/rollback do
@@ -781,6 +800,9 @@ impl<P: ChatProvider> Harness<P> {
 
     fn reanchor_workspace_unchecked(&mut self, path: &std::path::Path) {
         self.workspace = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.skills = skills::SkillCatalog::load(&self.workspace, self.budget);
+        self.state.get_mut().skill_read_roots = self.skills.resource_roots();
+        self.last_skills_instructions = None;
         self.git_safety =
             git_safety::GitSafety::new_with_workflow(&self.workspace, self.task_workflow_enabled);
         // The rebuilt guard starts with no session id; re-stamp it (ADR-0031) so
@@ -832,6 +854,12 @@ impl<P: ChatProvider> Harness<P> {
     /// cwd-slug directory.
     pub(crate) fn workspace(&self) -> &std::path::Path {
         &self.workspace
+    }
+
+    /// Current Codex-compatible skill catalog for the `/skills` picker. The
+    /// turn boundary refreshes it before every provider request.
+    pub(crate) fn skills(&self) -> &[skills::SkillMetadata] {
+        self.skills.skills()
     }
 
     /// The active git-safety task's id, or `None` when no task is open. Lets the
@@ -957,6 +985,50 @@ impl<P: ChatProvider> Harness<P> {
         // fold pass nor the covered range splits a pending tool-call/result pair.
         self.maybe_microcompact(obs)?;
         self.maybe_auto_compact(obs, token, false).await?;
+        // Refresh at the safe turn boundary so newly installed or edited skills
+        // appear without restarting. Only a changed catalog is appended; this
+        // is the narrow contextual-diff behavior Codex uses to preserve cache
+        // stability while keeping skill metadata current.
+        let refreshed_skills = skills::SkillCatalog::load(&self.workspace, self.budget);
+        let available = refreshed_skills
+            .available_instructions()
+            .map(str::to_string);
+        let mut context = Vec::new();
+        if self
+            .last_skills_instructions
+            .as_ref()
+            .is_none_or(|previous| previous != &available)
+        {
+            match &available {
+                Some(instructions) => context.push(Message::developer(instructions)),
+                None if self.last_skills_instructions.is_some() => context.push(
+                    Message::developer(
+                        "<skills_instructions>\nNo skills are currently available.\n</skills_instructions>",
+                    ),
+                ),
+                None => {}
+            }
+            self.last_skills_instructions = Some(available);
+        }
+        for warning in refreshed_skills.warnings() {
+            if self.reported_skill_warnings.insert(warning.clone()) {
+                obs.on_event(AgentEvent::Notice(warning.clone()))?;
+            }
+        }
+        let injections = refreshed_skills.injections(prompt);
+        for warning in injections.warnings {
+            if self.reported_skill_warnings.insert(warning.clone()) {
+                obs.on_event(AgentEvent::Notice(warning))?;
+            }
+        }
+        context.extend(
+            injections
+                .messages
+                .into_iter()
+                .map(|message| Message::user(&message)),
+        );
+        self.state.borrow_mut().skill_read_roots = refreshed_skills.resource_roots();
+        self.skills = refreshed_skills;
         // Task-metadata plumbing (ADR-0031): hand this turn's prompt preview and
         // the current session id to the guard before the turn. The guard stamps
         // them as opaque display payload onto any task this turn opens; a
@@ -989,7 +1061,14 @@ impl<P: ChatProvider> Harness<P> {
         // (a held `enter()` guard does not).
         let result = self
             .agent
-            .submit_turn(prompt, obs, gate, &env, token, self.steering.as_deref())
+            .submit_turn_with_context(
+                TurnInput::with_context(prompt, context),
+                obs,
+                gate,
+                &env,
+                token,
+                self.steering.as_deref(),
+            )
             .instrument(tracing::info_span!("turn"))
             .await;
         let changed_in_model_turn = self.agent.mutated_this_turn();
@@ -2088,6 +2167,22 @@ impl<P: ChatProvider> Harness<P> {
             to_id: self.entry_ids[end - 1].clone()?,
         })
     }
+}
+
+fn last_skills_instructions(messages: &[Message]) -> Option<Option<String>> {
+    messages.iter().rev().find_map(|message| {
+        (message.role == Role::Developer && message.content.starts_with("<skills_instructions>"))
+            .then(|| {
+                if message
+                    .content
+                    .contains("No skills are currently available.")
+                {
+                    None
+                } else {
+                    Some(message.content.clone())
+                }
+            })
+    })
 }
 
 fn framed_summary(plan: &CompactionPlan, text: &str) -> String {

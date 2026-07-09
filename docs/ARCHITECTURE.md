@@ -100,7 +100,7 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 | Oversized tool-output handle storage | `handles.rs`, `wayland/mod.rs` |
 | Context compaction | `wayland/mod.rs`, `session.rs` |
 | System-prompt / project-instruction assembly (fragments + generated tool blocks + project docs + runtime context) | `wayland/system_prompt/` |
-| Skills | _planned_ |
+| Skills: bounded repo/user/system/admin discovery, Codex metadata/config compatibility, metadata budgeting, contextual injection, confined resource reads, refresh-at-turn-boundary | `wayland/skills/`, `wayland/mod.rs`, `tools/read.rs` |
 
 Depends on Tier 1 only. The `Harness` is the analogue of pi's `AgentHarness`
 (`agent-harness.ts`): it owns `env`/`session`, passes `env` into the run, and

@@ -322,6 +322,36 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   and drive prompt/tool inclusion from resolved provider/model/thinking/mode.
   [Planned]
 
+## Skills
+
+- **Codex-compatible filesystem format** — recursively load `SKILL.md` files
+  with validated YAML `name`/`description` metadata, frontmatter short
+  descriptions, and optional `agents/openai.yaml` interface, dependency, and
+  policy metadata. [Implemented]
+- **Repo, user, system, and admin discovery** — scan `.agents/skills` from
+  repository root to cwd, legacy `<repo>/.codex/skills`, `~/.agents/skills`,
+  existing `$CODEX_HOME/skills` plus its bundled `.system` root,
+  `~/.iris/skills`, and administrator roots. Canonical-path dedupe, bounded
+  depth/count, symlinked directories, and non-fatal load errors match Codex's
+  local loader behavior. [Implemented]
+- **Codex config compatibility** — honor `skills.include_instructions` and
+  ordered name/path `skills.config` enable rules from Codex's config. Optional
+  malformed metadata fails open. [Implemented]
+- **Progressive disclosure** — expose name, description, and source path under
+  a 2% context budget; load the full `SKILL.md` only after selection. Catalog
+  changes inject at turn boundaries without rewriting the system prompt.
+  [Implemented]
+- **Explicit and implicit invocation** — unique `$skill-name` and
+  path-qualified picker mentions inject the selected body; the model can select
+  implicitly from descriptions unless `allow_implicit_invocation` is false.
+  [Implemented]
+- **TUI discovery** — `$` and `/skills` open a searchable selector; selecting a
+  duplicate name inserts its exact `skill://` path. Interface display names and
+  short descriptions appear when present. [Implemented]
+- **Confined resource reads** — a loaded skill extends `read` with its own
+  canonical directory only. References work under workspace confinement;
+  sibling paths and out-of-workspace mutation remain denied. [Implemented]
+
 ## Modes
 
 - **Mode switching** — switch named mode profiles mid-session. Runtime
