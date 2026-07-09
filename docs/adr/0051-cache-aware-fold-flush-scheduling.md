@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-0048's fold engine flushed on one trigger: a token watermark (budget/2).
+ADR-0048's fold engine flushed on one trigger: a token watermark.
 The watermark fires under context pressure, which correlates with active
 (warm-cache) work — the worst-timed moment. Measured
 (`docs/benchmarks/issue-400-fold-flush-cost.md`): a warm fold-only flush costs
@@ -31,7 +31,22 @@ order:
 | A5 | context below profile `min_cacheable_tokens` | nothing cached yet |
 | A6 | manual `/compact` | user-initiated break; folds ride it |
 | B | mid-session idle gap past `cold_after` | TTL expired (inferred) |
-| C | micro-watermark (budget/2) | pressure backstop, unchanged |
+| C | configurable token watermark | pressure backstop |
+| I | explicit immediate policy | user accepts a warm rewrite at every safe boundary |
+
+`toolResultCompaction.cacheTiming` selects which triggers release pending local
+folds:
+
+| Policy | Triggers |
+|---|---|
+| `breakOnly` | A1-A6 |
+| `cacheAware` | A1-A6, B, C |
+| `pressureOnly` | A1, C |
+| `immediate` | A1-A6 when present, otherwise I |
+
+`cacheAware` is the structured and legacy default. The pressure threshold is
+`triggerTokens`, default 64,000; legacy `microcompactionWatermark` supplies it
+when no structured block exists.
 
 Provider cache economics live in a provider-neutral `CacheProfile`
 (`cold_after`, `probably_cold_after`, `write_premium`, `read_rate`,
@@ -108,7 +123,9 @@ All committed in `docs/benchmarks/issue-400-fold-flush-cost.md`:
 ### Non-goals (explicit)
 - No default-on flip (needs the retention-quality benchmark, not just
   economics).
-- No failure-output/bash folding (~1.5% mass; evidence says no).
+- No default failure-output folding. Local clearing includes failures only with
+  explicit `includeFailures`; native clearing requires the same consent because
+  Anthropic exposes no status selector.
 - No dependence on `cache_edits`; no server-side `compact`.
 - Phase 3 calibration (persisted per-turn `ProviderUsage`, watermark
   retuning, probabilistic Codex threshold, auto-1h retention) deferred to

@@ -44,15 +44,15 @@ Fold spent tool results to deterministic stubs, opt-in, with recovery one step a
   coverage. Precedence at rebuild: compactions apply first; a fold whose target id lies in a
   covered range is a no-op. Folds apply in memory and durably in the same step, so live and
   resumed context agree (the ADR-0009 invariant).
-- **Recovery per result class.** Reproducible results (read/ls/grep/find): the stub names
-  the path or command — the workspace is the recovery path, no new machinery.
-  Non-reproducible results (bash output): the folded content registers in the
-  `ToolOutputStore` at fold time and the stub carries the handle id; `read_output` pages it
-  back (ADR-0011).
-- **Fold policy.** Batch folds at a micro-watermark below the compaction budget, so one
+- **Recovery per result.** Reproducible results may be recreated from the workspace, but
+  every fold also names its durable entry id and `tool_call_id`. The original assistant
+  call and result remain in the existing session JSONL and
+  `recall(tool_call_id="...")` returns that pair. Existing `ToolOutputStore` offload still
+  pages oversized recall output; folds do not create a second body store.
+- **V1 fold policy.** Batch folds at a micro-watermark below the compaction budget, so one
   prefix cache break amortizes many folds; never fold inside the retained tail; never fold
-  an error-classified result (ADR-0040) that no later success of the same command has
-  superseded.
+  an error-classified result (ADR-0040). The structured extension below supersedes the
+  fixed trigger and failure policy while preserving these conservative defaults.
 
 **V1 scope (re-scoped on the committed M2 benchmark).** The measurement gate
 (`docs/benchmarks/issue-378-residual-tool-mass.md`) found superseded reads + retired-failure
@@ -61,31 +61,42 @@ within that foldable slice superseded reads are effectively the entire signal (~
 failure output is negligible (~1.5%, an identical-rerun upper bound, since bash exit status is
 not persisted). **V1 therefore folds superseded reads only (latest-read-wins,
 workspace-recoverable).** Retired-failure-output folding and bash-output-handle folding are
-**deferred** on that evidence — not architected out: the fold engine is a set of pluggable
-policies (`src/wayland/fold.rs`), so each deferred class plugs in later as an additional
-policy arm and stub variant without reworking the pass. The stub format stays extensible for
-the bash `ToolOutputStore` handle it will carry.
+**deferred from V1** on that evidence. The structured extension later adds generic local
+clearing with transcript recovery instead of a per-fold bash handle; retired failures remain
+excluded by default and require explicit `includeFailures`.
 
-**Structured extension (2026-07-09).** The legacy `microcompaction=true` alias
-still resolves to this exact V1 policy and cache-aware 64,000-token watermark.
-The opt-in `toolResultCompaction` block generalizes the same durable fold engine:
-semantic dedupe can retain the latest N successful reads per path, and local
-age/count clearing can fold older eligible recoverable results. Shared recency
-guards win; overlapping reasons produce one fold/stub; every stub names the
-durable entry id and `tool_call_id` recovery call. Anthropic-native clearing is
-a Mimir backend, not a Wayland policy.
-- **Opt-in, default off, surfaced in `/settings`.** A `microcompaction` config field
-  (camelCase key `microcompaction`), project-tunable as a cost/quality knob like
-  `compactionSummarizer` — it cannot redirect requests, and everything folded stays
-  recoverable. The `/settings` menu gains a toggle; changes take effect at the next turn
-  boundary. The setting gates fold *writing* only: rebuild always honors persisted fold
-  entries, so a transcript folded under one setting reads identically under another.
+**Structured extension (2026-07-09).** The opt-in `toolResultCompaction` block
+generalizes the same durable fold engine:
+
+- Semantic dedupe retains the latest N successful `read`/`ls` bodies per path. A later
+  successful `edit`/`write` supersedes prior bodies for that path.
+- Local clearing folds older eligible results after `keepRecentToolUses`, shared recent
+  result/token guards, exclusions, failure policy, and the minimum reclaim threshold are
+  applied. Shared recency guards always win. Two reducers selecting the same result emit
+  one fold and one stub with both reasons.
+- `conservative` preserves V1. `balanced` adds replayable local clearing and keeps eight
+  eligible uses. `aggressive` uses `allRecoverable` and keeps four. Presets protect 2,000
+  recent tokens; balanced/aggressive also protect four recent results. Clearing requires
+  1,000 reclaimable tokens and excludes `edit`, `write`, `recall`, and `read_output` by
+  default. `custom` enables only explicitly selected reducers.
+- The legacy `microcompaction=true` alias remains conservative, cache-aware, and uses the
+  independent 64,000-token watermark unless overridden.
+- Anthropic-native clearing is resolved in Mimir. Wayland receives only the remaining
+  provider-neutral local policy. Local/native reducers must be provably disjoint
+  (ADR-0022).
+- The setting gates fold *writing* only. Rebuild always honors persisted fold entries, so
+  live and resumed context agree after settings change.
+
+`/settings` exposes enabled, aggressiveness, cache timing, trigger tokens,
+retain-per-path, and keep-recent values. Tool-name arrays, clearing mode/backend,
+failure inclusion, and native input clearing remain JSON settings because the current menu
+has no list editor.
 - **Measurement gates implementation.** Before the fold engine is built, a read-only report
   over real session transcripts (per-entry `tokenEstimate` is persisted) establishes the
   residual tool-result mass by tool class and age, committed under `docs/benchmarks/`. If
   superseded reads do not dominate, the first slice is re-scoped. Folding then becomes an
   arm in the ADR-0045 A/B, with the needle contract: a needle survives in rebuilt context or
-  behind a named handle that survives verbatim.
+  behind a durable recovery reference that survives verbatim.
 
 ## Alternatives Considered
 
@@ -140,9 +151,9 @@ a Mimir backend, not a Wayland policy.
 
 ### Risks
 - Double reduction defeats the ADR-0037 guards: folding a filtered result discards the
-  failure detail filtering deliberately kept. Mitigate: the fold policy honors the same
-  guard classes (unresolved failures never fold), and ADR-0045 needles assert failure detail
-  survives or sits behind a named handle.
+  failure detail filtering deliberately kept. Mitigate: failures stay excluded by default;
+  explicit inclusion remains recoverable by `tool_call_id`; ADR-0045 needles assert detail
+  survives or remains behind a durable recovery reference.
 - A stub could mislead the model about what it has already seen. Mitigate: stubs are
   explicit about what was folded and how to recover it, and the system-prompt fragment
   (ADR-0046) covers folds alongside compaction markers.
