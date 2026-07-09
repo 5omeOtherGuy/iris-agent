@@ -1692,6 +1692,49 @@ mod tests {
     }
 
     #[test]
+    fn thinking_toggle_updates_incremental_terminal_surface() -> std::io::Result<()> {
+        let mut screen = Screen::new();
+        let mut surface = TerminalSurface::new(Vec::new());
+        let size = Size::new(80, 18);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(
+            "Checking parser precedence.".to_string(),
+        ));
+        screen.apply(UiEvent::AssistantRawReasoningDelta(
+            "Inspect completed response before item placeholder wins.".to_string(),
+        ));
+        screen.apply(UiEvent::AssistantTextDelta("Answer.".to_string()));
+
+        let first = render_perf_cycle(&mut screen, &mut surface, size)?;
+        let collapsed = strip_ansi(&surface.state().previous_lines.join("\n"));
+        assert_eq!(first, RenderKind::First);
+        assert!(
+            collapsed.contains("Checking parser precedence."),
+            "{collapsed}"
+        );
+        assert!(
+            !collapsed.contains("Inspect completed response"),
+            "{collapsed}"
+        );
+
+        assert!(screen.toggle_all_panels());
+        let toggled = render_perf_cycle(&mut screen, &mut surface, size)?;
+        let expanded = strip_ansi(&surface.state().previous_lines.join("\n"));
+        assert_ne!(toggled, RenderKind::Unchanged);
+        assert!(
+            expanded.contains("Inspect completed response"),
+            "{expanded}"
+        );
+        assert!(
+            !expanded.contains("Checking parser precedence."),
+            "{expanded}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn live_reasoning_commits_on_reasoning_only_completion() {
         // A turn that streams reasoning and then ends with no answer text (e.g.
         // straight into a tool or turn end) must still commit the trace.
@@ -5315,10 +5358,11 @@ mod tests {
             redacted: false,
         });
         let collapsed = rendered_text(&mut screen, 80, 18);
-        // Collapsed = summary body, same binary disclosure as a tool block: the
-        // `▸` arrow, no bespoke `… N more paragraphs` hint.
+        // Summary-only thinking has no alternate expanded body, so it renders
+        // without a no-op disclosure affordance.
         assert!(collapsed.contains("THINKING"), "{collapsed}");
-        assert!(collapsed.contains("▸"), "{collapsed}");
+        assert!(!collapsed.contains("▸"), "{collapsed}");
+        assert!(!collapsed.contains("▾"), "{collapsed}");
         assert!(!collapsed.contains("more paragraph"), "{collapsed}");
         assert!(!collapsed.contains("ctrl+o to expand"), "{collapsed}");
         assert!(
@@ -5332,46 +5376,41 @@ mod tests {
     }
 
     #[test]
-    fn short_reasoning_is_foldable_and_arrives_collapsed() {
+    fn short_reasoning_without_raw_is_not_foldable() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         screen.apply(UiEvent::AssistantReasoning {
             text: "One short thought.".to_string(),
             redacted: false,
         });
-        // Even a one-paragraph thought folds now — the disclosure indicator is
-        // universal. It arrives collapsed with the summary visible and ctrl+o
-        // reveals the expanded body.
         let collapsed = rendered_text(&mut screen, 80, 14);
         assert!(collapsed.contains("THINKING"), "{collapsed}");
-        assert!(collapsed.contains("▸"), "{collapsed}");
+        assert!(!collapsed.contains("▸"), "{collapsed}");
+        assert!(!collapsed.contains("▾"), "{collapsed}");
         assert!(
             collapsed.contains("One short thought."),
-            "short reasoning summary is visible while collapsed: {collapsed}"
+            "short reasoning summary is visible: {collapsed}"
         );
-        assert!(screen.toggle_latest_panel());
-        let expanded = rendered_text(&mut screen, 80, 14);
-        assert!(expanded.contains("▾"), "{expanded}");
-        assert!(expanded.contains("One short thought."), "{expanded}");
+        assert!(!screen.toggle_latest_panel());
     }
 
     #[test]
-    fn reasoning_thinking_block_expands_to_show_trace() {
+    fn summary_only_thinking_does_not_offer_noop_expand() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         screen.apply(UiEvent::AssistantReasoning {
             text: "Inspect the config.\n\nThen inspect the cache.".to_string(),
             redacted: false,
         });
-        // Thinking panel is the latest panel for a reasoning-only turn.
-        assert!(screen.toggle_latest_panel());
-        let expanded = rendered_text(&mut screen, 80, 14);
-        assert!(expanded.contains("▾"), "{expanded}");
+        let rendered = rendered_text(&mut screen, 80, 14);
+        assert!(rendered.contains("THINKING"), "{rendered}");
         assert!(
-            expanded.contains("Then inspect the cache."),
-            "expanded trace missing: {expanded}"
+            rendered.contains("Then inspect the cache."),
+            "summary body missing: {rendered}"
         );
-        assert!(!expanded.contains("more paragraph"), "{expanded}");
+        assert!(!rendered.contains("▸"), "{rendered}");
+        assert!(!rendered.contains("▾"), "{rendered}");
+        assert!(!screen.toggle_latest_panel());
     }
 
     #[test]
@@ -5419,8 +5458,8 @@ mod tests {
                 .any(|r| matches!(r.chrome.as_ref(), Some(ChromeRow::RailEnd))),
             "rail end marker missing"
         );
-        // The header renders as a muted `▸ THINKING` line (arrow + label, no
-        // box); the rail glyph lives on the body rows.
+        // The header renders as a muted `THINKING` line (label, no box); the
+        // rail glyph lives on the body rows.
         let lines: Vec<String> = rendered_lines(&mut screen, 80, 14)
             .into_iter()
             .map(|line| line_text(&line))
@@ -5429,23 +5468,20 @@ mod tests {
             .iter()
             .find(|t| t.contains("THINKING"))
             .expect("THINKING rail header");
-        assert!(header.contains('\u{25b8}'), "collapsed arrow ▸: {header}");
+        assert!(
+            !header.contains('\u{25b8}') && !header.contains('\u{25be}'),
+            "summary-only thinking has no disclosure arrow: {header}"
+        );
         assert!(!header.contains('\u{2502}'), "no box side │: {header}");
-        // The summary body is visible while collapsed; expand and confirm the
-        // body still hangs on the muted `┊` rail, never box chrome.
+        // The summary body hangs on the muted `┊` rail, never box chrome.
         assert!(
             lines.iter().any(|t| t.contains("Weigh the options.")),
             "collapsed thinking shows its summary body: {lines:?}"
         );
-        assert!(screen.toggle_latest_panel());
-        let expanded: Vec<String> = rendered_lines(&mut screen, 80, 14)
-            .into_iter()
-            .map(|line| line_text(&line))
-            .collect();
-        let body = expanded
+        let body = lines
             .iter()
             .find(|t| t.contains("Weigh the options."))
-            .expect("expanded body row");
+            .expect("summary body row");
         assert!(body.contains('\u{250a}'), "rail glyph ┊ on body: {body}");
     }
 
@@ -5459,20 +5495,17 @@ mod tests {
             text: String::new(),
             redacted: true,
         });
-        // Redacted reasoning shows the placeholder in both states — never trace
-        // text (there is none to leak).
+        // Redacted reasoning has no alternate expanded body, so it shows the
+        // placeholder without a no-op disclosure affordance.
         let collapsed = rendered_text(&mut screen, 80, 14);
         assert!(collapsed.contains("THINKING"), "{collapsed}");
+        assert!(!collapsed.contains("▸"), "{collapsed}");
+        assert!(!collapsed.contains("▾"), "{collapsed}");
         assert!(
             collapsed.contains("withheld"),
-            "redacted placeholder is visible while collapsed: {collapsed}"
+            "redacted placeholder is visible: {collapsed}"
         );
-        assert!(screen.toggle_latest_panel());
-        let expanded = rendered_text(&mut screen, 80, 14);
-        assert!(
-            expanded.contains("withheld"),
-            "redacted placeholder missing when expanded: {expanded}"
-        );
+        assert!(!screen.toggle_latest_panel());
     }
 
     #[test]
@@ -5660,9 +5693,9 @@ mod tests {
 
     #[test]
     fn ctrl_o_toggle_all_expands_then_collapses() {
-        // With a mix of collapsed and expanded foldable blocks (tool blocks +
-        // a thinking rail), toggle-all expands ALL when any is collapsed, then
-        // collapses ALL on the next press.
+        // With a mix of collapsed and expanded foldable tool blocks plus a
+        // non-foldable summary-only thinking rail, toggle-all only touches the
+        // blocks that have alternate expanded bodies.
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         screen.apply(UiEvent::ToolResult {
@@ -5682,33 +5715,36 @@ mod tests {
             redacted: false,
         });
         let headers = screen.transcript.panel_header_rows();
-        assert_eq!(headers.len(), 3, "three foldable blocks arrive collapsed");
+        assert_eq!(headers.len(), 3, "three block headers");
+        assert!(!screen.transcript.set_panel_expanded_at(headers[2], true));
         assert!(
-            headers
+            headers[..2]
                 .iter()
                 .all(|&h| screen.transcript.panel_expanded_at(h) == Some(false)),
-            "all arrive collapsed"
+            "tool blocks arrive collapsed"
         );
         // Mixed state: expand one so not all are collapsed.
         screen.transcript.set_panel_expanded_at(headers[0], true);
 
-        // First toggle-all: any collapsed -> expand all (rail included).
+        // First toggle-all: any collapsed -> expand all foldable blocks.
         assert!(screen.toggle_all_panels());
         assert!(
             screen
                 .transcript
                 .panel_header_rows()
                 .iter()
+                .take(2)
                 .all(|&h| screen.transcript.panel_expanded_at(h) == Some(true)),
             "first press expands all"
         );
-        // Second toggle-all: none collapsed -> collapse all.
+        // Second toggle-all: none collapsed -> collapse all foldable blocks.
         assert!(screen.toggle_all_panels());
         assert!(
             screen
                 .transcript
                 .panel_header_rows()
                 .iter()
+                .take(2)
                 .all(|&h| screen.transcript.panel_expanded_at(h) == Some(false)),
             "second press collapses all"
         );
