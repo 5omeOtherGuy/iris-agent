@@ -1620,6 +1620,78 @@ mod tests {
     }
 
     #[test]
+    fn live_summary_collapses_and_raw_expands() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(
+            "Checking parser precedence.".to_string(),
+        ));
+        screen.apply(UiEvent::AssistantRawReasoningDelta(
+            "Need inspect completed_response before item-level placeholder wins.".to_string(),
+        ));
+        screen.apply(UiEvent::AssistantTextDelta("Answer.".to_string()));
+
+        let collapsed = rendered_text(&mut screen, 80, 18);
+        assert!(collapsed.contains("THINKING"), "{collapsed}");
+        assert!(collapsed.contains("▸"), "{collapsed}");
+        assert!(
+            collapsed.contains("Checking parser precedence."),
+            "collapsed thinking shows summary: {collapsed}"
+        );
+        assert!(
+            !collapsed.contains("Need inspect completed_response"),
+            "collapsed thinking hides raw reasoning: {collapsed}"
+        );
+
+        assert!(screen.toggle_latest_panel());
+        let expanded = rendered_text(&mut screen, 80, 18);
+        assert!(expanded.contains("▾"), "{expanded}");
+        assert!(
+            expanded.contains("Need inspect completed_response"),
+            "expanded thinking reveals raw reasoning: {expanded}"
+        );
+        assert!(
+            !expanded.contains("Checking parser precedence."),
+            "expanded thinking swaps summary for raw body: {expanded}"
+        );
+    }
+
+    #[test]
+    fn find_matches_collapsed_thinking_summary() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(
+            "Checking parser precedence.".to_string(),
+        ));
+        screen.apply(UiEvent::AssistantRawReasoningDelta(
+            "Inspect completed response before item placeholder wins.".to_string(),
+        ));
+        screen.apply(UiEvent::AssistantTextDelta("Answer.".to_string()));
+
+        let collapsed = rendered_text(&mut screen, 80, 18);
+        assert!(
+            collapsed.contains("Checking parser precedence."),
+            "{collapsed}"
+        );
+        assert!(
+            !collapsed.contains("Inspect completed response"),
+            "{collapsed}"
+        );
+
+        let matches = screen.transcript.search_matches("parser precedence");
+        assert!(
+            !matches.is_empty(),
+            "collapsed thinking summary is searchable"
+        );
+    }
+
+    #[test]
     fn live_reasoning_commits_on_reasoning_only_completion() {
         // A turn that streams reasoning and then ends with no answer text (e.g.
         // straight into a tool or turn end) must still commit the trace.
@@ -5243,20 +5315,19 @@ mod tests {
             redacted: false,
         });
         let collapsed = rendered_text(&mut screen, 80, 18);
-        // Collapsed = header only, same binary disclosure as a tool block: the
-        // `▸` arrow, no body, no bespoke `… N more paragraphs` hint. The whole
-        // trace (including the first paragraph) is unmounted until expanded.
+        // Collapsed = summary body, same binary disclosure as a tool block: the
+        // `▸` arrow, no bespoke `… N more paragraphs` hint.
         assert!(collapsed.contains("THINKING"), "{collapsed}");
         assert!(collapsed.contains("▸"), "{collapsed}");
         assert!(!collapsed.contains("more paragraph"), "{collapsed}");
         assert!(!collapsed.contains("ctrl+o to expand"), "{collapsed}");
         assert!(
-            !collapsed.contains("First I check"),
-            "collapsed thinking unmounts its whole body: {collapsed}"
+            collapsed.contains("First I check"),
+            "collapsed thinking shows the summary: {collapsed}"
         );
         assert!(
-            !collapsed.contains("Then the cache"),
-            "later paragraphs stay hidden while collapsed: {collapsed}"
+            collapsed.contains("Then the cache"),
+            "collapsed summary includes later summary paragraphs: {collapsed}"
         );
     }
 
@@ -5269,13 +5340,14 @@ mod tests {
             redacted: false,
         });
         // Even a one-paragraph thought folds now — the disclosure indicator is
-        // universal. It arrives collapsed (body hidden) and ctrl+o reveals it.
+        // universal. It arrives collapsed with the summary visible and ctrl+o
+        // reveals the expanded body.
         let collapsed = rendered_text(&mut screen, 80, 14);
         assert!(collapsed.contains("THINKING"), "{collapsed}");
         assert!(collapsed.contains("▸"), "{collapsed}");
         assert!(
-            !collapsed.contains("One short thought."),
-            "short reasoning arrives collapsed: {collapsed}"
+            collapsed.contains("One short thought."),
+            "short reasoning summary is visible while collapsed: {collapsed}"
         );
         assert!(screen.toggle_latest_panel());
         let expanded = rendered_text(&mut screen, 80, 14);
@@ -5359,11 +5431,11 @@ mod tests {
             .expect("THINKING rail header");
         assert!(header.contains('\u{25b8}'), "collapsed arrow ▸: {header}");
         assert!(!header.contains('\u{2502}'), "no box side │: {header}");
-        // Body is unmounted while collapsed (binary disclosure); expand and
-        // confirm it hangs on the muted `┊` rail, never box chrome.
+        // The summary body is visible while collapsed; expand and confirm the
+        // body still hangs on the muted `┊` rail, never box chrome.
         assert!(
-            !lines.iter().any(|t| t.contains("Weigh the options.")),
-            "collapsed thinking unmounts its body: {lines:?}"
+            lines.iter().any(|t| t.contains("Weigh the options.")),
+            "collapsed thinking shows its summary body: {lines:?}"
         );
         assert!(screen.toggle_latest_panel());
         let expanded: Vec<String> = rendered_lines(&mut screen, 80, 14)
@@ -5387,14 +5459,13 @@ mod tests {
             text: String::new(),
             redacted: true,
         });
-        // Redacted reasoning folds like any other block: it arrives collapsed to
-        // the header, and expanding reveals only the placeholder — never trace
+        // Redacted reasoning shows the placeholder in both states — never trace
         // text (there is none to leak).
         let collapsed = rendered_text(&mut screen, 80, 14);
         assert!(collapsed.contains("THINKING"), "{collapsed}");
         assert!(
-            !collapsed.contains("withheld"),
-            "placeholder is unmounted while collapsed: {collapsed}"
+            collapsed.contains("withheld"),
+            "redacted placeholder is visible while collapsed: {collapsed}"
         );
         assert!(screen.toggle_latest_panel());
         let expanded = rendered_text(&mut screen, 80, 14);
