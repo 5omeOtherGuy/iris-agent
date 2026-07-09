@@ -463,9 +463,13 @@ impl SettingsPanel {
     }
 
     /// Paste into an active edit (the loop routes `Event::Paste` here).
+    /// Registers are single-line controls: interior line breaks collapse to
+    /// spaces so a multi-line paste can never embed a newline in a saved value.
     pub(crate) fn push_str(&mut self, text: &str) {
         if let Some(edit) = self.edit.as_mut() {
-            edit.buffer.push_str(text.trim_end_matches(['\r', '\n']));
+            let mut flat = text.replace(['\r', '\n'], " ");
+            flat.truncate(flat.trim_end().len());
+            edit.buffer.push_str(&flat);
             edit.error = None;
         }
     }
@@ -531,12 +535,25 @@ impl SettingsPanel {
             RowId::Field(field) => match archetype(RowId::Field(field)) {
                 Archetype::Switch => {
                     let options = self.snap.switch_options(field);
-                    let current = self.snap.switch_value(field);
-                    let pos = options.iter().position(|o| *o == current).unwrap_or(0);
-                    let next = step_clamped(pos, options.len(), forward);
-                    if next == pos {
+                    if options.is_empty() {
                         return ModalOutcome::Ignore;
                     }
+                    let current = self.snap.switch_value(field);
+                    // A hand-edited value outside the vocabulary sits between
+                    // detents: the first click snaps into the scale (right →
+                    // first position, left → last), like a dial's off-ladder
+                    // snap. A known position steps one detent and clamps.
+                    let next = match options.iter().position(|o| *o == current) {
+                        Some(pos) => {
+                            let next = step_clamped(pos, options.len(), forward);
+                            if next == pos {
+                                return ModalOutcome::Ignore;
+                            }
+                            next
+                        }
+                        None if forward => 0,
+                        None => options.len() - 1,
+                    };
                     let value = options[next];
                     self.snap.set_switch_value(field, value);
                     self.arm_flash();
@@ -859,16 +876,21 @@ impl SettingsPanel {
                     .snap
                     .reasoning_levels
                     .iter()
-                    .position(|(level, _)| *level == self.snap.reasoning)
-                    .unwrap_or(0);
-                push_switch(spans, &options, pos, flashing, false, false, avail);
+                    .position(|(level, _)| *level == self.snap.reasoning);
+                let current = pos.map(|p| options[p]).unwrap_or("");
+                push_switch(spans, &options, pos, current, flashing, false, false, avail);
             }
             RowId::SkipApprovals => {
                 let pos = usize::from(self.snap.skip_permissions);
                 push_switch(
                     spans,
                     &["off", "on"],
-                    pos,
+                    Some(pos),
+                    if self.snap.skip_permissions {
+                        "on"
+                    } else {
+                        "off"
+                    },
                     flashing,
                     self.snap.skip_permissions,
                     false,
@@ -885,8 +907,8 @@ impl SettingsPanel {
                 Archetype::Switch => {
                     let options = self.snap.switch_options(field);
                     let current = self.snap.switch_value(field);
-                    let pos = options.iter().position(|o| *o == current).unwrap_or(0);
-                    push_switch(spans, options, pos, flashing, false, inert, avail);
+                    let pos = options.iter().position(|o| *o == current);
+                    push_switch(spans, options, pos, &current, flashing, false, inert, avail);
                 }
                 Archetype::Dial => {
                     let value = self.snap.dial_value(field);
@@ -977,10 +999,18 @@ fn nearest_position(ladder: &[u64], value: u64) -> usize {
 /// A labeled detent track (`○ strict  ◉ auto  ○ never`), or its rotary form
 /// (`○○◉  auto`) when the track does not fit `avail`. `danger` paints the
 /// selected mark red (the guarded switch); `inert` dims the whole control.
+///
+/// `pos: None` = a hand-edited value outside the vocabulary: the switch sits
+/// BETWEEN detents — no position lights, and the raw `current` value is
+/// printed after the track so the display never claims a position the config
+/// does not hold (numbers/positions are honest). The first `←`/`→` snaps it
+/// into the scale.
+#[allow(clippy::too_many_arguments)]
 fn push_switch(
     spans: &mut Vec<Span<'static>>,
     options: &[&str],
-    pos: usize,
+    pos: Option<usize>,
+    current: &str,
     flashing: bool,
     danger: bool,
     inert: bool,
@@ -1013,7 +1043,7 @@ fn push_switch(
             if i > 0 {
                 spans.push(Span::raw("  "));
             }
-            if i == pos {
+            if Some(i) == pos {
                 spans.push(Span::styled(
                     format!("{} ", crate::ui::symbols::ACTIVE),
                     mark_style,
@@ -1026,20 +1056,22 @@ fn push_switch(
                 ));
             }
         }
+        if pos.is_none() {
+            // Between detents: print what the config actually holds.
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(current.to_string(), label_style));
+        }
     } else {
-        // Rotary form: position dots + the selected value.
+        // Rotary form: position dots + the TRUE current value.
         for (i, _) in options.iter().enumerate() {
-            spans.push(if i == pos {
+            spans.push(if Some(i) == pos {
                 Span::styled(crate::ui::symbols::ACTIVE.to_string(), mark_style)
             } else {
                 Span::styled(crate::ui::symbols::EMPTY.to_string(), dim())
             });
         }
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            options.get(pos).copied().unwrap_or("").to_string(),
-            label_style,
-        ));
+        spans.push(Span::styled(current.to_string(), label_style));
     }
 }
 
@@ -1536,5 +1568,86 @@ mod tests {
     fn port_return_reopens_on_the_port_row() {
         let panel = SettingsPanel::with_selected(snapshot(), RowId::Scope);
         assert_eq!(panel.selected(), RowId::Scope);
+    }
+
+    #[test]
+    fn an_off_vocabulary_value_sits_between_detents_and_prints_raw() {
+        // A hand-edited config value outside the switch vocabulary (e.g. the
+        // "catppuccin" theme alias, or an unknown approval token) must never
+        // light a position it does not hold — the old tree showed the raw
+        // value, and the faceplate must stay at least as honest.
+        let mut snap = snapshot();
+        snap.default_approval = "on-request".to_string();
+        let panel = SettingsPanel::new(snap);
+        let line = panel.control_line(RowId::Field(Field::DefaultApproval), false, 80);
+        let rendered = text(std::slice::from_ref(&line));
+        assert!(
+            rendered.contains("on-request"),
+            "raw value printed: {rendered}"
+        );
+        assert!(
+            !line
+                .spans
+                .iter()
+                .any(|span| span.content.contains(crate::ui::symbols::ACTIVE)),
+            "no detent lights for a value between detents: {rendered}"
+        );
+        // Same law on a rotary (the theme row): true value, no lit dot.
+        let mut snap = snapshot();
+        snap.theme = "catppuccin".to_string();
+        let panel = SettingsPanel::new(snap);
+        let line = panel.control_line(RowId::Field(Field::Theme), false, 80);
+        let rendered = text(std::slice::from_ref(&line));
+        assert!(rendered.contains("catppuccin"), "{rendered}");
+        assert!(
+            !line
+                .spans
+                .iter()
+                .any(|span| span.content.contains(crate::ui::symbols::ACTIVE)),
+            "rotary shows no position for an off-vocabulary value: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_off_vocabulary_value_snaps_into_the_scale_on_first_click() {
+        let mut snap = snapshot();
+        snap.default_approval = "on-request".to_string();
+        let mut panel = SettingsPanel::new(snap);
+        select(&mut panel, RowId::Field(Field::DefaultApproval));
+        // Right snaps to the first detent, like a dial's off-ladder snap.
+        assert_eq!(
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::DefaultApproval,
+                value: Some("strict".to_string()),
+            })
+        );
+        // And left from between detents snaps to the last one.
+        let mut snap = snapshot();
+        snap.default_approval = "on-request".to_string();
+        let mut panel = SettingsPanel::new(snap);
+        select(&mut panel, RowId::Field(Field::DefaultApproval));
+        assert_eq!(
+            panel.handle_key(ModalKey::Left),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::DefaultApproval,
+                value: Some("never".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_multi_line_paste_flattens_into_the_single_line_register() {
+        let mut panel = panel();
+        select(&mut panel, RowId::Field(Field::VerifyCommand));
+        panel.handle_key(ModalKey::Enter);
+        panel.push_str("cargo fmt\ncargo test\r\n");
+        assert_eq!(
+            panel.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::VerifyCommand,
+                value: Some("cargo fmt cargo test".to_string()),
+            })
+        );
     }
 }
