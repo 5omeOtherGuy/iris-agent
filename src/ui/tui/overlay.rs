@@ -112,11 +112,32 @@ pub(crate) fn overlay_menu(
     }
     if let Some(footer) = footer {
         out.push(Line::default());
-        let mut line = Line::from(Span::styled(footer.to_string(), dim_style()));
+        let mut line = Line::from(Span::styled(fit_hint_fields(footer, avail), dim_style()));
         truncate_line(&mut line, avail);
         out.push(line);
     }
     out
+}
+
+/// Fit a ` · `-joined key-hint footer into `width` by dropping whole trailing
+/// fields — keymap honesty extends to narrow panes: a mid-word clipped hint
+/// (`es`) reads as a dead control, so a hint either prints whole or not at
+/// all. Leading fields keep priority; a single over-wide field falls through
+/// to the caller's hard truncation.
+fn fit_hint_fields(footer: &str, width: usize) -> String {
+    if display_width(footer) <= width {
+        return footer.to_string();
+    }
+    let fields: Vec<&str> = footer.split(" \u{b7} ").collect();
+    let mut keep = fields.len();
+    while keep > 1 {
+        keep -= 1;
+        let candidate = fields[..keep].join(" \u{b7} ");
+        if display_width(&candidate) <= width {
+            return candidate;
+        }
+    }
+    fields.first().unwrap_or(&"").to_string()
 }
 
 /// Max command rows the palette shows at once. A longer match list scrolls to
@@ -332,5 +353,32 @@ mod tests {
             rendered.contains(&format!("({total}/{total})")),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn narrow_hint_footer_drops_whole_fields_never_clips_mid_word() {
+        let footer = "↑↓ move · ←→ effort (medium) · ↵ select · s session · esc cancel";
+        // Wide enough: printed whole.
+        assert_eq!(super::fit_hint_fields(footer, 80), footer);
+        // Narrow: trailing fields drop as units — no `es`/`s ses` stumps.
+        let fitted = super::fit_hint_fields(footer, 50);
+        assert_eq!(fitted, "↑↓ move · ←→ effort (medium) · ↵ select");
+        // Very narrow: the leading field survives alone.
+        assert_eq!(super::fit_hint_fields(footer, 10), "↑↓ move");
+        // And a menu rendered at that width carries the fitted hint.
+        let lines = super::overlay_menu(
+            Some("Select model"),
+            vec![(Line::from("GPT 5.5"), true)],
+            Some(footer),
+            50,
+        );
+        let rendered = lines
+            .iter()
+            .map(|line| super::line_text(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("↵ select"), "{rendered}");
+        assert!(!rendered.contains("esc"), "{rendered}");
+        assert!(!rendered.ends_with("es"), "{rendered}");
     }
 }
