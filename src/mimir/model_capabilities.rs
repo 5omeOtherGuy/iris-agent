@@ -481,7 +481,7 @@ pub(crate) fn join_display_levels(provider: ProviderId, model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mimir::selection::{ContextManagement, PromptCacheRetention};
+    use crate::mimir::selection::{CodexTransport, ContextManagement, PromptCacheRetention};
 
     fn selection(provider: ProviderId, reasoning: Option<ReasoningEffort>) -> ModelSelection {
         ModelSelection {
@@ -490,6 +490,7 @@ mod tests {
             base_url: "https://example".to_string(),
             reasoning,
             cache_retention: PromptCacheRetention::Short,
+            codex_transport: CodexTransport::Auto,
             context_management: ContextManagement::default(),
             legacy_context_management: ContextManagement::default(),
             tool_result_compaction: crate::config::Settings::default()
@@ -661,6 +662,7 @@ mod tests {
                 base_url: "https://example".to_string(),
                 reasoning: Some(ReasoningEffort::XHigh),
                 cache_retention: PromptCacheRetention::Short,
+                codex_transport: CodexTransport::Auto,
                 context_management: ContextManagement::default(),
                 legacy_context_management: ContextManagement::default(),
                 tool_result_compaction: crate::config::Settings::default()

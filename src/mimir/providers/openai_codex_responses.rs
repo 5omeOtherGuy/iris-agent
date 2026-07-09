@@ -1,21 +1,29 @@
+use std::future::Future;
 #[cfg(test)]
 use std::io::BufRead;
 use std::io::BufReader;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures::{SinkExt, StreamExt};
 use reqwest::Url;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue as WsHeaderValue;
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
 use super::transport::{
-    Attempt, HttpClass, StreamReadError, TurnSink, classify_http_status_retryable,
-    for_each_sse_event, retry_after_hint, run_with_retry, spawn_stream,
+    Attempt, ChannelSink, HttpClass, StreamReadError, TurnSink, classify_http_status_retryable,
+    for_each_sse_event, retry_after_hint, run_with_retry, spawn_async_stream, spawn_stream,
 };
 use crate::mimir::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
-use crate::mimir::selection::{PromptCacheRetention, ReasoningEffort};
+use crate::mimir::selection::{CodexTransport, PromptCacheRetention, ReasoningEffort};
 use crate::nexus::{
     AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderStream, ProviderUsage,
     ReasoningBlock, Role, ToolCall, Tools,
@@ -29,6 +37,50 @@ use crate::nexus::{
 // every provider adapter.
 const PROVIDER_ID: &str = "openai-codex";
 const API_ID: &str = "openai-codex-responses";
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+const WS_MAX_AGE: Duration = Duration::from_secs(55 * 60);
+const WS_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
+type CodexWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WsFallback {
+    RetryWebSocket,
+    RetryFullWebSocket,
+    ForceRefresh,
+    FallbackSse,
+    Fatal,
+}
+
+#[derive(Default)]
+struct CodexWsState {
+    socket: Option<ReusableCodexWs>,
+    disabled_for_session: bool,
+    continuation: Option<CodexContinuation>,
+}
+
+struct ReusableCodexWs {
+    stream: CodexWs,
+    opened_at: Instant,
+    last_used: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct CodexContinuation {
+    last_full_body: Value,
+    last_response_id: String,
+    last_response_items: Vec<Value>,
+}
+
+impl std::fmt::Debug for CodexWsState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexWsState")
+            .field("socket", &self.socket.is_some())
+            .field("disabled_for_session", &self.disabled_for_session)
+            .field("continuation", &self.continuation)
+            .finish()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiCodexResponsesProvider {
@@ -42,6 +94,8 @@ pub(crate) struct OpenAiCodexResponsesProvider {
     cache_prefix: Arc<Mutex<super::PromptCachePrefix>>,
     tokens: OpenAiCodexTokenStore,
     retry_policy: crate::mimir::retry::RetryPolicy,
+    codex_transport: CodexTransport,
+    ws_state: Arc<tokio::sync::Mutex<CodexWsState>>,
 }
 
 impl OpenAiCodexResponsesProvider {
@@ -51,6 +105,7 @@ impl OpenAiCodexResponsesProvider {
     /// resolved strings plus the optional reasoning level. `system_prompt` is the
     /// harness-assembled instruction string; the provider only forwards it into
     /// the request envelope.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         model: &str,
         base_url: &str,
@@ -59,6 +114,7 @@ impl OpenAiCodexResponsesProvider {
         prompt_cache_key: &str,
         cache_retention: PromptCacheRetention,
         retry_policy: crate::mimir::retry::RetryPolicy,
+        codex_transport: CodexTransport,
     ) -> Result<Self> {
         Ok(Self {
             // Shared process-wide client: warm pooled connections (HTTP/2 +
@@ -74,6 +130,8 @@ impl OpenAiCodexResponsesProvider {
             cache_prefix: Arc::new(Mutex::new(super::PromptCachePrefix::default())),
             tokens: OpenAiCodexTokenStore::from_env()?,
             retry_policy,
+            codex_transport,
+            ws_state: Arc::new(tokio::sync::Mutex::new(CodexWsState::default())),
         })
     }
 }
@@ -115,18 +173,312 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
             None,
             self.cache_retention,
         );
+        let request_for_stream = request.clone();
         let url = resolve_codex_url(&self.base_url)?;
         let provider = self.clone();
         let cancel = cancel.clone();
-        Ok(spawn_stream(
-            move |sink, cancel| provider.run_blocking(url, &request, sink, cancel),
+        if self.codex_transport == CodexTransport::Sse {
+            return Ok(spawn_stream(
+                move |sink, cancel| provider.run_blocking(url, &request_for_stream, sink, cancel),
+                cancel,
+            ));
+        }
+        Ok(spawn_async_stream(
+            move |sink, cancel| async move { provider.run_auto(url, request, sink, cancel).await },
             cancel,
         ))
     }
 }
 
 impl OpenAiCodexResponsesProvider {
-    /// Drive the blocking retry/reauth state machine and SSE parse on a
+    async fn run_auto(
+        &self,
+        url: Url,
+        full_request: Value,
+        mut sink: ChannelSink,
+        cancel: CancellationToken,
+    ) -> Result<AssistantTurn> {
+        if self.ws_state.lock().await.disabled_for_session {
+            return self
+                .run_blocking_off_thread(url, full_request, sink, cancel)
+                .await;
+        }
+        let ws_url = resolve_codex_ws_url_from_resolved(&url)?;
+        let mut tried_limit_refresh = false;
+        let mut tried_previous_full = false;
+        let mut tried_reauth = false;
+        let mut force_full = false;
+        loop {
+            let token = self.codex_token_off_thread(tried_reauth).await?;
+            match self
+                .run_ws_once(
+                    ws_url.clone(),
+                    &full_request,
+                    &token,
+                    &mut sink,
+                    &cancel,
+                    force_full,
+                )
+                .await
+            {
+                Ok(turn) => return Ok(turn),
+                Err((policy, error)) => match policy {
+                    WsFallback::RetryWebSocket if !tried_limit_refresh => {
+                        tried_limit_refresh = true;
+                        self.drop_ws_socket().await;
+                    }
+                    WsFallback::RetryFullWebSocket if !tried_previous_full => {
+                        tried_previous_full = true;
+                        force_full = true;
+                        self.clear_continuation().await;
+                    }
+                    WsFallback::ForceRefresh if !tried_reauth => {
+                        tried_reauth = true;
+                        self.drop_ws_socket().await;
+                    }
+                    WsFallback::FallbackSse => {
+                        self.disable_ws_for_session().await;
+                        return self
+                            .run_blocking_off_thread(url, full_request, sink, cancel)
+                            .await;
+                    }
+                    _ => return Err(error),
+                },
+            }
+        }
+    }
+
+    async fn codex_token_off_thread(&self, force_refresh: bool) -> Result<AccessToken> {
+        let tokens = self.tokens.clone();
+        let client = self.client.clone();
+        tokio::task::spawn_blocking(move || {
+            if force_refresh {
+                tokens.force_refresh(&client)
+            } else {
+                tokens.access_token(&client)
+            }
+        })
+        .await
+        .context("Codex token task failed")?
+    }
+
+    async fn run_blocking_off_thread(
+        &self,
+        url: Url,
+        request: Value,
+        sink: ChannelSink,
+        cancel: CancellationToken,
+    ) -> Result<AssistantTurn> {
+        let provider = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut sink = sink;
+            provider.run_blocking(url, &request, &mut sink, &cancel)
+        })
+        .await
+        .context("Codex SSE fallback task failed")?
+    }
+
+    async fn run_ws_once(
+        &self,
+        ws_url: Url,
+        full_request: &Value,
+        token: &AccessToken,
+        sink: &mut dyn TurnSink,
+        cancel: &CancellationToken,
+        force_full: bool,
+    ) -> std::result::Result<AssistantTurn, (WsFallback, anyhow::Error)> {
+        let frame = {
+            let state = self.ws_state.lock().await;
+            build_ws_create_frame(full_request, state.continuation.as_ref(), force_full)
+        };
+        let mut reusable = match self.take_ws_socket().await {
+            Some(socket) => socket,
+            None => ReusableCodexWs {
+                stream: await_ws_setup(
+                    "connect",
+                    WS_CONNECT_TIMEOUT,
+                    cancel,
+                    false,
+                    connect_codex_ws(ws_url, token, &self.prompt_cache_key),
+                )
+                .await?,
+                opened_at: Instant::now(),
+                last_used: Instant::now(),
+            },
+        };
+        let text =
+            serde_json::to_string(&frame).map_err(|error| (WsFallback::Fatal, error.into()))?;
+        await_ws_setup("send", WS_SEND_TIMEOUT, cancel, false, async {
+            reusable
+                .stream
+                .send(WsMessage::Text(text.into()))
+                .await
+                .map_err(|error| {
+                    anyhow!(
+                        "Codex WebSocket send failed: {}",
+                        safe_transport_error(&error)
+                    )
+                })
+        })
+        .await?;
+
+        let mut parser = ResponseStreamParser::new(&self.model);
+        loop {
+            let next = tokio::select! {
+                _ = cancel.cancelled() => {
+                    self.clear_continuation().await;
+                    return Err((WsFallback::Fatal, anyhow!("Codex WebSocket request cancelled")));
+                }
+                message = reusable.stream.next() => message,
+            };
+            let Some(message) = next else {
+                let error: anyhow::Error = CodexStreamProtocolAnomaly::closed_before_completed(
+                    parser.last_event_type.clone(),
+                )
+                .into();
+                return Err((
+                    classify_ws_error(&error, parser.emitted_visible_output()),
+                    error,
+                ));
+            };
+            match message {
+                Ok(WsMessage::Text(text)) => {
+                    sink.on_activity()
+                        .map_err(|error| (WsFallback::Fatal, error))?;
+                    if let Err(error) = parser.ingest_event(&text, sink) {
+                        let policy = classify_ws_error(&error, parser.emitted_visible_output());
+                        return Err((policy, error));
+                    }
+                }
+                Ok(WsMessage::Binary(bytes)) => {
+                    sink.on_activity()
+                        .map_err(|error| (WsFallback::Fatal, error))?;
+                    let text = String::from_utf8(bytes.to_vec()).map_err(|_| {
+                        let error: anyhow::Error = CodexStreamProtocolAnomaly::invalid_json(
+                            parser.last_event_type.clone(),
+                        )
+                        .into();
+                        (
+                            classify_ws_error(&error, parser.emitted_visible_output()),
+                            error,
+                        )
+                    })?;
+                    if let Err(error) = parser.ingest_event(&text, sink) {
+                        let policy = classify_ws_error(&error, parser.emitted_visible_output());
+                        return Err((policy, error));
+                    }
+                }
+                Ok(WsMessage::Ping(payload)) => {
+                    sink.on_activity()
+                        .map_err(|error| (WsFallback::Fatal, error))?;
+                    await_ws_setup(
+                        "pong",
+                        WS_SEND_TIMEOUT,
+                        cancel,
+                        parser.emitted_visible_output(),
+                        async {
+                            reusable
+                                .stream
+                                .send(WsMessage::Pong(payload))
+                                .await
+                                .map_err(|error| {
+                                    anyhow!(
+                                        "Codex WebSocket pong failed: {}",
+                                        safe_transport_error(&error)
+                                    )
+                                })
+                        },
+                    )
+                    .await?;
+                }
+                Ok(WsMessage::Pong(_)) => {
+                    sink.on_activity()
+                        .map_err(|error| (WsFallback::Fatal, error))?;
+                }
+                Ok(WsMessage::Close(_)) => {
+                    let error: anyhow::Error = CodexStreamProtocolAnomaly::closed_before_completed(
+                        parser.last_event_type.clone(),
+                    )
+                    .into();
+                    return Err((
+                        classify_ws_error(&error, parser.emitted_visible_output()),
+                        error,
+                    ));
+                }
+                Ok(WsMessage::Frame(_)) => {}
+                Err(error) => {
+                    let error = anyhow!(
+                        "Codex WebSocket read failed: {}",
+                        safe_transport_error(&error)
+                    );
+                    let policy = classify_ws_error(&error, parser.emitted_visible_output());
+                    return Err((policy, error));
+                }
+            }
+            if parser.saw_completed {
+                break;
+            }
+        }
+        let completed_response = parser.completed_response.clone();
+        let emitted_visible = parser.emitted_visible_output();
+        let turn = parser
+            .finish()
+            .map_err(|error| (classify_ws_error(&error, emitted_visible), error))?;
+        if let Some(usage) = &turn.usage {
+            self.record_usage(usage);
+        }
+        if let Some(response) = completed_response.as_ref()
+            && let Some(id) = turn.response_id.as_deref()
+        {
+            self.update_continuation(full_request, response, id).await;
+        } else {
+            self.clear_continuation().await;
+        }
+        reusable.last_used = Instant::now();
+        self.put_ws_socket(reusable).await;
+        Ok(turn)
+    }
+
+    async fn take_ws_socket(&self) -> Option<ReusableCodexWs> {
+        let mut state = self.ws_state.lock().await;
+        let reusable = state.socket.take()?;
+        let now = Instant::now();
+        (now.duration_since(reusable.opened_at) < WS_MAX_AGE
+            && now.duration_since(reusable.last_used) < WS_IDLE_TTL)
+            .then_some(reusable)
+    }
+
+    async fn put_ws_socket(&self, reusable: ReusableCodexWs) {
+        self.ws_state.lock().await.socket = Some(reusable);
+    }
+
+    async fn drop_ws_socket(&self) {
+        self.ws_state.lock().await.socket = None;
+    }
+
+    async fn clear_continuation(&self) {
+        self.ws_state.lock().await.continuation = None;
+    }
+
+    async fn disable_ws_for_session(&self) {
+        let mut state = self.ws_state.lock().await;
+        state.disabled_for_session = true;
+        state.socket = None;
+        state.continuation = None;
+    }
+
+    async fn update_continuation(&self, full_request: &Value, response: &Value, id: &str) {
+        let Some(items) = normalize_response_items_for_continuation(response) else {
+            self.clear_continuation().await;
+            return;
+        };
+        self.ws_state.lock().await.continuation = Some(CodexContinuation {
+            last_full_body: ws_body_from_full_request(full_request),
+            last_response_id: id.to_string(),
+            last_response_items: items,
+        });
+    }
+
     /// `spawn_blocking` thread, forwarding text deltas through `sink` and
     /// returning the assembled turn.
     fn run_blocking(
@@ -286,10 +638,11 @@ fn build_codex_request(
             body["prompt_cache_retention"] = json!("24h");
         }
     }
-    // `previous_response_id` requires server-side response storage (store:true).
-    // Iris sends store:false, so production never supplies one; the field is
-    // emitted only when a caller explicitly provides it (documented shape), so a
-    // stored-response deployment can opt in later without changing the builder.
+    // `previous_response_id` normally requires server-side storage. The
+    // WebSocket path is the exception: OpenAI's WebSocket Mode guide permits it
+    // with `store:false` while the referenced response remains in the active
+    // connection-local cache. HTTP/SSE production requests still pass `None` and
+    // send full context.
     if let Some(previous) = previous_response_id
         .map(str::trim)
         .filter(|id| !id.is_empty())
@@ -436,6 +789,279 @@ fn resolve_codex_url(base_url: &str) -> Result<Url> {
     };
     url.set_path(&next_path);
     Ok(url)
+}
+
+fn resolve_codex_ws_url_from_resolved(http_url: &Url) -> Result<Url> {
+    let mut url = http_url.clone();
+    let scheme = match url.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        other => bail!("unsupported Codex WebSocket base URL scheme: {other}"),
+    };
+    url.set_scheme(scheme)
+        .map_err(|_| anyhow!("failed to derive Codex WebSocket URL"))?;
+    Ok(url)
+}
+
+#[cfg(test)]
+fn resolve_codex_ws_url(base_url: &str) -> Result<Url> {
+    resolve_codex_ws_url_from_resolved(&resolve_codex_url(base_url)?)
+}
+
+fn ws_body_from_full_request(full_request: &Value) -> Value {
+    let mut body = full_request.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.remove("stream");
+        object.remove("background");
+    }
+    body
+}
+
+fn build_ws_create_frame(
+    full_request: &Value,
+    continuation: Option<&CodexContinuation>,
+    force_full: bool,
+) -> Value {
+    let mut body = ws_body_from_full_request(full_request);
+    if !force_full
+        && let Some(continuation) = continuation
+        && let Some(delta) = continuation_delta(&body, continuation)
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert("input".to_string(), Value::Array(delta));
+        object.insert(
+            "previous_response_id".to_string(),
+            Value::String(continuation.last_response_id.clone()),
+        );
+    }
+    let mut frame = Map::new();
+    frame.insert(
+        "type".to_string(),
+        Value::String("response.create".to_string()),
+    );
+    if let Some(object) = body.as_object() {
+        frame.extend(object.clone());
+    }
+    Value::Object(frame)
+}
+
+fn continuation_delta(
+    current_body: &Value,
+    continuation: &CodexContinuation,
+) -> Option<Vec<Value>> {
+    if !same_continuation_shape(current_body, &continuation.last_full_body) {
+        return None;
+    }
+    let current = current_body.get("input")?.as_array()?;
+    let previous = continuation.last_full_body.get("input")?.as_array()?;
+    let mut expected = previous.clone();
+    expected.extend(continuation.last_response_items.clone());
+    current
+        .starts_with(&expected)
+        .then(|| current[expected.len()..].to_vec())
+}
+
+fn same_continuation_shape(current: &Value, previous: &Value) -> bool {
+    fn without_input_and_previous(value: &Value) -> Value {
+        let mut value = value.clone();
+        if let Some(object) = value.as_object_mut() {
+            object.remove("input");
+            object.remove("previous_response_id");
+        }
+        value
+    }
+    without_input_and_previous(current) == without_input_and_previous(previous)
+}
+
+fn normalize_response_items_for_continuation(response: &Value) -> Option<Vec<Value>> {
+    let output = response.get("output")?.as_array()?;
+    let mut items = Vec::new();
+    for item in output {
+        if let Some(item) = normalize_response_item_for_continuation(item)? {
+            items.push(item);
+        }
+    }
+    Some(items)
+}
+
+fn normalize_response_item_for_continuation(item: &Value) -> Option<Option<Value>> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => normalize_message_for_continuation(item).map(Some),
+        Some("function_call") => normalize_function_call_for_continuation(item).map(Some),
+        Some("reasoning") => Some(normalize_reasoning_for_continuation(item)),
+        Some("function_call_output") => None,
+        Some(_) | None => None,
+    }
+}
+
+fn normalize_message_for_continuation(item: &Value) -> Option<Value> {
+    let role = item
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("assistant");
+    if role != "assistant" {
+        return None;
+    }
+    let text = extract_output_text(item);
+    (!text.is_empty()).then(|| {
+        json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": text }],
+        })
+    })
+}
+
+fn normalize_function_call_for_continuation(item: &Value) -> Option<Value> {
+    (item.get("type").and_then(Value::as_str) == Some("function_call")).then(|| {
+        let arguments = item
+            .get("arguments")
+            .and_then(parse_arguments)
+            .unwrap_or_else(|| json!({}))
+            .to_string();
+        json!({
+            "type": "function_call",
+            "call_id": item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            "name": item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            "arguments": arguments,
+        })
+    })
+}
+
+fn normalize_reasoning_for_continuation(item: &Value) -> Option<Value> {
+    let encrypted = item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(json!({
+        "type": "reasoning",
+        "encrypted_content": encrypted,
+        "summary": [],
+    }))
+}
+
+async fn await_ws_setup<T, Fut>(
+    operation: &'static str,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    emitted_visible_output: bool,
+    future: Fut,
+) -> std::result::Result<T, (WsFallback, anyhow::Error)>
+where
+    Fut: Future<Output = Result<T>>,
+{
+    let result = tokio::select! {
+        _ = cancel.cancelled() => {
+            return Err((WsFallback::Fatal, anyhow!("Codex WebSocket request cancelled")));
+        }
+        result = tokio::time::timeout(timeout, future) => result,
+    };
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => {
+            let policy = classify_ws_error(&error, emitted_visible_output);
+            Err((policy, error))
+        }
+        Err(_) => Err((
+            if emitted_visible_output {
+                WsFallback::Fatal
+            } else {
+                WsFallback::FallbackSse
+            },
+            anyhow!(
+                "Codex WebSocket {operation} timed out after {}s",
+                timeout.as_secs()
+            ),
+        )),
+    }
+}
+
+fn build_codex_ws_request(
+    url: &Url,
+    token: &AccessToken,
+    session_id: &str,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    let mut request = url.as_str().into_client_request()?;
+    let headers = request.headers_mut();
+    headers.insert(
+        AUTHORIZATION.as_str(),
+        WsHeaderValue::from_str(&format!("Bearer {}", token.bearer))?,
+    );
+    headers.insert(
+        "chatgpt-account-id",
+        WsHeaderValue::from_str(&token.account_id)?,
+    );
+    headers.insert("originator", WsHeaderValue::from_static("iris"));
+    headers.insert(
+        USER_AGENT.as_str(),
+        WsHeaderValue::from_static("iris-agent"),
+    );
+    headers.insert(
+        "OpenAI-Beta",
+        WsHeaderValue::from_static("responses_websockets=2026-02-06"),
+    );
+    headers.insert("session-id", WsHeaderValue::from_str(session_id)?);
+    headers.insert(
+        "x-client-request-id",
+        WsHeaderValue::from_str(&format!("iris-{session_id}"))?,
+    );
+    Ok(request)
+}
+
+async fn connect_codex_ws(url: Url, token: &AccessToken, session_id: &str) -> Result<CodexWs> {
+    let request = build_codex_ws_request(&url, token, session_id)?;
+    let (stream, _) = tokio_tungstenite::connect_async(request).await?;
+    Ok(stream)
+}
+
+fn classify_ws_error(error: &anyhow::Error, emitted_visible_output: bool) -> WsFallback {
+    if emitted_visible_output {
+        return WsFallback::Fatal;
+    }
+    let text = error.to_string();
+    if text.contains("previous_response_not_found") {
+        WsFallback::RetryFullWebSocket
+    } else if text.contains("websocket_connection_limit_reached") {
+        WsFallback::RetryWebSocket
+    } else if text.contains("401") || text.contains("403") {
+        WsFallback::ForceRefresh
+    } else {
+        WsFallback::FallbackSse
+    }
+}
+
+fn safe_transport_error(error: &impl std::fmt::Display) -> &'static str {
+    let text = error.to_string();
+    if text.contains("401") {
+        "status=401"
+    } else if text.contains("403") {
+        "status=403"
+    } else if text.contains("previous_response_not_found") {
+        "code=previous_response_not_found"
+    } else if text.contains("websocket_connection_limit_reached") {
+        "code=websocket_connection_limit_reached"
+    } else {
+        "transport_error"
+    }
+}
+
+#[cfg(test)]
+fn ws_headers_for_test(
+    token: &AccessToken,
+    session_id: &str,
+) -> Result<tokio_tungstenite::tungstenite::http::HeaderMap> {
+    let url = Url::parse("wss://chatgpt.com/backend-api/codex/responses")?;
+    Ok(build_codex_ws_request(&url, token, session_id)?
+        .headers()
+        .clone())
 }
 
 #[cfg(test)]
@@ -612,7 +1238,7 @@ impl ResponseStreamParser {
                     }
                 }
             }
-            Some("response.completed") => {
+            Some("response.completed") | Some("response.done") => {
                 self.saw_completed = true;
                 self.completed_response = value.get("response").cloned();
                 if let Some(id) = self
@@ -624,6 +1250,7 @@ impl ResponseStreamParser {
                     self.response_id = Some(id.to_string());
                 }
             }
+            Some("error") => bail!("Codex WebSocket error: {}", top_level_error(&value)),
             Some("response.failed") => bail!("Codex response failed: {}", response_error(&value)),
             Some("response.incomplete") => {
                 bail!("Codex response incomplete: {}", incomplete_reason(&value))
@@ -792,6 +1419,14 @@ fn response_error(value: &Value) -> String {
     let error = value
         .get("response")
         .and_then(|response| response.get("error"));
+    format_error_fields(error, "response.failed event received")
+}
+
+fn top_level_error(value: &Value) -> String {
+    format_error_fields(value.get("error"), "error event received")
+}
+
+fn format_error_fields(error: Option<&Value>, fallback: &str) -> String {
     let mut fields = Vec::new();
     if let Some(kind) = error
         .and_then(|error| error.get("type"))
@@ -808,7 +1443,7 @@ fn response_error(value: &Value) -> String {
         fields.push(format!("code={code}"));
     }
     if fields.is_empty() {
-        "response.failed event received".to_string()
+        fallback.to_string()
     } else {
         fields.join(" ")
     }

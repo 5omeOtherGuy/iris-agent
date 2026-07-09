@@ -25,7 +25,7 @@ use super::*;
 use crate::mimir::auth::anthropic::claude_code_credentials_available;
 use crate::mimir::providers::anthropic_messages::AnthropicProvider;
 use crate::mimir::retry::RetryPolicy;
-use crate::mimir::selection::{ContextManagement, PromptCacheRetention};
+use crate::mimir::selection::{CodexTransport, ContextManagement, PromptCacheRetention};
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::ToolState;
 use crate::wayland::{Harness, SummarizerKind};
@@ -805,6 +805,7 @@ fn inferred_cold_flush_live_codex() {
             key,
             PromptCacheRetention::DEFAULT,
             RetryPolicy::default(),
+            CodexTransport::Sse,
         )
     };
     let control = match build("iris-bench-cold-ctrl") {

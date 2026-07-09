@@ -583,6 +583,7 @@ pub(crate) fn candidate_for(
         base_url,
         reasoning,
         cache_retention: current.cache_retention,
+        codex_transport: current.codex_transport,
         context_management: current.context_management.clone(),
         legacy_context_management: current.legacy_context_management.clone(),
         tool_result_compaction: current.tool_result_compaction.clone(),
@@ -1385,6 +1386,7 @@ mod tests {
             base_url: "https://example".to_string(),
             reasoning: None,
             cache_retention: selection::PromptCacheRetention::Short,
+            codex_transport: selection::CodexTransport::Auto,
             context_management: selection::ContextManagement::default(),
             legacy_context_management: selection::ContextManagement::default(),
             tool_result_compaction: crate::config::Settings::default()
