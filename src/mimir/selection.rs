@@ -462,7 +462,7 @@ impl ModelSelection {
             .unwrap_or_else(|| provider.default_model().to_string());
         let base_url = base_url_for(provider, settings.base_url.as_deref());
         let reasoning = match trimmed_non_empty(settings.default_reasoning.as_deref()) {
-            Some(value) => Some(crate::mimir::model_capabilities::parse_level(
+            Some(value) => Some(crate::mimir::model_capabilities::parse_persisted_level(
                 provider, &model, value,
             )?),
             None => None,
@@ -772,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_parses_default_reasoning_as_provider_native_label() {
+    fn resolve_parses_default_reasoning_as_persisted_normalized_token() {
         let _env = crate::mimir::test_support::env_lock();
         unsafe {
             env::remove_var("IRIS_MODEL");
@@ -786,12 +786,24 @@ mod tests {
             Some("anthropic"),
             Some("claude-sonnet-5"),
             None,
-            Some("low"),
+            Some("medium"),
         );
         assert_eq!(
             ModelSelection::resolve(&adaptive).unwrap().reasoning,
-            Some(ReasoningEffort::Minimal),
-            "Anthropic adaptive `low` is the provider-native lowest effort"
+            Some(ReasoningEffort::Medium),
+            "persisted normalized tokens must round-trip before provider-native labels"
+        );
+
+        let hand_edited = settings(
+            Some("anthropic"),
+            Some("claude-sonnet-5"),
+            None,
+            Some("max"),
+        );
+        assert_eq!(
+            ModelSelection::resolve(&hand_edited).unwrap().reasoning,
+            Some(ReasoningEffort::XHigh),
+            "non-normalized provider-native labels remain accepted for hand-edited settings"
         );
 
         let manual = settings(

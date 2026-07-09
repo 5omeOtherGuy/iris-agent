@@ -276,6 +276,23 @@ pub(crate) fn parse_level(
     .into())
 }
 
+/// Parse a persisted settings/session reasoning value. Iris writes normalized
+/// [`ReasoningEffort::as_str`] tokens, while interactive input uses provider-
+/// native labels. Some providers (notably Anthropic adaptive thinking) have
+/// labels that overlap normalized tokens but mean a different internal level, so
+/// persisted values must prefer the normalized interpretation and only fall back
+/// to provider-native parsing for hand-edited values like `max` or `4,096`.
+pub(crate) fn parse_persisted_level(
+    provider: ProviderId,
+    model: &str,
+    value: &str,
+) -> Result<ReasoningEffort> {
+    if let Ok(level) = ReasoningEffort::parse(value) {
+        return Ok(level);
+    }
+    parse_level(provider, model, value)
+}
+
 fn normalize_label(value: &str) -> String {
     let mut normalized = value.trim().to_ascii_lowercase().replace(',', "");
     normalized = normalized.replace('_', "-");
