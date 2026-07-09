@@ -2619,7 +2619,8 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
-    trust_path: Option<OsString>,
+    trust_path: Option<Option<OsString>>,
+    config_path: Option<Option<OsString>>,
 }
 
 impl EnvGuard {
@@ -2627,11 +2628,25 @@ impl EnvGuard {
         let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let guard = Self {
             _lock: lock,
-            trust_path: std::env::var_os("IRIS_TRUST_PATH"),
+            trust_path: Some(std::env::var_os("IRIS_TRUST_PATH")),
+            config_path: None,
         };
         // SAFETY: nexus env-sensitive tests run under ENV_LOCK and restore the
         // process-global var before releasing it.
         unsafe { std::env::set_var("IRIS_TRUST_PATH", path) };
+        guard
+    }
+
+    fn with_config_path(path: &Path) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let guard = Self {
+            _lock: lock,
+            trust_path: None,
+            config_path: Some(std::env::var_os("IRIS_CONFIG_PATH")),
+        };
+        // SAFETY: nexus env-sensitive tests run under ENV_LOCK and restore the
+        // process-global var before releasing it.
+        unsafe { std::env::set_var("IRIS_CONFIG_PATH", path) };
         guard
     }
 }
@@ -2640,9 +2655,17 @@ impl Drop for EnvGuard {
     fn drop(&mut self) {
         // SAFETY: serialized under ENV_LOCK by EnvGuard and restored on drop.
         unsafe {
-            match &self.trust_path {
-                Some(value) => std::env::set_var("IRIS_TRUST_PATH", value),
-                None => std::env::remove_var("IRIS_TRUST_PATH"),
+            if let Some(previous) = &self.trust_path {
+                match previous {
+                    Some(value) => std::env::set_var("IRIS_TRUST_PATH", value),
+                    None => std::env::remove_var("IRIS_TRUST_PATH"),
+                }
+            }
+            if let Some(previous) = &self.config_path {
+                match previous {
+                    Some(value) => std::env::set_var("IRIS_CONFIG_PATH", value),
+                    None => std::env::remove_var("IRIS_CONFIG_PATH"),
+                }
             }
         }
     }
@@ -7869,25 +7892,42 @@ fn approval_mode_parses_and_round_trips_tokens() {
 }
 
 #[test]
-fn approval_mode_from_startup_setting_resolves_or_defaults() {
-    // Absent -> today's default (posture unchanged).
+fn permission_mode_parses_dangerous_as_exclusive_mode() {
     assert_eq!(
-        ApprovalMode::from_startup_setting(None),
-        ApprovalMode::Strict
-    );
-    // A valid token is applied.
-    assert_eq!(
-        ApprovalMode::from_startup_setting(Some("auto")),
-        ApprovalMode::Auto
+        PermissionMode::parse("dangerously-skip-permissions"),
+        Some(PermissionMode::DangerousSkipPermissions)
     );
     assert_eq!(
-        ApprovalMode::from_startup_setting(Some("never")),
-        ApprovalMode::NeverAsk
+        PermissionMode::parse("--dangerously-skip-permissions"),
+        Some(PermissionMode::DangerousSkipPermissions)
     );
-    // An invalid token falls back to the default rather than changing posture.
     assert_eq!(
-        ApprovalMode::from_startup_setting(Some("bogus")),
-        ApprovalMode::Strict
+        PermissionMode::parse("auto"),
+        Some(PermissionMode::Approval(ApprovalMode::Auto))
+    );
+    assert_eq!(
+        PermissionMode::from_startup_setting(Some("dangerously-skip-permissions")),
+        PermissionMode::DangerousSkipPermissions
+    );
+}
+
+#[test]
+fn permission_mode_from_startup_setting_resolves_or_defaults() {
+    assert_eq!(
+        PermissionMode::from_startup_setting(None),
+        PermissionMode::Approval(ApprovalMode::Strict)
+    );
+    assert_eq!(
+        PermissionMode::from_startup_setting(Some("auto")),
+        PermissionMode::Approval(ApprovalMode::Auto)
+    );
+    assert_eq!(
+        PermissionMode::from_startup_setting(Some("never")),
+        PermissionMode::Approval(ApprovalMode::NeverAsk)
+    );
+    assert_eq!(
+        PermissionMode::from_startup_setting(Some("bogus")),
+        PermissionMode::Approval(ApprovalMode::Strict)
     );
 }
 
@@ -7897,6 +7937,7 @@ fn approval_command_switches_session_mode_in_text_path() -> Result<()> {
     // session preset at the inter-turn boundary, so the following clean
     // in-workspace write auto-runs without an approval prompt on stdin.
     let workspace = test_workspace()?;
+    let _env = EnvGuard::with_config_path(&workspace.path.join("settings.json"));
     let provider = FakeProvider::new(vec![
         Ok(single_call_turn(
             "write",
@@ -7926,6 +7967,11 @@ fn approval_command_switches_session_mode_in_text_path() -> Result<()> {
         fs::read_to_string(workspace.path.join("out.txt"))?,
         "auto\n",
         "the auto-approved write ran without a prompt"
+    );
+    assert!(
+        fs::read_to_string(workspace.path.join("settings.json"))?
+            .contains("\"defaultApproval\": \"auto\""),
+        "the permission mode is persisted as the default"
     );
     Ok(())
 }

@@ -531,9 +531,16 @@ impl<P: ChatProvider> Harness<P> {
     }
 
     /// Change this session's dangerous approval-gate bypass at the inter-turn
-    /// boundary. Session-only: nothing is persisted.
+    /// boundary and append an audit marker to the active transcript. Global
+    /// default persistence is owned by Tier 3; Wayland records the session-local
+    /// state so resume can distinguish "no marker" from an explicit clear.
     pub(crate) fn set_skip_permissions(&mut self, skip: bool) {
         self.agent.set_skip_permissions(skip);
+        if let Some(log) = self.session.as_mut()
+            && let Err(error) = log.append_dangerous_mode_state(skip)
+        {
+            tracing::warn!(error = %format!("{error:#}"), "failed to record skip-permissions mode");
+        }
     }
 
     /// Whether the dangerous approval-gate bypass is active for this session.

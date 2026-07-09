@@ -18,12 +18,13 @@
 //! older binaries tolerate newer config. A malformed file is a hard error -- a
 //! silently-ignored config is a footgun.
 //!
-//! Live tool/approval policy is not configured here: the session approval mode
-//! (`/approval`) and project permission grants (`/trust`) are session/project
-//! state, not settings keys. The one exception is `defaultApproval`, the
-//! startup approval posture, which is GLOBAL-ONLY (a cloned project must never
-//! be able to weaken it -- see `merged_with`). Cross-session approval-grant
-//! persistence is still tracked separately (roadmap #14).
+//! Live project grants are not configured here: project permission grants (`/trust`)
+//! are HOME-owned state, not repo settings. The one exception is
+//! `defaultApproval`, the global startup permission mode. It may be
+//! `strict|auto|never|dangerously-skip-permissions`, but remains GLOBAL-ONLY (a
+//! cloned project must never be able to weaken it -- see `merged_with`).
+//! Cross-session approval-grant persistence is still tracked separately
+//! (roadmap #14).
 
 use std::env;
 use std::io::Write;
@@ -142,13 +143,13 @@ pub(crate) struct Settings {
     /// Terminal-UI behavior (ADR-0029 screen-mode policy). Display-only
     /// preferences: no security-sensitive capability lives here.
     pub(crate) tui: Option<TuiSettings>,
-    /// Startup approval posture (`strict|auto|never`, ADR-0032). Parsed by
-    /// [`crate::nexus::ApprovalMode::parse`] and applied to the harness at
-    /// startup; an absent/invalid value leaves today's default (`strict`).
+    /// Startup permission mode (`strict|auto|never|dangerously-skip-permissions`).
+    /// Normal modes are parsed by [`crate::nexus::ApprovalMode::parse`]; the
+    /// dangerous token is handled by the host as the explicit skip-permissions
+    /// mode. An absent/invalid value leaves today's default (`strict`).
     /// GLOBAL-ONLY: a cloned project must never be able to lower the initial
-    /// posture to `never`, so (like `prompt_cache_retention`) it is taken from
-    /// global config and never from an untrusted project file. The live
-    /// `/approval` command stays session-only and is unaffected.
+    /// posture or enable dangerous skip, so (like `prompt_cache_retention`) it is
+    /// taken from global config and never from an untrusted project file.
     pub(crate) default_approval: Option<String>,
     /// Where the git dropdown's `w` (new worktree) gesture creates worktrees,
     /// relative to the main worktree root when not absolute. Absent ->
@@ -328,9 +329,9 @@ impl Settings {
             // redirect, so a project may set it; project value wins, else
             // global.
             tui: project.tui.or(self.tui),
-            // Startup approval posture gates whether tools auto-run without a
-            // prompt, so (like prompt_cache_retention) it is GLOBAL-ONLY: a
-            // cloned project must never lower the initial posture to `never`.
+            // Startup permission mode gates whether tools auto-run without a
+            // prompt and may enable dangerous skip, so it is GLOBAL-ONLY: a
+            // cloned project must never lower the initial posture.
             default_approval: self.default_approval,
             // A local worktree location preference; project value wins.
             worktree_root: project.worktree_root.or(self.worktree_root),
@@ -495,10 +496,11 @@ pub(crate) fn save_enabled_models(ids: Option<&[String]>) -> Result<()> {
     update_global(&[("enabledModels", value)])
 }
 
-/// Persist the startup approval posture (`strict|auto|never`) in the global
-/// settings file. GLOBAL-ONLY (like [`save_prompt_cache_retention`]): a cloned
-/// project must never redirect the initial posture, so this always writes the
-/// user-global file.
+/// Persist the startup permission mode
+/// (`strict|auto|never|dangerously-skip-permissions`) in the global settings
+/// file. GLOBAL-ONLY (like [`save_prompt_cache_retention`]): a cloned project
+/// must never redirect the initial posture, so this always writes the user-global
+/// file.
 pub(crate) fn save_default_approval(mode: &str) -> Result<()> {
     update_global(&[("defaultApproval", Value::String(mode.to_string()))])
 }
@@ -1347,22 +1349,32 @@ mod tests {
     }
 
     #[test]
-    fn config_cannot_activate_dangerously_skip_permissions() {
-        // ADR-0049 activation isolation: the skip-permissions mode is not configurable.
-        // Settings has no field for it, so a malicious global OR project config
-        // carrying `dangerouslySkipPermissions: true` is inert -- serde ignores
-        // the unknown key and the loaded Settings is byte-equal to the default.
-        // There is intentionally no accessor or field a config could populate.
+    fn dangerous_default_approval_is_global_only() {
         let dir = temp_dir();
         let global = dir.path.join("global.json");
         let project = dir.path.join("project.json");
-        std::fs::write(&global, r#"{ "dangerouslySkipPermissions": true }"#).unwrap();
-        std::fs::write(&project, r#"{ "dangerouslySkipPermissions": true }"#).unwrap();
+        std::fs::write(
+            &global,
+            r#"{ "defaultApproval": "dangerously-skip-permissions", "dangerouslySkipPermissions": true }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"{ "defaultApproval": "dangerously-skip-permissions", "dangerouslySkipPermissions": true }"#,
+        )
+        .unwrap();
         let settings = Settings::load_from(Some(&global), &project).unwrap();
         assert_eq!(
-            settings,
-            Settings::default(),
-            "an unknown skip-permissions key must not populate any setting"
+            settings.default_approval.as_deref(),
+            Some("dangerously-skip-permissions"),
+            "the global defaultApproval token may select dangerous mode"
+        );
+
+        let absent_global =
+            Settings::load_from(Some(&dir.path.join("none.json")), &project).unwrap();
+        assert_eq!(
+            absent_global.default_approval, None,
+            "a project file still cannot enable dangerous mode"
         );
     }
 
@@ -1399,8 +1411,12 @@ mod tests {
         let global = dir.path.join("global.json");
         let project = dir.path.join("project.json");
         fs::write(&global, r#"{ "defaultApproval": "strict" }"#).unwrap();
-        // A cloned project must never lower the posture to `never`.
-        fs::write(&project, r#"{ "defaultApproval": "never" }"#).unwrap();
+        // A cloned project must never lower the posture or enable dangerous skip.
+        fs::write(
+            &project,
+            r#"{ "defaultApproval": "dangerously-skip-permissions" }"#,
+        )
+        .unwrap();
         let settings = Settings::load_from(Some(&global), &project).unwrap();
         assert_eq!(settings.default_approval.as_deref(), Some("strict"));
         // Absent global -> None (today's default applies at startup).

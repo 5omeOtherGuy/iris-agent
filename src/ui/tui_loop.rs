@@ -38,8 +38,8 @@ use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_catalog;
 use crate::mimir::selection::ModelSelection;
 use crate::nexus::{
-    AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, ReviewContext,
-    ToolCall,
+    AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, PermissionMode,
+    ReviewContext, ToolCall,
 };
 use crate::tool_display::approval_dirty_note;
 use crate::ui::UiEvent;
@@ -618,6 +618,7 @@ fn perform_swap<P: ChatProvider>(
         loaded.entry_ids,
         resumed,
     );
+    harness.set_approval_mode(loaded.approval_mode);
     if harness.skip_permissions() != loaded.skip_permissions {
         harness.set_skip_permissions(loaded.skip_permissions);
     }
@@ -1419,26 +1420,28 @@ fn route_command<P: ChatProvider>(
             Ok(RouteOutcome::Consumed)
         }
         "/approval" => {
-            // ADR-0032 session control. Changing the preset at this inter-turn
-            // boundary is safe: the harness forwards it to Nexus, which owns
-            // enforcement. The statusline posture is kept in lockstep so the
-            // label never claims a mode the runtime is not in.
+            // Permission mode (ADR-0032 + ADR-0049). Changing it at this
+            // inter-turn boundary is safe: the harness forwards it to Nexus,
+            // which owns enforcement. The statusline posture is kept in lockstep
+            // so the label never claims a mode the runtime is not in.
             tui.screen.commit_user(prompt);
             let lines = if rest.is_empty() {
                 vec![format!(
-                    "approval mode: {} (use /approval strict|auto|never)",
-                    harness.approval_mode().as_token()
+                    "approval mode: {} (use /approval {})",
+                    crate::cli::current_permission_token(harness),
+                    crate::cli::APPROVAL_USAGE
                 )]
             } else {
-                match crate::nexus::ApprovalMode::parse(rest) {
+                match PermissionMode::parse(rest) {
                     Some(mode) => {
-                        harness.set_approval_mode(mode);
+                        let lines = crate::cli::apply_permission_mode(harness, mode);
                         tui.screen
                             .set_approval_policy(effective_approval_policy(harness));
-                        vec![format!("approval mode set to {}", mode.as_token())]
+                        lines
                     }
                     None => vec![format!(
-                        "unknown approval mode `{rest}` (use strict|auto|never)"
+                        "unknown approval mode `{rest}` (use {})",
+                        crate::cli::APPROVAL_USAGE
                     )],
                 }
             };

@@ -51,6 +51,12 @@ const INTERRUPT_NOTICE: &str = "interrupted; send another message to continue.";
 pub(crate) const SKIP_PERMISSIONS_BANNER: &str =
     "ALL PERMISSION CHECKS DISABLED - every command will run without approval";
 
+/// Persisted/runtime token for the explicit approval-gate bypass mode. This is
+/// the only `defaultApproval` value that maps to skip-permissions; project
+/// settings are never allowed to supply it because config merging keeps
+/// `defaultApproval` global-only.
+pub(crate) const DANGEROUS_SKIP_PERMISSIONS_TOKEN: &str = "dangerously-skip-permissions";
+
 /// Outcome of an approval review for a single tool call. Provider/UI-neutral so
 /// the core loop owns the approval policy without depending on any front-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,14 +117,34 @@ impl ApprovalMode {
             _ => None,
         }
     }
+}
 
-    /// Resolve the startup approval posture from the persisted `defaultApproval`
-    /// setting (GLOBAL-ONLY): a valid token is applied, while an absent or
-    /// invalid value leaves today's default (`strict`) so a missing or typo'd
-    /// setting never changes posture. The live `/approval` command is
-    /// unaffected and stays session-only.
+/// Exclusive permission mode selected by the operator. Normal approval presets
+/// clear the dangerous bypass; the dangerous mode enables skip-permissions and
+/// makes the normal approval preset irrelevant until a normal mode is selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermissionMode {
+    Approval(ApprovalMode),
+    DangerousSkipPermissions,
+}
+
+impl PermissionMode {
+    pub(crate) fn parse(token: &str) -> Option<Self> {
+        let token = token.trim().to_ascii_lowercase();
+        match token.as_str() {
+            DANGEROUS_SKIP_PERMISSIONS_TOKEN | "--dangerously-skip-permissions" => {
+                Some(Self::DangerousSkipPermissions)
+            }
+            _ => ApprovalMode::parse(&token).map(Self::Approval),
+        }
+    }
+
+    /// Resolve the persisted global default permission mode. Invalid or absent
+    /// values fall back to `strict`; project config cannot supply this field.
     pub(crate) fn from_startup_setting(setting: Option<&str>) -> Self {
-        setting.and_then(Self::parse).unwrap_or_default()
+        setting
+            .and_then(Self::parse)
+            .unwrap_or(Self::Approval(ApprovalMode::Strict))
     }
 }
 
@@ -425,8 +451,8 @@ pub(crate) enum AgentEvent {
     /// bypassed for EVERY gated call, including calls a safety floor
     /// (destructive/dirty) would normally stop. A distinct, greppable audit
     /// event so this bypass is never silent and never confused with an
-    /// ordinary policy auto-approval. Emitted by Nexus; the mode is explicit,
-    /// session-scoped, and never config/project-state driven.
+    /// ordinary policy auto-approval. Emitted by Nexus; the mode is explicit and
+    /// never project/trust/env driven.
     ToolAutoApprovedDangerous(ToolCall),
     DiffPreview {
         call: ToolCall,
@@ -1164,13 +1190,14 @@ pub(crate) struct Agent<P> {
     // Nexus owns the enforcement: the mode only decides prompt-vs-auto-vs-deny
     // for a call not already blocked by a floor or covered by an explicit grant.
     approval_mode: ApprovalMode,
-    // `--dangerously-skip-permissions` (ADR-0049): when true, EVERY gated tool
-    // call is auto-approved, including calls a safety floor (destructive/dirty)
-    // would normally stop. Set ONLY by the host from the explicit CLI flag at
-    // construction; it is deliberately not a live toggle and has no config,
-    // trust-store, env, or repo path that can enable it (activation isolation).
-    // Session-scoped: no grant is ever persisted while it is on, and turning it
-    // off restores exactly the prior behavior.
+    // `--dangerously-skip-permissions` / dangerous permission mode (ADR-0049):
+    // when true, EVERY gated tool call is auto-approved, including calls a
+    // safety floor (destructive/dirty) would normally stop. Set only by the host
+    // from operator-controlled runtime state (CLI flag, global defaultApproval,
+    // or the session transcript being resumed); project config, trust stores,
+    // env, and repo paths cannot enable it.
+    // No grant is ever persisted while it is on, and turning it off restores the
+    // normal approval-mode path.
     skip_permissions: bool,
     // Provider/model round-trip id sequence. Nexus owns these ids because it
     // owns the provider loop; Wayland may persist them, but never mints them.
@@ -1304,7 +1331,7 @@ impl<P: ChatProvider> Agent<P> {
         self.approval_mode
     }
 
-    /// Enable `--dangerously-skip-permissions` (ADR-0049) for this session.
+    /// Enable dangerous skip-permissions (ADR-0049) for this runtime state.
     /// When on, every gated call is auto-approved, floors included, and no grant
     /// is ever persisted.
     pub(crate) fn with_skip_permissions(mut self, skip: bool) -> Self {
@@ -1312,9 +1339,8 @@ impl<P: ChatProvider> Agent<P> {
         self
     }
 
-    /// Change `--dangerously-skip-permissions` at a safe inter-turn boundary.
-    /// The host may persist this in the Iris session transcript; config/project
-    /// stores still cannot activate it.
+    /// Change dangerous skip-permissions at a safe inter-turn boundary. The host
+    /// controls activation and persistence; Nexus owns the enforcement.
     pub(crate) fn set_skip_permissions(&mut self, skip: bool) {
         self.skip_permissions = skip;
     }
