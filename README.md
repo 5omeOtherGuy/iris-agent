@@ -154,7 +154,8 @@ restarting the process.
 
 At the prompt, `/model` views or switches provider/model and
 `/reasoning off|minimal|low|medium|high|xhigh` changes thinking effort at a safe
-turn boundary. In the rich TUI, `/resume`, `/new`, `/settings`,
+turn boundary. In the rich TUI, `$` or `/skills` opens the installed-skill
+picker. `/resume`, `/new`, `/settings`,
 `/scoped-models`, `/trust` (or `/permissions`), `/login`, and `/logout` open
 selectors or actions; in the text fallback those selector commands report that
 they are TUI-only. `/session` shows the
@@ -268,6 +269,45 @@ inject through the old fragment surface (ADR-0026). Project docs
 (`AGENTS.md`/`CLAUDE.md`) remain the intentional repo/user steering channel;
 review them like any other project instruction file.
 
+### Skills
+
+Iris loads Codex-compatible filesystem skills. A skill is a directory containing
+`SKILL.md` with YAML `name` and `description` fields:
+
+```markdown
+---
+name: review-patch
+description: Review a patch for correctness, safety, and missing tests.
+---
+
+Follow the review workflow here.
+```
+
+Discovery matches Codex's local layout:
+
+- `.agents/skills` in each directory from the repository root to the current
+  working directory;
+- `<repo>/.codex/skills` for Codex's legacy project location;
+- `~/.agents/skills` for user skills;
+- `$CODEX_HOME/skills` (default `~/.codex/skills`) and its bundled `.system`
+  root for existing Codex installs;
+- `~/.iris/skills` for Iris-only installs;
+- `/etc/codex/skills` and `/etc/iris/skills` for administrator-installed skills.
+
+Type `$` or run `/skills` to search and insert a path-qualified mention. A
+unique `$skill-name` works directly. Iris also advertises skill names,
+descriptions, and paths to the model so it can select a matching skill
+implicitly. Only metadata enters the initial context, capped at 2% of the
+configured context budget; the full `SKILL.md` loads when selected. Set
+`policy.allow_implicit_invocation: false` in `agents/openai.yaml` to require an
+explicit mention. Skill edits are detected at the next turn boundary.
+Optional `metadata.short-description`, `interface`, `dependencies`, and
+`policy` fields use Codex's `agents/openai.yaml` schema. Iris honors
+`skills.include_instructions` and ordered `skills.config` enable/disable rules
+from `$CODEX_HOME/config.toml`. A selected global skill may read references
+beneath its own directory even when workspace confinement is enabled; no skill
+root grants write access outside the workspace.
+
 Per-project permissions persist in `~/.iris/trust.json`, keyed by the canonical
 (symlink-resolved) working directory (ADR-0027):
 
@@ -292,6 +332,8 @@ Per-project permissions persist in `~/.iris/trust.json`, keyed by the canonical
 - `IRIS_CONFIG_PATH` — global settings-file path; defaults to `~/.iris/settings.json`.
 - `IRIS_TRUST_PATH` — project-permission policy store path; defaults to `~/.iris/trust.json`; overrides must be absolute and outside the project directory.
 - `IRIS_SESSION_DIR` — session transcript root; defaults to `~/.iris/sessions`.
+- `CODEX_HOME` — optional existing Codex home; Iris reads its `skills`
+  directory and skill settings in `config.toml` for compatibility.
 - `CLAUDE_CONFIG_DIR` — Claude Code config directory override for Anthropic token bootstrap.
 - `ANTIGRAVITY_CLIENT_SECRET` — Antigravity Google OAuth client secret, read at runtime or embedded when set while building Iris; required for `login antigravity` and refresh unless the binary was built with it.
 - `ANTIGRAVITY_PROJECT_ID` — optional Antigravity project-id override; when set it wins over any persisted project id, otherwise Iris discovers/persists one from `loadCodeAssist` and errors if discovery fails.
@@ -331,6 +373,8 @@ Implemented:
 - Native bash output filtering: command output is reduced inside the runtime
   before it enters the transcript (measured; see
   [Token efficiency](#token-efficiency)).
+- Codex-compatible native skills with repo/user/system/admin discovery, progressive
+  disclosure, explicit and implicit invocation, and a searchable TUI picker.
 
 Next:
 

@@ -706,7 +706,7 @@ fn tool_declarations(tools: &Tools) -> Vec<Value> {
 
 fn codex_input_item(message: &Message, current_origin: &ModelOrigin) -> Option<Value> {
     let item = match message.role {
-        Role::User | Role::Assistant => json!({
+        Role::Developer | Role::User | Role::Assistant => json!({
             "type": "message",
             "role": message.role.as_str(),
             "content": [{ "type": message_content_type(message.role), "text": message.content }],
@@ -746,6 +746,7 @@ fn openai_origin(model: &str) -> ModelOrigin {
 
 fn message_content_type(role: Role) -> &'static str {
     match role {
+        Role::Developer => "input_text",
         Role::User => "input_text",
         Role::Assistant => "output_text",
         Role::AssistantReasoning | Role::AssistantToolCall | Role::Tool => {

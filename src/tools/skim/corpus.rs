@@ -141,12 +141,14 @@ fn read_full_and_skim(sample: &Sample) -> (String, String, String) {
         &root,
         &json!({"path": sample.file_name}),
         &mut ObservedFiles::new(),
+        &[],
     )
     .unwrap();
     let skim = crate::tools::read::execute(
         &root,
         &json!({"path": sample.file_name, "skim": true}),
         &mut ObservedFiles::new(),
+        &[],
     )
     .unwrap();
     let meta = skim
@@ -253,13 +255,13 @@ fn corpus_skim_overhead_under_10ms_per_call() {
         let root = root_of(&dir);
         let args = json!({"path": sample.file_name, "skim": true});
         // Warm the page cache with one read.
-        let _ = crate::tools::read::execute(&root, &args, &mut ObservedFiles::new()).unwrap();
+        let _ = crate::tools::read::execute(&root, &args, &mut ObservedFiles::new(), &[]).unwrap();
         bench_support::assert_call_overhead_under(
             sample.class,
             std::time::Duration::from_millis(10),
             || {
-                let _ =
-                    crate::tools::read::execute(&root, &args, &mut ObservedFiles::new()).unwrap();
+                let _ = crate::tools::read::execute(&root, &args, &mut ObservedFiles::new(), &[])
+                    .unwrap();
             },
         );
     }

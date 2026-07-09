@@ -27,8 +27,8 @@
 //! 2. middle fragments: slotted by ascending `slot` (same slot: alphabetical by
 //!    `name`), then unslotted fragments alphabetically,
 //! 3. dynamic context: `<project_context>` (AGENTS.md/CLAUDE.md), then the
-//!    skills seam (deferred -- no skill registry yet), then the `Current date` /
-//!    `Current working directory` lines,
+//!    `Current date` / `Current working directory` lines. Skills use separate
+//!    lower-authority contextual messages (ADR-0053), not this system prompt.
 //! 4. the anchored tool tail: `available_tools` (generated), then
 //!    `available_tool_guidelines` (generated), then `tool_use` (authored).
 //!
@@ -152,13 +152,11 @@ fn build_prompt(
         push_block(&mut blocks, &fragment.name, Some(&fragment.body));
     }
 
-    // Dynamic context, pi order: project_context -> skills -> date/cwd.
+    // Dynamic system context: project_context -> date/cwd. Native skills are
+    // appended as separate contextual messages by the harness (ADR-0053).
     if let Some(project_context) = project_context_block(docs) {
         blocks.push(project_context);
     }
-    // Skills seam (DEFERRED): Iris has no skill registry yet, so no skills block
-    // is emitted. When one exists, format it here -- between project_context and
-    // the date/cwd lines -- so the dynamic-context order matches pi.
     blocks.push(runtime_context_block(workspace, date));
 
     // Anchored tool tail: generated list, generated guidelines, authored prose.

@@ -1249,3 +1249,14 @@ fn reasoning_display_text_is_summary_only_never_raw_content() {
     }));
     assert_eq!(text, "summary");
 }
+
+#[test]
+fn developer_context_keeps_its_native_responses_role() {
+    let origin = ModelOrigin::new(PROVIDER_ID, API_ID, "gpt-test");
+    let item = codex_input_item(&Message::developer("skill catalog"), &origin).unwrap();
+
+    assert_eq!(item["type"], json!("message"));
+    assert_eq!(item["role"], json!("developer"));
+    assert_eq!(item["content"][0]["type"], json!("input_text"));
+    assert_eq!(item["content"][0]["text"], json!("skill catalog"));
+}

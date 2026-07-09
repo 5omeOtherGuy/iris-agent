@@ -1,6 +1,6 @@
 # Iris — Roadmap
 
-> Status (2026-06-26): Milestone 1, the async-hard runtime completion, and the
+> Status (2026-07-09): Milestone 1, the async-hard runtime completion, and the
 > Milestone 2 foundations are done. Iris has a terminal-surface TUI with
 > Iris-owned transcript replay plus a text fallback, selectable Mimir providers (`openai-codex`,
 > `anthropic`, and `antigravity`), runtime model/reasoning switching, streamed
@@ -10,7 +10,8 @@
 > reasoning/context/cache settings, linear session resume, JSONL session
 > persistence, handle-backed large tool outputs, token estimates, turn-boundary
 > auto-compaction, default-short provider-native prompt-cache controls, and
-> default-off context-management controls.
+> default-off context-management controls, and Codex-compatible native skills
+> with progressive disclosure and explicit/implicit invocation.
 > Nexus runs a tokio async loop with turn-level cancellation: the provider is an
 > async stream raced against cancellation, tools are async with child tokens,
 > concurrency-safe tools run in parallel while everything else stays exclusive,
@@ -130,9 +131,10 @@ Implemented today:
   Wayland `system_prompt::assemble` builds in-binary shipped fragments +
   generated live-tool blocks + dynamic project docs (`AGENTS.md`/`CLAUDE.md`) +
   runtime context in one place; fresh and resumed sessions feed the same
-  assembled string through the provider request path. Skills/templates remain
-  deferred (issue #57); named slots and selector-driven assembly remain open
-  (#76/#73). ADR-0026 made fragments fully internal (superseding the #202
+  assembled string through the provider request path. Native filesystem skills
+  are implemented (issue #57); templates remain deferred, and named slots plus
+  selector-driven assembly remain open (#76/#73). ADR-0026 made fragments fully
+  internal (superseding the #202
   user/repo `.md` loading and its per-project trust gate: no
   `~/.iris/fragments` materialization, no repo `.iris/fragments` loading, no
   fragment-trust prompt); project docs keep loading. ADR-0027 repurposed the

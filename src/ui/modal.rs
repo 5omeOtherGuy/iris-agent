@@ -26,6 +26,7 @@ use crate::wayland::trust::ProjectPolicyEdit;
 const MODEL_ROWS: usize = 5;
 const SCOPED_ROWS: usize = 5;
 const PROVIDER_ROWS: usize = 5;
+const SKILL_ROWS: usize = 7;
 
 /// A key the loop forwards to the active modal. A neutral subset of crossterm
 /// keys so modal handling is unit-testable without constructing terminal events.
@@ -151,6 +152,10 @@ pub(crate) enum ModalAction {
     SaveApiKey(String),
     /// Remove the stored credential for this provider id.
     Logout(String),
+    /// Insert one path-qualified skill mention into the composer. The path
+    /// disambiguates duplicate skill names exactly as Codex's structured
+    /// selector does.
+    InsertSkillMention { name: String, path: String },
     /// Provider-select cancel during `/login` returns to the method selector.
     BackToLoginMethod,
 }
@@ -182,6 +187,7 @@ pub(crate) enum Modal {
     Trust(TrustMenu),
     Session(SessionPicker),
     Tasks(TaskPicker),
+    Skills(SkillPicker),
     LoginMethod(MethodSelect),
     Providers(ProviderSelect),
     LoginDialog(LoginDialog),
@@ -202,6 +208,7 @@ impl Modal {
             Modal::Trust(menu) => menu.handle_key(key),
             Modal::Session(picker) => picker.handle_key(key),
             Modal::Tasks(picker) => picker.handle_key(key),
+            Modal::Skills(picker) => picker.handle_key(key),
             Modal::LoginMethod(menu) => menu.handle_key(key),
             Modal::Providers(picker) => picker.handle_key(key),
             Modal::LoginDialog(dialog) => dialog.handle_key(key),
@@ -240,11 +247,84 @@ impl Modal {
             Modal::Trust(menu) => menu.render(width),
             Modal::Session(picker) => picker.render(width),
             Modal::Tasks(picker) => picker.render(width),
+            Modal::Skills(picker) => picker.render(width),
             Modal::LoginMethod(menu) => menu.render(width),
             Modal::Providers(picker) => picker.render(width),
             Modal::LoginDialog(dialog) => dialog.render(width),
             Modal::ApiKeyDialog(dialog) => dialog.render(width),
         }
+    }
+}
+
+// --- skills picker ---
+
+#[derive(Debug, Clone)]
+pub(crate) struct SkillPicker {
+    selector: Selector,
+}
+
+impl SkillPicker {
+    pub(crate) fn new(skills: &[crate::wayland::skills::SkillMetadata]) -> Self {
+        let items = skills
+            .iter()
+            .map(|skill| {
+                let scope = match skill.scope {
+                    crate::wayland::skills::SkillScope::Repo => "repo",
+                    crate::wayland::skills::SkillScope::User => "user",
+                    crate::wayland::skills::SkillScope::System => "system",
+                    crate::wayland::skills::SkillScope::Admin => "admin",
+                };
+                SelectorItem::new(
+                    skill.path.display().to_string(),
+                    skill.display_name().to_string(),
+                )
+                .detail(skill.display_description().to_string())
+                .trailing(scope)
+            })
+            .collect();
+        Self {
+            selector: Selector::new(items, true, true, SKILL_ROWS),
+        }
+    }
+
+    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match key {
+            ModalKey::Up => {
+                self.selector.up();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Down => {
+                self.selector.down();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Char(character) => {
+                self.selector.push_char(character);
+                ModalOutcome::Redraw
+            }
+            ModalKey::Backspace => {
+                self.selector.backspace();
+                ModalOutcome::Redraw
+            }
+            ModalKey::CtrlC if self.selector.clear_search() => ModalOutcome::Redraw,
+            ModalKey::Enter => match self.selector.selected() {
+                Some(skill) => ModalOutcome::Emit(ModalAction::InsertSkillMention {
+                    name: skill.label.clone(),
+                    path: skill.id.clone(),
+                }),
+                None => ModalOutcome::Ignore,
+            },
+            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        crate::ui::tui::overlay_menu(
+            Some("Select skill"),
+            selector_rows(&self.selector, "No matching skills"),
+            Some("type to filter · ↑↓ move · ↵ mention · esc cancel"),
+            usize::from(width),
+        )
     }
 }
 
@@ -1807,7 +1887,10 @@ impl ApiKeyDialog {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::wayland::skills::{SkillMetadata, SkillScope};
 
     fn cat(provider: ProviderId, id: &str) -> CatalogModel {
         CatalogModel {
@@ -1823,6 +1906,50 @@ mod tests {
             cat(ProviderId::Anthropic, "claude-sonnet-4-6"),
             cat(ProviderId::Antigravity, "gemini-3.5-flash"),
         ]
+    }
+
+    #[test]
+    fn skill_picker_filters_and_emits_path_qualified_selection() {
+        let skills = vec![
+            SkillMetadata {
+                name: "alpha".to_string(),
+                description: "Alpha workflow".to_string(),
+                short_description: None,
+                interface: None,
+                dependencies: None,
+                path: PathBuf::from("/skills/alpha/SKILL.md"),
+                scope: SkillScope::Repo,
+                policy: Default::default(),
+            },
+            SkillMetadata {
+                name: "beta".to_string(),
+                description: "Beta workflow".to_string(),
+                short_description: None,
+                interface: None,
+                dependencies: None,
+                path: PathBuf::from("/skills/beta/SKILL.md"),
+                scope: SkillScope::User,
+                policy: Default::default(),
+            },
+        ];
+        let mut picker = SkillPicker::new(&skills);
+
+        assert_eq!(picker.handle_key(ModalKey::Char('b')), ModalOutcome::Redraw);
+        assert_eq!(
+            picker.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::InsertSkillMention {
+                name: "beta".to_string(),
+                path: "/skills/beta/SKILL.md".to_string(),
+            })
+        );
+        let text = picker
+            .render(80)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("beta"));
+        assert!(!text.contains("alpha"));
     }
 
     fn render_text(picker: &ModelPicker) -> String {

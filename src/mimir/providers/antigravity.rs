@@ -304,6 +304,9 @@ fn build_contents(messages: &[Message]) -> Vec<Value> {
             continue;
         }
         let (role, part) = match message.role {
+            // Gemini has no developer role in `contents`; keep it as a user
+            // context part rather than raising it into system instructions.
+            Role::Developer => ("user", json!({ "text": message.content })),
             Role::User => ("user", json!({ "text": message.content })),
             Role::Assistant => ("model", json!({ "text": message.content })),
             Role::AssistantToolCall => {
@@ -863,5 +866,16 @@ data: {\"error\":{\"message\":\"quota exceeded\"}}
             inner.get("systemInstruction").is_none(),
             "empty system prompt omitted"
         );
+    }
+
+    #[test]
+    fn developer_context_maps_to_a_user_part() {
+        let contents =
+            build_contents(&[Message::developer("skill catalog"), Message::user("task")]);
+
+        assert_eq!(contents.len(), 1, "consecutive user parts coalesce");
+        assert_eq!(contents[0]["role"], json!("user"));
+        assert_eq!(contents[0]["parts"][0]["text"], json!("skill catalog"));
+        assert_eq!(contents[0]["parts"][1]["text"], json!("task"));
     }
 }
