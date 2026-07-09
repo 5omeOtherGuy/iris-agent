@@ -1240,7 +1240,7 @@ fn watch_for_interrupt(token: &CancellationToken, done: &AtomicBool) {
 mod tests {
     use super::*;
     use anyhow::{Result, anyhow};
-    use std::cell::RefCell;
+    use std::{cell::RefCell, env};
 
     use crate::mimir::test_support::ConfigPathGuard;
     use crate::nexus::{Agent, AssistantTurn, Message, ProviderEvent, ProviderStream, Tools};
@@ -1307,6 +1307,31 @@ mod tests {
             context_management: selection::ContextManagement::default(),
             retry_policy: crate::mimir::retry::RetryPolicy::default(),
             open_ai_compatible: selection::OpenAiCompatibleConfig::default(),
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let prev = env::var(key).ok();
+            // SAFETY: callers hold ConfigPathGuard, which serializes test env
+            // mutation through the shared mimir env lock. This guard is declared
+            // after ConfigPathGuard so it restores before that lock is released.
+            unsafe { env::remove_var(key) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(prev) => unsafe { env::set_var(self.key, prev) },
+                None => unsafe { env::remove_var(self.key) },
+            }
         }
     }
 
@@ -1914,6 +1939,54 @@ mod tests {
         assert!(
             saved.contains("defaultReasoning") && saved.contains("high"),
             "the clamped level must be persisted as defaultReasoning: {saved}"
+        );
+    }
+
+    #[test]
+    fn reasoning_command_persisted_anthropic_adaptive_level_survives_restart() {
+        // Root-cause regression for the #514/#512 interaction: Anthropic
+        // adaptive display labels are shifted relative to Iris's stored tokens.
+        // `/reasoning high` installs internal `Medium` and writes `"medium"`;
+        // startup must read that as the stored token `Medium`, not as the
+        // provider-native label `medium` (which would lower it to `Low`).
+        let (mut harness, dir) = fake_harness();
+        let path = dir.path.join("settings.json");
+        let _config = ConfigPathGuard::set(&path);
+        let _model_env = EnvVarGuard::unset("IRIS_MODEL");
+        config::save_default_model("anthropic", "claude-sonnet-5").unwrap();
+        let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
+        let mut switch = Some(ModelSwitch::new(
+            selection(ProviderId::Anthropic, "claude-sonnet-5"),
+            "PROMPT".to_string(),
+            &build,
+            None,
+        ));
+
+        let lines =
+            handle_model_command("/reasoning high", &mut harness, &mut switch).expect("handled");
+        assert!(
+            lines.iter().any(|line| line.contains("reasoning: high")),
+            "interactive confirmation must stay provider-native: {lines:?}"
+        );
+        let saved = std::fs::read_to_string(&path).expect("settings file written");
+        assert!(
+            saved.contains(r#""defaultReasoning": "medium""#),
+            "Iris stores the normalized token for Anthropic adaptive high: {saved}"
+        );
+
+        let reloaded = config::Settings::load(&dir.path).unwrap();
+        let resolved = ModelSelection::resolve(&reloaded).unwrap();
+        assert_eq!(resolved.provider, ProviderId::Anthropic);
+        assert_eq!(resolved.model, "claude-sonnet-5");
+        assert_eq!(resolved.reasoning, Some(ReasoningEffort::Medium));
+        assert_eq!(
+            model_capabilities::display_level(
+                resolved.provider,
+                &resolved.model,
+                resolved.reasoning.unwrap()
+            ),
+            "high",
+            "restart must display the same provider-native effort the user selected"
         );
     }
 
