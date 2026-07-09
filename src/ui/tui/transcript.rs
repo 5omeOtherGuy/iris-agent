@@ -446,6 +446,7 @@ impl Transcript {
         let expanded_text = raw
             .filter(|text| !text.trim().is_empty())
             .unwrap_or(collapsed_text);
+        let has_distinct_expanded_body = !redacted && expanded_text.trim() != collapsed_text.trim();
         let collapsed_groups: Vec<Vec<Line<'static>>> = if redacted {
             vec![vec![Line::from(Span::styled(
                 REDACTED_THINKING_BODY,
@@ -470,22 +471,36 @@ impl Transcript {
             expanded: false,
             label: THINKING_LABEL.to_string(),
             right: elapsed.unwrap_or_default(),
-            foldable: true,
+            foldable: has_distinct_expanded_body,
         }));
         for (index, group) in collapsed_groups.into_iter().enumerate() {
             if index > 0 {
-                block.push(rail_body_row(Line::default()).with_fold(FoldVis::WhenCollapsed));
+                block.push(rail_body_row(Line::default()).with_fold(
+                    if has_distinct_expanded_body {
+                        FoldVis::WhenCollapsed
+                    } else {
+                        FoldVis::Always
+                    },
+                ));
             }
             for line in group {
-                block.push(rail_body_row(line).with_fold(FoldVis::WhenCollapsed));
+                block.push(
+                    rail_body_row(line).with_fold(if has_distinct_expanded_body {
+                        FoldVis::WhenCollapsed
+                    } else {
+                        FoldVis::Always
+                    }),
+                );
             }
         }
-        for (index, group) in expanded_groups.into_iter().enumerate() {
-            if index > 0 {
-                block.push(rail_body_row(Line::default()).with_fold(FoldVis::WhenExpanded));
-            }
-            for line in group {
-                block.push(rail_body_row(line).with_fold(FoldVis::WhenExpanded));
+        if has_distinct_expanded_body {
+            for (index, group) in expanded_groups.into_iter().enumerate() {
+                if index > 0 {
+                    block.push(rail_body_row(Line::default()).with_fold(FoldVis::WhenExpanded));
+                }
+                for line in group {
+                    block.push(rail_body_row(line).with_fold(FoldVis::WhenExpanded));
+                }
             }
         }
         block.push(TranscriptRow::chrome(ChromeRow::RailEnd));
