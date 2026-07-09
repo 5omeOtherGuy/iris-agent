@@ -475,6 +475,15 @@ fn handle_reasoning<P: ChatProvider>(
     let mut candidate = switch.selection.clone();
     candidate.reasoning = Some(clamped);
     lines.extend(apply_selection(candidate, harness, switch));
+    // Persist only after a successful switch: apply_selection leaves
+    // switch.selection untouched on failure and returns no switch-confirmation
+    // line, so mirror the picker's non-blocking persistence path only when the
+    // selection was actually installed.
+    if lines.iter().any(|line| line.starts_with("switched to "))
+        && let Err(error) = config::save_default_reasoning(clamped.as_str())
+    {
+        lines.push(format!("(reasoning not saved: {error:#})"));
+    }
     lines
 }
 
@@ -689,20 +698,79 @@ fn last_assistant_text(messages: &[Message]) -> Option<&str> {
         .map(|message| message.content.as_str())
 }
 
-/// `/copy`: put the last assistant reply on the system clipboard and report
-/// what happened. Shared by the TUI and text front-ends.
-pub(crate) fn copy_command_lines<P: ChatProvider>(harness: &Harness<P>) -> Vec<String> {
-    let Some(text) = last_assistant_text(harness.messages()) else {
+/// Which assistant output `/copy` should place on the clipboard. `Last` (the
+/// default and the pre-existing behavior) is the most recent reply; `All` is
+/// every assistant reply in the session, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopySelection {
+    Last,
+    All,
+}
+
+/// Parse the `/copy` argument. Empty or `last` selects the last reply (the
+/// documented default that preserves the original `/copy` behavior); `all`
+/// selects every assistant reply. Any other token is unrecognized, so the
+/// caller shows usage instead of silently copying the wrong thing.
+pub(crate) fn parse_copy_selection(rest: &str) -> Option<CopySelection> {
+    match rest.trim() {
+        "" | "last" => Some(CopySelection::Last),
+        "all" => Some(CopySelection::All),
+        _ => None,
+    }
+}
+
+/// The text `/copy <selection>` puts on the clipboard, or `None` when there is
+/// no assistant reply yet. `All` joins every non-empty assistant reply with a
+/// blank line so the copied block reads as the running transcript of output.
+pub(crate) fn copy_selection_text(
+    messages: &[Message],
+    selection: CopySelection,
+) -> Option<String> {
+    match selection {
+        CopySelection::Last => last_assistant_text(messages).map(str::to_string),
+        CopySelection::All => {
+            let replies: Vec<&str> = messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant && !m.content.trim().is_empty())
+                .map(|m| m.content.as_str())
+                .collect();
+            (!replies.is_empty()).then(|| replies.join("\n\n"))
+        }
+    }
+}
+
+/// Usage lines for `/copy`, shown for `/copy help` and any unrecognized option.
+fn copy_help_lines() -> Vec<String> {
+    vec![
+        "/copy [last|all] - copy assistant output to the clipboard".to_string(),
+        "  /copy, /copy last - the most recent assistant reply (default)".to_string(),
+        "  /copy all         - every assistant reply in this session".to_string(),
+        "tip: in pager mode, /mouse toggles terminal-native select/copy".to_string(),
+    ]
+}
+
+/// `/copy [last|all]`: put the requested assistant output on the system
+/// clipboard and report what happened. Shared by the TUI and text front-ends.
+/// `rest` is the text typed after `/copy`; empty preserves the original
+/// last-reply behavior.
+pub(crate) fn copy_command_lines<P: ChatProvider>(harness: &Harness<P>, rest: &str) -> Vec<String> {
+    let Some(selection) = parse_copy_selection(rest) else {
+        return copy_help_lines();
+    };
+    let Some(text) = copy_selection_text(harness.messages(), selection) else {
         return vec!["no assistant reply to copy yet.".to_string()];
     };
-    match crate::ui::clipboard::copy(text) {
+    let what = match selection {
+        CopySelection::Last => "last assistant reply",
+        CopySelection::All => "all assistant replies",
+    };
+    match crate::ui::clipboard::copy(&text) {
         Ok(crate::ui::clipboard::CopyMethod::NativeTool) => {
-            vec!["copied last assistant reply to the clipboard.".to_string()]
+            vec![format!("copied {what} to the clipboard.")]
         }
-        Ok(crate::ui::clipboard::CopyMethod::Osc52) => vec![
-            "sent last assistant reply to the clipboard via OSC 52 (requires terminal support)."
-                .to_string(),
-        ],
+        Ok(crate::ui::clipboard::CopyMethod::Osc52) => vec![format!(
+            "sent {what} to the clipboard via OSC 52 (requires terminal support)."
+        )],
         Err(error) => vec![format!("could not copy: {error:#}")],
     }
 }
@@ -1009,8 +1077,12 @@ fn run_session_inner<P: ChatProvider>(
         }
         // Read-only session commands work the same here as in the TUI and never
         // start a turn.
-        if prompt == "/copy" {
-            for line in copy_command_lines(harness) {
+        let (cmd, rest) = match prompt.split_once(char::is_whitespace) {
+            Some((cmd, rest)) => (cmd, rest.trim()),
+            None => (prompt, ""),
+        };
+        if cmd == "/copy" {
+            for line in copy_command_lines(harness, rest) {
                 ui.emit(UiEvent::Notice(line))?;
             }
             continue;
@@ -1170,6 +1242,7 @@ mod tests {
     use anyhow::{Result, anyhow};
     use std::cell::RefCell;
 
+    use crate::mimir::test_support::ConfigPathGuard;
     use crate::nexus::{Agent, AssistantTurn, Message, ProviderEvent, ProviderStream, Tools};
     use crate::ui::text::TextUi;
     use crate::wayland::Harness;
@@ -1351,8 +1424,56 @@ mod tests {
     fn copy_command_reports_missing_assistant_reply() {
         let (harness, _dir) = fake_harness();
         assert_eq!(
-            copy_command_lines(&harness),
+            copy_command_lines(&harness, ""),
             vec!["no assistant reply to copy yet.".to_string()]
+        );
+        // The `all` variant also has nothing to copy in an empty session.
+        assert_eq!(
+            copy_command_lines(&harness, "all"),
+            vec!["no assistant reply to copy yet.".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_copy_selection_maps_documented_variants() {
+        assert_eq!(parse_copy_selection(""), Some(CopySelection::Last));
+        assert_eq!(parse_copy_selection("  "), Some(CopySelection::Last));
+        assert_eq!(parse_copy_selection("last"), Some(CopySelection::Last));
+        assert_eq!(parse_copy_selection("all"), Some(CopySelection::All));
+        // Unrecognized options fall through to usage, not a wrong copy.
+        assert_eq!(parse_copy_selection("help"), None);
+        assert_eq!(parse_copy_selection("everything"), None);
+    }
+
+    #[test]
+    fn copy_selection_text_selects_last_or_all_replies() {
+        let messages = vec![
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant("a2"),
+            // Blank/non-text rows are skipped in both selections.
+            Message::assistant("   "),
+        ];
+        assert_eq!(
+            copy_selection_text(&messages, CopySelection::Last),
+            Some("a2".to_string())
+        );
+        assert_eq!(
+            copy_selection_text(&messages, CopySelection::All),
+            Some("a1\n\na2".to_string())
+        );
+        assert_eq!(copy_selection_text(&[], CopySelection::Last), None);
+        assert_eq!(copy_selection_text(&[], CopySelection::All), None);
+    }
+
+    #[test]
+    fn copy_command_shows_usage_for_unknown_option() {
+        let (harness, _dir) = fake_harness();
+        let lines = copy_command_lines(&harness, "nope");
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("/copy [last|all] - copy assistant output to the clipboard")
         );
     }
 
@@ -1613,7 +1734,8 @@ mod tests {
 
     #[test]
     fn reasoning_only_switch_stays_silent_about_context() {
-        let (mut harness, _dir) = seeded_harness(200_000, None);
+        let (mut harness, dir) = seeded_harness(200_000, None);
+        let _config = ConfigPathGuard::set(&dir.path.join("settings.json"));
         let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
         let mut switch = Some(ModelSwitch::new(
             selection(ProviderId::OpenAiCodex, "gpt-5.5"),
@@ -1670,7 +1792,8 @@ mod tests {
 
     #[test]
     fn reasoning_command_sets_and_clamps_level() {
-        let (mut harness, _dir) = fake_harness();
+        let (mut harness, dir) = fake_harness();
+        let _config = ConfigPathGuard::set(&dir.path.join("settings.json"));
         let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
         // Codex supports xhigh natively.
         let mut switch = Some(ModelSwitch::new(
@@ -1765,6 +1888,82 @@ mod tests {
         );
         // Rejected input leaves the selection untouched.
         assert_eq!(switch.as_ref().unwrap().selection.reasoning, None);
+    }
+
+    #[test]
+    fn reasoning_command_persists_default_after_successful_switch() {
+        // Issue #514: a successful `/reasoning` switch must persist the clamped
+        // level as the global default so it survives a restart.
+        let (mut harness, dir) = fake_harness();
+        let path = dir.path.join("settings.json");
+        let _config = ConfigPathGuard::set(&path);
+        let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
+        let mut switch = Some(ModelSwitch::new(
+            selection(ProviderId::OpenAiCodex, "gpt-5.5"),
+            "PROMPT".to_string(),
+            &build,
+            None,
+        ));
+        let lines =
+            handle_model_command("/reasoning high", &mut harness, &mut switch).expect("handled");
+        assert!(
+            !lines.iter().any(|l| l.contains("not saved")),
+            "a successful switch must not report a persistence error: {lines:?}"
+        );
+        let saved = std::fs::read_to_string(&path).expect("settings file written");
+        assert!(
+            saved.contains("defaultReasoning") && saved.contains("high"),
+            "the clamped level must be persisted as defaultReasoning: {saved}"
+        );
+    }
+
+    #[test]
+    fn reasoning_command_failed_switch_does_not_persist() {
+        // A provider build failure leaves the selection untouched, so nothing
+        // is persisted (mirrors the existing invalid-level behavior).
+        let (mut harness, dir) = fake_harness();
+        let path = dir.path.join("settings.json");
+        let _config = ConfigPathGuard::set(&path);
+        let build = |_s: &ModelSelection, _p: &str| Err(anyhow!("boom"));
+        let mut switch = Some(ModelSwitch::new(
+            selection(ProviderId::OpenAiCodex, "gpt-5.5"),
+            "PROMPT".to_string(),
+            &build,
+            None,
+        ));
+        let lines =
+            handle_model_command("/reasoning high", &mut harness, &mut switch).expect("handled");
+        assert!(
+            lines.iter().any(|l| l.contains("could not switch")),
+            "{lines:?}"
+        );
+        assert!(
+            !path.exists(),
+            "a failed switch must not persist a default reasoning level"
+        );
+    }
+
+    #[test]
+    fn reasoning_command_failed_switch_does_not_persist_when_level_already_active() {
+        // Regression for the success check: if the requested level already is
+        // active, a failed provider rebuild still must not write settings.
+        let (mut harness, dir) = fake_harness();
+        let path = dir.path.join("settings.json");
+        let _config = ConfigPathGuard::set(&path);
+        let build = |_s: &ModelSelection, _p: &str| Err(anyhow!("boom"));
+        let mut active = selection(ProviderId::OpenAiCodex, "gpt-5.5");
+        active.reasoning = Some(ReasoningEffort::High);
+        let mut switch = Some(ModelSwitch::new(active, "PROMPT".to_string(), &build, None));
+        let lines =
+            handle_model_command("/reasoning high", &mut harness, &mut switch).expect("handled");
+        assert!(
+            lines.iter().any(|l| l.contains("could not switch")),
+            "{lines:?}"
+        );
+        assert!(
+            !path.exists(),
+            "a failed same-level switch must not persist a default reasoning level"
+        );
     }
 
     #[test]

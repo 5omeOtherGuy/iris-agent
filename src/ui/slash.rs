@@ -88,7 +88,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/copy",
-        description: "Copy the last assistant reply to the clipboard",
+        description: "Copy assistant output to the clipboard [last|all]",
         action: SlashAction::Submit,
     },
     SlashCommand {

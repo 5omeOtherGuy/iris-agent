@@ -820,6 +820,7 @@ fn reduced_motion_value(env_on: bool, setting: Option<bool>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mimir::test_support::ConfigPathGuard;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -881,6 +882,32 @@ mod tests {
         let path = env::temp_dir().join(format!("iris-config-test-{nanos}-{seq}"));
         fs::create_dir(&path).unwrap();
         TempDir { path }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let prev = env::var(key).ok();
+            // SAFETY: tests that mutate process env hold the shared mimir env
+            // lock through ConfigPathGuard / env_lock. This guard is declared
+            // after that lock holder in the test, so it restores before the
+            // lock is released.
+            unsafe { env::remove_var(key) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(prev) => unsafe { env::set_var(self.key, prev) },
+                None => unsafe { env::remove_var(self.key) },
+            }
+        }
     }
 
     #[test]
@@ -1408,38 +1435,6 @@ mod tests {
         assert_eq!(tui.theme.as_deref(), Some("gruvbox"));
     }
 
-    /// Point `IRIS_CONFIG_PATH` at a temp file for a save round-trip, restoring
-    /// any previous value afterward. The save helpers write the user-global file,
-    /// which this override selects.
-    /// Serializes the save-round-trip tests: `IRIS_CONFIG_PATH` is process-
-    /// global, so tests that point it at a temp file must not run concurrently.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct ConfigPathGuard {
-        prev: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl ConfigPathGuard {
-        fn set(path: &Path) -> Self {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = env::var("IRIS_CONFIG_PATH").ok();
-            // SAFETY: the ENV_LOCK guard serializes all IRIS_CONFIG_PATH writers;
-            // restored on drop.
-            unsafe { env::set_var("IRIS_CONFIG_PATH", path) };
-            ConfigPathGuard { prev, _lock }
-        }
-    }
-
-    impl Drop for ConfigPathGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(prev) => unsafe { env::set_var("IRIS_CONFIG_PATH", prev) },
-                None => unsafe { env::remove_var("IRIS_CONFIG_PATH") },
-            }
-        }
-    }
-
     #[test]
     fn save_microcompaction_rejects_enabling_beside_clear_tool_uses() {
         // Mutual exclusion at the /settings save boundary (issue #400,
@@ -1561,6 +1556,36 @@ mod tests {
             verify.get("maxAttempts"),
             Some(&Value::from(2)),
             "sibling kept"
+        );
+    }
+
+    #[test]
+    fn saved_default_model_and_reasoning_are_reapplied_on_restart() {
+        // Issue #490: the whole point of persisting defaults is that a fresh
+        // startup reuses them without reconfiguration. Prove the full loop --
+        // save to disk (as `/model` + `/reasoning` do), reload the file, and
+        // resolve the startup selection -- rather than only asserting the file
+        // contents (which the CLI-level tests already cover).
+        use crate::mimir::selection::ModelSelection;
+
+        let dir = temp_dir();
+        let path = dir.path.join("settings.json");
+        let _guard = ConfigPathGuard::set(&path);
+        let _model_env = EnvVarGuard::unset("IRIS_MODEL");
+
+        save_default_model("openai-codex", "issue-490-custom-model").unwrap();
+        save_default_reasoning("high").unwrap();
+
+        // Reload from disk exactly like startup (no project file present).
+        let reloaded = Settings::load_from(Some(&path), &dir.path.join("no-project.json")).unwrap();
+        let resolved = ModelSelection::resolve(&reloaded).unwrap();
+
+        assert_eq!(resolved.provider.as_str(), "openai-codex");
+        assert_eq!(resolved.model, "issue-490-custom-model");
+        assert_eq!(
+            resolved.reasoning.map(|level| level.as_str().to_string()),
+            Some("high".to_string()),
+            "persisted defaultReasoning must be reapplied at startup"
         );
     }
 
