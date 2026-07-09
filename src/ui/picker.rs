@@ -486,6 +486,17 @@ fn effort_picker<P>(switch: &ModelSwitch<'_, P>) -> Modal {
     Modal::Effort(EffortPicker::new(levels, current))
 }
 
+fn toggle_skip_permissions_mode(
+    skip_permissions: bool,
+    approval_mode: ApprovalMode,
+) -> PermissionMode {
+    if skip_permissions {
+        PermissionMode::Approval(approval_mode)
+    } else {
+        PermissionMode::DangerousSkipPermissions
+    }
+}
+
 /// Apply a model/scoped/effort/settings [`ModalAction`]. Login actions are
 /// handled by the loop via [`crate::ui::login`], not here.
 pub(crate) fn apply_action<P: ChatProvider>(
@@ -531,11 +542,8 @@ pub(crate) fn apply_action<P: ChatProvider>(
             ActionResult::Keep(lines)
         }
         ModalAction::ToggleSkipPermissions => {
-            let mode = if harness.skip_permissions() {
-                PermissionMode::Approval(ApprovalMode::Strict)
-            } else {
-                PermissionMode::DangerousSkipPermissions
-            };
+            let mode =
+                toggle_skip_permissions_mode(harness.skip_permissions(), harness.approval_mode());
             let lines = cli::apply_permission_mode(harness, mode);
             let snap = settings_snapshot(harness, switch);
             ActionResult::Replace(
@@ -964,6 +972,22 @@ mod tests {
         // forward picks the first, backward the last - never skipping index 0.
         assert_eq!(next_cycle_index(2, None, true), 0);
         assert_eq!(next_cycle_index(2, None, false), 1);
+    }
+
+    #[test]
+    fn skip_permissions_toggle_restores_parked_approval_mode() {
+        assert_eq!(
+            toggle_skip_permissions_mode(false, ApprovalMode::Auto),
+            PermissionMode::DangerousSkipPermissions
+        );
+        assert_eq!(
+            toggle_skip_permissions_mode(true, ApprovalMode::Auto),
+            PermissionMode::Approval(ApprovalMode::Auto)
+        );
+        assert_eq!(
+            toggle_skip_permissions_mode(true, ApprovalMode::NeverAsk),
+            PermissionMode::Approval(ApprovalMode::NeverAsk)
+        );
     }
 
     #[test]
