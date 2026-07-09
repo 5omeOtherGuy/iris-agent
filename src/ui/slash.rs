@@ -118,7 +118,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/approval",
-        description: "Set the approval preset [strict|auto|never]",
+        description: "Set approval [strict|auto|never|dangerously-skip-permissions]",
         action: SlashAction::Submit,
     },
     SlashCommand {

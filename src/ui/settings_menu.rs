@@ -162,7 +162,7 @@ impl Field {
                 options: &["auto", "always", "never"],
             },
             Field::DefaultApproval => FieldKind::Enum {
-                options: &["strict", "auto", "never"],
+                options: &["strict", "auto", "never", "dangerously-skip-permissions"],
             },
             Field::PromptCacheRetention => FieldKind::Enum {
                 options: &["none", "short", "long"],

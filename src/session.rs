@@ -881,9 +881,11 @@ pub(crate) struct StoredSession {
     /// so reopening a session reports the same total every time. The foundation
     /// the next slice (auto-compaction budgeting) reads instead of recomputing.
     pub(crate) context_tokens: u64,
-    /// Last persisted dangerous skip-permissions state for this session. This is
+    /// Last persisted dangerous skip-permissions state for this session. `None`
+    /// means the transcript has no marker and should inherit the global default;
+    /// `Some(false)` is an explicit clear after a prior dangerous marker. This is
     /// chrome/runtime state, not provider-visible context.
-    pub(crate) dangerous_skip_permissions: bool,
+    pub(crate) dangerous_skip_permissions: Option<bool>,
 }
 
 /// Serialize one message into its session entry value, with a stable id and a
@@ -1199,10 +1201,11 @@ fn read_messages(path: &Path) -> Result<RebuiltContext> {
 
 /// Read the last persisted dangerous skip-permissions state from the transcript.
 /// Legacy markers without `enabled` mean enabled=true; malformed lines are skipped
-/// like the rest of the session reader.
-fn read_dangerous_skip_permissions(path: &Path) -> Result<bool> {
+/// like the rest of the session reader. `None` means this transcript never chose
+/// the dangerous mode, so callers may fall back to the global default.
+fn read_dangerous_skip_permissions(path: &Path) -> Result<Option<bool>> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut enabled = false;
+    let mut enabled = None;
     for line in bytes
         .split(|&b| b == b'\n')
         .map(|line| std::str::from_utf8(line).map(str::trim))
@@ -1218,10 +1221,12 @@ fn read_dangerous_skip_permissions(path: &Path) -> Result<bool> {
         if value.get("type").and_then(Value::as_str) == Some("dangerousMode")
             && value.get("mode").and_then(Value::as_str) == Some("dangerously-skip-permissions")
         {
-            enabled = value
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
+            enabled = Some(
+                value
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+            );
         }
     }
     Ok(enabled)
@@ -1921,7 +1926,19 @@ mod tests {
             id
         };
         let stored = open_by_id(&store, &id);
-        assert!(!stored.dangerous_skip_permissions);
+        assert_eq!(stored.dangerous_skip_permissions, Some(false));
+    }
+
+    #[test]
+    fn dangerous_mode_state_absent_inherits_global_default() {
+        let dir = temp_dir();
+        let store = SessionStore::with_root(dir.path.clone());
+        let id = {
+            let log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+            log.id().to_string()
+        };
+        let stored = open_by_id(&store, &id);
+        assert_eq!(stored.dangerous_skip_permissions, None);
     }
 
     #[test]

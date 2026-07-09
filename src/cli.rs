@@ -12,7 +12,9 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 use crate::mimir::model_capabilities;
 use crate::mimir::selection::{self, ModelSelection, ProviderId, ReasoningEffort};
-use crate::nexus::{AgentObserver, ApprovalGate, ChatProvider, Message, Role};
+use crate::nexus::{
+    AgentObserver, ApprovalGate, ApprovalMode, ChatProvider, Message, PermissionMode, Role,
+};
 use crate::session::{self, SessionLog, SessionStore};
 use crate::ui::tui::TuiUi;
 use crate::ui::{Ui, UiBridge, UiEvent, slash};
@@ -183,7 +185,10 @@ pub(crate) struct LoadedSource {
     /// compactable (#375).
     pub(crate) entry_ids: Vec<Option<String>>,
     pub(crate) resumed: usize,
-    /// Persisted dangerous skip-permissions state for the target session.
+    /// Normal approval preset to install for this target session. Dangerous skip
+    /// is carried separately so it remains an exclusive mode.
+    pub(crate) approval_mode: ApprovalMode,
+    /// Persisted/default dangerous skip-permissions state for the target session.
     pub(crate) skip_permissions: bool,
 }
 
@@ -192,6 +197,52 @@ pub(crate) struct LoadedSource {
 /// provider builder reads, so it can generate/select the id, open or create the
 /// log, and load messages; the loop only asks for the swap.
 pub(crate) type SessionLoader<'a> = dyn Fn(&SessionSource) -> Result<LoadedSource> + 'a;
+
+pub(crate) const APPROVAL_USAGE: &str = "strict|auto|never|dangerously-skip-permissions";
+
+/// The operator-visible permission mode: dangerous skip is exclusive and hides
+/// the normal approval preset while active.
+pub(crate) fn current_permission_token<P: ChatProvider>(harness: &Harness<P>) -> &'static str {
+    if harness.skip_permissions() {
+        crate::nexus::DANGEROUS_SKIP_PERMISSIONS_TOKEN
+    } else {
+        harness.approval_mode().as_token()
+    }
+}
+
+/// Apply a permission mode to the live harness without writing settings. Normal
+/// modes always clear dangerous skip; dangerous mode enables it and leaves the
+/// normal preset parked until a normal mode is selected.
+pub(crate) fn set_permission_mode<P: ChatProvider>(harness: &mut Harness<P>, mode: PermissionMode) {
+    match mode {
+        PermissionMode::Approval(mode) => {
+            harness.set_approval_mode(mode);
+            if harness.skip_permissions() {
+                harness.set_skip_permissions(false);
+            }
+        }
+        PermissionMode::DangerousSkipPermissions => {
+            if !harness.skip_permissions() {
+                harness.set_skip_permissions(true);
+            }
+        }
+    }
+}
+
+/// Apply a permission mode and persist it as the global default. Persistence
+/// errors are surfaced as notice lines but never block the live mode switch.
+pub(crate) fn apply_permission_mode<P: ChatProvider>(
+    harness: &mut Harness<P>,
+    mode: PermissionMode,
+) -> Vec<String> {
+    set_permission_mode(harness, mode);
+    let token = current_permission_token(harness);
+    let mut lines = vec![format!("approval mode set to {token}")];
+    if let Err(error) = config::save_default_approval(token) {
+        lines.push(format!("(default not saved: {error:#})"));
+    }
+    lines
+}
 
 /// Startup-only TUI state: an optional modal to show before the first input
 /// event, whether the home/start page should render, and the session id when
@@ -1140,26 +1191,28 @@ fn run_session_inner<P: ChatProvider>(
             }
             continue;
         }
-        // Approval preset (ADR-0032). A real session control, meaningful in the
-        // non-TTY path too (e.g. `never` for a read-only/non-interactive
-        // posture), handled at this safe boundary and never sent to the model.
+        // Permission mode (ADR-0032 + ADR-0049). A real session control,
+        // meaningful in the non-TTY path too (e.g. `never` for read-only runs or
+        // dangerous skip in a sandbox), handled at this safe boundary and never
+        // sent to the model.
         if prompt == "/approval" || prompt.starts_with("/approval ") {
             let rest = prompt["/approval".len()..].trim();
-            let line = if rest.is_empty() {
-                format!(
-                    "approval mode: {} (use /approval strict|auto|never)",
-                    harness.approval_mode().as_token()
-                )
+            let lines = if rest.is_empty() {
+                vec![format!(
+                    "approval mode: {} (use /approval {APPROVAL_USAGE})",
+                    current_permission_token(harness)
+                )]
             } else {
-                match crate::nexus::ApprovalMode::parse(rest) {
-                    Some(mode) => {
-                        harness.set_approval_mode(mode);
-                        format!("approval mode set to {}", mode.as_token())
-                    }
-                    None => format!("unknown approval mode `{rest}` (use strict|auto|never)"),
+                match PermissionMode::parse(rest) {
+                    Some(mode) => apply_permission_mode(harness, mode),
+                    None => vec![format!(
+                        "unknown approval mode `{rest}` (use {APPROVAL_USAGE})"
+                    )],
                 }
             };
-            ui.emit(UiEvent::Notice(line))?;
+            for line in lines {
+                ui.emit(UiEvent::Notice(line))?;
+            }
             continue;
         }
         if prompt == "/tasks" || prompt.starts_with("/tasks ") {

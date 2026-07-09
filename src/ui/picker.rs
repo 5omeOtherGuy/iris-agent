@@ -13,7 +13,7 @@ use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_capabilities;
 use crate::mimir::model_catalog::{self, CatalogModel, ExactMatch};
 use crate::mimir::selection::{ProviderId, ReasoningEffort};
-use crate::nexus::ChatProvider;
+use crate::nexus::{ApprovalMode, ChatProvider, PermissionMode};
 use crate::session::{self, ResumableSession, SessionStore};
 use crate::ui::modal::{
     EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SessionPicker, SessionRow,
@@ -395,10 +395,7 @@ fn settings_snapshot<P: ChatProvider>(
             .unwrap_or_else(|| "auto".to_string()),
         scroll_speed: tui.and_then(|t| t.scroll_speed).unwrap_or(3),
         reduced_motion: tui.and_then(|t| t.reduced_motion).unwrap_or(false),
-        default_approval: settings
-            .default_approval
-            .clone()
-            .unwrap_or_else(|| "strict".to_string()),
+        default_approval: cli::current_permission_token(harness).to_string(),
         skip_permissions: harness.skip_permissions(),
         context_token_budget: settings.context_token_budget(),
         compaction_summarizer: settings
@@ -489,6 +486,17 @@ fn effort_picker<P>(switch: &ModelSwitch<'_, P>) -> Modal {
     Modal::Effort(EffortPicker::new(levels, current))
 }
 
+fn toggle_skip_permissions_mode(
+    skip_permissions: bool,
+    approval_mode: ApprovalMode,
+) -> PermissionMode {
+    if skip_permissions {
+        PermissionMode::Approval(approval_mode)
+    } else {
+        PermissionMode::DangerousSkipPermissions
+    }
+}
+
 /// Apply a model/scoped/effort/settings [`ModalAction`]. Login actions are
 /// handled by the loop via [`crate::ui::login`], not here.
 pub(crate) fn apply_action<P: ChatProvider>(
@@ -534,19 +542,16 @@ pub(crate) fn apply_action<P: ChatProvider>(
             ActionResult::Keep(lines)
         }
         ModalAction::ToggleSkipPermissions => {
-            let enabled = !harness.skip_permissions();
-            harness.set_skip_permissions(enabled);
+            let mode =
+                toggle_skip_permissions_mode(harness.skip_permissions(), harness.approval_mode());
+            let lines = cli::apply_permission_mode(harness, mode);
             let snap = settings_snapshot(harness, switch);
             ActionResult::Replace(
                 Box::new(Modal::SettingsSub(settings_menu::SubMenu::new(
                     settings_menu::Category::Approvals,
                     &snap,
                 ))),
-                vec![if enabled {
-                    "Dangerously skip permissions enabled for this session".to_string()
-                } else {
-                    "Dangerously skip permissions disabled for this session".to_string()
-                }],
+                lines,
             )
         }
         ModalAction::EditPolicy(edit) => {
@@ -601,7 +606,11 @@ pub(crate) fn apply_action<P: ChatProvider>(
                     // harness so the toggle takes effect at the next turn
                     // boundary in this session (DoD, ADR-0048/#378), the same
                     // way `EditPolicy` refreshes live Nexus state on save.
-                    if field == settings_menu::Field::Microcompaction {
+                    if field == settings_menu::Field::DefaultApproval {
+                        if let Some(mode) = value.as_deref().and_then(PermissionMode::parse) {
+                            cli::set_permission_mode(harness, mode);
+                        }
+                    } else if field == settings_menu::Field::Microcompaction {
                         harness.set_microcompaction(value.as_deref() == Some("true"));
                     } else if field == settings_menu::Field::MicrocompactionWatermark
                         && let Some(value) = value.as_deref()
@@ -963,6 +972,22 @@ mod tests {
         // forward picks the first, backward the last - never skipping index 0.
         assert_eq!(next_cycle_index(2, None, true), 0);
         assert_eq!(next_cycle_index(2, None, false), 1);
+    }
+
+    #[test]
+    fn skip_permissions_toggle_restores_parked_approval_mode() {
+        assert_eq!(
+            toggle_skip_permissions_mode(false, ApprovalMode::Auto),
+            PermissionMode::DangerousSkipPermissions
+        );
+        assert_eq!(
+            toggle_skip_permissions_mode(true, ApprovalMode::Auto),
+            PermissionMode::Approval(ApprovalMode::Auto)
+        );
+        assert_eq!(
+            toggle_skip_permissions_mode(true, ApprovalMode::NeverAsk),
+            PermissionMode::Approval(ApprovalMode::NeverAsk)
+        );
     }
 
     #[test]
