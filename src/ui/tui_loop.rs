@@ -556,7 +556,7 @@ async fn session_loop<P: ChatProvider>(
                             &mut git_generation,
                         )
                         .await?;
-                        tui.screen.end_turn();
+                        tui.screen.end_background_work();
                         open_deferred_settings(harness, tui, switch, steering.as_ref());
                         tui.draw()?;
                     }
@@ -2273,7 +2273,7 @@ async fn dispatch_action<P: ChatProvider>(
                 git_generation,
             )
             .await?;
-            tui.screen.end_turn();
+            tui.screen.end_background_work();
             if !compact_ok {
                 open_deferred_settings(harness, tui, switch, steering);
                 return Ok(None);

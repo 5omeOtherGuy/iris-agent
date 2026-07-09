@@ -6729,6 +6729,40 @@ mod tests {
     }
 
     #[test]
+    fn session_receipt_counts_user_turns_not_background_compactions() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        screen.apply(UiEvent::Notice("compacted context".to_string()));
+        screen.end_background_work();
+        assert_eq!(
+            screen.session_receipt(),
+            None,
+            "compaction-only work must not print a user-turn receipt"
+        );
+
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 1_000,
+                output_tokens: 20,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 1_020,
+                cache_creation: None,
+            }),
+        });
+        screen.end_turn();
+
+        let receipt = screen.session_receipt().expect("receipt after user turn");
+        assert!(receipt.contains(" ┊ 1 turn ┊ "), "{receipt}");
+    }
+
+    #[test]
     fn session_receipt_survives_a_session_swap() {
         let mut screen = Screen::new();
         screen.start_turn();

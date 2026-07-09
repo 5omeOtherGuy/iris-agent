@@ -1657,8 +1657,18 @@ impl Screen {
     }
 
     pub(crate) fn end_turn(&mut self) {
+        self.end_work_phase(true);
+    }
+
+    pub(crate) fn end_background_work(&mut self) {
+        self.end_work_phase(false);
+    }
+
+    fn end_work_phase(&mut self, count_turn: bool) {
         self.queued = 0;
-        self.session_meter.turns = self.session_meter.turns.saturating_add(1);
+        if count_turn {
+            self.session_meter.turns = self.session_meter.turns.saturating_add(1);
+        }
         self.turn_divider.elapsed = self.spinner.elapsed();
         self.transcript.push_turn_divider(
             self.turn_divider.had_work,
