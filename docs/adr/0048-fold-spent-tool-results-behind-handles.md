@@ -65,6 +65,15 @@ workspace-recoverable).** Retired-failure-output folding and bash-output-handle 
 policies (`src/wayland/fold.rs`), so each deferred class plugs in later as an additional
 policy arm and stub variant without reworking the pass. The stub format stays extensible for
 the bash `ToolOutputStore` handle it will carry.
+
+**Structured extension (2026-07-09).** The legacy `microcompaction=true` alias
+still resolves to this exact V1 policy and cache-aware 64,000-token watermark.
+The opt-in `toolResultCompaction` block generalizes the same durable fold engine:
+semantic dedupe can retain the latest N successful reads per path, and local
+age/count clearing can fold older eligible recoverable results. Shared recency
+guards win; overlapping reasons produce one fold/stub; every stub names the
+durable entry id and `tool_call_id` recovery call. Anthropic-native clearing is
+a Mimir backend, not a Wayland policy.
 - **Opt-in, default off, surfaced in `/settings`.** A `microcompaction` config field
   (camelCase key `microcompaction`), project-tunable as a cost/quality knob like
   `compactionSummarizer` — it cannot redirect requests, and everything folded stays

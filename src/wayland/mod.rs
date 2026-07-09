@@ -28,7 +28,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use crate::config::VerificationConfig;
+use crate::config::{CompactionCacheTiming, ToolResultCompactionPolicy, VerificationConfig};
 use crate::handles::HandleStore;
 use crate::nexus::ToolOutputStore;
 use crate::nexus::{
@@ -38,7 +38,8 @@ use crate::nexus::{
 };
 use crate::session::{
     CompactionTaskState, SessionLog, estimate_tokens, message_token_estimate, preview_line,
-    read_span, render_carry_block, render_compaction_body_with_task_state, render_task_state_block,
+    read_span, read_tool_call, render_carry_block, render_compaction_body_with_task_state,
+    render_task_state_block,
 };
 use crate::tools::ToolState;
 use crate::tools::recall;
@@ -57,6 +58,13 @@ impl SessionSpanReader for SessionSpanSource {
     fn recall_span(&self, from: u64, to: u64) -> Result<Vec<(Option<String>, Message)>> {
         match &self.transcript {
             Some(path) => read_span(path, from, to),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn recall_tool_call(&self, tool_call_id: &str) -> Result<Vec<(Option<String>, Message)>> {
+        match &self.transcript {
+            Some(path) => read_tool_call(path, tool_call_id),
             None => Ok(Vec::new()),
         }
     }
@@ -105,17 +113,6 @@ const MANUAL_COMPACT_KEEP_TOKENS: u64 = 1_000;
 /// read-only probes is enough for the worker to consult the workspace when it
 /// chooses; the parent still validates and persists the returned text.
 const SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS: usize = 4;
-
-/// Default independent microcompaction watermark. Mirrors config's default so
-/// bare/test harnesses keep the old default behavior without depending on the
-/// auto-compaction budget.
-const DEFAULT_MICROCOMPACTION_WATERMARK: u64 = 64_000;
-
-/// Recent-tail token target the fold pass protects: the most-recent turns within
-/// this many tokens NEVER fold, so the model's immediate working set stays
-/// verbatim (ADR-0048). Kept small (one recent exchange) so folding still
-/// reaches most of the accumulated older mass.
-const MICRO_FOLD_KEEP_TOKENS: u64 = 2_000;
 
 /// Provider-neutral prompt-cache economics the fold scheduler consumes
 /// (issue #400, design §4.3). The harness never sees provider names: Tier 3
@@ -280,15 +277,11 @@ pub(crate) struct Harness<P> {
     summarizer_factory: Option<SummarizerFactory>,
     background_compaction: Option<BackgroundCompaction>,
     next_compaction_job_seq: u64,
-    // Opt-in microcompaction (ADR-0048, #378): when true, spent tool results are
-    // folded to deterministic stubs at an independent watermark. Default false
-    // (a bare/test harness never folds); the Tier-3 app installs the configured
-    // value. Gates fold WRITING only -- rebuild always honors persisted fold
-    // entries regardless of this flag.
-    microcompaction: bool,
-    // Provider-visible context size at which microcompaction's watermark trigger
-    // flushes pending folds. Independent from the auto-compaction budget.
-    microcompaction_watermark: u64,
+    // Resolved local tool-result compaction policy. Default-off for bare/test
+    // harnesses; Tier 3 installs the provider-resolved policy at startup and on
+    // runtime provider switches. Gates fold WRITING only -- rebuild always
+    // honors persisted fold entries.
+    tool_result_compaction: ToolResultCompactionPolicy,
     // Prompt-cache economics of the active provider lane (issue #400),
     // installed by Tier 3 from the resolved selection. Default = safe unknown.
     cache_profile: CacheProfile,
@@ -405,8 +398,9 @@ impl<P: ChatProvider> Harness<P> {
             summarizer_factory: None,
             background_compaction: None,
             next_compaction_job_seq: 0,
-            microcompaction: false,
-            microcompaction_watermark: DEFAULT_MICROCOMPACTION_WATERMARK,
+            tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .expect("built-in tool-result compaction defaults are valid"),
             cache_profile: CacheProfile::default(),
             pending_break: None,
             last_selection: None,
@@ -444,12 +438,20 @@ impl<P: ChatProvider> Harness<P> {
     /// the harness default is off. Takes effect at the next turn boundary (the
     /// fold pass runs in [`submit_turn`](Self::submit_turn) before the request),
     /// so a `/settings` toggle applies to the following turn, not the current one.
+    #[cfg(test)]
     pub(crate) fn set_microcompaction(&mut self, enabled: bool) {
-        self.microcompaction = enabled;
+        self.tool_result_compaction.enabled = enabled;
     }
 
+    #[cfg(test)]
     pub(crate) fn set_microcompaction_watermark(&mut self, watermark: u64) {
-        self.microcompaction_watermark = watermark;
+        self.tool_result_compaction.trigger_tokens = watermark;
+    }
+
+    /// Install the fully resolved provider-neutral local policy. Mimir has
+    /// already removed any B work delegated to a provider-native backend.
+    pub(crate) fn set_tool_result_compaction(&mut self, policy: ToolResultCompactionPolicy) {
+        self.tool_result_compaction = policy;
     }
 
     pub(crate) fn task_workflow_enabled(&self) -> bool {
@@ -1225,19 +1227,24 @@ impl<P: ChatProvider> Harness<P> {
     /// is attached (a fold has nowhere to be recorded), so detection is gated
     /// exactly like flushing.
     fn pending_folds(&self) -> Vec<fold::FoldPlan> {
-        if !self.microcompaction || self.session.is_none() {
+        if !self.tool_result_compaction.enabled || self.session.is_none() {
             return Vec::new();
         }
         let messages = self.agent.messages();
         // Protect the recent tail: the fold engine never folds at or after this
         // index (the model's immediate working set stays verbatim).
-        let tail_start = fold_tail_start(messages, MICRO_FOLD_KEEP_TOKENS);
+        let tail_start = fold_tail_start(
+            messages,
+            self.tool_result_compaction
+                .semantic_dedupe
+                .protect_recent_tokens,
+        );
         fold::plan_folds(
             messages,
             &self.entry_ids,
             tail_start,
             &self.workspace,
-            fold::V1_POLICIES,
+            &self.tool_result_compaction,
         )
     }
 
@@ -1286,6 +1293,10 @@ impl<P: ChatProvider> Harness<P> {
         {
             return Some(FoldTrigger::CompactionBoundary);
         }
+        if self.tool_result_compaction.cache_timing == CompactionCacheTiming::PressureOnly {
+            return (total >= self.tool_result_compaction.trigger_tokens)
+                .then_some(FoldTrigger::Watermark);
+        }
         if pending_break.is_some() {
             return pending_break;
         }
@@ -1308,6 +1319,12 @@ impl<P: ChatProvider> Harness<P> {
         if total < self.cache_profile.min_cacheable_tokens {
             return Some(FoldTrigger::BelowMinCacheable);
         }
+        if self.tool_result_compaction.cache_timing == CompactionCacheTiming::Immediate {
+            return Some(FoldTrigger::Immediate);
+        }
+        if self.tool_result_compaction.cache_timing == CompactionCacheTiming::BreakOnly {
+            return None;
+        }
         // B (Phase 2): mid-session idle gap past the profile's cold threshold
         // -- the transcript's last activity (live appends, falling back to the
         // resume scan) is old enough that the prefix cache has expired, so the
@@ -1327,7 +1344,7 @@ impl<P: ChatProvider> Harness<P> {
                 return Some(FoldTrigger::InferredCold);
             }
         }
-        if total >= self.microcompaction_watermark {
+        if total >= self.tool_result_compaction.trigger_tokens {
             return Some(FoldTrigger::Watermark);
         }
         None
@@ -1386,13 +1403,25 @@ impl<P: ChatProvider> Harness<P> {
         let mut folded = self.agent.messages().to_vec();
         let mut applied = 0usize;
         let mut reclaimed = 0u64;
+        let mut semantic_dedupe_folds = 0usize;
+        let mut tool_clearing_folds = 0usize;
         for plan in plans {
             let stub_tokens = estimate_tokens(&plan.stub);
-            log.append_fold(
+            let mut reasons = Vec::new();
+            if plan.has_reason(fold::FoldReason::SemanticDedupe) {
+                semantic_dedupe_folds += 1;
+                reasons.push("semanticDedupe");
+            }
+            if plan.has_reason(fold::FoldReason::ToolClearing) {
+                tool_clearing_folds += 1;
+                reasons.push("toolClearing");
+            }
+            log.append_fold_with_reasons(
                 &plan.entry_id,
                 &plan.stub,
                 Some(stub_tokens),
                 trigger.code(),
+                &reasons,
             )?;
             reclaimed = reclaimed.saturating_add(
                 estimate_tokens(&folded[plan.index].content).saturating_sub(stub_tokens),
@@ -1409,6 +1438,8 @@ impl<P: ChatProvider> Harness<P> {
         self.agent.replace_messages(folded);
         obs.on_event(AgentEvent::FoldApplied {
             folds: applied,
+            semantic_dedupe_folds,
+            tool_clearing_folds,
             reclaimed_tokens_estimate: reclaimed,
             trigger,
         })?;
@@ -1520,7 +1551,9 @@ impl<P: ChatProvider> Harness<P> {
         // fold-then-compact order of the automatic boundary, so the covered
         // range compacts stubs instead of spent bodies.
         let pending = self.pending_folds();
-        if !pending.is_empty() {
+        if !pending.is_empty()
+            && self.tool_result_compaction.cache_timing != CompactionCacheTiming::PressureOnly
+        {
             self.flush_folds(&pending, FoldTrigger::ManualCompact, obs)?;
         }
         let messages = self.agent.messages().to_vec();

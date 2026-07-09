@@ -109,7 +109,7 @@ global/user-only.
 - Provider usage metadata may be incomplete or absent; UI and benchmarks must
   treat missing usage as unknown, not zero savings.
 
-## Addendum (2026-07-05, issue #400)
+## Addendum (2026-07-05, issue #400; superseded 2026-07-09)
 
 `anthropicContextManagement.clearToolUses` and local microcompaction
 (ADR-0048) are mutually exclusive: the server drops tool results Iris still
@@ -120,3 +120,20 @@ fighting over the same mass). Enforced at selection load
 compatible: folds never touch thinking blocks, and recall reads Iris's own
 log. This discharges epic #379's unfiled "anthropicContextManagement
 interplay" gap.
+
+## Addendum (2026-07-09, configurable tool-result compaction)
+
+The blanket exclusion is narrowed to candidate-set overlap. Local reducers and
+Anthropic `clear_tool_uses` may run together only when native `exclude_tools`
+excludes every local candidate. Semantic dedupe contributes `read` and `ls`;
+local clearing contributes its mode/eligibility set. Selection load and nested
+live-settings application reject overlap with both setting names and the
+conflicting tools.
+`clearThinking` remains compatible.
+
+`toolResultCompaction.toolClearing.backend` is global-only for
+`anthropicNative` and `auto`. Explicit native clearing fails on other providers;
+`auto` falls back to local. Native clearing requires explicit
+`includeFailures=true` because Anthropic exposes no result-status filter. Full
+original calls/results remain in Iris's JSONL and are recoverable with
+`recall(tool_call_id="...")`.

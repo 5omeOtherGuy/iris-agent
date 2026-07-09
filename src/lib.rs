@@ -505,9 +505,7 @@ fn run_agent_inner(
         system_prompt.clone(),
         background_session_id.clone(),
     );
-    // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
-    harness.set_microcompaction(settings.microcompaction());
-    harness.set_microcompaction_watermark(settings.microcompaction_watermark());
+    harness.set_tool_result_compaction(selection.tool_result_compaction.clone());
     let _ = harness.set_task_workflow_enabled(settings.tasks());
     // Prompt-cache profile + selection identity for the fold scheduler
     // (issue #400): resolved here so wayland consumes only profile fields.
@@ -697,9 +695,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
         system_prompt.clone(),
         background_session_id.clone(),
     );
-    // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
-    harness.set_microcompaction(settings.microcompaction());
-    harness.set_microcompaction_watermark(settings.microcompaction_watermark());
+    harness.set_tool_result_compaction(selection.tool_result_compaction.clone());
     let _ = harness.set_task_workflow_enabled(settings.tasks());
     // Prompt-cache profile + selection identity for the fold scheduler
     // (issue #400): resolved here so wayland consumes only profile fields.
@@ -883,9 +879,7 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
         system_prompt.clone(),
         background_session_id.clone(),
     );
-    // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
-    harness.set_microcompaction(settings.microcompaction());
-    harness.set_microcompaction_watermark(settings.microcompaction_watermark());
+    harness.set_tool_result_compaction(selection.tool_result_compaction.clone());
     let _ = harness.set_task_workflow_enabled(settings.tasks());
     // Prompt-cache profile + selection identity for the fold scheduler
     // (issue #400): resolved here so wayland consumes only profile fields.

@@ -92,6 +92,10 @@ pub(crate) enum Field {
     CompactionSummarizer,
     Microcompaction,
     MicrocompactionWatermark,
+    CompactionAggressiveness,
+    CompactionCacheTiming,
+    SemanticRetainPerPath,
+    ToolClearingKeepRecent,
     BashToolMode,
     MaxToolRoundtrips,
     PromptCacheRetention,
@@ -128,6 +132,10 @@ impl Field {
             | Field::CompactionSummarizer
             | Field::Microcompaction
             | Field::MicrocompactionWatermark
+            | Field::CompactionAggressiveness
+            | Field::CompactionCacheTiming
+            | Field::SemanticRetainPerPath
+            | Field::ToolClearingKeepRecent
             | Field::BashToolMode
             | Field::MaxToolRoundtrips
             | Field::PromptCacheRetention => Category::Runtime,
@@ -145,8 +153,12 @@ impl Field {
             Field::DefaultApproval => "Default approval",
             Field::ContextTokenBudget => "Auto-compaction threshold",
             Field::CompactionSummarizer => "Compaction summarizer",
-            Field::Microcompaction => "Microcompaction",
-            Field::MicrocompactionWatermark => "Microcompaction watermark",
+            Field::Microcompaction => "Tool-result compaction",
+            Field::MicrocompactionWatermark => "Compaction trigger tokens",
+            Field::CompactionAggressiveness => "Compaction aggressiveness",
+            Field::CompactionCacheTiming => "Compaction cache timing",
+            Field::SemanticRetainPerPath => "Reads retained per path",
+            Field::ToolClearingKeepRecent => "Recent tool uses kept",
             Field::BashToolMode => "Bash tool mode",
             Field::MaxToolRoundtrips => "Max tool round-trips",
             Field::PromptCacheRetention => "Prompt cache retention",
@@ -170,6 +182,12 @@ impl Field {
             Field::CompactionSummarizer => FieldKind::Enum {
                 options: &["excerpts", "provider", "subagent"],
             },
+            Field::CompactionAggressiveness => FieldKind::Enum {
+                options: &["conservative", "balanced", "aggressive", "custom"],
+            },
+            Field::CompactionCacheTiming => FieldKind::Enum {
+                options: &["breakOnly", "cacheAware", "pressureOnly", "immediate"],
+            },
             Field::Theme => FieldKind::Enum {
                 options: crate::ui::theme::available(),
             },
@@ -191,6 +209,11 @@ impl Field {
             Field::VerifyMaxAttempts => FieldKind::Numeric {
                 min: 1,
                 max: 10,
+                allow_empty: false,
+            },
+            Field::SemanticRetainPerPath | Field::ToolClearingKeepRecent => FieldKind::Numeric {
+                min: 1,
+                max: 1_000,
                 allow_empty: false,
             },
             Field::VerifyCommand | Field::WorktreeRoot => FieldKind::Text { allow_empty: true },
@@ -216,6 +239,10 @@ pub(crate) struct Snapshot {
     pub(crate) compaction_summarizer: String,
     pub(crate) microcompaction: bool,
     pub(crate) microcompaction_watermark: u64,
+    pub(crate) compaction_aggressiveness: String,
+    pub(crate) compaction_cache_timing: String,
+    pub(crate) semantic_retain_per_path: u64,
+    pub(crate) tool_clearing_keep_recent: u64,
     pub(crate) bash_tool_mode: bool,
     pub(crate) max_tool_roundtrips: Option<usize>,
     pub(crate) prompt_cache_retention: String,
@@ -239,6 +266,10 @@ impl Snapshot {
             Field::CompactionSummarizer => self.compaction_summarizer.clone(),
             Field::Microcompaction => on_off(self.microcompaction),
             Field::MicrocompactionWatermark => self.microcompaction_watermark.to_string(),
+            Field::CompactionAggressiveness => self.compaction_aggressiveness.clone(),
+            Field::CompactionCacheTiming => self.compaction_cache_timing.clone(),
+            Field::SemanticRetainPerPath => self.semantic_retain_per_path.to_string(),
+            Field::ToolClearingKeepRecent => self.tool_clearing_keep_recent.to_string(),
             Field::BashToolMode => on_off(self.bash_tool_mode),
             Field::MaxToolRoundtrips => match self.max_tool_roundtrips {
                 Some(cap) => cap.to_string(),
@@ -264,6 +295,8 @@ impl Snapshot {
             Field::ScrollSpeed => self.scroll_speed.to_string(),
             Field::ContextTokenBudget => self.context_token_budget.to_string(),
             Field::MicrocompactionWatermark => self.microcompaction_watermark.to_string(),
+            Field::SemanticRetainPerPath => self.semantic_retain_per_path.to_string(),
+            Field::ToolClearingKeepRecent => self.tool_clearing_keep_recent.to_string(),
             Field::MaxToolRoundtrips => self
                 .max_tool_roundtrips
                 .map(|c| c.to_string())
@@ -372,7 +405,11 @@ fn rows_for(category: Category, snapshot: &Snapshot) -> Vec<Row> {
             field_row(Field::ContextTokenBudget, snapshot),
             field_row(Field::CompactionSummarizer, snapshot),
             field_row(Field::Microcompaction, snapshot),
+            field_row(Field::CompactionAggressiveness, snapshot),
+            field_row(Field::CompactionCacheTiming, snapshot),
             field_row(Field::MicrocompactionWatermark, snapshot),
+            field_row(Field::SemanticRetainPerPath, snapshot),
+            field_row(Field::ToolClearingKeepRecent, snapshot),
             field_row(Field::BashToolMode, snapshot),
             field_row(Field::MaxToolRoundtrips, snapshot),
             field_row(Field::PromptCacheRetention, snapshot),
@@ -732,6 +769,10 @@ mod tests {
             compaction_summarizer: "subagent".to_string(),
             microcompaction: false,
             microcompaction_watermark: 64_000,
+            compaction_aggressiveness: "conservative".to_string(),
+            compaction_cache_timing: "cacheAware".to_string(),
+            semantic_retain_per_path: 1,
+            tool_clearing_keep_recent: 8,
             bash_tool_mode: false,
             max_tool_roundtrips: None,
             prompt_cache_retention: "short".to_string(),
@@ -981,6 +1022,14 @@ mod tests {
             watermark.action,
             ModalAction::OpenSettingsEntry(Field::MicrocompactionWatermark)
         );
+        assert!(rows.iter().any(|row| {
+            row.item.id == Field::CompactionAggressiveness.label()
+                && row.item.detail.as_deref() == Some("conservative")
+        }));
+        assert!(rows.iter().any(|row| {
+            row.item.id == Field::CompactionCacheTiming.label()
+                && row.item.detail.as_deref() == Some("cacheAware")
+        }));
     }
 
     #[test]
@@ -997,6 +1046,10 @@ mod tests {
             Field::CompactionSummarizer,
             Field::Microcompaction,
             Field::MicrocompactionWatermark,
+            Field::CompactionAggressiveness,
+            Field::CompactionCacheTiming,
+            Field::SemanticRetainPerPath,
+            Field::ToolClearingKeepRecent,
             Field::BashToolMode,
             Field::MaxToolRoundtrips,
             Field::PromptCacheRetention,

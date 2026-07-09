@@ -43,8 +43,8 @@ break events still valid, watermark unchanged.
 Every flush records its trigger class on the persisted `fold` entry and a new
 `FoldApplied` observer event; `/context` itemizes the window (system+tools,
 raw vs summarized conversation, folded-reclaimed with per-batch tags, pending
-mass, headroom). `clear_tool_uses` + microcompaction are mutually exclusive
-(ADR-0022 addendum).
+mass, headroom). `clear_tool_uses` and local reducers require disjoint eligible
+tool sets (ADR-0022 addendum, narrowed 2026-07-09).
 
 Compaction is unchanged: the scheduler re-times fold writes only. Opt-in
 stays opt-in; rebuild honors persisted folds regardless of the setting;

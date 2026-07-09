@@ -34,6 +34,13 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+mod tool_result_compaction;
+
+pub(crate) use tool_result_compaction::{
+    CompactionAggressiveness, CompactionCacheTiming, ToolClearingBackend, ToolClearingMode,
+    ToolResultCompactionPolicy, ToolResultCompactionSettings,
+};
+
 /// Settings loaded from the JSON config files. Every field is optional; an
 /// absent field falls back to the next layer (safe project fields -> global ->
 /// built-in default, with env applied above where the provider supports it).
@@ -97,6 +104,12 @@ pub(crate) struct Settings {
     /// never redirect requests, so a project file may tune it. Gates fold
     /// WRITING only; a persisted fold always rebuilds regardless of this value.
     pub(crate) microcompaction: Option<bool>,
+    /// Structured, opt-in tool-result compaction policy. Local semantic dedupe
+    /// and clearing knobs are project-tunable; provider-native backend controls
+    /// remain global-only in [`Settings::merged_with`]. When absent, the legacy
+    /// `microcompaction` + `microcompactionWatermark` pair resolves to the
+    /// conservative policy unchanged.
+    pub(crate) tool_result_compaction: Option<ToolResultCompactionSettings>,
     /// Opt-in durable task workflow (ADR-0052, issue #444): checkpoint refs,
     /// recovery/adoption, task lifecycle entries, badges, task diffs, and
     /// rollback across restarts. Absent/false -> off; the dirty-tree guard
@@ -270,6 +283,10 @@ impl Settings {
     /// base-url control where bearer tokens are sent and must come from global
     /// user config or built-in defaults.
     fn merged_with(self, project: Settings) -> Settings {
+        let tool_result_compaction = tool_result_compaction::merge(
+            self.tool_result_compaction.clone(),
+            project.tool_result_compaction.clone(),
+        );
         Settings {
             default_provider: self.default_provider,
             default_model: project.default_model.or(self.default_model),
@@ -291,6 +308,7 @@ impl Settings {
             // trades in-context detail for recoverable detail, never redirects a
             // request), so a project may tune it; project value wins, else global.
             microcompaction: project.microcompaction.or(self.microcompaction),
+            tool_result_compaction,
             // Durable task workflow is opt-in product surface, not the safety
             // floor. Project config may enable it for a repo; absent defaults
             // off via the accessor.
@@ -435,6 +453,18 @@ impl Settings {
         self.microcompaction.unwrap_or(false)
     }
 
+    /// Resolve the structured policy, or the legacy conservative alias when no
+    /// structured block exists. This is the single validation boundary shared
+    /// by Wayland and Mimir; malformed enum/count/tool-list values fail before
+    /// a provider is built or a fold is planned.
+    pub(crate) fn tool_result_compaction(&self) -> Result<ToolResultCompactionPolicy> {
+        tool_result_compaction::resolve(
+            self.tool_result_compaction.as_ref(),
+            self.microcompaction(),
+            self.microcompaction_watermark(),
+        )
+    }
+
     /// Whether the durable task workflow is enabled. Default off; the dirty-tree
     /// guard still runs regardless of this value.
     pub(crate) fn tasks(&self) -> bool {
@@ -531,6 +561,7 @@ pub(crate) fn save_context_token_budget(budget: u64) -> Result<()> {
 
 /// Persist the microcompaction watermark in the global settings file, clamped to
 /// the same sane positive token range as the auto-compaction threshold.
+#[cfg(test)]
 pub(crate) fn save_microcompaction_watermark(watermark: u64) -> Result<()> {
     let watermark = watermark.clamp(MIN_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET);
     update_global(&[("microcompactionWatermark", Value::from(watermark))])
@@ -540,33 +571,87 @@ pub(crate) fn save_microcompaction_watermark(watermark: u64) -> Result<()> {
 /// (ADR-0048, #378). A boolean, so no clamping is needed; the `/settings` toggle
 /// and config parsing both validate at the boundary.
 ///
-/// Enabling is rejected while `anthropicContextManagement.clearToolUses` is
-/// configured (issue #400, ADR-0022 addendum): server-side tool-result
-/// clearing and local microcompaction are mutually exclusive (the server
-/// drops content Iris still models as present). The raw-key check mirrors
-/// `ContextManagement::validate_compatible_with_microcompaction`, which
-/// enforces the same rule over the MERGED settings at selection load;
-/// `anthropicContextManagement` is global-only, so the global file is the
-/// complete truth for the key this save guards against.
+/// Enabling is rejected when legacy Anthropic clearing overlaps the legacy
+/// semantic candidate set (`read`, `ls`). Excluding both tools proves the
+/// reducers disjoint and is accepted. Typed selection validation applies the
+/// same rule to the merged structured policy.
+#[cfg(test)]
 pub(crate) fn save_microcompaction(enabled: bool) -> Result<()> {
     if enabled {
         let path = global_path()
             .context("cannot resolve the global settings path (set HOME or IRIS_CONFIG_PATH)")?;
         let object = read_object(&path)?;
-        let clears_tool_uses = object
+        let clear_tool_uses = object
             .get("anthropicContextManagement")
-            .and_then(|value| value.get("clearToolUses"))
-            .is_some();
-        if clears_tool_uses {
+            .and_then(|value| value.get("clearToolUses"));
+        let excludes_local_c = clear_tool_uses
+            .and_then(|value| value.get("excludeTools"))
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                ["read", "ls"]
+                    .iter()
+                    .all(|required| tools.iter().any(|tool| tool.as_str() == Some(required)))
+            });
+        if clear_tool_uses.is_some() && !excludes_local_c {
             anyhow::bail!(
                 "anthropicContextManagement.clearToolUses and microcompaction cannot be enabled \
-                 together: the server drops tool results Iris still models as present, so \
-                 context accounting and fold plans diverge. Disable one of them \
-                 (clearThinking remains compatible with microcompaction)."
+                 together for overlapping tools; exclude both read and ls from clearToolUses, \
+                 or disable one reducer (clearThinking remains compatible)."
             );
         }
     }
     update_global(&[("microcompaction", Value::Bool(enabled))])
+}
+
+pub(crate) fn save_tool_result_compaction_enabled(enabled: bool) -> Result<()> {
+    update_global_nested(
+        &["toolResultCompaction"],
+        &[("enabled", Value::Bool(enabled))],
+        true,
+    )
+}
+
+pub(crate) fn save_tool_result_compaction_aggressiveness(value: &str) -> Result<()> {
+    let value = CompactionAggressiveness::parse(Some(value))?.as_str();
+    update_global_nested(
+        &["toolResultCompaction"],
+        &[("aggressiveness", Value::String(value.to_string()))],
+        true,
+    )
+}
+
+pub(crate) fn save_tool_result_compaction_cache_timing(value: &str) -> Result<()> {
+    let value = CompactionCacheTiming::parse(Some(value))?.as_str();
+    update_global_nested(
+        &["toolResultCompaction"],
+        &[("cacheTiming", Value::String(value.to_string()))],
+        true,
+    )
+}
+
+pub(crate) fn save_tool_result_compaction_trigger_tokens(tokens: u64) -> Result<()> {
+    let tokens = tokens.clamp(MIN_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET);
+    update_global_nested(
+        &["toolResultCompaction"],
+        &[("triggerTokens", Value::from(tokens))],
+        true,
+    )
+}
+
+pub(crate) fn save_tool_result_compaction_retain_per_path(retain: u64) -> Result<()> {
+    update_global_nested(
+        &["toolResultCompaction", "semanticDedupe"],
+        &[("retainPerPath", Value::from(retain.max(1)))],
+        true,
+    )
+}
+
+pub(crate) fn save_tool_result_compaction_keep_recent_tool_uses(keep: u64) -> Result<()> {
+    update_global_nested(
+        &["toolResultCompaction", "toolClearing"],
+        &[("keepRecentToolUses", Value::from(keep.max(1)))],
+        true,
+    )
 }
 
 /// Persist the bash-tool-mode toggle in the global settings file. A boolean,
@@ -713,6 +798,44 @@ fn update_global_block(block: &str, updates: &[(&str, Value)]) -> Result<()> {
         }
     }
     object.insert(block.to_string(), Value::Object(nested));
+    write_object_atomically(&path, &object)
+}
+
+fn update_global_nested(
+    blocks: &[&str],
+    updates: &[(&str, Value)],
+    validate_compaction: bool,
+) -> Result<()> {
+    let path = global_path()
+        .context("cannot resolve the global settings path (set HOME or IRIS_CONFIG_PATH)")?;
+    let mut object = read_object(&path)?;
+    let mut current = &mut object;
+    for block in blocks {
+        let value = current
+            .entry((*block).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !value.is_object() {
+            *value = Value::Object(Map::new());
+        }
+        current = value
+            .as_object_mut()
+            .expect("value replaced with an object above");
+    }
+    for (key, value) in updates {
+        if value.is_null() {
+            current.remove(*key);
+        } else {
+            current.insert((*key).to_string(), value.clone());
+        }
+    }
+    if validate_compaction {
+        let settings: Settings = serde_json::from_value(Value::Object(object.clone()))
+            .context("updated settings are invalid")?;
+        let policy = settings.tool_result_compaction()?;
+        if policy.enabled {
+            crate::mimir::selection::ModelSelection::resolve(&settings)?;
+        }
+    }
     write_object_atomically(&path, &object)
 }
 
@@ -962,6 +1085,182 @@ mod tests {
         fs::write(&project, r#"{ "microcompaction": true }"#).unwrap();
         let settings = Settings::load_from(Some(&global), &project).unwrap();
         assert!(settings.microcompaction());
+    }
+
+    #[test]
+    fn tool_result_compaction_defaults_off_and_legacy_alias_is_conservative() {
+        let defaulted = Settings::default().tool_result_compaction().unwrap();
+        assert!(!defaulted.enabled);
+        assert_eq!(
+            defaulted.aggressiveness,
+            CompactionAggressiveness::Conservative
+        );
+        assert_eq!(defaulted.cache_timing, CompactionCacheTiming::CacheAware);
+        assert_eq!(defaulted.trigger_tokens, 64_000);
+        assert!(defaulted.semantic_dedupe.enabled);
+        assert_eq!(defaulted.semantic_dedupe.retain_per_path, 1);
+        assert!(!defaulted.tool_clearing.enabled);
+        assert!(defaulted.legacy_alias);
+
+        let legacy = Settings {
+            microcompaction: Some(true),
+            microcompaction_watermark: Some(17_000),
+            ..Settings::default()
+        }
+        .tool_result_compaction()
+        .unwrap();
+        assert!(legacy.enabled);
+        assert_eq!(legacy.trigger_tokens, 17_000);
+        assert!(legacy.semantic_dedupe.enabled);
+        assert!(!legacy.tool_clearing.enabled);
+    }
+
+    #[test]
+    fn structured_compaction_parses_presets_and_explicit_overrides() {
+        let raw = serde_json::json!({
+            "toolResultCompaction": {
+                "enabled": true,
+                "aggressiveness": "aggressive",
+                "cacheTiming": "immediate",
+                "triggerTokens": 12000,
+                "semanticDedupe": {
+                    "retainPerPath": 3,
+                    "protectRecentToolResults": 7,
+                    "protectRecentTokens": 900
+                },
+                "toolClearing": {
+                    "backend": "local",
+                    "mode": "selected",
+                    "keepRecentToolUses": 5,
+                    "clearAtLeastTokens": 200,
+                    "eligibleTools": ["bash", "grep", "bash"],
+                    "excludedTools": ["edit"],
+                    "includeFailures": true
+                }
+            }
+        });
+        let settings: Settings = serde_json::from_value(raw).unwrap();
+        let policy = settings.tool_result_compaction().unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.cache_timing, CompactionCacheTiming::Immediate);
+        assert_eq!(policy.semantic_dedupe.retain_per_path, 3);
+        assert_eq!(policy.semantic_dedupe.protect_recent_tool_results, 7);
+        assert!(policy.tool_clearing.enabled, "aggressive preset enables B");
+        assert_eq!(policy.tool_clearing.mode, ToolClearingMode::Selected);
+        assert_eq!(policy.tool_clearing.eligible_tools, vec!["bash", "grep"]);
+        assert!(policy.tool_clearing.include_failures);
+        assert!(!policy.legacy_alias);
+    }
+
+    #[test]
+    fn structured_compaction_rejects_degenerate_counts_and_empty_names() {
+        for (raw, needle) in [
+            (
+                serde_json::json!({"toolResultCompaction":{"enabled":true,"triggerTokens":0}}),
+                "triggerTokens",
+            ),
+            (
+                serde_json::json!({"toolResultCompaction":{"enabled":true,"semanticDedupe":{"retainPerPath":0}}}),
+                "retainPerPath",
+            ),
+            (
+                serde_json::json!({"toolResultCompaction":{"enabled":true,"semanticDedupe":{"protectRecentToolResults":0,"protectRecentTokens":0}}}),
+                "recent working set",
+            ),
+            (
+                serde_json::json!({"toolResultCompaction":{"enabled":true,"aggressiveness":"custom","toolClearing":{"enabled":true,"mode":"selected","eligibleTools":[]}}}),
+                "eligibleTools",
+            ),
+            (
+                serde_json::json!({"toolResultCompaction":{"enabled":true,"aggressiveness":"custom","toolClearing":{"enabled":true,"mode":"selected","eligibleTools":["  "]}}}),
+                "empty tool name",
+            ),
+        ] {
+            let settings: Settings = serde_json::from_value(raw).unwrap();
+            let error = format!("{:#}", settings.tool_result_compaction().unwrap_err());
+            assert!(
+                error.contains(needle),
+                "{error:?} did not contain {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_merge_tunes_local_policy_but_cannot_select_or_rewrite_native() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(
+            &global,
+            r#"{"toolResultCompaction":{"enabled":true,"toolClearing":{"enabled":true,"backend":"anthropicNative","keepRecentToolUses":4,"excludedTools":["read","ls"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            r#"{"toolResultCompaction":{"enabled":false,"cacheTiming":"pressureOnly","semanticDedupe":{"retainPerPath":2},"toolClearing":{"backend":"local","keepRecentToolUses":99}}}"#,
+        )
+        .unwrap();
+        let merged = Settings::load_from(Some(&global), &project).unwrap();
+        let policy = merged.tool_result_compaction().unwrap();
+        assert!(
+            policy.enabled,
+            "project cannot disable global native config"
+        );
+        assert_eq!(policy.cache_timing, CompactionCacheTiming::PressureOnly);
+        assert_eq!(policy.semantic_dedupe.retain_per_path, 2);
+        assert_eq!(
+            policy.tool_clearing.backend,
+            ToolClearingBackend::AnthropicNative
+        );
+        assert_eq!(policy.tool_clearing.keep_recent_tool_uses, 4);
+
+        fs::write(&global, "{}").unwrap();
+        fs::write(
+            &project,
+            r#"{"toolResultCompaction":{"enabled":true,"toolClearing":{"enabled":true,"backend":"auto"}}}"#,
+        )
+        .unwrap();
+        let merged = Settings::load_from(Some(&global), &project).unwrap();
+        let policy = merged.tool_result_compaction().unwrap();
+        assert!(policy.enabled);
+        assert!(
+            !policy.tool_clearing.enabled,
+            "project native block ignored"
+        );
+        assert_eq!(policy.tool_clearing.backend, ToolClearingBackend::Local);
+    }
+
+    #[test]
+    fn structured_compaction_save_helpers_preserve_unknown_nested_keys() {
+        let dir = temp_dir();
+        let path = dir.path.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"futureTop":9,"toolResultCompaction":{"futurePolicy":7,"semanticDedupe":{"futureSemantic":3},"toolClearing":{"futureClearing":4}}}"#,
+        )
+        .unwrap();
+        let _guard = ConfigPathGuard::set(&path);
+
+        save_tool_result_compaction_aggressiveness("balanced").unwrap();
+        save_tool_result_compaction_cache_timing("pressureOnly").unwrap();
+        save_tool_result_compaction_trigger_tokens(12_000).unwrap();
+        save_tool_result_compaction_retain_per_path(3).unwrap();
+        save_tool_result_compaction_keep_recent_tool_uses(6).unwrap();
+        save_tool_result_compaction_enabled(true).unwrap();
+
+        let object = read_object(&path).unwrap();
+        assert_eq!(object["futureTop"], 9);
+        let policy = &object["toolResultCompaction"];
+        assert_eq!(policy["futurePolicy"], 7);
+        assert_eq!(policy["aggressiveness"], "balanced");
+        assert_eq!(policy["cacheTiming"], "pressureOnly");
+        assert_eq!(policy["triggerTokens"], 12_000);
+        assert_eq!(policy["semanticDedupe"]["retainPerPath"], 3);
+        assert_eq!(policy["semanticDedupe"]["futureSemantic"], 3);
+        assert_eq!(policy["toolClearing"]["keepRecentToolUses"], 6);
+        assert_eq!(policy["toolClearing"]["futureClearing"], 4);
+        let loaded = Settings::load_from(Some(&path), &dir.path.join("none.json")).unwrap();
+        assert!(loaded.tool_result_compaction().unwrap().enabled);
     }
 
     #[test]
@@ -1453,10 +1752,8 @@ mod tests {
 
     #[test]
     fn save_microcompaction_rejects_enabling_beside_clear_tool_uses() {
-        // Mutual exclusion at the /settings save boundary (issue #400,
-        // ADR-0022 addendum): enabling microcompaction while the global file
-        // configures anthropicContextManagement.clearToolUses is rejected;
-        // disabling stays allowed, and clearThinking does not block.
+        // Overlap rejection at the /settings save boundary: legacy
+        // microcompaction targets read/ls, so native clearing must exclude both.
         let dir = temp_dir();
         let path = dir.path.join("settings.json");
         fs::write(
@@ -1474,6 +1771,13 @@ mod tests {
         );
         // Disabling is always allowed (it resolves the conflict).
         save_microcompaction(false).unwrap();
+
+        fs::write(
+            &path,
+            r#"{ "anthropicContextManagement": { "clearToolUses": { "excludeTools": ["read", "ls"] } } }"#,
+        )
+        .unwrap();
+        save_microcompaction(true).unwrap();
 
         // clearThinking alone does not block enabling.
         fs::write(

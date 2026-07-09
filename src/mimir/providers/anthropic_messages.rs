@@ -937,6 +937,14 @@ fn apply_context_management(body: &mut Value, context_management: &ContextManage
         if let Some(value) = clear.clear_at_least_input_tokens {
             edit["clear_at_least"] = typed_value("input_tokens", value);
         }
+        if let Some(exclude_tools) = &clear.exclude_tools
+            && !exclude_tools.is_empty()
+        {
+            edit["exclude_tools"] = json!(exclude_tools);
+        }
+        if let Some(clear_tool_inputs) = clear.clear_tool_inputs {
+            edit["clear_tool_inputs"] = json!(clear_tool_inputs);
+        }
         edits.push(edit);
     }
     if let Some(clear) = &context_management.clear_thinking {
@@ -1953,6 +1961,8 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
                 trigger_input_tokens: Some(30_000),
                 keep_tool_uses: Some(4),
                 clear_at_least_input_tokens: Some(10_000),
+                exclude_tools: Some(vec!["recall".to_string(), "read_output".to_string()]),
+                clear_tool_inputs: Some(false),
             }),
             clear_thinking: Some(crate::mimir::selection::ClearThinking {
                 trigger_input_tokens: Some(80_000),
@@ -1977,7 +1987,9 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
                         "type": "clear_tool_uses_20250919",
                         "trigger": { "type": "input_tokens", "value": 30000 },
                         "keep": { "type": "tool_uses", "value": 4 },
-                        "clear_at_least": { "type": "input_tokens", "value": 10000 }
+                        "clear_at_least": { "type": "input_tokens", "value": 10000 },
+                        "exclude_tools": ["recall", "read_output"],
+                        "clear_tool_inputs": false
                     },
                     {
                         "type": "clear_thinking_20251015",

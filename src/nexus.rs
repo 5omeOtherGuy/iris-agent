@@ -286,6 +286,9 @@ pub(crate) enum FoldTrigger {
     InferredCold,
     /// C: the context reached the micro-watermark (pressure backstop).
     Watermark,
+    /// Explicit immediate policy: pending local folds flush at every safe turn
+    /// boundary even when no cache break or pressure trigger is present.
+    Immediate,
 }
 
 impl FoldTrigger {
@@ -300,6 +303,7 @@ impl FoldTrigger {
             FoldTrigger::ManualCompact => "A6",
             FoldTrigger::InferredCold => "B",
             FoldTrigger::Watermark => "C",
+            FoldTrigger::Immediate => "I",
         }
     }
 }
@@ -400,6 +404,12 @@ pub(crate) enum AgentEvent {
     FoldApplied {
         /// Folds applied in this batch.
         folds: usize,
+        /// Fold targets selected by semantic stale-read dedupe. A target also
+        /// selected by clearing is counted in both reason totals but only once
+        /// in `folds`.
+        semantic_dedupe_folds: usize,
+        /// Fold targets selected by local age/count clearing.
+        tool_clearing_folds: usize,
         /// Estimated context tokens reclaimed (original bodies minus stubs).
         reclaimed_tokens_estimate: u64,
         /// Why the flush ran (design §4.4 trigger taxonomy).
@@ -643,6 +653,11 @@ pub(crate) trait SessionSpanReader {
     /// tool error for an explicit span). Errors only on a transcript read
     /// failure -- never a panic or a path escape.
     fn recall_span(&self, from: u64, to: u64) -> Result<Vec<(Option<String>, Message)>>;
+
+    /// Return the original assistant tool-call and tool-result messages whose
+    /// persisted `toolCallId` equals `tool_call_id`, in transcript order. An
+    /// empty vec means this session contains no such call id.
+    fn recall_tool_call(&self, tool_call_id: &str) -> Result<Vec<(Option<String>, Message)>>;
 }
 
 /// Display-only live-output sink for a running tool (issue #90 sub-item 1). A

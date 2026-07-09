@@ -2256,6 +2256,8 @@ impl Transcript {
             }
             UiEvent::FoldApplied {
                 folds,
+                semantic_dedupe_folds,
+                tool_clearing_folds,
                 reclaimed_tokens_estimate,
                 trigger,
             } => {
@@ -2268,7 +2270,7 @@ impl Transcript {
                     crate::ui::symbols::SEP,
                     dim_style(),
                     &format!(
-                        "Folded {folds} spent tool result(s) \u{2014} reclaimed ~{} tokens [{}]",
+                        "Folded {folds} spent tool result(s) ({semantic_dedupe_folds} semantic, {tool_clearing_folds} clearing) \u{2014} reclaimed ~{} tokens [{}]",
                         super::screen::compact_count(reclaimed_tokens_estimate),
                         trigger.code(),
                     ),

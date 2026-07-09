@@ -855,8 +855,12 @@ Potential scope:
   observer event, and the `/context` breakdown. Per-trigger marginal write <= 0
   is CI-asserted; the Class-B live pair realized a -355-token write delta
   (Anthropic, real 390s idle) and a 317-token input saving (Codex, read-side).
-  `clearToolUses` + microcompaction are now mutually exclusive (ADR-0022
-  addendum), discharging the provider-native context-management interplay gap.
+  Configurable tool-result compaction now extends that durable fold path with
+  retain-N semantic read dedupe, local age/count clearing, four cache-timing
+  modes, and `recall(tool_call_id=...)`. The legacy `microcompaction` alias stays
+  conservative/default-off. Optional Anthropic-native clearing maps public
+  `exclude_tools`/`clear_tool_inputs`; native and local reducers compose only
+  over disjoint tool sets (ADR-0022 addendum, 2026-07-09).
   Phase 3 calibration (persisted per-turn usage, watermark retuning) is
   [#395](https://github.com/5omeOtherGuy/iris-agent/issues/395). Deferred
   (still open, outside #372): the over-budget-no-coverable-range floor and
