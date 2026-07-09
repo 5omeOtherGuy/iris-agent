@@ -290,6 +290,10 @@ pub(super) struct Transcript {
     /// The open diff-bodied EDIT panel, if a mutation is pending/running.
     active_edit: Option<ActiveEdit>,
     pub(super) exploring_open: bool,
+    /// Explicit user fold on the OPEN explore group (mirrors the
+    /// `user_expanded` intent of exec/tool/edit actives): survives the
+    /// compact-by-default collapse when the group closes.
+    explore_user_expanded: Option<bool>,
     /// Wall-clock start of the current provider turn; drives the honest
     /// "time until reasoning arrived" telemetry on the thinking header.
     provider_turn_started: Option<Instant>,
@@ -359,6 +363,9 @@ impl Transcript {
     /// Append a blank separator row before a new top-level block, unless the
     /// transcript is empty or already ends in a real separator row.
     fn push_blank(&mut self) {
+        if self.exploring_open {
+            self.collapse_settled_explore();
+        }
         self.exploring_open = false;
         match self.rows.last() {
             None => {}
@@ -1900,6 +1907,28 @@ impl Transcript {
         })
     }
 
+    /// Compact by default (§8.1) for the grouped EXPLORE path: when the group
+    /// closes (the next top-level block begins), the settled explore collapses
+    /// to its header + footer record — unless the user explicitly expanded it
+    /// while it was open. The other families collapse at finalize in
+    /// `append_tool_panel`; EXPLORE's finalize moment IS the group close,
+    /// since ops keep appending until then.
+    fn collapse_settled_explore(&mut self) {
+        let user_expanded = self.explore_user_expanded.take();
+        if user_expanded == Some(true) {
+            return;
+        }
+        let Some(header) = self.current_explore_header_row() else {
+            return;
+        };
+        if let Some(ChromeRow::Header { expanded, .. }) = self.rows[header].chrome.as_mut()
+            && *expanded
+        {
+            *expanded = false;
+            self.mark_dirty_from(header);
+        }
+    }
+
     fn active_exploration_duration(&self, running: bool) -> Option<Duration> {
         if running {
             let started = self
@@ -2037,6 +2066,8 @@ impl Transcript {
             self.pop_trailing_explore_footer();
         } else {
             self.push_blank();
+            // A fresh group carries no stale fold intent from a prior one.
+            self.explore_user_expanded = None;
             self.rows.push(TranscriptRow::chrome(ChromeRow::BlockStart));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
                 expanded: true,
@@ -2080,6 +2111,8 @@ impl Transcript {
             self.pop_trailing_explore_footer();
         } else {
             self.push_blank();
+            // A fresh group carries no stale fold intent from a prior one.
+            self.explore_user_expanded = None;
             self.rows.push(TranscriptRow::chrome(ChromeRow::BlockStart));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
                 expanded: true,
@@ -2729,6 +2762,9 @@ impl Transcript {
     /// in-place rebuild at finalize. A block's header row is `body_start + 1`
     /// (the row after its `BlockStart`); at most one exec/tool/edit is active.
     fn record_user_fold(&mut self, header: usize, expanded: bool) {
+        if self.exploring_open && self.current_explore_header_row() == Some(header) {
+            self.explore_user_expanded = Some(expanded);
+        }
         if let Some(active) = self.active_exec.as_mut()
             && active.body_start + 1 == header
         {

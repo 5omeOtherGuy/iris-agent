@@ -792,7 +792,7 @@ mod tests {
     #[test]
     fn start_page_renders_inside_the_pager_frame() {
         let mut screen = footer_screen();
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
         let frame = compose_frame(&mut screen, Size::new(80, 30)).lines;
         assert_eq!(frame.len(), 30);
         let rows = frame_rows(&frame, 80, 30);

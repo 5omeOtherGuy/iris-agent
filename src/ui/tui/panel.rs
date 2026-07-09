@@ -333,15 +333,18 @@ impl PanelState {
         }
     }
 
+    /// The `/find`-and-copy plain-text mirror of a block's state. Uses the
+    /// closed §5 vocabulary — the same glyphs the footer paints — never `✗`
+    /// (outside the set) or `•` (the markdown bullet has one job).
     pub(super) fn plain_prefix(self) -> &'static str {
         match self {
-            Self::Running => "• Running",
-            Self::Done => "• Ran",
-            Self::Error => "✗ Ran",
-            Self::Cancelled => "• Cancelled",
-            Self::Preview => "• Preview",
-            Self::Review => "• Review",
-            Self::Denied => "✗ Denied",
+            Self::Running => "● Running",
+            Self::Done => "◆ Ran",
+            Self::Error => "■ Ran",
+            Self::Cancelled => "□ Cancelled",
+            Self::Preview => "◇ Preview",
+            Self::Review => "▲ Review",
+            Self::Denied => "■ Denied",
         }
     }
 }

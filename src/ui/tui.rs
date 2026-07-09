@@ -3175,7 +3175,7 @@ mod tests {
             "~/repo".to_string(),
         );
         screen.apply(UiEvent::SessionStarted);
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
         render_perf_cycle(&mut screen, &mut surface, size).expect("start-page frame");
         // New session selected / first prompt submitted -> start page dismissed.
         screen.leave_start_page();
@@ -3308,7 +3308,7 @@ mod tests {
             ..Default::default()
         }));
         screen.apply(UiEvent::SessionStarted);
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
         // Settle the power-on lamp test; this test pins the settled page.
         screen.start_page.as_mut().expect("start page").skip_boot();
 
@@ -4120,6 +4120,66 @@ mod tests {
         assert!(rendered.contains("hi"), "{rendered}");
         assert!(rendered.contains("┊ interleaved note"), "{rendered}");
         assert!(!rendered.contains("RUNNING"), "{rendered}");
+    }
+
+    #[test]
+    fn settled_explore_collapses_when_the_group_closes() {
+        let mut screen = Screen::new();
+        let call = call_args("read", json!({ "path": "src/lib.rs" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "l1\nl2\nl3".to_string(),
+            exit_code: None,
+            duration: Some(Duration::from_millis(5)),
+        });
+        // While the group is open the live block stays expanded.
+        let rendered = rendered_text(&mut screen, 100, 16);
+        assert!(rendered.contains("Read"), "open group shows its ops: {rendered}");
+
+        // The next top-level block closes the group: compact by default, the
+        // settled explore collapses to header + footer.
+        screen.apply(UiEvent::AssistantText("done".to_string()));
+        let rendered = rendered_text(&mut screen, 100, 16);
+        assert!(rendered.contains("▸ EXPLORE"), "collapsed: {rendered}");
+        assert!(
+            !rendered.contains("Read  "),
+            "op rows unmounted when collapsed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn user_expanded_explore_survives_the_group_close() {
+        let mut screen = Screen::new();
+        let call = call_args("read", json!({ "path": "src/lib.rs" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "l1".to_string(),
+            exit_code: None,
+            duration: Some(Duration::from_millis(5)),
+        });
+        // The user explicitly re-affirms the open block's expansion…
+        let header = screen
+            .transcript
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.chrome.as_ref(),
+                    Some(ChromeRow::Header {
+                        title: "EXPLORE",
+                        ..
+                    })
+                )
+            })
+            .expect("explore header");
+        screen.transcript.set_panel_expanded_at(header, true);
+        // …so the group close honors that intent instead of collapsing.
+        screen.apply(UiEvent::AssistantText("done".to_string()));
+        let rendered = rendered_text(&mut screen, 100, 16);
+        assert!(rendered.contains("▾ EXPLORE"), "{rendered}");
+        assert!(rendered.contains("Read"), "{rendered}");
     }
 
     #[test]
@@ -6464,6 +6524,51 @@ mod tests {
         let idx = lines.iter().position(|line| line == divider).unwrap();
         assert_eq!(lines[idx - 1].trim(), "", "{lines:?}");
         assert_eq!(lines[idx + 1].trim(), "", "{lines:?}");
+    }
+
+    #[test]
+    fn turn_divider_sums_token_flows_across_the_tool_loop() {
+        let usage = |input: u64, output: u64| ProviderUsage {
+            provider: "anthropic".to_string(),
+            model: "opus-4.8".to_string(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: input + output,
+            cache_creation: None,
+        };
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        // Provider turn 1 proposes the tool…
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(usage(6_800, 35)),
+        });
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(3)),
+        });
+        // …provider turn 2 answers. The divider reports the whole task's
+        // flows (6.8k+8k sent, 35+40 received), matching its whole-task
+        // elapsed — never just the last provider turn.
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_2".to_string(),
+            response_id: None,
+            usage: Some(usage(8_000, 40)),
+        });
+        screen.end_turn();
+        let lines: Vec<String> = screen.wrapped_lines(90).iter().map(line_text).collect();
+        assert!(
+            lines.iter().any(|line| line.contains("↑14.8k ↓75")),
+            "divider sums the task's provider turns: {lines:?}"
+        );
     }
 
     #[test]

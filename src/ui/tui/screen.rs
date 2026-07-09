@@ -80,7 +80,27 @@ impl TurnDivider {
             usage: Some(usage), ..
         } = event
         {
-            self.usage = Some(usage.clone());
+            // A task can span several provider turns (the tool loop); the
+            // divider's ↑/↓ must be the TASK's cost, so token flows are
+            // summed. `total_tokens` is a level (conversation size after the
+            // latest turn), not a flow — keep the latest, never a sum.
+            match &mut self.usage {
+                Some(sum) => {
+                    sum.input_tokens = sum.input_tokens.saturating_add(usage.input_tokens);
+                    sum.output_tokens = sum.output_tokens.saturating_add(usage.output_tokens);
+                    sum.cache_read_input_tokens = sum
+                        .cache_read_input_tokens
+                        .saturating_add(usage.cache_read_input_tokens);
+                    sum.cache_write_input_tokens = sum
+                        .cache_write_input_tokens
+                        .saturating_add(usage.cache_write_input_tokens);
+                    sum.reasoning_output_tokens = sum
+                        .reasoning_output_tokens
+                        .saturating_add(usage.reasoning_output_tokens);
+                    sum.total_tokens = usage.total_tokens;
+                }
+                None => self.usage = Some(usage.clone()),
+            }
         }
     }
 }
@@ -288,7 +308,10 @@ impl ApprovalPolicy {
     fn symbol(self) -> &'static str {
         match self {
             Self::SkipPermissions => crate::ui::symbols::ERROR,
-            Self::Auto => crate::ui::symbols::ACTIVE,
+            // `◆` green per §9.3 (the settled/trusted posture). Never `◉`,
+            // which is the mode glyph on the same statusline — one glyph,
+            // one job (§5).
+            Self::Auto => crate::ui::symbols::DONE,
             Self::OnRequest => crate::ui::symbols::REVIEW,
             Self::NeverAsk => crate::ui::symbols::CANCELLED,
             Self::ReadOnly => crate::ui::symbols::ERROR,
@@ -673,7 +696,7 @@ fn working_indicator_line_with_activity(
 fn working_lines(
     frame: &str,
     elapsed: Option<Duration>,
-    footer: Option<&Footer>,
+    usage: Option<&ProviderUsage>,
     activity: Option<&str>,
     queued: usize,
     width: usize,
@@ -683,7 +706,7 @@ fn working_lines(
         elapsed.unwrap_or_default(),
         true,
         activity,
-        footer.and_then(|footer| footer.usage.as_ref()),
+        usage,
         queued,
         width,
     )]
@@ -1083,8 +1106,12 @@ impl Screen {
     /// `recoverable` is the count of recoverable Iris tasks in this workspace at
     /// launch, surfaced as a dim badge on the `Tasks` row (ADR-0031) instead of
     /// popping a picker over the home menu.
-    pub(crate) fn show_start_page(&mut self, recoverable: usize) {
-        self.start_page = Some(StartPage::new(self.reduced_motion, recoverable));
+    pub(crate) fn show_start_page(&mut self, recoverable: usize, punctuation_chords: bool) {
+        self.start_page = Some(StartPage::new(
+            self.reduced_motion,
+            recoverable,
+            punctuation_chords,
+        ));
     }
 
     /// Apply the resolved reduced-motion posture (env flag OR persisted
@@ -1746,7 +1773,10 @@ impl Screen {
             working_lines(
                 self.spinner.frame(),
                 self.spinner.elapsed(),
-                self.footer.as_ref(),
+                // Task-so-far sums (the divider's accumulator), so the live
+                // ↑/↓ matches the elapsed's whole-task scope — never just the
+                // last completed provider round.
+                self.turn_divider.usage.as_ref(),
                 Some(self.phase.label()),
                 self.queued,
                 usize::from(width),
@@ -3460,7 +3490,9 @@ mod tests {
                 ApprovalPolicy::SkipPermissions,
                 "■ dangerously skip permissions",
             ),
-            (ApprovalPolicy::Auto, "◉ auto"),
+            // `◆` per §9.3 — never `◉`, which is the mode glyph on the same
+            // line (one glyph, one job).
+            (ApprovalPolicy::Auto, "◆ auto"),
             (ApprovalPolicy::OnRequest, "▲ on-request"),
             (ApprovalPolicy::NeverAsk, "□ never-ask"),
             (ApprovalPolicy::ReadOnly, "■ read-only"),

@@ -361,7 +361,8 @@ async fn session_loop<P: ChatProvider>(
     // The start page (IrisMark + launcher) shows only for an interactive launch
     // with no task and no resume target; a startup resume picker supersedes it.
     if start_page && startup_modal.is_none() {
-        tui.screen.show_start_page(recoverable);
+        let punctuation_chords = tui.keyboard_enhanced();
+        tui.screen.show_start_page(recoverable, punctuation_chords);
     }
     refresh_footer(tui, switch);
     apply_recovery(recovery, tui);
@@ -4108,7 +4109,7 @@ mod tests {
     #[test]
     fn start_page_launcher_navigates_wraps_and_activates() {
         let mut screen = Screen::new();
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
 
         // ↓ moves to Resume session; ↵ activates it (opens the resume picker).
         assert!(matches!(
@@ -4138,7 +4139,7 @@ mod tests {
     #[test]
     fn start_page_tasks_entry_opens_the_task_surface() {
         let mut screen = Screen::new();
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
         // New session → Resume session → Tasks, then ↵ opens the task surface —
         // the surface is a home entry now, not a picker forced open on launch.
         handle_idle_event(&mut screen, key(KeyCode::Down));
@@ -4160,7 +4161,7 @@ mod tests {
     #[test]
     fn start_page_ctrl_chords_activate_directly() {
         let mut screen = Screen::new();
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
         assert!(matches!(
             handle_idle_event(
                 &mut screen,
@@ -4204,7 +4205,7 @@ mod tests {
     #[test]
     fn start_page_ctrl_r_stays_redo_once_the_composer_has_text() {
         let mut screen = Screen::new();
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
         handle_idle_event(&mut screen, key(KeyCode::Char('x')));
         // A non-empty composer keeps ctrl-r as the editor's redo binding.
         assert!(matches!(
@@ -4220,7 +4221,7 @@ mod tests {
     #[test]
     fn start_page_composer_stays_live_and_submit_starts_the_session() {
         let mut screen = Screen::new();
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
         // Typing goes to the composer, not the launcher.
         for c in "fix the bug".chars() {
             handle_idle_event(&mut screen, key(KeyCode::Char(c)));

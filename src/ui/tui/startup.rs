@@ -104,12 +104,17 @@ pub(crate) struct StartPage {
     /// as a dim badge on the `Tasks` row instead of force-opening a picker, so
     /// the count is visible without a modal popping over the home menu.
     recoverable: usize,
+    /// Whether ctrl+punctuation chords are receivable (kitty keyboard
+    /// enhancement negotiated). Keymap honesty: `ctrl-,` is advertised only
+    /// when the terminal can actually deliver it; the Settings row stays
+    /// reachable by `↑`/`↓` + `↵` either way.
+    punctuation_chords: bool,
     /// Power-on lamp-test progress. Reduced motion starts settled.
     boot: BootPhase,
 }
 
 impl StartPage {
-    pub(crate) fn new(reduced_motion: bool, recoverable: usize) -> Self {
+    pub(crate) fn new(reduced_motion: bool, recoverable: usize, punctuation_chords: bool) -> Self {
         Self {
             selected: 0,
             head: 0,
@@ -117,6 +122,7 @@ impl StartPage {
             last_advance: None,
             reduced_motion,
             recoverable,
+            punctuation_chords,
             boot: if reduced_motion {
                 BootPhase::Done
             } else {
@@ -314,6 +320,15 @@ impl StartPage {
     /// tonal fill. No hairline dividers between rows.
     fn menu_row(&self, index: usize, menu_width: usize) -> Vec<Span<'static>> {
         let (action, label, hint) = MENU_ITEMS[index];
+        // Keymap honesty: without the keyboard-enhancement protocol a plain
+        // terminal cannot transmit ctrl+comma at all, so that hint would be a
+        // dead control. Advertise the slash command instead — every printed
+        // control must work.
+        let hint = if action == StartAction::Settings && !self.punctuation_chords {
+            "/settings"
+        } else {
+            hint
+        };
         let selected = index == self.selected;
         let marker = if selected {
             Span::styled(format!("{} ", symbols::ACTIVE), prompt_style())
@@ -414,7 +429,7 @@ mod tests {
 
     #[test]
     fn ping_pong_reverses_at_both_ends_and_never_wraps() {
-        let mut page = StartPage::new(false, 0);
+        let mut page = StartPage::new(false, 0, true);
         let mut seen = vec![page.head()];
         for _ in 0..(MARK_DOTS * 4) {
             page.advance_for_test();
@@ -439,7 +454,7 @@ mod tests {
 
     #[test]
     fn reduced_motion_holds_a_static_center_dot() {
-        let mut page = StartPage::new(true, 0);
+        let mut page = StartPage::new(true, 0, true);
         assert!(!page.tick(), "reduced motion never animates");
         let lines = page.render(80);
         let mark = line_text(&lines[0]);
@@ -453,7 +468,7 @@ mod tests {
     #[test]
     fn launcher_never_renders_over_width_at_narrow_panes() {
         use super::super::wrap::display_width;
-        let mut page = StartPage::new(false, 0);
+        let mut page = StartPage::new(false, 0, true);
         page.skip_boot();
         for width in 1..=(MENU_WIDTH + 4) {
             for line in page.render(width) {
@@ -465,13 +480,13 @@ mod tests {
 
     #[test]
     fn power_on_fills_holds_then_reveals_the_launcher() {
-        let mut page = StartPage::new(false, 0);
+        let mut page = StartPage::new(false, 0, true);
         assert!(page.booting());
         // Frame 0: silkscreen printed, strip dark, menu hidden — but the block
         // height already matches the settled page (no reflow while waking).
         let first = page.render(80);
         let settled_height = {
-            let mut done = StartPage::new(true, 0);
+            let mut done = StartPage::new(true, 0, true);
             done.skip_boot();
             done.render(80).len()
         };
@@ -511,7 +526,7 @@ mod tests {
 
     #[test]
     fn any_key_completes_the_boot_instantly() {
-        let mut page = StartPage::new(false, 0);
+        let mut page = StartPage::new(false, 0, true);
         assert!(page.booting());
         page.skip_boot();
         assert!(!page.booting());
@@ -520,7 +535,7 @@ mod tests {
 
     #[test]
     fn reduced_motion_never_boots() {
-        let page = StartPage::new(true, 0);
+        let page = StartPage::new(true, 0, true);
         assert!(!page.booting(), "reduced motion starts settled");
         assert!(line_text(&page.render(80)[3]).contains("New session"));
     }
@@ -528,7 +543,7 @@ mod tests {
     #[test]
     fn silkscreen_prints_the_wordmark_and_rev_on_the_strip_measure() {
         use super::super::wrap::display_width;
-        let page = StartPage::new(true, 0);
+        let page = StartPage::new(true, 0, true);
         let lines = page.render(80);
         let silkscreen = line_text(&lines[1]);
         assert!(silkscreen.contains(WORDMARK), "{silkscreen:?}");
@@ -547,7 +562,7 @@ mod tests {
 
     #[test]
     fn launcher_selection_wraps_both_ways() {
-        let mut page = StartPage::new(true, 0);
+        let mut page = StartPage::new(true, 0, true);
         assert_eq!(page.selected_action(), StartAction::NewSession);
         page.up();
         assert_eq!(page.selected_action(), StartAction::Quit);
@@ -564,7 +579,7 @@ mod tests {
 
     #[test]
     fn launcher_rows_carry_marker_leader_and_key_hints() {
-        let page = StartPage::new(true, 0);
+        let page = StartPage::new(true, 0, true);
         let lines = page.render(80);
         // Mark, silkscreen, blank, then the five menu rows.
         assert_eq!(lines.len(), 3 + 5);
@@ -586,13 +601,13 @@ mod tests {
     #[test]
     fn tasks_row_shows_a_recoverable_badge_only_when_nonzero() {
         // No recoverable tasks: the Tasks row is a plain launcher row.
-        let none = StartPage::new(true, 0);
+        let none = StartPage::new(true, 0, true);
         let tasks = line_text(&none.render(80)[5]);
         assert!(!tasks.contains("to recover"), "{tasks:?}");
 
         // With recoverable tasks: a dim `· N to recover` badge, still ending in
         // the key hint, and the row never renders over width.
-        let some = StartPage::new(true, 2);
+        let some = StartPage::new(true, 2, true);
         let tasks = line_text(&some.render(80)[5]);
         assert!(tasks.contains("· 2 to recover"), "{tasks:?}");
         assert!(tasks.trim_end().ends_with("ctrl-t"), "{tasks:?}");
@@ -609,7 +624,7 @@ mod tests {
 
     #[test]
     fn selected_row_uses_the_surface_fill_and_bold_label() {
-        let page = StartPage::new(true, 0);
+        let page = StartPage::new(true, 0, true);
         let lines = page.render(80);
         let selected = &lines[3];
         assert!(
@@ -636,7 +651,7 @@ mod tests {
 
     #[test]
     fn trail_follows_behind_the_travel_direction() {
-        let mut page = StartPage::new(false, 0);
+        let mut page = StartPage::new(false, 0, true);
         page.skip_boot();
         page.advance_for_test();
         page.advance_for_test();
