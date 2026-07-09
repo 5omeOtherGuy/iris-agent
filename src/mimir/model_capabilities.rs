@@ -591,6 +591,35 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_label_round_trips_through_parse_and_display() {
+        // Regression for issue #512: the status footer must render the provider
+        // -native label the user selected, not the internal normalized token.
+        // For Anthropic adaptive models the two diverge by one notch (display
+        // `high` maps to internal `Medium`), so a footer built from
+        // `ReasoningEffort::as_str()` shows `medium` for a `/reasoning high`
+        // request. `display_level` must invert `parse_level` for every label.
+        let model = "claude-sonnet-5";
+        for option in level_options(ProviderId::Anthropic, model) {
+            let parsed = parse_level(ProviderId::Anthropic, model, option.label).unwrap();
+            assert_eq!(
+                parsed, option.level,
+                "parse round-trip for {}",
+                option.label
+            );
+            assert_eq!(
+                display_level(ProviderId::Anthropic, model, parsed),
+                option.label,
+                "display round-trip for {}",
+                option.label
+            );
+        }
+        // The specific issue-#512 case: `high` never displays as `medium`.
+        let high = parse_level(ProviderId::Anthropic, model, "high").unwrap();
+        assert_eq!(high, ReasoningEffort::Medium);
+        assert_eq!(display_level(ProviderId::Anthropic, model, high), "high");
+    }
+
+    #[test]
     fn anthropic_xhigh_is_model_specific() {
         // The shipped subscription models accept xhigh natively (it maps up to
         // Anthropic's `max`/`xhigh` effort or the `xhigh` 32768 budget): validate

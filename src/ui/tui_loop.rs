@@ -156,9 +156,25 @@ impl RenderScheduler {
     }
 }
 
-/// The active turn's cancellation token, shared with the input thread so a raw
-/// Ctrl-C cancels even while a synchronous tool blocks the executor thread.
-type CurrentTurn = Arc<Mutex<Option<CancellationToken>>>;
+/// The active turn's cancellation token, shared with the input thread so raw
+/// Ctrl-C (and Esc when no higher-priority UI owns it) cancels even while a
+/// synchronous tool blocks the executor thread.
+struct RunningTurn {
+    token: CancellationToken,
+    esc_cancels: bool,
+}
+
+type CurrentTurn = Arc<Mutex<Option<RunningTurn>>>;
+
+fn set_esc_cancel_enabled(current_turn: &CurrentTurn, enabled: bool) {
+    if let Some(turn) = current_turn
+        .lock()
+        .expect("turn token lock poisoned")
+        .as_mut()
+    {
+        turn.esc_cancels = enabled;
+    }
+}
 
 /// Run the interactive terminal-surface session to completion on `runtime`, then
 /// restore the terminal. `tui` already owns raw mode and paste/key flags.
@@ -524,6 +540,7 @@ async fn session_loop<P: ChatProvider>(
                         )
                         .await?;
                         tui.screen.end_turn();
+                        open_deferred_settings(tui, switch, steering.as_ref());
                         tui.draw()?;
                     }
                     RouteOutcome::Fall => {
@@ -543,6 +560,7 @@ async fn session_loop<P: ChatProvider>(
                         )
                         .await?;
                         tui.screen.end_turn();
+                        open_deferred_settings(tui, switch, steering.as_ref());
                         // Turn completion is a refresh trigger: the turn may
                         // have mutated the tree or task state.
                         git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
@@ -551,6 +569,7 @@ async fn session_loop<P: ChatProvider>(
                 }
             }
         }
+        open_deferred_settings(tui, switch, steering.as_ref());
         // A model/effort switch (Ctrl+P, Shift+Tab, or a `/model` `/reasoning`
         // command) lands in this iteration; refresh the footer so the trailing
         // draw reflects the new selection immediately, not on the next keypress.
@@ -655,6 +674,21 @@ fn apply_recovery(outcome: RecoveryOutcome, tui: &mut TuiUi) {
     }
 }
 
+/// Open a `/settings` request that was typed while a turn/compact operation was
+/// running. The running phase records only an intent; the modal opens here at a
+/// safe boundary, where model/settings actions already route.
+fn open_deferred_settings<P: ChatProvider>(
+    tui: &mut TuiUi,
+    switch: &mut Option<ModelSwitch<'_, P>>,
+    steering: &SteeringQueue,
+) {
+    if steering.take_settings()
+        && let Some(sw) = switch.as_mut()
+    {
+        tui.screen.open_modal(picker::open_settings(sw));
+    }
+}
+
 /// Request a coalesced render during an active turn: draw immediately when the
 /// pacing window allows, otherwise leave the request pending for the loop's
 /// flush branch to draw at the [`MIN_RENDER_INTERVAL`] boundary.
@@ -691,9 +725,14 @@ fn apply_model_switch_lines<P: ChatProvider>(
     if switched && let Some(selection) = after {
         tui.screen.set_switch_status(SwitchStatus::new(
             selection.model.clone(),
-            selection
-                .reasoning
-                .map(|effort| effort.as_str().to_string()),
+            selection.reasoning.map(|effort| {
+                crate::mimir::model_capabilities::display_level(
+                    selection.provider,
+                    &selection.model,
+                    effort,
+                )
+                .to_string()
+            }),
             harness.context_token_estimate(),
             switch_cache_status(before, selection),
             compact_recommended,
@@ -743,9 +782,14 @@ fn refresh_footer<P: ChatProvider>(tui: &mut TuiUi, switch: &Option<ModelSwitch<
         return;
     };
     let selection = sw.selection();
-    let effort = selection
-        .reasoning
-        .map(|effort| effort.as_str().to_string());
+    let effort = selection.reasoning.map(|effort| {
+        crate::mimir::model_capabilities::display_level(
+            selection.provider,
+            &selection.model,
+            effort,
+        )
+        .to_string()
+    });
     let qualified_model = format!("{}/{}", selection.provider.as_str(), selection.model);
     let context = if selection.provider == crate::mimir::selection::ProviderId::OpenAiCompatible {
         selection
@@ -1315,6 +1359,18 @@ fn context_breakdown_lines<P: ChatProvider>(
     lines
 }
 
+/// Whether a submitted line is the `/settings` command (the leading token,
+/// ignoring any trailing arguments), matching `route_command`'s own token
+/// split. Used by the running phase to divert `/settings` from steering into a
+/// deferred picker-open at the next safe boundary (issue #489).
+fn is_settings_command(text: &str) -> bool {
+    let trimmed = text.trim();
+    let cmd = trimmed
+        .split_once(char::is_whitespace)
+        .map_or(trimmed, |(cmd, _)| cmd);
+    cmd == "/settings"
+}
+
 fn route_command<P: ChatProvider>(
     prompt: &str,
     harness: &mut Harness<P>,
@@ -1483,9 +1539,9 @@ fn route_command<P: ChatProvider>(
             tui.screen.commit_user(prompt);
             Ok(RouteOutcome::Compact)
         }
-        "/copy" if rest.is_empty() => {
+        "/copy" => {
             tui.screen.commit_user(prompt);
-            apply_notices(tui, crate::cli::copy_command_lines(harness));
+            apply_notices(tui, crate::cli::copy_command_lines(harness, rest));
             Ok(RouteOutcome::Consumed)
         }
         // pi-mono spells it `/debug`; `/dbug` is accepted as an unlisted alias.
@@ -1782,10 +1838,13 @@ async fn run_harness_op<P: ChatProvider>(
     let bridge = LoopBridge { event_tx, appr_tx };
 
     // Clear any stale interrupt before arming, then publish the token so the
-    // input thread can cancel this turn on Ctrl-C.
+    // input thread can cancel this turn on Ctrl-C/Esc.
     crate::signals::reset();
     let token = CancellationToken::new();
-    *current_turn.lock().expect("turn token lock poisoned") = Some(token.clone());
+    *current_turn.lock().expect("turn token lock poisoned") = Some(RunningTurn {
+        token: token.clone(),
+        esc_cancels: true,
+    });
 
     let mut pending: Option<PendingApproval> = None;
     // Cleared once terminal input reaches EOF so the closed channel is no longer
@@ -1862,6 +1921,7 @@ async fn run_harness_op<P: ChatProvider>(
                         allow_always: request.allow_always,
                         allow_project: request.allow_project,
                     });
+                    set_esc_cancel_enabled(current_turn, false);
                     request_render(&mut sched, tui)?;
                 }
                 maybe = input_rx.recv(), if input_open => {
@@ -1891,12 +1951,17 @@ async fn run_harness_op<P: ChatProvider>(
                                 &mut pending,
                                 steering,
                                 git_cache,
+                                &token,
                             ) {
                                 // Reflect any just-enqueued (or cleared) steering
                                 // input on the working indicator.
                                 tui.screen.set_queued(steering.len());
                                 request_render(&mut sched, tui)?;
                             }
+                            set_esc_cancel_enabled(
+                                current_turn,
+                                pending.is_none() && tui.screen.session_menu.is_none(),
+                            );
                         }
                         None => {
                             // Terminal input ended (EOF): stop polling the closed
@@ -2123,6 +2188,7 @@ async fn dispatch_action<P: ChatProvider>(
             .await?;
             tui.screen.end_turn();
             if !compact_ok {
+                open_deferred_settings(tui, switch, steering);
                 return Ok(None);
             }
             let action = ModalAction::ConfirmModelSwitch {
@@ -2150,6 +2216,7 @@ async fn dispatch_action<P: ChatProvider>(
                     tui.screen.open_modal(*modal);
                 }
             }
+            open_deferred_settings(tui, switch, steering);
         }
         ModalAction::ResumeSession(id) => {
             // Close the picker and hand the chosen session up to the loop, which
@@ -2484,21 +2551,28 @@ fn to_modal_key(event: &Event) -> Option<ModalKey> {
 }
 
 /// Spawn the blocking terminal-read thread. It forwards every event to the loop
-/// and, on a raw Ctrl-C while a turn is active, cancels that turn's token from
-/// this OS thread (the executor thread may be blocked in a synchronous tool).
+/// and, on a raw Ctrl-C while a turn is active (or Esc when no higher-priority
+/// UI owns it), cancels that turn's token from this OS thread (the executor
+/// thread may be blocked in a synchronous tool).
 fn spawn_input_thread(tx: UnboundedSender<Event>, current_turn: CurrentTurn) {
     std::thread::spawn(move || {
         // Ends when terminal reads fail or the loop drops the receiver.
         while let Ok(event) = event::read() {
-            if is_ctrl_c(&event) {
+            if is_ctrl_c(&event) || is_esc_key(&event) {
                 // Hold the lock across the cancel so the turn cannot end and a
                 // new one begin in between (which would leak a stale interrupt
-                // and cancel the wrong turn). Matches the old watcher: set the
-                // interrupt flag (a repeat reaps bash child groups), then cancel.
+                // and cancel the wrong turn). Ctrl-C also sets the interrupt
+                // flag (a repeat reaps bash child groups); Esc is a soft turn
+                // cancel and only applies when the loop says no menu/approval
+                // owns Esc.
                 let guard = current_turn.lock().expect("turn token lock poisoned");
-                if let Some(token) = guard.as_ref() {
-                    crate::signals::interrupt_from_terminal();
-                    token.cancel();
+                if let Some(turn) = guard.as_ref() {
+                    if is_ctrl_c(&event) {
+                        crate::signals::interrupt_from_terminal();
+                        turn.token.cancel();
+                    } else if turn.esc_cancels {
+                        turn.token.cancel();
+                    }
                 }
             }
             if tx.send(event).is_err() {
@@ -2512,6 +2586,12 @@ fn is_ctrl_c(event: &Event) -> bool {
     matches!(event, Event::Key(key)
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && (key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat))
+}
+
+fn is_esc_key(event: &Event) -> bool {
+    matches!(event, Event::Key(key)
+        if matches!(key.code, KeyCode::Esc)
             && (key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat))
 }
 
@@ -3086,6 +3166,7 @@ fn handle_running_event(
     pending: &mut Option<PendingApproval>,
     steering: &SteeringQueue,
     git_cache: &GitStatusCache,
+    token: &CancellationToken,
 ) -> bool {
     match event {
         // Paste composes into the live editor (but not while an approval is
@@ -3243,9 +3324,29 @@ fn handle_running_event(
                 }
                 KeyCode::Enter => {
                     let text = screen.submit();
-                    if !text.trim().is_empty() {
+                    if is_settings_command(text.trim()) {
+                        // `/settings` is a UI command, not model input: defer
+                        // opening the settings picker to the next safe boundary
+                        // instead of steering the literal text into the turn
+                        // (issue #489). The loop drains this after the turn ends.
+                        steering.request_settings();
+                        screen.apply(UiEvent::Notice(
+                            "settings will open when this turn ends".to_string(),
+                        ));
+                    } else if !text.trim().is_empty() {
                         steering.enqueue_steering(text);
                     }
+                    true
+                }
+                // Esc with nothing higher-priority to consume it (no pending
+                // approval, no open dropdown, not a pager/scrollback key)
+                // cancels the running turn (issue #511). Mirrors Ctrl-C's
+                // abort: drop any queued steering and cancel the token so
+                // Nexus aborts the turn. Cancel is idempotent with the input
+                // thread's own Ctrl-C cancel.
+                KeyCode::Esc => {
+                    steering.clear();
+                    token.cancel();
                     true
                 }
                 code => apply_editor_key(screen, code, ctrl, alt),
@@ -3334,7 +3435,14 @@ mod tests {
         pending: &mut Option<PendingApproval>,
         steering: &SteeringQueue,
     ) -> bool {
-        super::handle_running_event(screen, event, pending, steering, &GitStatusCache::default())
+        super::handle_running_event(
+            screen,
+            event,
+            pending,
+            steering,
+            &GitStatusCache::default(),
+            &CancellationToken::new(),
+        )
     }
 
     #[test]
@@ -3805,8 +3913,8 @@ mod tests {
         ));
         assert!(screen.session_menu.is_some());
 
-        // Esc closes and never reaches the interrupt path (the turn's token is
-        // untouched -- only ctrl-c cancels).
+        // An open dropdown consumes Esc: it closes the readout and never falls
+        // through to the turn-cancel path (issue #511 preserves menu Esc).
         assert!(handle_running_event(
             &mut screen,
             key(KeyCode::Esc),
@@ -4467,6 +4575,90 @@ mod tests {
     }
 
     #[test]
+    fn running_esc_cancels_turn_when_nothing_higher_priority_consumes_it() {
+        // Esc with no approval pending and no dropdown open cancels the running
+        // turn (issue #511): the token is cancelled and queued steering dropped.
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let steering = SteeringQueue::default();
+        steering.enqueue_steering("queued".to_string());
+        let token = CancellationToken::new();
+        let mut pending: Option<PendingApproval> = None;
+        assert!(super::handle_running_event(
+            &mut screen,
+            key(KeyCode::Esc),
+            &mut pending,
+            &steering,
+            &GitStatusCache::default(),
+            &token,
+        ));
+        assert!(token.is_cancelled());
+        assert_eq!(steering.len(), 0);
+    }
+
+    #[test]
+    fn running_esc_denies_pending_approval_without_cancelling_turn() {
+        // A pending approval owns Esc: it denies (preserved) and must not cancel
+        // the turn's token (issue #511 must not regress approval Esc).
+        let mut screen = Screen::new();
+        let steering = SteeringQueue::default();
+        let (tx, rx) = oneshot::channel();
+        let mut pending = Some(PendingApproval {
+            call: call(),
+            reply: tx,
+            allow_always: true,
+            allow_project: false,
+        });
+        let token = CancellationToken::new();
+        assert!(super::handle_running_event(
+            &mut screen,
+            key(KeyCode::Esc),
+            &mut pending,
+            &steering,
+            &GitStatusCache::default(),
+            &token,
+        ));
+        assert_eq!(rx.blocking_recv().unwrap(), ApprovalDecision::Deny);
+        assert!(
+            !token.is_cancelled(),
+            "approval Esc denies, it does not cancel the turn"
+        );
+    }
+
+    #[test]
+    fn running_esc_with_open_dropdown_closes_it_without_cancelling() {
+        // An open dropdown consumes Esc (closes the readout) and leaves the turn
+        // running (issue #511 preserves menu Esc).
+        let mut screen = git_screen();
+        screen.start_turn();
+        let steering = SteeringQueue::default();
+        let mut pending: Option<PendingApproval> = None;
+        let token = CancellationToken::new();
+        super::handle_running_event(
+            &mut screen,
+            key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            &mut pending,
+            &steering,
+            &GitStatusCache::default(),
+            &token,
+        );
+        assert!(screen.session_menu.is_some());
+        assert!(super::handle_running_event(
+            &mut screen,
+            key(KeyCode::Esc),
+            &mut pending,
+            &steering,
+            &GitStatusCache::default(),
+            &token,
+        ));
+        assert!(screen.session_menu.is_none());
+        assert!(
+            !token.is_cancelled(),
+            "menu Esc closes the dropdown, not the turn"
+        );
+    }
+
+    #[test]
     fn running_enter_queues_steering_and_clears_editor() {
         let mut screen = Screen::new();
         let steering = SteeringQueue::default();
@@ -4516,6 +4708,62 @@ mod tests {
         let mut pending: Option<PendingApproval> = None;
         handle_running_event(&mut screen, key(KeyCode::Enter), &mut pending, &steering);
         assert_eq!(steering.len(), 0, "a blank submit queues nothing");
+    }
+
+    #[test]
+    fn running_settings_command_defers_picker_without_steering() {
+        // Issue #489: `/settings` typed mid-turn is a UI command, not model
+        // input. Enter must request the deferred picker, never steer the text
+        // into the turn.
+        let mut screen = Screen::new();
+        let steering = SteeringQueue::default();
+        let mut pending: Option<PendingApproval> = None;
+        for ch in "/settings".chars() {
+            handle_running_event(&mut screen, key(KeyCode::Char(ch)), &mut pending, &steering);
+        }
+        assert!(handle_running_event(
+            &mut screen,
+            key(KeyCode::Enter),
+            &mut pending,
+            &steering,
+        ));
+        assert_eq!(steering.len(), 0, "/settings is not steered to the model");
+        assert!(steering.take_settings(), "the picker is requested");
+        // Drained once: a second boundary check does not re-open it.
+        assert!(!steering.take_settings());
+        assert!(screen.editor_is_empty(), "the composer is cleared");
+    }
+
+    #[test]
+    fn running_non_command_text_still_steers() {
+        // Regression guard for #489: ordinary text keeps its steering path and
+        // never trips the settings request.
+        let mut screen = Screen::new();
+        let steering = SteeringQueue::default();
+        let mut pending: Option<PendingApproval> = None;
+        for ch in "/settle the merge".chars() {
+            handle_running_event(&mut screen, key(KeyCode::Char(ch)), &mut pending, &steering);
+        }
+        assert!(handle_running_event(
+            &mut screen,
+            key(KeyCode::Enter),
+            &mut pending,
+            &steering,
+        ));
+        assert_eq!(steering.take_steering(), vec!["/settle the merge"]);
+        assert!(!steering.take_settings(), "no settings request for prose");
+    }
+
+    #[test]
+    fn is_settings_command_matches_only_the_settings_token() {
+        assert!(is_settings_command("/settings"));
+        assert!(is_settings_command("  /settings  "));
+        // Trailing args are ignored, matching route_command's token split.
+        assert!(is_settings_command("/settings foo"));
+        assert!(!is_settings_command("/settle"));
+        assert!(!is_settings_command("/settingsx"));
+        assert!(!is_settings_command("settings"));
+        assert!(!is_settings_command("please open /settings"));
     }
 
     #[test]
