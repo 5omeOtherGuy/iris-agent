@@ -308,11 +308,25 @@ itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
   reserve rows above the composer and shift the editor down — not a floating
   layer over the pane. No cast shadow, no scrim, no blur, no glass; the pane is
   flat and fully opaque throughout. The composer's top edge is the only frame.
-- **Motion is almost nil.** Only two live motions exist: the **LED-chase
-  working indicator** (`●··· → ·●·· → ··●· → ···●`) and the **edge-dot pulse**
-  on the context meter / running symbol at high usage. No braille spinners, no
-  rainbow meters, no easing-heavy transitions. Both degrade to a **static
-  readout** under `prefers-reduced-motion: reduce`.
+- **Motion is physics, and it is quantized.** Every sanctioned motion is a
+  discrete step on the loop's tick grid — machines step, they do not ease. The
+  closed set:
+  1. the **LED-chase working indicator** (`●··· → ·●·· → ··●· → ···●`) and the
+     IrisMark's idle ping-pong sweep — the only *looping* motions, and they run
+     only while something is genuinely live;
+  2. the **edge-dot pulse** on the context meter / running symbol at high usage;
+  3. the **power-on lamp test** (§12.5) — the start page's one-shot boot: the
+     strip fills two LEDs per tick, holds all-lit for two ticks, releases. Runs
+     once, on the start page only, and any key completes it instantly;
+  4. the **detent flash** — when a bottom-statusline segment changes (model,
+     effort, approval policy) or the context meter lights a new LED, the changed
+     element alone renders bright for two ticks, then settles: the mechanical
+     acknowledgment that a switch clicked into a new position. Never fires from
+     startup initialization (it is armed only once the first frame settles), so
+     a flash is always news.
+  No braille spinners, no rainbow meters, no easing, no fades, no ambient
+  motion. Everything above degrades to its **static settled state** under
+  `prefers-reduced-motion: reduce` / `IRIS_REDUCED_MOTION`.
 - **Interaction states are quiet.** Hover/selected rows in overlays use the
   `surface` fill — never a colored left-border accent. Focus is the cyan
   interactive role. State changes are reported by the symbol vocabulary, not by
@@ -742,6 +756,24 @@ Canonical commands: `/model` · `/diff` · `/undo` · `/compact` · `/clear` ·
 ### 9.6 File reference (`@`)
 `@` references a workspace file (a path completion). Same overlay idiom.
 
+### 9.7 The exit receipt
+
+When a session that ran at least one turn ends, Iris prints **one dim line**
+after terminal teardown — the instrument's printed slip, landing in normal
+terminal scrollback in both screen modes (in pager mode it is the only trace
+of the run; inline it closes the transcript):
+
+```
+iris 0.1.0 ┊ 12m ┊ 3 turns ┊ ↑412k ↓18.9k ┊ cache 88%
+```
+
+Fields, in order, `┊`-joined under the separator law: product + rev · wall
+time · turn count · tokens sent/received summed over **every provider turn**
+(the billing measure — unlike the per-task divider) · the cached share of
+sent tokens. **Numbers are honest** (§11): a field the runtime did not
+measure is omitted, never guessed; a session with no turns prints nothing —
+a receipt for nothing is noise.
+
 ---
 
 ## 10 · Overlays
@@ -819,6 +851,7 @@ tasks (ADR-0031) are surfaced **here** — a dim `· N to recover` badge on the
 ~/demo ┊ git main                                     CTX 0/300k ○○○○○○○○○○
 
                         ○ ○ ○ ● ○ ○ ○ ○ ○ ○ ○ ○        ← IrisMark (animated)
+                        I R I S                 0.1.0  ← silkscreen (printed)
 
                         ◉ New session ················ ctrl-n
                           Resume session ·············· ctrl-r
@@ -840,6 +873,23 @@ behind the travel direction (trail-1 non-bold orange, trail-2 dimmest; head
 bright orange). All other dots are dim `○`. It reuses the working indicator's
 tick machinery: it stops when the terminal is unfocused, and under
 `IRIS_REDUCED_MOTION` it holds a single static lit dot at the center.
+
+**Silkscreen.** One row directly under the strip — printed faceplate text, so
+it is visible from the first frame and never animates: the letter-spaced
+wordmark `I R I S` anchored to the strip's **left** edge, the crate rev
+anchored to its **right** edge (dim). Wordmark in body ink, plain weight — the
+LEDs stay the only bright element. This is the interface's one version
+surface and its only wordmark; still no ASCII art, no figlet.
+
+**Power-on.** An interactive launch runs the **lamp test** (§6 motion 3):
+frame 0 shows the silkscreen printed, the strip dark, and the menu hidden
+(blank rows — the block's height never changes, so nothing reflows); the
+LEDs then fill left-to-right two per tick, hold all-lit for two ticks —
+every LED proves itself — and release into the idle ping-pong as the menu
+rows go live. Any key completes the boot instantly and still performs its
+normal action; the composer is live throughout; under reduced motion the
+page starts settled. The boot exists only here: launching with a task or a
+resume target powers straight into work, no ceremony.
 
 **Launcher.** A keyboard-navigable list (~44 columns, centered, one blank row
 below the mark) in the house picker idiom — NO hairline dividers between rows:
@@ -880,8 +930,10 @@ starts the session with it.
 10. **Closed symbol set.** No glyph outside §5; `…`/`−`/`┊` (not `...`/`-`/`|`);
     no emoji.
 11. **Composer is unconditional.** No show/hide/reveal/collapse mechanic.
-12. **Motion** is only the LED chase (working indicator + IrisMark) + edge
-    pulse, all reduced-motion safe.
+12. **Motion** is only the closed quantized set of §6 — LED chase (working
+    indicator + IrisMark), edge pulse, the start page's one-shot lamp test,
+    and the two-tick detent flash — all stepped on the tick grid, all
+    reduced-motion safe, and none of them ambient.
 
 ---
 
