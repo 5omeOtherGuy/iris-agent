@@ -87,21 +87,12 @@ pub(crate) enum ModalAction {
     ApplyScoped(Option<Vec<String>>),
     /// Persist the scope to settings (Ctrl+S); the picker stays open.
     SaveScoped(Option<Vec<String>>),
-    /// Apply this effort/thinking level.
-    SetEffort(ReasoningEffort),
-    /// Settings menu -> open the thinking-level submenu (default reasoning).
-    OpenEffortPicker,
-    /// Settings -> back to the top-level category list.
-    OpenSettingsRoot,
-    /// Settings -> open a category's submenu.
-    OpenSettingsCategory(crate::ui::settings_menu::Category),
-    /// Settings -> open the enum picker for this field.
-    OpenSettingsEnum(crate::ui::settings_menu::Field),
-    /// Settings -> open the text/numeric entry for this field.
-    OpenSettingsEntry(crate::ui::settings_menu::Field),
+    /// Settings panel: the reasoning switch clicked to a new detent. Applies to
+    /// the live session AND persists as the default; the panel stays open.
+    AdjustEffort(ReasoningEffort),
     /// Persist a settings field to the user-global file (`None` clears the key).
-    /// The loop maps the field to its `config::save_*` and re-opens the parent
-    /// category submenu on the refreshed values.
+    /// The loop maps the field to its `config::save_*`; the panel stays open
+    /// and keeps its own display state (it already clicked the detent).
     SaveSetting {
         field: crate::ui::settings_menu::Field,
         value: Option<String>,
@@ -173,11 +164,8 @@ pub(crate) enum Modal {
     Model(ModelPicker),
     SwitchContext(SwitchContextPrompt),
     Scoped(ScopedModels),
-    Effort(EffortPicker),
-    Settings(crate::ui::settings_menu::SettingsMenu),
-    SettingsSub(crate::ui::settings_menu::SubMenu),
-    SettingsEnum(crate::ui::settings_menu::EnumMenu),
-    SettingsEntry(crate::ui::settings_menu::EntryDialog),
+    // Boxed (like Tasks) so the panel's snapshot does not dominate the enum.
+    Settings(Box<crate::ui::settings_menu::SettingsPanel>),
     Trust(TrustMenu),
     Session(SessionPicker),
     Tasks(TaskPicker),
@@ -193,11 +181,7 @@ impl Modal {
             Modal::Model(picker) => picker.handle_key(key),
             Modal::SwitchContext(prompt) => prompt.handle_key(key),
             Modal::Scoped(picker) => picker.handle_key(key),
-            Modal::Effort(picker) => picker.handle_key(key),
-            Modal::Settings(menu) => menu.handle_key(key),
-            Modal::SettingsSub(menu) => menu.handle_key(key),
-            Modal::SettingsEnum(menu) => menu.handle_key(key),
-            Modal::SettingsEntry(dialog) => dialog.handle_key(key),
+            Modal::Settings(panel) => panel.handle_key(key),
             Modal::Trust(menu) => menu.handle_key(key),
             Modal::Session(picker) => picker.handle_key(key),
             Modal::Tasks(picker) => picker.handle_key(key),
@@ -218,11 +202,31 @@ impl Modal {
                 dialog.push_str(text);
                 ModalOutcome::Redraw
             }
-            Modal::SettingsEntry(dialog) => {
-                dialog.push_str(text);
+            Modal::Settings(panel) => {
+                panel.push_str(text);
                 ModalOutcome::Redraw
             }
             _ => ModalOutcome::Ignore,
+        }
+    }
+
+    /// Advance modal-owned animation one loop tick (today: the settings
+    /// panel's detent flash). Returns true while something is still settling,
+    /// so the loop keeps repainting on the tick grid until it does.
+    pub(crate) fn tick(&mut self) -> bool {
+        match self {
+            Modal::Settings(panel) => panel.tick(),
+            _ => false,
+        }
+    }
+
+    /// Render with an explicit line budget (the docked-menu region's height).
+    /// Only the settings panel windows itself to the viewport; every other
+    /// modal is already bounded by its own row cap and ignores the budget.
+    pub(crate) fn render_budgeted(&self, width: usize, budget: usize) -> Vec<Line<'static>> {
+        match self {
+            Modal::Settings(panel) => panel.render_budgeted(width, budget),
+            _ => Modal::render(self, u16::try_from(width).unwrap_or(u16::MAX)),
         }
     }
 
@@ -231,11 +235,7 @@ impl Modal {
             Modal::Model(picker) => picker.render(width),
             Modal::SwitchContext(prompt) => prompt.render(width),
             Modal::Scoped(picker) => picker.render(width),
-            Modal::Effort(picker) => picker.render(width),
-            Modal::Settings(menu) => menu.render(width),
-            Modal::SettingsSub(menu) => menu.render(width),
-            Modal::SettingsEnum(menu) => menu.render(width),
-            Modal::SettingsEntry(dialog) => dialog.render(width),
+            Modal::Settings(panel) => panel.render(width),
             Modal::Trust(menu) => menu.render(width),
             Modal::Session(picker) => picker.render(width),
             Modal::Tasks(picker) => picker.render(width),
@@ -596,8 +596,10 @@ impl ModelPicker {
             "↑↓ move · ←→ effort ({}) · ↵ select · s session · esc cancel",
             self.display_effort_label()
         );
+        // ONE selector for the adjacent pair: rows pick the model, ←→ clicks
+        // the reasoning detent. `/model` and a bare `/reasoning` both open it.
         crate::ui::tui::overlay_menu(
-            Some("Select model"),
+            Some("Model & reasoning"),
             rows,
             Some(&footer),
             usize::from(width),
@@ -912,74 +914,6 @@ impl ScopedModels {
             Some("Scoped models"),
             rows,
             Some(&footer),
-            usize::from(width),
-        )
-    }
-}
-
-// --- effort picker ---
-
-#[derive(Debug, Clone)]
-pub(crate) struct EffortPicker {
-    selector: Selector,
-    levels: Vec<model_capabilities::ReasoningOption>,
-}
-
-impl EffortPicker {
-    pub(crate) fn new(
-        levels: Vec<model_capabilities::ReasoningOption>,
-        current: ReasoningEffort,
-    ) -> Self {
-        let items: Vec<SelectorItem> = levels
-            .iter()
-            .map(|option| {
-                let mut item =
-                    SelectorItem::new(option.level.as_str(), option.label).detail(option.detail);
-                if option.level == current {
-                    item = item.trailing("current");
-                }
-                item
-            })
-            .collect();
-        let mut selector = Selector::new(items, false, true, 8);
-        selector.select_id(current.as_str());
-        EffortPicker { selector, levels }
-    }
-
-    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
-        match key {
-            ModalKey::Up => {
-                self.selector.up();
-                ModalOutcome::Redraw
-            }
-            ModalKey::Down => {
-                self.selector.down();
-                ModalOutcome::Redraw
-            }
-            ModalKey::Enter => match self.selected_level() {
-                Some(level) => ModalOutcome::Emit(ModalAction::SetEffort(level)),
-                None => ModalOutcome::Ignore,
-            },
-            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
-            _ => ModalOutcome::Ignore,
-        }
-    }
-
-    fn selected_level(&self) -> Option<ReasoningEffort> {
-        let id = self.selector.selected_id()?;
-        self.levels
-            .iter()
-            .copied()
-            .find(|option| option.level.as_str() == id)
-            .map(|option| option.level)
-    }
-
-    fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let rows = selector_rows(&self.selector, "No levels");
-        crate::ui::tui::overlay_menu(
-            Some("Reasoning effort"),
-            rows,
-            Some("↑↓ move · ↵ select · esc cancel"),
             usize::from(width),
         )
     }
@@ -1880,7 +1814,7 @@ mod tests {
         let text = render_text(&picker);
         // Frameless: bold uppercase title, ◉ current marker, provider meta — and
         // no box-drawing frame anywhere.
-        assert!(text.contains("SELECT MODEL"), "{text}");
+        assert!(text.contains("MODEL & REASONING"), "{text}");
         assert!(
             !text.chars().any(|c| "┌┐└┘├┤│".contains(c)),
             "no frame chars: {text}"
@@ -2210,26 +2144,9 @@ mod tests {
     }
 
     #[test]
-    fn effort_picker_selects_level() {
-        let levels = model_capabilities::level_options(ProviderId::OpenAi, "gpt-4.1").to_vec();
-        let mut picker = EffortPicker::new(levels, ReasoningEffort::Low);
-        // Preselected on Low; move up to Off and select.
-        picker.handle_key(ModalKey::Up);
-        match picker.handle_key(ModalKey::Enter) {
-            ModalOutcome::Emit(ModalAction::SetEffort(level)) => {
-                assert_eq!(level, ReasoningEffort::Off);
-            }
-            other => panic!("expected SetEffort, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn modal_renders_through_component_trait_with_width_clamp() {
         use crate::ui::tui::Component;
-        let modal = Modal::Effort(EffortPicker::new(
-            model_capabilities::level_options(ProviderId::OpenAi, "gpt-4.1").to_vec(),
-            ReasoningEffort::Low,
-        ));
+        let modal = Modal::LoginMethod(MethodSelect::new());
         // The Component impl forwards to Modal::render after clamping usize->u16.
         assert_eq!(Component::render(&modal, 40), Modal::render(&modal, 40));
         // An out-of-u16-range width clamps to u16::MAX rather than overflowing.

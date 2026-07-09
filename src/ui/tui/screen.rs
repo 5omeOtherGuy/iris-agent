@@ -590,7 +590,7 @@ fn content_width(width: usize) -> usize {
         .max(1)
 }
 
-pub(super) fn compact_count(value: u64) -> String {
+pub(crate) fn compact_count(value: u64) -> String {
     fn trim_decimal(text: String) -> String {
         if let Some(stripped) = text.strip_suffix(".0") {
             stripped.to_string()
@@ -1678,8 +1678,10 @@ impl Screen {
             return false;
         }
         // Detent flashes decay on the same quantized cadence as everything
-        // else; a live flash forces the redraws that let it settle.
+        // else; a live flash forces the redraws that let it settle. The
+        // settings panel's own detent flash settles through the same grid.
         let settling = self.detents.tick();
+        let modal_settling = self.modal.as_mut().is_some_and(|modal| modal.tick());
         // The start page's IrisMark reuses the spinner tick machinery and holds
         // still under reduced motion (StartPage::tick handles both cadence and
         // freeze). It must keep ticking even in an inactive terminal pane: tmux
@@ -1689,7 +1691,7 @@ impl Screen {
         } else {
             self.spinner.tick()
         };
-        animated || settling
+        animated || settling || modal_settling
     }
 
     /// Drive one paced assistant-stream commit tick: migrate newly-stable
@@ -2612,6 +2614,14 @@ struct ChromeHeights {
     editor: u16,
 }
 
+/// Rows the docked menu region may honestly occupy: the viewport minus the
+/// protected composer (`MIN_EDITOR_H`) and the pinned session bar + hairline
+/// (2 rows) the pager draws over the pane top. A menu allowed past this is
+/// painted under the bar and loses its head.
+fn menu_room(height: u16) -> u16 {
+    height.saturating_sub(MIN_EDITOR_H).saturating_sub(2)
+}
+
 /// Allocate chrome rows. The composer is protected first: the menu yields to
 /// `MIN_EDITOR_H` (hairline + one input row + internal rule + statusline) before anything else
 /// is squeezed. The bottom padding is preferred, not protected, so overlays can
@@ -2671,10 +2681,18 @@ pub(super) fn render_editor_chrome(
     // Approvals no longer dock here — the review renders inside the gated tool
     // block (`▲ REVIEW`). This region is the modal/palette overlay only.
     let menu_lines: Option<Vec<Line<'static>>> = match screen.focus_for(&input_text) {
-        FocusTarget::Modal => screen
-            .modal
-            .as_ref()
-            .map(|modal| Component::render(modal, menu_inner_width)),
+        FocusTarget::Modal => {
+            // The modal knows the region's line budget so a tall surface (the
+            // settings panel) windows itself instead of being clipped: the
+            // viewport minus the protected composer, the pinned session bar
+            // (2 rows the pager always draws over the pane top), and the
+            // menu region's two inset rows.
+            let budget = usize::from(menu_room(area.height).saturating_sub(2));
+            screen
+                .modal
+                .as_ref()
+                .map(|modal| modal.render_budgeted(menu_inner_width, budget))
+        }
         FocusTarget::Palette => {
             Some(PaletteView::for_palette(&screen.palette, &input_text).render(menu_inner_width))
         }
@@ -2682,13 +2700,18 @@ pub(super) fn render_editor_chrome(
         // the docked menu region above the composer.
         FocusTarget::Editor | FocusTarget::SessionMenu => None,
     };
+    // The legacy 16-row cap still floors small viewports; a taller terminal
+    // lets a self-windowing modal (the settings panel) use the space above
+    // the protected composer and below the session bar instead of clipping
+    // at 16 rows.
+    let menu_cap = MAX_MENU_ROWS.max(menu_room(area.height));
     let menu_wanted = menu_lines
         .as_ref()
         .map(|lines| {
             u16::try_from(lines.len())
                 .unwrap_or(u16::MAX)
                 .saturating_add(2)
-                .min(MAX_MENU_ROWS)
+                .min(menu_cap)
         })
         .unwrap_or(0);
 

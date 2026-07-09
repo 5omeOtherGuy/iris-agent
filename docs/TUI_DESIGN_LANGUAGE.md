@@ -319,7 +319,8 @@ itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
      strip fills two LEDs per tick, holds all-lit for two ticks, releases. Runs
      once, on the start page only, and any key completes it instantly;
   4. the **detent flash** — when a bottom-statusline segment changes (model,
-     effort, approval policy) or the context meter lights a new LED, the changed
+     effort, approval policy), the context meter lights a new LED, or a
+     settings-panel control clicks to a new position (§10.1), the changed
      element alone renders bright for two ticks, then settles: the mechanical
      acknowledgment that a switch clicked into a new position. Never fires from
      startup initialization (it is armed only once the first frame settles), so
@@ -793,10 +794,96 @@ The composer's top edge sits directly below, so the menu needs no frame of its
 own to read as a distinct region.
 
 - **SlashMenu** — command palette (§9.5). Title-less: just the rows.
-- **Picker** — model switcher, settings, scoped-models, **tasks**, resume, login
-  provider list. Rows: `[◉ if active] label … meta hint`.
+- **Picker** — model switcher, scoped-models, **tasks**, resume, login provider
+  list. Rows: `[◉ if active] label … meta hint`. **Adjacent things share one
+  picker:** the model switcher IS the reasoning switcher (`Model & reasoning` —
+  rows pick the model, `←`/`→` clicks the effort detent); `/model` and a bare
+  `/reasoning` both open it, and the typed forms (`/model <id>`,
+  `/reasoning <level>`) stay as the fast path. Never a second bespoke list for
+  a sibling of an existing surface.
+- **Settings panel** — the faceplate (§10.1). Not a category tree.
 - **HelpOverlay** — the `?` cheatsheet: grouped key→action rows (keys in ink,
   actions muted, quiet uppercase group headings). No color, no icons.
+
+### 10.1 The settings panel — the faceplate
+
+`/settings` is ONE flat control surface, like the printed back panel of a lab
+instrument: every setting is a row, grouped under dim uppercase **silkscreen
+section headers** (`ENGINE · SAFETY · MEMORY · CHECKS · PANEL · GIT` — what
+runs → what it may do → what it remembers → how it self-checks → the panel
+itself → where it works), and adjusted **in place**. No sub-menu is ever
+opened to change a value; drilling three levels to flip a switch is the
+anti-instrument.
+
+```
+SETTINGS                                                    iris 0.1.0
+
+ENGINE
+  model             ▸ gpt-5.5 ┊ openai-codex
+  reasoning         ○ off  ○ minimal  ○ low  ◉ medium  ○ high  ○ xhigh
+  model scope       ▸ all models
+  providers         ▸ 3 connected
+
+MEMORY
+  compact at        ●●●●●●○○○○  232k tokens
+  microcompaction   ○ off  ◉ on
+  watermark         ●●●●●○○○○○  32k tokens
+
+↑↓ select · ←→ set · esc close
+```
+
+**Masthead.** Row one is the panel's silkscreen: bold `SETTINGS`, the crate
+rev right-bound on the panel measure (the same identity print as the start
+page and the exit receipt). It is pinned — a windowed panel scrolls its
+sections under it, never past it.
+
+**Four control archetypes** — a closed set, like the four tool families.
+Never invent a fifth:
+
+- **switch** — a fixed vocabulary printed as a labeled detent track
+  (`○ strict  ◉ auto  ○ never`). `←`/`→` click one detent and **clamp at the
+  stops** (a real switch never wraps; against the stop is a silent no-op).
+  Bools are two-position switches (`○ off  ◉ on`). The `◉` is the handle —
+  orange wherever it sits (selection color, not state color); the one guarded
+  switch (`skip approvals`) paints its handle **danger red in the on
+  position** and carries a permanent dim caution silkscreen
+  (`dangerous ┊ session only`). When the labeled track does not fit the
+  width, the row degrades to its **rotary form** — position dots + the
+  selected value (`○○◉○○  medium`) — width alone decides, per row.
+- **dial** — a numeric on a **10-detent ladder** rendered as the house 10-dot
+  meter (filled `●`, orange edge, dim `○`) plus the honest printed value
+  (`232k tokens` — the ONE house token format). `←`/`→` step to the
+  neighbouring detent; an off-ladder value (hand-edited json) snaps into the
+  ladder on its first click while the printed number stays true. `↵` opens an
+  inline register for a precise value, clamped to the field's hard bounds.
+- **register** — free text edited inline on the row: `↵` edits (buffer + the
+  `▋` caret), `↵` saves, `esc` cancels, an empty buffer clears the key when
+  the field allows it; a rejected buffer shows an inline danger token
+  (`■ whole numbers only`), never a modal.
+- **port** — a `▸` row that opens a deeper surface (model picker, scoped
+  models, project permissions, login). **Settings is home:** when that
+  surface closes — selected or cancelled — the panel re-opens on the port row
+  that launched it, snapshot refreshed.
+
+**Mechanics.** `↑`/`↓` move over controls (wrapping; headers and blanks are
+skipped — silkscreen is not selectable). Every adjustment **saves
+immediately** (position IS state, like a physical switch) and the changed
+element renders bright for two ticks — the §6 detent flash, on the same tick
+grid as the statusline detents, settled instantly under reduced motion. The
+theme row is a **live rotary**: each click re-skins the whole pane before
+your eyes. A **dependent control dims to inert hardware** while its master is
+off (the watermark under `microcompaction ○ off`) but stays operable. The
+footer prints only the selected row's true verbs (`←→ set` · `←→ adjust · ↵
+type` · `↵ edit` · `↵ open` — keymap honesty per archetype).
+
+**Height honesty.** On a tall pane the whole faceplate prints at once. On a
+short one the panel windows itself under the pinned session bar and above the
+protected composer, scrolling with the house `(n/N)` position row — never
+clipped, never painted under other chrome.
+
+**Pruning.** The faceplate is curated; the service hatch is `settings.json`.
+Niche flags (bash tool mode, tool round-trip caps, retry tuning, custom
+endpoint blocks) stay json-only. Every panel row must earn its silkscreen.
 
 ---
 

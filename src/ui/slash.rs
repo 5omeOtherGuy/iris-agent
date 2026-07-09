@@ -48,12 +48,12 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/model",
-        description: "Show or switch provider/model",
+        description: "Pick model & reasoning (or /model <id>)",
         action: SlashAction::Submit,
     },
     SlashCommand {
         name: "/reasoning",
-        description: "Set reasoning effort [off|minimal|low|medium|high|xhigh]",
+        description: "Pick model & reasoning (or /reasoning <level>)",
         action: SlashAction::Submit,
     },
     SlashCommand {
@@ -113,7 +113,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/settings",
-        description: "Open settings menu",
+        description: "Open the settings panel",
         action: SlashAction::Submit,
     },
     SlashCommand {

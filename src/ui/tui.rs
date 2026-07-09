@@ -63,11 +63,12 @@ pub(crate) use overlay::{FocusTarget, overlay_menu};
 use panel::PanelState;
 #[cfg(test)]
 use rows::{ChromeRow, TranscriptRow, hrule_line};
+pub(crate) use screen::compact_count;
+use screen::render_document_with_hints;
 pub(crate) use screen::{
     ApprovalPolicy, ContextAccounting, Screen, SwitchCacheStatus, SwitchStatus,
 };
 pub(crate) use screen::{BarSegment, session_bar_hit};
-use screen::{compact_count, render_document_with_hints};
 #[cfg(test)]
 use screen::{
     composer_statusline, editor_visual_rows, fresh_editor, render_document,
@@ -6312,7 +6313,7 @@ mod tests {
         let model_idx = rendered.find("GPT 5.5").expect("model row");
         let editor_idx = rendered.find("Give Iris a task").expect("composer row");
         assert!(model_idx < editor_idx, "{rendered}");
-        assert!(!rendered.contains("Select model"), "{rendered}");
+        assert!(!rendered.contains("Model & reasoning"), "{rendered}");
     }
 
     #[test]
@@ -6331,8 +6332,106 @@ mod tests {
         let rendered = rendered_text(&mut screen, 80, 17);
         assert!(rendered.contains("Sonnet 5"), "{rendered}");
         assert!(rendered.contains("effort (max)"), "{rendered}");
-        assert!(rendered.contains("SELECT MODEL"), "{rendered}");
+        assert!(rendered.contains("MODEL & REASONING"), "{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
+    }
+
+    fn faceplate_snapshot() -> crate::ui::settings_menu::Snapshot {
+        use crate::mimir::selection::ReasoningEffort;
+        crate::ui::settings_menu::Snapshot {
+            default_model: "openai-codex/gpt-5.5".to_string(),
+            reasoning_levels: vec![
+                (ReasoningEffort::Low, "low"),
+                (ReasoningEffort::Medium, "medium"),
+                (ReasoningEffort::High, "high"),
+            ],
+            reasoning: ReasoningEffort::Medium,
+            scope_summary: "all models".to_string(),
+            providers_connected: 2,
+            default_approval: "auto".to_string(),
+            skip_permissions: false,
+            context_token_budget: 232_000,
+            compaction_summarizer: "subagent".to_string(),
+            microcompaction: true,
+            microcompaction_watermark: 32_000,
+            prompt_cache_retention: "short".to_string(),
+            verify_command: None,
+            verify_max_attempts: 3,
+            theme: "terminal".to_string(),
+            alt_screen: "auto".to_string(),
+            scroll_speed: 3,
+            reduced_motion: false,
+            worktree_root: None,
+        }
+    }
+
+    #[test]
+    fn settings_panel_docks_the_whole_faceplate_on_a_tall_viewport() {
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::SettingsPanel;
+
+        let mut screen = Screen::new();
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::new(
+            faceplate_snapshot(),
+        ))));
+        let rendered = rendered_text(&mut screen, 100, 44);
+        // Masthead silkscreen + every section printed at once.
+        assert!(rendered.contains("SETTINGS"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("iris {}", env!("CARGO_PKG_VERSION"))),
+            "{rendered}"
+        );
+        for section in ["ENGINE", "SAFETY", "MEMORY", "CHECKS", "PANEL", "GIT"] {
+            assert!(rendered.contains(section), "{section} visible:\n{rendered}");
+        }
+        // The control archetypes: a printed switch scale, a 10-LED dial with
+        // its honest value, and a `▸` port.
+        assert!(rendered.contains("○ low  ◉ medium  ○ high"), "{rendered}");
+        assert!(rendered.contains("●●●●●●○○○○  232k tokens"), "{rendered}");
+        assert!(rendered.contains("▸ gpt-5.5 ┊ openai-codex"), "{rendered}");
+        // Nothing windowed: no position row on a tall viewport.
+        assert!(!rendered.contains("(1/19)"), "{rendered}");
+        // The composer stays protected below the panel.
+        assert!(rendered.contains("Give Iris a task"), "{rendered}");
+    }
+
+    #[test]
+    fn settings_panel_windows_honestly_under_the_session_bar_on_short_viewports() {
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::SettingsPanel;
+
+        let mut screen = Screen::new();
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::new(
+            faceplate_snapshot(),
+        ))));
+        let rendered = rendered_text(&mut screen, 80, 20);
+        // The masthead is pinned (never scrolled out, never painted under the
+        // session bar) and the window scrolls with the house position row.
+        assert!(rendered.contains("SETTINGS"), "{rendered}");
+        assert!(rendered.contains("ENGINE"), "{rendered}");
+        assert!(rendered.contains("(1/19)"), "{rendered}");
+        assert!(!rendered.contains("worktree root"), "windowed:\n{rendered}");
+        assert!(rendered.contains("Give Iris a task"), "{rendered}");
+    }
+
+    #[test]
+    fn settings_detent_flash_settles_through_the_screen_tick() {
+        use crate::ui::modal::{Modal, ModalKey};
+        use crate::ui::settings_menu::SettingsPanel;
+
+        let mut screen = Screen::new();
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::new(
+            faceplate_snapshot(),
+        ))));
+        // Click the reasoning switch one detent right (row 1 on the panel).
+        let modal = screen.modal.as_mut().expect("panel open");
+        modal.handle_key(ModalKey::Down);
+        modal.handle_key(ModalKey::Right);
+        // The flash decays on the shared tick grid, forcing repaints until the
+        // element settles — the same cadence as the statusline detents.
+        assert!(screen.tick(), "first tick still settling");
+        assert!(screen.tick(), "second tick settles");
+        assert!(!screen.tick(), "settled: no more repaints");
     }
 
     #[test]
@@ -6793,7 +6892,7 @@ mod tests {
         // Descriptions align in one column across rows.
         assert_eq!(
             line_text(exit).find("End the session"),
-            line_text(model).find("Show or switch provider/model")
+            line_text(model).find("Pick model & reasoning (or /model <id>)")
         );
         assert!(
             model

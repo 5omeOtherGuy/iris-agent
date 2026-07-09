@@ -16,10 +16,10 @@ use crate::mimir::selection::{ProviderId, ReasoningEffort};
 use crate::nexus::ChatProvider;
 use crate::session::{self, ResumableSession, SessionStore};
 use crate::ui::modal::{
-    EffortPicker, Modal, ModalAction, ModelPicker, ScopedModels, SessionPicker, SessionRow,
-    SwitchContextPrompt, TaskPicker, TrustMenu,
+    Modal, ModalAction, ModelPicker, ScopedModels, SessionPicker, SessionRow, SwitchContextPrompt,
+    TaskPicker, TrustMenu,
 };
-use crate::ui::settings_menu::{self, SettingsMenu};
+use crate::ui::settings_menu::{self, SettingsPanel};
 use crate::ui::task_view::TaskCard;
 use crate::wayland::Harness;
 use crate::wayland::git_safety::{ActiveTaskDisplay, AdoptedTask, GitSafety, RecoverableTask};
@@ -355,17 +355,35 @@ pub(crate) fn open_trust<P: ChatProvider>(harness: &Harness<P>) -> Modal {
     ))
 }
 
-/// Build the `/settings` modal: the top-level category list. Submenus are opened
-/// lazily (with a fresh settings snapshot) as the user navigates, reusing the
-/// existing "Replace the modal" pattern.
-pub(crate) fn open_settings<P>(_switch: &ModelSwitch<'_, P>) -> Modal {
-    Modal::Settings(SettingsMenu::new())
+/// Build the `/settings` modal: the flat settings panel (the faceplate),
+/// populated with a fresh snapshot of the persisted + live values.
+pub(crate) fn open_settings<P: ChatProvider>(
+    harness: &Harness<P>,
+    switch: &ModelSwitch<'_, P>,
+) -> Modal {
+    Modal::Settings(Box::new(SettingsPanel::new(settings_snapshot(
+        harness, switch,
+    ))))
 }
 
-/// Snapshot the current persisted settings (plus the live model default) so the
-/// settings menus can show each field's current value as muted metadata. Reads
-/// the merged global+project config for `cwd`; a read failure degrades to
-/// built-in defaults rather than failing the menu.
+/// Re-open the panel with the cursor on `row` — the port-return path (leaving
+/// the model picker / trust / scoped / login surfaces lands back on the port
+/// that opened them, with the snapshot refreshed to show what changed).
+pub(crate) fn open_settings_at<P: ChatProvider>(
+    harness: &Harness<P>,
+    switch: &ModelSwitch<'_, P>,
+    row: settings_menu::RowId,
+) -> Modal {
+    Modal::Settings(Box::new(SettingsPanel::with_selected(
+        settings_snapshot(harness, switch),
+        row,
+    )))
+}
+
+/// Snapshot the current persisted settings (plus the live session state the
+/// panel controls) so the panel shows each control's real position. Reads the
+/// merged global+project config for `cwd`; a read failure degrades to built-in
+/// defaults rather than failing the panel.
 fn settings_snapshot<P: ChatProvider>(
     harness: &Harness<P>,
     switch: &ModelSwitch<'_, P>,
@@ -376,20 +394,47 @@ fn settings_snapshot<P: ChatProvider>(
         .unwrap_or_default();
     let tui = settings.tui_settings();
     let selection = switch.selection();
-    let default_reasoning = settings
-        .default_reasoning
-        .as_deref()
-        .and_then(|value| ReasoningEffort::parse(value).ok())
-        .unwrap_or(ReasoningEffort::DEFAULT);
+    // The reasoning switch clicks through the ACTIVE model's levels; a
+    // non-reasoning OpenAI-compatible endpoint pins the switch to `off`.
+    let reasoning_levels: Vec<(ReasoningEffort, &'static str)> = if selection.provider
+        == ProviderId::OpenAiCompatible
+        && !selection.open_ai_compatible.reasoning
+    {
+        vec![(ReasoningEffort::Off, ReasoningEffort::Off.as_str())]
+    } else {
+        model_capabilities::level_options(selection.provider, &selection.model)
+            .iter()
+            .map(|option| (option.level, option.label))
+            .collect()
+    };
+    let reasoning = model_capabilities::clamp(
+        selection.provider,
+        &selection.model,
+        selection.reasoning.unwrap_or(ReasoningEffort::DEFAULT),
+    );
+    let available = available_now();
+    let providers_connected = available
+        .iter()
+        .map(|model| model.provider.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let scope_summary = match switch.scoped() {
+        Some(ids) if !ids.is_empty() => {
+            format!(
+                "{} of {} enabled",
+                ids.len(),
+                available.len().max(ids.len())
+            )
+        }
+        _ => "all models".to_string(),
+    };
     settings_menu::Snapshot {
         default_model: config::default_model_qualified()
             .unwrap_or_else(|| current_qualified(switch)),
-        default_reasoning: model_capabilities::display_level(
-            selection.provider,
-            &selection.model,
-            default_reasoning,
-        )
-        .to_string(),
+        reasoning_levels,
+        reasoning,
+        scope_summary,
+        providers_connected,
         alt_screen: tui
             .and_then(|t| t.alt_screen.clone())
             .unwrap_or_else(|| "auto".to_string()),
@@ -407,8 +452,6 @@ fn settings_snapshot<P: ChatProvider>(
             .unwrap_or_else(|| "subagent".to_string()),
         microcompaction: settings.microcompaction(),
         microcompaction_watermark: settings.microcompaction_watermark(),
-        bash_tool_mode: settings.bash_tool_mode(),
-        max_tool_roundtrips: settings.max_tool_roundtrips(),
         prompt_cache_retention: settings
             .prompt_cache_retention
             .clone()
@@ -449,11 +492,6 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
         Field::MicrocompactionWatermark => {
             config::save_microcompaction_watermark(value.unwrap_or("0").parse()?)
         }
-        Field::BashToolMode => config::save_bash_tool_mode(parse_bool(value)),
-        Field::MaxToolRoundtrips => config::save_max_tool_roundtrips(match value {
-            Some(v) => Some(v.parse::<usize>()?),
-            None => None,
-        }),
         Field::PromptCacheRetention => {
             config::save_prompt_cache_retention(value.unwrap_or("short"))
         }
@@ -466,27 +504,6 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
             config::save_theme(id)
         }
     }
-}
-
-/// Build the effort/thinking picker for the current model (settings submenu).
-fn effort_picker<P>(switch: &ModelSwitch<'_, P>) -> Modal {
-    let selection = switch.selection();
-    if selection.provider == ProviderId::OpenAiCompatible && !selection.open_ai_compatible.reasoning
-    {
-        let levels = model_capabilities::level_options(selection.provider, &selection.model)
-            .iter()
-            .copied()
-            .filter(|option| option.level == ReasoningEffort::Off)
-            .collect();
-        return Modal::Effort(EffortPicker::new(levels, ReasoningEffort::Off));
-    }
-    let levels = model_capabilities::level_options(selection.provider, &selection.model).to_vec();
-    let current = model_capabilities::clamp(
-        selection.provider,
-        &selection.model,
-        selection.reasoning.unwrap_or(ReasoningEffort::DEFAULT),
-    );
-    Modal::Effort(EffortPicker::new(levels, current))
 }
 
 /// Apply a model/scoped/effort/settings [`ModalAction`]. Login actions are
@@ -534,20 +551,15 @@ pub(crate) fn apply_action<P: ChatProvider>(
             ActionResult::Keep(lines)
         }
         ModalAction::ToggleSkipPermissions => {
+            // The panel's guarded switch already clicked its own display; the
+            // harness is the live state, so flip it and keep the panel open.
             let enabled = !harness.skip_permissions();
             harness.set_skip_permissions(enabled);
-            let snap = settings_snapshot(harness, switch);
-            ActionResult::Replace(
-                Box::new(Modal::SettingsSub(settings_menu::SubMenu::new(
-                    settings_menu::Category::Approvals,
-                    &snap,
-                ))),
-                vec![if enabled {
-                    "Dangerously skip permissions enabled for this session".to_string()
-                } else {
-                    "Dangerously skip permissions disabled for this session".to_string()
-                }],
-            )
+            ActionResult::Keep(vec![if enabled {
+                "Dangerously skip permissions enabled for this session".to_string()
+            } else {
+                "Dangerously skip permissions disabled for this session".to_string()
+            }])
         }
         ModalAction::EditPolicy(edit) => {
             // Wayland owns the policy store edit and live Nexus refresh; re-open
@@ -558,43 +570,22 @@ pub(crate) fn apply_action<P: ChatProvider>(
             };
             ActionResult::Replace(Box::new(open_trust(harness)), lines)
         }
-        ModalAction::SetEffort(level) => ActionResult::Close(apply_effort(level, harness, switch)),
-        ModalAction::OpenEffortPicker => {
-            ActionResult::Replace(Box::new(effort_picker(switch)), Vec::new())
-        }
-        // --- settings menu tree ---
-        ModalAction::OpenSettingsRoot => {
-            ActionResult::Replace(Box::new(open_settings(switch)), Vec::new())
-        }
-        ModalAction::OpenSettingsCategory(category) => {
-            let snap = settings_snapshot(harness, switch);
-            ActionResult::Replace(
-                Box::new(Modal::SettingsSub(settings_menu::SubMenu::new(
-                    category, &snap,
-                ))),
-                Vec::new(),
-            )
-        }
-        ModalAction::OpenSettingsEnum(field) => {
-            let snap = settings_snapshot(harness, switch);
-            ActionResult::Replace(
-                Box::new(Modal::SettingsEnum(settings_menu::EnumMenu::new(
-                    field, &snap,
-                ))),
-                Vec::new(),
-            )
-        }
-        ModalAction::OpenSettingsEntry(field) => {
-            let snap = settings_snapshot(harness, switch);
-            ActionResult::Replace(
-                Box::new(Modal::SettingsEntry(settings_menu::EntryDialog::new(
-                    field, &snap,
-                ))),
-                Vec::new(),
+        ModalAction::AdjustEffort(level) => {
+            // The panel's reasoning switch: apply to the live session and
+            // persist as the default, exactly like the model picker's inline
+            // effort. The panel stays open and already shows the new detent,
+            // so the switch chatter is suppressed — only a failed persist is
+            // surfaced (numbers/notices stay honest).
+            let lines = apply_effort(level, harness, switch);
+            ActionResult::Keep(
+                lines
+                    .into_iter()
+                    .filter(|line| line.contains("not saved"))
+                    .collect(),
             )
         }
         ModalAction::SaveSetting { field, value } => {
-            let lines = match save_setting_field(field, value.as_deref()) {
+            match save_setting_field(field, value.as_deref()) {
                 Ok(()) => {
                     // Some settings are read live by the harness, not just at
                     // startup: mirror the persisted value onto the running
@@ -609,19 +600,23 @@ pub(crate) fn apply_action<P: ChatProvider>(
                     {
                         harness.set_microcompaction_watermark(value);
                     }
-                    Vec::new()
+                    // The panel is the display truth while open: it already
+                    // clicked the detent, so keep it (no rebuild jank).
+                    ActionResult::Keep(Vec::new())
                 }
-                Err(error) => vec![format!("could not save setting: {error:#}")],
-            };
-            // Re-open the parent category submenu on the refreshed values.
-            let snap = settings_snapshot(harness, switch);
-            ActionResult::Replace(
-                Box::new(Modal::SettingsSub(settings_menu::SubMenu::new(
-                    field.category(),
-                    &snap,
-                ))),
-                lines,
-            )
+                Err(error) => {
+                    // The write failed: rebuild the panel from disk so the
+                    // control settles back onto the persisted position.
+                    ActionResult::Replace(
+                        Box::new(open_settings_at(
+                            harness,
+                            switch,
+                            settings_menu::RowId::Field(field),
+                        )),
+                        vec![format!("could not save setting: {error:#}")],
+                    )
+                }
+            }
         }
         ModalAction::OpenModelPicker => {
             let available = available_now();

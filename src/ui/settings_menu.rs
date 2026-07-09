@@ -1,86 +1,65 @@
-//! Settings menu tree (Tier 3, presentation-only, harness-free).
+//! The settings panel — the faceplate (Tier 3, presentation-only, harness-free).
 //!
-//! The `/settings` surface is a category list; each category opens a submenu of
-//! rows that either (a) hand off to an existing modal (model picker, effort
-//! picker, `/trust`, `/scoped-models`, `/login`), (b) open a small enum picker,
-//! (c) open a free-text/numeric entry, or (d) toggle a bool in place. Every
-//! widget here is pure: it turns a [`ModalKey`] into a [`ModalOutcome`], and the
-//! loop ([`crate::ui::picker::apply_action`]) performs the disk writes and opens
-//! existing modals at the safe inter-turn boundary. Navigation between settings
-//! surfaces reuses the existing "Replace the modal" pattern
-//! ([`crate::ui::picker::ActionResult::Replace`]).
+//! `/settings` is ONE flat control surface, not a category tree: every setting
+//! is a row on a silkscreened panel (dim uppercase section headers), adjusted
+//! **in place** with `←`/`→` like clicking a physical detent. No sub-menu is
+//! ever opened to change a value. Each row is one of four control archetypes —
+//! a closed set, like the four tool families:
+//!
+//! - **switch** — a fixed vocabulary printed as a labeled detent track
+//!   (`○ strict  ◉ auto  ○ never`); `←`/`→` click between positions and CLAMP
+//!   at the ends (a real switch never wraps). Bools are two-position switches.
+//!   When the track does not fit the width, it degrades to its **rotary** form:
+//!   position dots + the selected value (`○○◉  auto`).
+//! - **dial** — a numeric on a 10-detent LED ladder (`●●●●●●○○○○  232k tokens`),
+//!   the house meter idiom; `←`/`→` step to the neighbouring detent, `↵` opens
+//!   an inline register for a precise value. The printed number is always the
+//!   TRUE persisted value (numbers are honest); the fill is its detent.
+//! - **register** — free text edited inline on the row (`▋` caret); `↵` edits,
+//!   `↵` again saves, `esc` cancels. An empty buffer clears the key when the
+//!   field allows it.
+//! - **port** — a `▸` row that opens a deeper surface (model picker, project
+//!   permissions, scoped models, login). The loop returns to the panel when
+//!   that surface closes, so the panel is home.
+//!
+//! Every widget here is pure: it turns a [`ModalKey`] into a [`ModalOutcome`],
+//! and the loop ([`crate::ui::picker::apply_action`]) performs the disk writes
+//! at the safe inter-turn boundary. A change is acknowledged mechanically: the
+//! adjusted element renders bright for two ticks (the §6 detent flash), gated
+//! by reduced motion. A dependent control (the microcompaction watermark) goes
+//! dark while its master switch is off — inert hardware, still operable.
 //!
 //! All writes go to the user-global settings file via `config::save_*`;
 //! global-vs-project scope governs only load/merge precedence in
 //! [`crate::config::Settings::merged_with`]. Two fields are GLOBAL-ONLY so a
 //! cloned project cannot lower posture: `defaultApproval` and
-//! `promptCacheRetention`.
+//! `promptCacheRetention`. Deliberately absent from the faceplate (service
+//! hatch: `settings.json` only): `bashToolMode`, `maxToolRoundtrips`, retry
+//! tuning, and the OpenAI-compatible endpoint block.
 
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::ui::modal::{ModalAction, ModalKey, ModalOutcome, dim, selector_rows};
-use crate::ui::selector::{Selector, SelectorItem};
+use crate::mimir::selection::ReasoningEffort;
+use crate::ui::modal::{ModalAction, ModalKey, ModalOutcome, dim};
 
-/// A top-level settings category. Selecting one opens its submenu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Category {
-    ModelReasoning,
-    Display,
-    Approvals,
-    Runtime,
-    Verification,
-    Providers,
-}
+/// Crate rev printed on the masthead (the panel's silkscreen, same source as
+/// the start page and the exit receipt).
+const REV: &str = env!("CARGO_PKG_VERSION");
 
-impl Category {
-    /// Every category, in menu order.
-    pub(crate) const ALL: [Category; 6] = [
-        Category::ModelReasoning,
-        Category::Display,
-        Category::Approvals,
-        Category::Runtime,
-        Category::Verification,
-        Category::Providers,
-    ];
+/// Label column width: two-cell indent + label, control column after. Wide
+/// enough that the longest label (`microcompaction`, 15) keeps a real gutter.
+const LABEL_W: usize = 18;
 
-    /// Stable selector key.
-    fn id(self) -> &'static str {
-        match self {
-            Category::ModelReasoning => "model",
-            Category::Display => "display",
-            Category::Approvals => "approvals",
-            Category::Runtime => "runtime",
-            Category::Verification => "verification",
-            Category::Providers => "providers",
-        }
-    }
+/// Detent-flash duration in loop ticks (the §6 two-tick acknowledgment).
+const FLASH_TICKS: u8 = 2;
 
-    fn title(self) -> &'static str {
-        match self {
-            Category::ModelReasoning => "Model & reasoning",
-            Category::Display => "Display",
-            Category::Approvals => "Approvals & trust",
-            Category::Runtime => "Runtime",
-            Category::Verification => "Verification",
-            Category::Providers => "Providers & scope",
-        }
-    }
+/// Default line budget when the render path supplies none: matches the legacy
+/// 16-row docked-menu cap minus its two inset rows.
+const DEFAULT_LINE_BUDGET: usize = 14;
 
-    fn description(self) -> &'static str {
-        match self {
-            Category::ModelReasoning => "default model, reasoning effort",
-            Category::Display => "theme, screen mode, scrolling, accessibility",
-            Category::Approvals => "startup posture, project permissions",
-            Category::Runtime => "context budget, tool loop, prompt cache",
-            Category::Verification => "post-change checks",
-            Category::Providers => "scoped models, worktrees, login",
-        }
-    }
-}
-
-/// A single persisted setting reachable from a submenu. Each field knows its
-/// parent [`Category`] (for back-navigation and post-save refresh) and its
-/// input kind (enum options / numeric bounds / free text / bool).
+/// A persisted setting adjusted in place on the panel. Pruned relative to the
+/// full `Settings` struct — see the module doc for the service-hatch list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Field {
     AltScreen,
@@ -92,625 +71,1035 @@ pub(crate) enum Field {
     CompactionSummarizer,
     Microcompaction,
     MicrocompactionWatermark,
-    BashToolMode,
-    MaxToolRoundtrips,
     PromptCacheRetention,
     VerifyCommand,
     VerifyMaxAttempts,
     WorktreeRoot,
 }
 
-/// How a [`Field`] is edited.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FieldKind {
-    /// One of a fixed closed vocabulary.
-    Enum { options: &'static [&'static str] },
-    /// A positive integer clamped to `[min, max]`; `allow_empty` clears the key.
-    Numeric {
-        min: u64,
-        max: u64,
-        allow_empty: bool,
+/// One row of the faceplate. `Field` rows edit persisted settings; the rest
+/// are the session-live controls (reasoning, skip-approvals) and the ports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowId {
+    Model,
+    Reasoning,
+    Scope,
+    Providers,
+    SkipApprovals,
+    Permissions,
+    Field(Field),
+}
+
+/// A silkscreened section: dim uppercase title + its rows, in panel order.
+struct Section {
+    title: &'static str,
+    rows: &'static [RowId],
+}
+
+/// The faceplate, top to bottom: what runs → what it may do → what it
+/// remembers → how it self-checks → the panel itself → where it works.
+const SECTIONS: &[Section] = &[
+    Section {
+        title: "ENGINE",
+        rows: &[
+            RowId::Model,
+            RowId::Reasoning,
+            RowId::Scope,
+            RowId::Providers,
+        ],
     },
-    /// Free text; `allow_empty` clears the key.
-    Text { allow_empty: bool },
-    /// A boolean toggled in place from the submenu (no separate widget).
-    Bool,
-}
+    Section {
+        title: "SAFETY",
+        rows: &[
+            RowId::Field(Field::DefaultApproval),
+            RowId::SkipApprovals,
+            RowId::Permissions,
+        ],
+    },
+    Section {
+        title: "MEMORY",
+        rows: &[
+            RowId::Field(Field::ContextTokenBudget),
+            RowId::Field(Field::CompactionSummarizer),
+            RowId::Field(Field::Microcompaction),
+            RowId::Field(Field::MicrocompactionWatermark),
+            RowId::Field(Field::PromptCacheRetention),
+        ],
+    },
+    Section {
+        title: "CHECKS",
+        rows: &[
+            RowId::Field(Field::VerifyCommand),
+            RowId::Field(Field::VerifyMaxAttempts),
+        ],
+    },
+    Section {
+        title: "PANEL",
+        rows: &[
+            RowId::Field(Field::Theme),
+            RowId::Field(Field::AltScreen),
+            RowId::Field(Field::ScrollSpeed),
+            RowId::Field(Field::ReducedMotion),
+        ],
+    },
+    Section {
+        title: "GIT",
+        rows: &[RowId::Field(Field::WorktreeRoot)],
+    },
+];
 
-impl Field {
-    pub(crate) fn category(self) -> Category {
-        match self {
-            Field::AltScreen | Field::ScrollSpeed | Field::ReducedMotion | Field::Theme => {
-                Category::Display
-            }
-            Field::DefaultApproval => Category::Approvals,
-            Field::ContextTokenBudget
-            | Field::CompactionSummarizer
-            | Field::Microcompaction
-            | Field::MicrocompactionWatermark
-            | Field::BashToolMode
-            | Field::MaxToolRoundtrips
-            | Field::PromptCacheRetention => Category::Runtime,
-            Field::VerifyCommand | Field::VerifyMaxAttempts => Category::Verification,
-            Field::WorktreeRoot => Category::Providers,
-        }
-    }
+/// Ten-detent ladders for the dials. Ten positions so every dial IS the house
+/// 10-dot meter: one click, one LED.
+const BUDGET_LADDER: [u64; 10] = [
+    64_000, 96_000, 128_000, 160_000, 200_000, 232_000, 300_000, 400_000, 600_000, 1_000_000,
+];
+const WATERMARK_LADDER: [u64; 10] = [
+    8_000, 12_000, 16_000, 24_000, 32_000, 48_000, 64_000, 96_000, 128_000, 192_000,
+];
+const UNIT_LADDER: [u64; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
-    fn label(self) -> &'static str {
-        match self {
-            Field::AltScreen => "Alt-screen",
-            Field::ScrollSpeed => "Scroll speed",
-            Field::ReducedMotion => "Reduced motion",
-            Field::Theme => "Theme",
-            Field::DefaultApproval => "Default approval",
-            Field::ContextTokenBudget => "Auto-compaction threshold",
-            Field::CompactionSummarizer => "Compaction summarizer",
-            Field::Microcompaction => "Microcompaction",
-            Field::MicrocompactionWatermark => "Microcompaction watermark",
-            Field::BashToolMode => "Bash tool mode",
-            Field::MaxToolRoundtrips => "Max tool round-trips",
-            Field::PromptCacheRetention => "Prompt cache retention",
-            Field::VerifyCommand => "Verify command",
-            Field::VerifyMaxAttempts => "Verify max attempts",
-            Field::WorktreeRoot => "Worktree root",
-        }
-    }
-
-    pub(crate) fn kind(self) -> FieldKind {
-        match self {
-            Field::AltScreen => FieldKind::Enum {
-                options: &["auto", "always", "never"],
-            },
-            Field::DefaultApproval => FieldKind::Enum {
-                options: &["strict", "auto", "never"],
-            },
-            Field::PromptCacheRetention => FieldKind::Enum {
-                options: &["none", "short", "long"],
-            },
-            Field::CompactionSummarizer => FieldKind::Enum {
-                options: &["excerpts", "provider", "subagent"],
-            },
-            Field::Theme => FieldKind::Enum {
-                options: crate::ui::theme::available(),
-            },
-            Field::ScrollSpeed => FieldKind::Numeric {
-                min: 1,
-                max: 100,
-                allow_empty: false,
-            },
-            Field::ContextTokenBudget | Field::MicrocompactionWatermark => FieldKind::Numeric {
-                min: 1_000,
-                max: 100_000_000,
-                allow_empty: false,
-            },
-            Field::MaxToolRoundtrips => FieldKind::Numeric {
-                min: 1,
-                max: 1_000,
-                allow_empty: true,
-            },
-            Field::VerifyMaxAttempts => FieldKind::Numeric {
-                min: 1,
-                max: 10,
-                allow_empty: false,
-            },
-            Field::VerifyCommand | Field::WorktreeRoot => FieldKind::Text { allow_empty: true },
-            Field::ReducedMotion | Field::Microcompaction | Field::BashToolMode => FieldKind::Bool,
-        }
+/// Hard bounds for typed dial entry, matching the `config::save_*` clamps.
+fn dial_bounds(field: Field) -> (u64, u64) {
+    match field {
+        Field::ContextTokenBudget | Field::MicrocompactionWatermark => (1_000, 100_000_000),
+        Field::ScrollSpeed => (1, 100),
+        Field::VerifyMaxAttempts => (1, 10),
+        _ => (0, u64::MAX),
     }
 }
 
-/// Current persisted values, read once by the loop from [`crate::config::Settings`]
-/// (plus the live selection for model/reasoning) so the menus can show the
-/// current value as muted metadata. Pure data, so the menu builders stay
+fn ladder(field: Field) -> &'static [u64] {
+    match field {
+        Field::ContextTokenBudget => &BUDGET_LADDER,
+        Field::MicrocompactionWatermark => &WATERMARK_LADDER,
+        _ => &UNIT_LADDER,
+    }
+}
+
+/// Compact dial value in the ONE house token format (`232k`, `12.5k`, `1m`) —
+/// the same formatter the meter, divider, and receipt print, so a number
+/// never reads differently on the panel than in the transcript.
+fn compact_value(value: u64) -> String {
+    crate::ui::tui::compact_count(value)
+}
+
+/// Current persisted values plus the live session state the panel controls
+/// (reasoning levels for the active model, skip-approvals). Read once by the
+/// loop from [`crate::config::Settings`]; pure data, so the panel stays
 /// harness-free and unit-testable.
 #[derive(Debug, Clone)]
 pub(crate) struct Snapshot {
+    /// Qualified `provider/model` id of the persisted default.
     pub(crate) default_model: String,
-    pub(crate) default_reasoning: String,
-    pub(crate) alt_screen: String,
-    pub(crate) scroll_speed: u16,
-    pub(crate) reduced_motion: bool,
+    /// Reasoning levels the ACTIVE model supports, panel order.
+    pub(crate) reasoning_levels: Vec<(ReasoningEffort, &'static str)>,
+    /// The active reasoning level (clamped to the model).
+    pub(crate) reasoning: ReasoningEffort,
+    /// `/scoped-models` summary: `all models` or `3 of 7 enabled`.
+    pub(crate) scope_summary: String,
+    /// Authenticated provider count for the providers port.
+    pub(crate) providers_connected: usize,
     pub(crate) default_approval: String,
     pub(crate) skip_permissions: bool,
     pub(crate) context_token_budget: u64,
     pub(crate) compaction_summarizer: String,
     pub(crate) microcompaction: bool,
     pub(crate) microcompaction_watermark: u64,
-    pub(crate) bash_tool_mode: bool,
-    pub(crate) max_tool_roundtrips: Option<usize>,
     pub(crate) prompt_cache_retention: String,
     pub(crate) verify_command: Option<String>,
     pub(crate) verify_max_attempts: u32,
-    pub(crate) worktree_root: Option<String>,
     pub(crate) theme: String,
+    pub(crate) alt_screen: String,
+    pub(crate) scroll_speed: u16,
+    pub(crate) reduced_motion: bool,
+    pub(crate) worktree_root: Option<String>,
 }
 
 impl Snapshot {
-    /// The current value of `field` as a display string (bools as `on`/`off`,
-    /// cleared/absent as a muted placeholder).
-    fn value(&self, field: Field) -> String {
+    fn switch_options(&self, field: Field) -> &'static [&'static str] {
         match field {
-            Field::AltScreen => self.alt_screen.clone(),
-            Field::ScrollSpeed => self.scroll_speed.to_string(),
-            Field::ReducedMotion => on_off(self.reduced_motion),
-            Field::Theme => self.theme.clone(),
-            Field::DefaultApproval => self.default_approval.clone(),
-            Field::ContextTokenBudget => self.context_token_budget.to_string(),
-            Field::CompactionSummarizer => self.compaction_summarizer.clone(),
-            Field::Microcompaction => on_off(self.microcompaction),
-            Field::MicrocompactionWatermark => self.microcompaction_watermark.to_string(),
-            Field::BashToolMode => on_off(self.bash_tool_mode),
-            Field::MaxToolRoundtrips => match self.max_tool_roundtrips {
-                Some(cap) => cap.to_string(),
-                None => "unbounded".to_string(),
-            },
-            Field::PromptCacheRetention => self.prompt_cache_retention.clone(),
-            Field::VerifyCommand => self
-                .verify_command
-                .clone()
-                .unwrap_or_else(|| "not set".to_string()),
-            Field::VerifyMaxAttempts => self.verify_max_attempts.to_string(),
-            Field::WorktreeRoot => self
-                .worktree_root
-                .clone()
-                .unwrap_or_else(|| "../wt (default)".to_string()),
+            Field::AltScreen => &["auto", "always", "never"],
+            Field::DefaultApproval => &["strict", "auto", "never"],
+            Field::PromptCacheRetention => &["none", "short", "long"],
+            Field::CompactionSummarizer => &["excerpts", "provider", "subagent"],
+            Field::Theme => crate::ui::theme::available(),
+            Field::Microcompaction | Field::ReducedMotion => &["off", "on"],
+            _ => &[],
         }
     }
 
-    /// The pre-filled text for an entry dialog: the raw current value, or empty
-    /// when the key is cleared/unset (so the placeholder does not seed the input).
-    fn entry_seed(&self, field: Field) -> String {
+    fn switch_value(&self, field: Field) -> String {
         match field {
-            Field::ScrollSpeed => self.scroll_speed.to_string(),
-            Field::ContextTokenBudget => self.context_token_budget.to_string(),
-            Field::MicrocompactionWatermark => self.microcompaction_watermark.to_string(),
-            Field::MaxToolRoundtrips => self
-                .max_tool_roundtrips
-                .map(|c| c.to_string())
-                .unwrap_or_default(),
-            Field::VerifyMaxAttempts => self.verify_max_attempts.to_string(),
-            Field::VerifyCommand => self.verify_command.clone().unwrap_or_default(),
-            Field::WorktreeRoot => self.worktree_root.clone().unwrap_or_default(),
+            Field::AltScreen => self.alt_screen.clone(),
+            Field::DefaultApproval => self.default_approval.clone(),
+            Field::PromptCacheRetention => self.prompt_cache_retention.clone(),
+            Field::CompactionSummarizer => self.compaction_summarizer.clone(),
+            Field::Theme => self.theme.clone(),
+            Field::Microcompaction => on_off(self.microcompaction),
+            Field::ReducedMotion => on_off(self.reduced_motion),
             _ => String::new(),
+        }
+    }
+
+    fn set_switch_value(&mut self, field: Field, value: &str) {
+        match field {
+            Field::AltScreen => self.alt_screen = value.to_string(),
+            Field::DefaultApproval => self.default_approval = value.to_string(),
+            Field::PromptCacheRetention => self.prompt_cache_retention = value.to_string(),
+            Field::CompactionSummarizer => self.compaction_summarizer = value.to_string(),
+            Field::Theme => self.theme = value.to_string(),
+            Field::Microcompaction => self.microcompaction = value == "on",
+            Field::ReducedMotion => self.reduced_motion = value == "on",
+            _ => {}
+        }
+    }
+
+    fn dial_value(&self, field: Field) -> u64 {
+        match field {
+            Field::ContextTokenBudget => self.context_token_budget,
+            Field::MicrocompactionWatermark => self.microcompaction_watermark,
+            Field::ScrollSpeed => u64::from(self.scroll_speed),
+            Field::VerifyMaxAttempts => u64::from(self.verify_max_attempts),
+            _ => 0,
+        }
+    }
+
+    fn set_dial_value(&mut self, field: Field, value: u64) {
+        match field {
+            Field::ContextTokenBudget => self.context_token_budget = value,
+            Field::MicrocompactionWatermark => self.microcompaction_watermark = value,
+            Field::ScrollSpeed => self.scroll_speed = value.min(u64::from(u16::MAX)) as u16,
+            Field::VerifyMaxAttempts => self.verify_max_attempts = value.min(10) as u32,
+            _ => {}
+        }
+    }
+
+    fn register_value(&self, field: Field) -> Option<String> {
+        match field {
+            Field::VerifyCommand => self.verify_command.clone(),
+            Field::WorktreeRoot => self.worktree_root.clone(),
+            _ => None,
+        }
+    }
+
+    fn set_register_value(&mut self, field: Field, value: Option<String>) {
+        match field {
+            Field::VerifyCommand => self.verify_command = value,
+            Field::WorktreeRoot => self.worktree_root = value,
+            _ => {}
         }
     }
 }
 
 fn on_off(value: bool) -> String {
-    if value {
-        "on".to_string()
-    } else {
-        "off".to_string()
+    if value { "on" } else { "off" }.to_string()
+}
+
+/// How a row is adjusted/activated: drives both key handling and the footer's
+/// keymap-honest verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Archetype {
+    Switch,
+    Dial,
+    Register,
+    Port,
+}
+
+fn archetype(row: RowId) -> Archetype {
+    match row {
+        RowId::Model | RowId::Scope | RowId::Providers | RowId::Permissions => Archetype::Port,
+        RowId::Reasoning | RowId::SkipApprovals => Archetype::Switch,
+        RowId::Field(field) => match field {
+            Field::AltScreen
+            | Field::DefaultApproval
+            | Field::PromptCacheRetention
+            | Field::CompactionSummarizer
+            | Field::Theme
+            | Field::Microcompaction
+            | Field::ReducedMotion => Archetype::Switch,
+            Field::ContextTokenBudget
+            | Field::MicrocompactionWatermark
+            | Field::ScrollSpeed
+            | Field::VerifyMaxAttempts => Archetype::Dial,
+            Field::VerifyCommand | Field::WorktreeRoot => Archetype::Register,
+        },
     }
 }
 
-/// One submenu row: a display item plus the action its Enter emits.
-#[derive(Debug, Clone)]
-struct Row {
-    item: SelectorItem,
-    action: ModalAction,
+fn label(row: RowId) -> &'static str {
+    match row {
+        RowId::Model => "model",
+        RowId::Reasoning => "reasoning",
+        RowId::Scope => "model scope",
+        RowId::Providers => "providers",
+        RowId::SkipApprovals => "skip approvals",
+        RowId::Permissions => "permissions",
+        RowId::Field(field) => match field {
+            Field::AltScreen => "alt screen",
+            Field::ScrollSpeed => "scroll speed",
+            Field::ReducedMotion => "reduced motion",
+            Field::Theme => "theme",
+            Field::DefaultApproval => "approvals",
+            Field::ContextTokenBudget => "compact at",
+            Field::CompactionSummarizer => "summarizer",
+            Field::Microcompaction => "microcompaction",
+            Field::MicrocompactionWatermark => "watermark",
+            Field::PromptCacheRetention => "prompt cache",
+            Field::VerifyCommand => "verify",
+            Field::VerifyMaxAttempts => "attempts",
+            Field::WorktreeRoot => "worktree root",
+        },
+    }
 }
 
-/// A field row whose current value is shown as muted detail. Bool fields toggle
-/// in place (Enter emits the flipped [`ModalAction::SaveSetting`]); enum/entry
-/// fields open the matching widget.
-fn field_row(field: Field, snapshot: &Snapshot) -> Row {
-    let action = match field.kind() {
-        FieldKind::Bool => {
-            let current = match field {
-                Field::ReducedMotion => snapshot.reduced_motion,
-                Field::Microcompaction => snapshot.microcompaction,
-                Field::BashToolMode => snapshot.bash_tool_mode,
-                _ => false,
-            };
-            ModalAction::SaveSetting {
-                field,
-                value: Some((!current).to_string()),
+/// A dial's unit, printed dim after the honest value. Empty = bare number.
+fn dial_unit(field: Field) -> &'static str {
+    match field {
+        Field::ContextTokenBudget | Field::MicrocompactionWatermark => " tokens",
+        Field::ScrollSpeed => " lines",
+        _ => "",
+    }
+}
+
+/// The display list: every rendered row of the panel body, in order. Controls
+/// carry their flat control index (the cursor space); headers and blanks are
+/// skipped by navigation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DisplayRow {
+    Header(&'static str),
+    Blank,
+    Control { index: usize, row: RowId },
+}
+
+fn display_rows() -> Vec<DisplayRow> {
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    for (i, section) in SECTIONS.iter().enumerate() {
+        if i > 0 {
+            out.push(DisplayRow::Blank);
+        }
+        out.push(DisplayRow::Header(section.title));
+        for &row in section.rows {
+            out.push(DisplayRow::Control { index, row });
+            index += 1;
+        }
+    }
+    out
+}
+
+fn controls() -> Vec<RowId> {
+    SECTIONS
+        .iter()
+        .flat_map(|section| section.rows.iter().copied())
+        .collect()
+}
+
+/// An in-place edit on a register (or a dial's typed precise value).
+#[derive(Debug, Clone)]
+struct Edit {
+    buffer: String,
+    numeric: bool,
+    error: Option<&'static str>,
+}
+
+/// The settings panel modal. Owns its snapshot as display truth while open:
+/// adjustments update it locally and emit the matching save action; the loop
+/// keeps the panel (no rebuild) on success so detents click without jank.
+#[derive(Debug, Clone)]
+pub(crate) struct SettingsPanel {
+    snap: Snapshot,
+    controls: Vec<RowId>,
+    cursor: usize,
+    edit: Option<Edit>,
+    /// Control index whose value renders bright, and ticks remaining.
+    flash: Option<(usize, u8)>,
+}
+
+impl SettingsPanel {
+    pub(crate) fn new(snapshot: Snapshot) -> Self {
+        SettingsPanel {
+            snap: snapshot,
+            controls: controls(),
+            cursor: 0,
+            edit: None,
+            flash: None,
+        }
+    }
+
+    /// Re-open with the cursor on `row` (the port-return path).
+    pub(crate) fn with_selected(snapshot: Snapshot, row: RowId) -> Self {
+        let mut panel = SettingsPanel::new(snapshot);
+        if let Some(pos) = panel.controls.iter().position(|&r| r == row) {
+            panel.cursor = pos;
+        }
+        panel
+    }
+
+    fn selected(&self) -> RowId {
+        self.controls[self.cursor]
+    }
+
+    /// Decay the detent flash one tick. Returns true while a flash is live so
+    /// the loop keeps repainting until the element settles.
+    pub(crate) fn tick(&mut self) -> bool {
+        match self.flash.as_mut() {
+            Some((_, ticks)) => {
+                *ticks = ticks.saturating_sub(1);
+                if *ticks == 0 {
+                    self.flash = None;
+                }
+                true
             }
-        }
-        FieldKind::Enum { .. } => ModalAction::OpenSettingsEnum(field),
-        FieldKind::Numeric { .. } | FieldKind::Text { .. } => ModalAction::OpenSettingsEntry(field),
-    };
-    Row {
-        item: SelectorItem::new(field.label(), field.label()).detail(snapshot.value(field)),
-        action,
-    }
-}
-
-/// A row that hands off to an existing modal.
-fn open_row(id: &str, label: &str, detail: Option<&str>, action: ModalAction) -> Row {
-    let mut item = SelectorItem::new(id, label);
-    if let Some(detail) = detail {
-        item = item.detail(detail);
-    }
-    Row { item, action }
-}
-
-/// The rows shown for a category, populated with current values.
-fn rows_for(category: Category, snapshot: &Snapshot) -> Vec<Row> {
-    match category {
-        Category::ModelReasoning => vec![
-            open_row(
-                "model",
-                "Default model",
-                Some(&snapshot.default_model),
-                ModalAction::OpenModelPicker,
-            ),
-            open_row(
-                "reasoning",
-                "Default reasoning",
-                Some(&snapshot.default_reasoning),
-                ModalAction::OpenEffortPicker,
-            ),
-        ],
-        Category::Display => vec![
-            field_row(Field::AltScreen, snapshot),
-            field_row(Field::ScrollSpeed, snapshot),
-            field_row(Field::ReducedMotion, snapshot),
-            field_row(Field::Theme, snapshot),
-        ],
-        Category::Approvals => vec![
-            field_row(Field::DefaultApproval, snapshot),
-            open_row(
-                "skip-permissions",
-                "Dangerously skip permissions",
-                Some(if snapshot.skip_permissions {
-                    "on"
-                } else {
-                    "off"
-                }),
-                ModalAction::ToggleSkipPermissions,
-            ),
-            open_row(
-                "trust",
-                "Project permissions",
-                Some("per-tool + bash grants"),
-                ModalAction::OpenTrustMenu,
-            ),
-        ],
-        Category::Runtime => vec![
-            field_row(Field::ContextTokenBudget, snapshot),
-            field_row(Field::CompactionSummarizer, snapshot),
-            field_row(Field::Microcompaction, snapshot),
-            field_row(Field::MicrocompactionWatermark, snapshot),
-            field_row(Field::BashToolMode, snapshot),
-            field_row(Field::MaxToolRoundtrips, snapshot),
-            field_row(Field::PromptCacheRetention, snapshot),
-        ],
-        Category::Verification => vec![
-            field_row(Field::VerifyCommand, snapshot),
-            field_row(Field::VerifyMaxAttempts, snapshot),
-        ],
-        Category::Providers => vec![
-            open_row(
-                "scoped",
-                "Scoped models",
-                Some("cycle scope"),
-                ModalAction::OpenScopedModels,
-            ),
-            field_row(Field::WorktreeRoot, snapshot),
-            open_row(
-                "login",
-                "Login / providers",
-                Some("add or remove a provider"),
-                ModalAction::OpenLoginMethod,
-            ),
-        ],
-    }
-}
-
-// --- category list (top level) ---
-
-#[derive(Debug, Clone)]
-pub(crate) struct SettingsMenu {
-    selector: Selector,
-}
-
-impl SettingsMenu {
-    pub(crate) fn new() -> Self {
-        let items: Vec<SelectorItem> = Category::ALL
-            .iter()
-            .map(|category| {
-                SelectorItem::new(category.id(), category.title()).detail(category.description())
-            })
-            .collect();
-        SettingsMenu {
-            selector: Selector::new(items, false, true, 8),
+            None => false,
         }
     }
 
-    fn selected_category(&self) -> Option<Category> {
-        let id = self.selector.selected_id()?;
-        Category::ALL.iter().copied().find(|c| c.id() == id)
+    /// Arm the two-tick acknowledgment on the adjusted control. Reduced motion
+    /// settles instantly (§6: every motion degrades to its settled state).
+    fn arm_flash(&mut self) {
+        if !self.snap.reduced_motion {
+            self.flash = Some((self.cursor, FLASH_TICKS));
+        }
+    }
+
+    /// Paste into an active edit (the loop routes `Event::Paste` here).
+    pub(crate) fn push_str(&mut self, text: &str) {
+        if let Some(edit) = self.edit.as_mut() {
+            edit.buffer.push_str(text.trim_end_matches(['\r', '\n']));
+            edit.error = None;
+        }
     }
 
     pub(crate) fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        if self.edit.is_some() {
+            return self.handle_edit_key(key);
+        }
         match key {
             ModalKey::Up => {
-                self.selector.up();
+                self.cursor = if self.cursor == 0 {
+                    self.controls.len() - 1
+                } else {
+                    self.cursor - 1
+                };
                 ModalOutcome::Redraw
             }
             ModalKey::Down => {
-                self.selector.down();
+                self.cursor = if self.cursor + 1 >= self.controls.len() {
+                    0
+                } else {
+                    self.cursor + 1
+                };
                 ModalOutcome::Redraw
             }
-            ModalKey::Enter | ModalKey::Right => match self.selected_category() {
-                Some(category) => ModalOutcome::Emit(ModalAction::OpenSettingsCategory(category)),
-                None => ModalOutcome::Ignore,
-            },
+            ModalKey::Left => self.adjust(false),
+            ModalKey::Right => self.adjust(true),
+            ModalKey::Enter => self.activate(),
             ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
             _ => ModalOutcome::Ignore,
         }
     }
 
-    pub(crate) fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let rows = selector_rows(&self.selector, "No settings");
-        crate::ui::tui::overlay_menu(
-            Some("Settings"),
-            rows,
-            Some("\u{2191}\u{2193} move \u{00b7} \u{21b5} open \u{00b7} esc close"),
-            usize::from(width),
-        )
-    }
-}
-
-// --- category submenu ---
-
-#[derive(Debug, Clone)]
-pub(crate) struct SubMenu {
-    category: Category,
-    selector: Selector,
-    rows: Vec<Row>,
-}
-
-impl SubMenu {
-    pub(crate) fn new(category: Category, snapshot: &Snapshot) -> Self {
-        let rows = rows_for(category, snapshot);
-        let items = rows.iter().map(|row| row.item.clone()).collect();
-        SubMenu {
-            category,
-            selector: Selector::new(items, false, true, 8),
-            rows,
-        }
-    }
-
-    fn selected_action(&self) -> Option<ModalAction> {
-        let id = self.selector.selected_id()?;
-        self.rows
-            .iter()
-            .find(|row| row.item.id == id)
-            .map(|row| row.action.clone())
-    }
-
-    pub(crate) fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
-        match key {
-            ModalKey::Up => {
-                self.selector.up();
-                ModalOutcome::Redraw
+    /// Click the selected control one detent left/right. Emits the save action
+    /// when the position actually changes; a clamped end is a silent no-op
+    /// (the switch is already against its stop).
+    fn adjust(&mut self, forward: bool) -> ModalOutcome {
+        match self.selected() {
+            RowId::Reasoning => {
+                let levels = &self.snap.reasoning_levels;
+                let pos = levels
+                    .iter()
+                    .position(|(level, _)| *level == self.snap.reasoning)
+                    .unwrap_or(0);
+                let next = step_clamped(pos, levels.len(), forward);
+                if next == pos {
+                    return ModalOutcome::Ignore;
+                }
+                let level = levels[next].0;
+                self.snap.reasoning = level;
+                self.arm_flash();
+                ModalOutcome::Emit(ModalAction::AdjustEffort(level))
             }
-            ModalKey::Down => {
-                self.selector.down();
-                ModalOutcome::Redraw
+            RowId::SkipApprovals => {
+                let target = forward;
+                if self.snap.skip_permissions == target {
+                    return ModalOutcome::Ignore;
+                }
+                self.snap.skip_permissions = target;
+                self.arm_flash();
+                ModalOutcome::Emit(ModalAction::ToggleSkipPermissions)
             }
-            ModalKey::Enter | ModalKey::Right => match self.selected_action() {
-                Some(action) => ModalOutcome::Emit(action),
-                None => ModalOutcome::Ignore,
+            RowId::Field(field) => match archetype(RowId::Field(field)) {
+                Archetype::Switch => {
+                    let options = self.snap.switch_options(field);
+                    let current = self.snap.switch_value(field);
+                    let pos = options.iter().position(|o| *o == current).unwrap_or(0);
+                    let next = step_clamped(pos, options.len(), forward);
+                    if next == pos {
+                        return ModalOutcome::Ignore;
+                    }
+                    let value = options[next];
+                    self.snap.set_switch_value(field, value);
+                    self.arm_flash();
+                    ModalOutcome::Emit(ModalAction::SaveSetting {
+                        field,
+                        value: Some(save_token(field, value)),
+                    })
+                }
+                Archetype::Dial => {
+                    let value = self.snap.dial_value(field);
+                    let Some(next) = next_detent(ladder(field), value, forward) else {
+                        return ModalOutcome::Ignore;
+                    };
+                    self.snap.set_dial_value(field, next);
+                    self.arm_flash();
+                    ModalOutcome::Emit(ModalAction::SaveSetting {
+                        field,
+                        value: Some(next.to_string()),
+                    })
+                }
+                _ => ModalOutcome::Ignore,
             },
-            // Back out to the category list.
-            ModalKey::Esc | ModalKey::CtrlC | ModalKey::Left => {
-                ModalOutcome::Emit(ModalAction::OpenSettingsRoot)
-            }
             _ => ModalOutcome::Ignore,
         }
     }
 
-    pub(crate) fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let rows = selector_rows(&self.selector, "No settings");
-        crate::ui::tui::overlay_menu(
-            Some(self.category.title()),
-            rows,
-            Some("\u{2191}\u{2193} move \u{00b7} \u{21b5} select \u{00b7} \u{2190}/esc back"),
-            usize::from(width),
-        )
-    }
-}
-
-// --- enum picker ---
-
-#[derive(Debug, Clone)]
-pub(crate) struct EnumMenu {
-    field: Field,
-    selector: Selector,
-}
-
-impl EnumMenu {
-    pub(crate) fn new(field: Field, snapshot: &Snapshot) -> Self {
-        let options = match field.kind() {
-            FieldKind::Enum { options } => options,
-            // A non-enum field never reaches here (the submenu only routes enum
-            // fields to this widget); fall back to an empty list defensively.
-            _ => &[],
-        };
-        let current = snapshot.value(field);
-        let items: Vec<SelectorItem> = options
-            .iter()
-            .map(|option| {
-                let mut item = SelectorItem::new(*option, *option);
-                if *option == current {
-                    item = item.trailing("current");
+    /// `↵` acts by archetype: ports open their surface, registers and dials
+    /// enter inline edit. Switches only move with `←`/`→` (pressing a slide
+    /// switch does nothing).
+    fn activate(&mut self) -> ModalOutcome {
+        match self.selected() {
+            RowId::Model => ModalOutcome::Emit(ModalAction::OpenModelPicker),
+            RowId::Scope => ModalOutcome::Emit(ModalAction::OpenScopedModels),
+            RowId::Providers => ModalOutcome::Emit(ModalAction::OpenLoginMethod),
+            RowId::Permissions => ModalOutcome::Emit(ModalAction::OpenTrustMenu),
+            RowId::Field(field) => match archetype(RowId::Field(field)) {
+                Archetype::Register => {
+                    self.edit = Some(Edit {
+                        buffer: self.snap.register_value(field).unwrap_or_default(),
+                        numeric: false,
+                        error: None,
+                    });
+                    ModalOutcome::Redraw
                 }
-                item
-            })
-            .collect();
-        let mut selector = Selector::new(items, false, true, 8);
-        selector.select_id(&current);
-        EnumMenu { field, selector }
-    }
-
-    pub(crate) fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
-        match key {
-            ModalKey::Up => {
-                self.selector.up();
-                ModalOutcome::Redraw
-            }
-            ModalKey::Down => {
-                self.selector.down();
-                ModalOutcome::Redraw
-            }
-            ModalKey::Enter => match self.selector.selected_id() {
-                Some(value) => ModalOutcome::Emit(ModalAction::SaveSetting {
-                    field: self.field,
-                    value: Some(value.to_string()),
-                }),
-                None => ModalOutcome::Ignore,
+                Archetype::Dial => {
+                    self.edit = Some(Edit {
+                        buffer: self.snap.dial_value(field).to_string(),
+                        numeric: true,
+                        error: None,
+                    });
+                    ModalOutcome::Redraw
+                }
+                _ => ModalOutcome::Ignore,
             },
-            ModalKey::Esc | ModalKey::CtrlC | ModalKey::Left => {
-                ModalOutcome::Emit(ModalAction::OpenSettingsCategory(self.field.category()))
-            }
             _ => ModalOutcome::Ignore,
         }
     }
 
-    pub(crate) fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let rows = selector_rows(&self.selector, "No options");
-        let title = format!(
-            "{} \u{00b7} {}",
-            self.field.category().title(),
-            self.field.label()
-        );
-        crate::ui::tui::overlay_menu(
-            Some(&title),
-            rows,
-            Some("\u{2191}\u{2193} move \u{00b7} \u{21b5} select \u{00b7} \u{2190}/esc back"),
-            usize::from(width),
-        )
-    }
-}
-
-// --- text / numeric entry ---
-
-#[derive(Debug, Clone)]
-pub(crate) struct EntryDialog {
-    field: Field,
-    input: String,
-    error: Option<String>,
-}
-
-impl EntryDialog {
-    pub(crate) fn new(field: Field, snapshot: &Snapshot) -> Self {
-        EntryDialog {
-            field,
-            input: snapshot.entry_seed(field),
-            error: None,
-        }
-    }
-
-    pub(crate) fn push_str(&mut self, text: &str) {
-        self.input.push_str(text.trim_end_matches(['\r', '\n']));
-        self.error = None;
-    }
-
-    /// Validate the buffer and, when valid, emit the save. Numeric fields reject
-    /// non-numbers and clamp to their bounds; an empty buffer clears the key when
-    /// the field allows it, otherwise it is rejected with an inline error.
-    fn confirm(&mut self) -> ModalOutcome {
-        let trimmed = self.input.trim();
-        match self.field.kind() {
-            FieldKind::Numeric {
-                min,
-                max,
-                allow_empty,
-            } => {
-                if trimmed.is_empty() {
-                    if allow_empty {
-                        return self.emit(None);
-                    }
-                    self.error = Some("enter a number".to_string());
-                    return ModalOutcome::Redraw;
-                }
-                match trimmed.parse::<u64>() {
-                    Ok(value) => self.emit(Some(value.clamp(min, max).to_string())),
-                    Err(_) => {
-                        self.error = Some("must be a whole number".to_string());
-                        ModalOutcome::Redraw
-                    }
-                }
-            }
-            FieldKind::Text { allow_empty } => {
-                if trimmed.is_empty() {
-                    if allow_empty {
-                        return self.emit(None);
-                    }
-                    self.error = Some("cannot be empty".to_string());
-                    return ModalOutcome::Redraw;
-                }
-                self.emit(Some(trimmed.to_string()))
-            }
-            // Enum/Bool fields never open an entry dialog.
-            FieldKind::Enum { .. } | FieldKind::Bool => ModalOutcome::Ignore,
-        }
-    }
-
-    fn emit(&self, value: Option<String>) -> ModalOutcome {
-        ModalOutcome::Emit(ModalAction::SaveSetting {
-            field: self.field,
-            value,
-        })
-    }
-
-    pub(crate) fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+    fn handle_edit_key(&mut self, key: ModalKey) -> ModalOutcome {
         match key {
-            ModalKey::Enter => self.confirm(),
+            ModalKey::Enter => self.commit_edit(),
+            ModalKey::Esc | ModalKey::CtrlC => {
+                self.edit = None;
+                ModalOutcome::Redraw
+            }
             ModalKey::Backspace => {
-                self.input.pop();
-                self.error = None;
+                if let Some(edit) = self.edit.as_mut() {
+                    edit.buffer.pop();
+                    edit.error = None;
+                }
                 ModalOutcome::Redraw
             }
             ModalKey::Char(ch) => {
-                self.input.push(ch);
-                self.error = None;
+                if let Some(edit) = self.edit.as_mut() {
+                    edit.buffer.push(ch);
+                    edit.error = None;
+                }
                 ModalOutcome::Redraw
-            }
-            ModalKey::Esc | ModalKey::CtrlC => {
-                ModalOutcome::Emit(ModalAction::OpenSettingsCategory(self.field.category()))
             }
             _ => ModalOutcome::Ignore,
         }
     }
 
-    pub(crate) fn render(&self, width: u16) -> Vec<Line<'static>> {
-        let allow_empty = matches!(
-            self.field.kind(),
-            FieldKind::Numeric {
-                allow_empty: true,
-                ..
-            } | FieldKind::Text { allow_empty: true }
-        );
-        let prompt = match self.field.kind() {
-            FieldKind::Numeric { min, max, .. } => {
-                format!("Enter a number ({min}\u{2013}{max}), then Enter.")
+    /// Validate the buffer and, when valid, save + settle the row. A numeric
+    /// buffer clamps to the field's hard bounds; an empty buffer clears the
+    /// key when the field allows it, else it is rejected inline.
+    fn commit_edit(&mut self) -> ModalOutcome {
+        let RowId::Field(field) = self.selected() else {
+            self.edit = None;
+            return ModalOutcome::Redraw;
+        };
+        let Some(edit) = self.edit.as_mut() else {
+            return ModalOutcome::Ignore;
+        };
+        let trimmed = edit.buffer.trim().to_string();
+        if edit.numeric {
+            if trimmed.is_empty() {
+                edit.error = Some("enter a number");
+                return ModalOutcome::Redraw;
             }
-            _ => "Enter a value, then Enter.".to_string(),
-        };
-        let mut rows: Vec<(Line<'static>, bool)> = vec![
-            (Line::from(Span::styled(prompt, dim())), false),
-            (Line::from(Span::raw(format!("> {}", self.input))), false),
-        ];
-        if let Some(error) = &self.error {
-            rows.push((Line::from(Span::styled(error.clone(), dim())), false));
-        }
-        let footer = if allow_empty {
-            "\u{21b5} save \u{00b7} \u{2190} back \u{00b7} empty clears"
+            match trimmed.parse::<u64>() {
+                Ok(value) => {
+                    let (min, max) = dial_bounds(field);
+                    let value = value.clamp(min, max);
+                    self.snap.set_dial_value(field, value);
+                    self.edit = None;
+                    self.arm_flash();
+                    ModalOutcome::Emit(ModalAction::SaveSetting {
+                        field,
+                        value: Some(value.to_string()),
+                    })
+                }
+                Err(_) => {
+                    edit.error = Some("whole numbers only");
+                    ModalOutcome::Redraw
+                }
+            }
         } else {
-            "\u{21b5} save \u{00b7} \u{2190} back"
-        };
-        let title = format!(
-            "{} \u{00b7} {}",
-            self.field.category().title(),
-            self.field.label()
-        );
-        crate::ui::tui::overlay_menu(Some(&title), rows, Some(footer), usize::from(width))
+            let value = (!trimmed.is_empty()).then_some(trimmed);
+            self.snap.set_register_value(field, value.clone());
+            self.edit = None;
+            self.arm_flash();
+            ModalOutcome::Emit(ModalAction::SaveSetting { field, value })
+        }
     }
+
+    // --- rendering ---
+
+    pub(crate) fn render(&self, width: u16) -> Vec<Line<'static>> {
+        self.render_budgeted(usize::from(width), DEFAULT_LINE_BUDGET)
+    }
+
+    /// Render within `budget` total lines (masthead + body window + footer).
+    /// The body windows over the display rows to keep the cursor visible; a
+    /// scrolled panel appends the house `(n/N)` position row.
+    pub(crate) fn render_budgeted(&self, width: usize, budget: usize) -> Vec<Line<'static>> {
+        let avail = width.max(20);
+        let rows = display_rows();
+        // Fixed lines outside the body window: masthead, the blank under it,
+        // and overlay_menu's blank + footer.
+        let fixed = 4usize;
+        let budget = budget.max(fixed + 3);
+        let mut window = budget - fixed;
+        let scrolled = rows.len() > window;
+        if scrolled {
+            window = window.saturating_sub(1).max(1);
+        }
+        let cursor_pos = rows
+            .iter()
+            .position(
+                |row| matches!(row, DisplayRow::Control { index, .. } if *index == self.cursor),
+            )
+            .unwrap_or(0);
+        let offset = crate::ui::selector::scroll_offset(cursor_pos, window);
+
+        let mut body: Vec<(Line<'static>, bool)> = Vec::new();
+        body.push((self.masthead(avail), false));
+        body.push((Line::default(), false));
+        for row in rows.iter().skip(offset).take(window) {
+            match row {
+                DisplayRow::Blank => body.push((Line::default(), false)),
+                DisplayRow::Header(title) => {
+                    body.push((Line::from(Span::styled((*title).to_string(), dim())), false));
+                }
+                DisplayRow::Control { index, row } => {
+                    let selected = *index == self.cursor;
+                    body.push((self.control_line(*row, selected, avail), selected));
+                }
+            }
+        }
+        if scrolled {
+            body.push((
+                Line::from(Span::styled(
+                    crate::ui::selector::position_label(self.cursor, self.controls.len()),
+                    dim(),
+                )),
+                false,
+            ));
+        }
+        crate::ui::tui::overlay_menu(None, body, Some(&self.footer()), avail)
+    }
+
+    /// `SETTINGS` bold + the crate rev right-bound — the faceplate masthead,
+    /// aligned to the panel measure like the start page's silkscreen.
+    fn masthead(&self, avail: usize) -> Line<'static> {
+        let measure = self.measure(avail);
+        let title = "SETTINGS";
+        let rev = format!("iris {REV}");
+        let gap = measure.saturating_sub(title.chars().count() + rev.chars().count());
+        if gap == 0 {
+            return Line::from(Span::styled(
+                title.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+        }
+        Line::from(vec![
+            Span::styled(
+                title.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(rev, dim()),
+        ])
+    }
+
+    /// The panel measure: the widest control row at this width, so the
+    /// masthead's rev right-aligns to the grid the controls establish.
+    fn measure(&self, avail: usize) -> usize {
+        self.controls
+            .iter()
+            .map(|&row| line_width(&self.control_line(row, false, avail)))
+            .max()
+            .unwrap_or(0)
+            .clamp(24.min(avail), avail)
+    }
+
+    /// One control row: `  label            <control>`, two-cell indent, the
+    /// control column at `LABEL_W`. The selected row's label is bold (the
+    /// surface fill comes from `overlay_menu`).
+    fn control_line(&self, row: RowId, selected: bool, avail: usize) -> Line<'static> {
+        let flashing = self
+            .flash
+            .is_some_and(|(index, _)| self.controls.get(index) == Some(&row));
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let name = label(row);
+        let label_style = if selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        // The watermark is inert hardware while its master switch is off.
+        let inert =
+            row == RowId::Field(Field::MicrocompactionWatermark) && !self.snap.microcompaction;
+        spans.push(Span::styled(
+            format!("  {name:<width$}", width = LABEL_W),
+            if inert {
+                label_style.patch(dim())
+            } else {
+                label_style
+            },
+        ));
+        let editing = selected && self.edit.is_some();
+        if editing {
+            self.push_edit_spans(&mut spans);
+        } else {
+            self.push_control_spans(row, &mut spans, flashing, inert, avail);
+        }
+        Line::from(spans)
+    }
+
+    fn push_edit_spans(&self, spans: &mut Vec<Span<'static>>) {
+        let Some(edit) = self.edit.as_ref() else {
+            return;
+        };
+        spans.push(Span::raw(edit.buffer.clone()));
+        spans.push(Span::styled(
+            "\u{258b}".to_string(),
+            Style::default().fg(crate::ui::palette::orange()),
+        ));
+        if let Some(error) = edit.error {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("{} {error}", crate::ui::symbols::ERROR),
+                Style::default().fg(crate::ui::palette::red()),
+            ));
+        }
+    }
+
+    fn push_control_spans(
+        &self,
+        row: RowId,
+        spans: &mut Vec<Span<'static>>,
+        flashing: bool,
+        inert: bool,
+        avail: usize,
+    ) {
+        match row {
+            RowId::Model => {
+                let (provider, model) = self
+                    .snap
+                    .default_model
+                    .split_once('/')
+                    .unwrap_or(("", self.snap.default_model.as_str()));
+                spans.push(port_marker());
+                spans.push(Span::raw(model.to_string()));
+                if !provider.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" {} {provider}", crate::ui::symbols::SEP),
+                        dim(),
+                    ));
+                }
+            }
+            RowId::Scope => {
+                spans.push(port_marker());
+                spans.push(Span::styled(self.snap.scope_summary.clone(), dim()));
+            }
+            RowId::Providers => {
+                spans.push(port_marker());
+                spans.push(Span::styled(
+                    match self.snap.providers_connected {
+                        0 => "none connected".to_string(),
+                        1 => "1 connected".to_string(),
+                        n => format!("{n} connected"),
+                    },
+                    dim(),
+                ));
+            }
+            RowId::Permissions => {
+                spans.push(port_marker());
+                spans.push(Span::styled("per-tool + bash grants".to_string(), dim()));
+            }
+            RowId::Reasoning => {
+                let options: Vec<&str> = self
+                    .snap
+                    .reasoning_levels
+                    .iter()
+                    .map(|(_, label)| *label)
+                    .collect();
+                let pos = self
+                    .snap
+                    .reasoning_levels
+                    .iter()
+                    .position(|(level, _)| *level == self.snap.reasoning)
+                    .unwrap_or(0);
+                push_switch(spans, &options, pos, flashing, false, false, avail);
+            }
+            RowId::SkipApprovals => {
+                let pos = usize::from(self.snap.skip_permissions);
+                push_switch(
+                    spans,
+                    &["off", "on"],
+                    pos,
+                    flashing,
+                    self.snap.skip_permissions,
+                    false,
+                    avail,
+                );
+                // Caution silkscreen: printed under the guard switch, always
+                // visible, `┊`-joined metadata (never key-hint `·`).
+                spans.push(Span::styled(
+                    format!("  dangerous {} session only", crate::ui::symbols::SEP),
+                    dim(),
+                ));
+            }
+            RowId::Field(field) => match archetype(row) {
+                Archetype::Switch => {
+                    let options = self.snap.switch_options(field);
+                    let current = self.snap.switch_value(field);
+                    let pos = options.iter().position(|o| *o == current).unwrap_or(0);
+                    push_switch(spans, options, pos, flashing, false, inert, avail);
+                }
+                Archetype::Dial => {
+                    let value = self.snap.dial_value(field);
+                    push_dial(
+                        spans,
+                        ladder(field),
+                        value,
+                        dial_unit(field),
+                        flashing,
+                        inert,
+                    );
+                }
+                Archetype::Register => match self.snap.register_value(field) {
+                    Some(value) => spans.push(Span::raw(value)),
+                    None => spans.push(Span::styled(
+                        match field {
+                            Field::WorktreeRoot => "../wt (default)".to_string(),
+                            _ => "not set".to_string(),
+                        },
+                        dim(),
+                    )),
+                },
+                // Field rows are never ports (the ports are the non-Field
+                // RowIds, matched above).
+                Archetype::Port => {}
+            },
+        }
+    }
+
+    /// Keymap-honest footer: the verbs for the selected row's archetype only.
+    fn footer(&self) -> String {
+        if let Some(edit) = self.edit.as_ref() {
+            return if edit.numeric {
+                "\u{21b5} save \u{00b7} esc cancel".to_string()
+            } else {
+                "\u{21b5} save \u{00b7} esc cancel \u{00b7} empty clears".to_string()
+            };
+        }
+        let verbs = match archetype(self.selected()) {
+            Archetype::Switch => "\u{2190}\u{2192} set",
+            Archetype::Dial => "\u{2190}\u{2192} adjust \u{00b7} \u{21b5} type",
+            Archetype::Register => "\u{21b5} edit",
+            Archetype::Port => "\u{21b5} open",
+        };
+        format!("\u{2191}\u{2193} select \u{00b7} {verbs} \u{00b7} esc close")
+    }
+}
+
+/// Shared port marker: the `▸` continuation glyph, dim, in the control column.
+fn port_marker() -> Span<'static> {
+    Span::styled(format!("{} ", crate::ui::symbols::COLLAPSED), dim())
+}
+
+/// Clamped detent step: a switch never wraps.
+fn step_clamped(pos: usize, len: usize, forward: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if forward {
+        (pos + 1).min(len - 1)
+    } else {
+        pos.saturating_sub(1)
+    }
+}
+
+/// The neighbouring ladder detent from `value`: right clicks into the smallest
+/// detent above the true value, left into the largest below — an off-ladder
+/// value snaps into the ladder on its first click. `None` at the stop.
+fn next_detent(ladder: &[u64], value: u64, forward: bool) -> Option<u64> {
+    if forward {
+        ladder.iter().copied().find(|&detent| detent > value)
+    } else {
+        ladder.iter().copied().rev().find(|&detent| detent < value)
+    }
+}
+
+/// Nearest ladder position for the LED fill (display only; the printed value
+/// stays the true value).
+fn nearest_position(ladder: &[u64], value: u64) -> usize {
+    ladder
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, &detent)| detent.abs_diff(value))
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+/// A labeled detent track (`○ strict  ◉ auto  ○ never`), or its rotary form
+/// (`○○◉  auto`) when the track does not fit `avail`. `danger` paints the
+/// selected mark red (the guarded switch); `inert` dims the whole control.
+fn push_switch(
+    spans: &mut Vec<Span<'static>>,
+    options: &[&str],
+    pos: usize,
+    flashing: bool,
+    danger: bool,
+    inert: bool,
+    avail: usize,
+) {
+    let selected_color = if danger {
+        crate::ui::palette::red()
+    } else {
+        crate::ui::palette::orange()
+    };
+    let mark_style = if inert {
+        dim()
+    } else {
+        Style::default().fg(selected_color)
+    };
+    let mut label_style = if inert { dim() } else { Style::default() };
+    if flashing {
+        label_style = label_style.add_modifier(Modifier::BOLD);
+    }
+    // Track width: `◉ label` per option, two spaces between. Width alone
+    // decides the form — a printed scale whenever it fits, the rotary window
+    // when it does not (the session bar's drop-rule honesty, §9.1).
+    let track: usize = options
+        .iter()
+        .map(|option| option.chars().count() + 2)
+        .sum::<usize>()
+        + options.len().saturating_sub(1) * 2;
+    if LABEL_W + 2 + track <= avail {
+        for (i, option) in options.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("  "));
+            }
+            if i == pos {
+                spans.push(Span::styled(
+                    format!("{} ", crate::ui::symbols::ACTIVE),
+                    mark_style,
+                ));
+                spans.push(Span::styled((*option).to_string(), label_style));
+            } else {
+                spans.push(Span::styled(
+                    format!("{} {option}", crate::ui::symbols::EMPTY),
+                    dim(),
+                ));
+            }
+        }
+    } else {
+        // Rotary form: position dots + the selected value.
+        for (i, _) in options.iter().enumerate() {
+            spans.push(if i == pos {
+                Span::styled(crate::ui::symbols::ACTIVE.to_string(), mark_style)
+            } else {
+                Span::styled(crate::ui::symbols::EMPTY.to_string(), dim())
+            });
+        }
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            options.get(pos).copied().unwrap_or("").to_string(),
+            label_style,
+        ));
+    }
+}
+
+/// A 10-detent LED fader (the house meter: filled `●`, orange edge, dim `○`)
+/// plus the honest printed value.
+fn push_dial(
+    spans: &mut Vec<Span<'static>>,
+    ladder: &[u64],
+    value: u64,
+    unit: &str,
+    flashing: bool,
+    inert: bool,
+) {
+    let pos = nearest_position(ladder, value);
+    let edge_style = if inert {
+        dim()
+    } else {
+        let style = Style::default().fg(crate::ui::palette::orange());
+        if flashing {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
+    };
+    let fill_style = if inert { dim() } else { Style::default() };
+    for (i, _) in ladder.iter().enumerate() {
+        spans.push(if i < pos {
+            Span::styled(crate::ui::symbols::RUNNING.to_string(), fill_style)
+        } else if i == pos {
+            Span::styled(crate::ui::symbols::RUNNING.to_string(), edge_style)
+        } else {
+            Span::styled(crate::ui::symbols::EMPTY.to_string(), dim())
+        });
+    }
+    spans.push(Span::raw("  "));
+    let mut value_style = if inert { dim() } else { Style::default() };
+    if flashing {
+        value_style = value_style.add_modifier(Modifier::BOLD);
+    }
+    spans.push(Span::styled(compact_value(value), value_style));
+    if !unit.is_empty() {
+        spans.push(Span::styled(unit.to_string(), dim()));
+    }
+}
+
+/// The token persisted for a switch position. Bool switches show `off`/`on`
+/// but persist `false`/`true`.
+fn save_token(field: Field, value: &str) -> String {
+    match field {
+        Field::Microcompaction | Field::ReducedMotion => (value == "on").to_string(),
+        _ => value.to_string(),
+    }
+}
+
+/// Sum of a line's span widths (all panel content is single-width).
+fn line_width(line: &Line<'static>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum()
 }
 
 #[cfg(test)]
@@ -720,297 +1109,432 @@ mod tests {
     fn snapshot() -> Snapshot {
         Snapshot {
             default_model: "openai-codex/gpt-5.5".to_string(),
-            default_reasoning: "medium".to_string(),
-            alt_screen: "auto".to_string(),
-            scroll_speed: 3,
-            reduced_motion: false,
+            reasoning_levels: vec![
+                (ReasoningEffort::Minimal, "minimal"),
+                (ReasoningEffort::Low, "low"),
+                (ReasoningEffort::Medium, "medium"),
+                (ReasoningEffort::High, "high"),
+                (ReasoningEffort::XHigh, "xhigh"),
+            ],
+            reasoning: ReasoningEffort::Medium,
+            scope_summary: "all models".to_string(),
+            providers_connected: 2,
             default_approval: "strict".to_string(),
             skip_permissions: false,
-            context_token_budget: 128_000,
+            context_token_budget: 232_000,
             compaction_summarizer: "subagent".to_string(),
             microcompaction: false,
-            microcompaction_watermark: 64_000,
-            bash_tool_mode: false,
-            max_tool_roundtrips: None,
+            microcompaction_watermark: 32_000,
             prompt_cache_retention: "short".to_string(),
             verify_command: None,
             verify_max_attempts: 3,
-            worktree_root: None,
             theme: "terminal".to_string(),
+            alt_screen: "auto".to_string(),
+            scroll_speed: 3,
+            reduced_motion: false,
+            worktree_root: None,
         }
     }
 
-    #[test]
-    fn category_menu_opens_the_selected_category() {
-        let mut menu = SettingsMenu::new();
-        // First row is Model & reasoning.
-        assert_eq!(
-            menu.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenSettingsCategory(Category::ModelReasoning))
-        );
-        // Move to Display and open it.
-        menu.handle_key(ModalKey::Down);
-        assert_eq!(
-            menu.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenSettingsCategory(Category::Display))
-        );
-        // Esc at the top closes.
-        assert_eq!(menu.handle_key(ModalKey::Esc), ModalOutcome::Close);
+    fn panel() -> SettingsPanel {
+        SettingsPanel::new(snapshot())
     }
 
-    #[test]
-    fn submenu_leaves_emit_the_intended_actions() {
-        let snap = snapshot();
-        // Display: alt-screen -> enum, scroll -> entry, reduced-motion -> toggle.
-        let mut display = SubMenu::new(Category::Display, &snap);
-        assert_eq!(
-            display.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenSettingsEnum(Field::AltScreen))
-        );
-        display.handle_key(ModalKey::Down);
-        assert_eq!(
-            display.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenSettingsEntry(Field::ScrollSpeed))
-        );
-        display.handle_key(ModalKey::Down);
-        // Reduced motion currently off -> toggling saves "true".
-        assert_eq!(
-            display.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::SaveSetting {
-                field: Field::ReducedMotion,
-                value: Some("true".to_string()),
+    fn select(panel: &mut SettingsPanel, row: RowId) {
+        let pos = panel
+            .controls
+            .iter()
+            .position(|&r| r == row)
+            .expect("row on the panel");
+        panel.cursor = pos;
+    }
+
+    fn text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
             })
-        );
-        // Left backs out to the category list.
-        assert_eq!(
-            display.handle_key(ModalKey::Left),
-            ModalOutcome::Emit(ModalAction::OpenSettingsRoot)
-        );
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
-    fn submenu_open_rows_reuse_existing_modals() {
-        let snap = snapshot();
-        let mut model = SubMenu::new(Category::ModelReasoning, &snap);
-        assert_eq!(
-            model.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenModelPicker)
-        );
-        model.handle_key(ModalKey::Down);
-        assert_eq!(
-            model.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenEffortPicker)
-        );
-
-        let mut providers = SubMenu::new(Category::Providers, &snap);
-        assert_eq!(
-            providers.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenScopedModels)
-        );
-        // Last row is login.
-        providers.handle_key(ModalKey::Down);
-        providers.handle_key(ModalKey::Down);
-        assert_eq!(
-            providers.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenLoginMethod)
-        );
+    fn faceplate_lists_every_section_and_prunes_the_service_hatch() {
+        let lines = panel().render_budgeted(80, 60);
+        let rendered = text(&lines);
+        for section in ["ENGINE", "SAFETY", "MEMORY", "CHECKS", "PANEL", "GIT"] {
+            assert!(rendered.contains(section), "{section} missing:\n{rendered}");
+        }
+        // Pruned to settings.json (service hatch): never on the faceplate.
+        assert!(!rendered.to_lowercase().contains("bash tool"));
+        assert!(!rendered.to_lowercase().contains("round-trips"));
+        assert!(!rendered.to_lowercase().contains("roundtrips"));
+        // Masthead: identity + rev, like the start-page silkscreen.
+        assert!(rendered.contains("SETTINGS"));
+        assert!(rendered.contains(&format!("iris {REV}")));
     }
 
     #[test]
-    fn approvals_menu_toggles_session_skip_permissions() {
-        let snap = snapshot();
-        let mut approvals = SubMenu::new(Category::Approvals, &snap);
-        approvals.handle_key(ModalKey::Down);
+    fn switch_clicks_one_detent_and_clamps_at_the_stop() {
+        let mut panel = panel();
+        select(&mut panel, RowId::Field(Field::DefaultApproval));
+        // strict -> auto.
         assert_eq!(
-            approvals.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::ToggleSkipPermissions)
-        );
-    }
-
-    #[test]
-    fn enum_menu_emits_the_selected_token_and_backs_out() {
-        let snap = snapshot();
-        let mut menu = EnumMenu::new(Field::DefaultApproval, &snap);
-        // Current is "strict" (preselected); move down to "auto".
-        menu.handle_key(ModalKey::Down);
-        assert_eq!(
-            menu.handle_key(ModalKey::Enter),
+            panel.handle_key(ModalKey::Right),
             ModalOutcome::Emit(ModalAction::SaveSetting {
                 field: Field::DefaultApproval,
                 value: Some("auto".to_string()),
             })
         );
-        // Esc backs out to the parent category, not Close.
+        // auto -> never.
         assert_eq!(
-            menu.handle_key(ModalKey::Esc),
-            ModalOutcome::Emit(ModalAction::OpenSettingsCategory(Category::Approvals))
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::DefaultApproval,
+                value: Some("never".to_string()),
+            })
+        );
+        // Against the stop: a real switch never wraps.
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+        // And back one detent.
+        assert_eq!(
+            panel.handle_key(ModalKey::Left),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::DefaultApproval,
+                value: Some("auto".to_string()),
+            })
         );
     }
 
     #[test]
-    fn numeric_entry_rejects_non_numbers_and_clamps() {
-        let snap = snapshot();
-        let mut entry = EntryDialog::new(Field::ScrollSpeed, &snap);
-        // Non-number is rejected (no emit, error shown).
-        entry.input = "abc".to_string();
-        assert_eq!(entry.handle_key(ModalKey::Enter), ModalOutcome::Redraw);
-        assert!(entry.error.is_some());
-        // Above the max clamps to 100.
-        entry.input = "9999".to_string();
+    fn bool_switches_persist_true_false_not_on_off() {
+        let mut panel = panel();
+        select(&mut panel, RowId::Field(Field::Microcompaction));
         assert_eq!(
-            entry.handle_key(ModalKey::Enter),
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::Microcompaction,
+                value: Some("true".to_string()),
+            })
+        );
+        // Already on: pushing further is a no-op, pulling back turns it off.
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+        assert_eq!(
+            panel.handle_key(ModalKey::Left),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::Microcompaction,
+                value: Some("false".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn skip_approvals_is_positional_and_only_fires_on_a_real_flip() {
+        let mut panel = panel();
+        select(&mut panel, RowId::SkipApprovals);
+        // Already off: pulling left is a no-op (never a blind toggle).
+        assert_eq!(panel.handle_key(ModalKey::Left), ModalOutcome::Ignore);
+        assert_eq!(
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::ToggleSkipPermissions)
+        );
+        // The panel's own display flipped with it.
+        assert!(panel.snap.skip_permissions);
+    }
+
+    #[test]
+    fn dial_snaps_an_off_ladder_value_into_the_ladder() {
+        let mut panel = panel();
+        select(&mut panel, RowId::Field(Field::ContextTokenBudget));
+        // 232k sits ON the ladder; right clicks into 300k.
+        assert_eq!(
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::ContextTokenBudget,
+                value: Some("300000".to_string()),
+            })
+        );
+        // An off-ladder value (90k, e.g. hand-edited json) snaps to the
+        // neighbouring detent on the first click.
+        panel.snap.context_token_budget = 90_000;
+        assert_eq!(
+            panel.handle_key(ModalKey::Left),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::ContextTokenBudget,
+                value: Some("64000".to_string()),
+            })
+        );
+        // At the bottom stop the dial no-ops.
+        panel.snap.context_token_budget = 64_000;
+        assert_eq!(panel.handle_key(ModalKey::Left), ModalOutcome::Ignore);
+    }
+
+    #[test]
+    fn dial_enter_types_a_precise_value_and_clamps_to_bounds() {
+        let mut panel = panel();
+        select(&mut panel, RowId::Field(Field::ScrollSpeed));
+        assert_eq!(panel.handle_key(ModalKey::Enter), ModalOutcome::Redraw);
+        // Seeded with the current value; type a replacement.
+        for _ in 0..1 {
+            panel.handle_key(ModalKey::Backspace);
+        }
+        panel.handle_key(ModalKey::Char('9'));
+        panel.handle_key(ModalKey::Char('9'));
+        panel.handle_key(ModalKey::Char('9'));
+        assert_eq!(
+            panel.handle_key(ModalKey::Enter),
             ModalOutcome::Emit(ModalAction::SaveSetting {
                 field: Field::ScrollSpeed,
                 value: Some("100".to_string()),
             })
         );
-        // A good in-range value is accepted verbatim.
-        entry.input = "12".to_string();
-        assert_eq!(
-            entry.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::SaveSetting {
-                field: Field::ScrollSpeed,
-                value: Some("12".to_string()),
-            })
-        );
+        // Non-numeric input is rejected inline, panel stays in edit.
+        panel.handle_key(ModalKey::Enter);
+        panel.handle_key(ModalKey::Char('x'));
+        assert_eq!(panel.handle_key(ModalKey::Enter), ModalOutcome::Redraw);
+        assert!(panel.edit.as_ref().is_some_and(|e| e.error.is_some()));
+        // Esc cancels the edit without saving.
+        assert_eq!(panel.handle_key(ModalKey::Esc), ModalOutcome::Redraw);
+        assert!(panel.edit.is_none());
     }
 
     #[test]
-    fn numeric_entry_empty_clears_only_when_allowed() {
-        let snap = snapshot();
-        // MaxToolRoundtrips allows empty -> clears to None (unbounded).
-        let mut clearable = EntryDialog::new(Field::MaxToolRoundtrips, &snap);
-        clearable.input = "   ".to_string();
+    fn register_edits_inline_and_empty_clears() {
+        let mut panel = panel();
+        select(&mut panel, RowId::Field(Field::VerifyCommand));
+        assert_eq!(panel.handle_key(ModalKey::Enter), ModalOutcome::Redraw);
+        panel.push_str("  cargo test  ");
         assert_eq!(
-            clearable.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::SaveSetting {
-                field: Field::MaxToolRoundtrips,
-                value: None,
-            })
-        );
-        // ScrollSpeed does not allow empty -> rejected.
-        let mut required = EntryDialog::new(Field::ScrollSpeed, &snap);
-        required.input = String::new();
-        assert_eq!(required.handle_key(ModalKey::Enter), ModalOutcome::Redraw);
-        assert!(required.error.is_some());
-    }
-
-    #[test]
-    fn text_entry_empty_clears_and_backs_out() {
-        let snap = snapshot();
-        let mut entry = EntryDialog::new(Field::VerifyCommand, &snap);
-        entry.push_str("  cargo test  ");
-        assert_eq!(
-            entry.handle_key(ModalKey::Enter),
+            panel.handle_key(ModalKey::Enter),
             ModalOutcome::Emit(ModalAction::SaveSetting {
                 field: Field::VerifyCommand,
                 value: Some("cargo test".to_string()),
             })
         );
-        // Clearing the text emits a None (clear the key).
-        entry.input = String::new();
+        // Re-enter, clear to empty: clears the key.
+        panel.handle_key(ModalKey::Enter);
+        for _ in 0.."cargo test".len() {
+            panel.handle_key(ModalKey::Backspace);
+        }
         assert_eq!(
-            entry.handle_key(ModalKey::Enter),
+            panel.handle_key(ModalKey::Enter),
             ModalOutcome::Emit(ModalAction::SaveSetting {
                 field: Field::VerifyCommand,
                 value: None,
             })
         );
-        // Esc backs out to the Verification category.
+    }
+
+    #[test]
+    fn ports_open_their_surfaces() {
+        let mut panel = panel();
+        select(&mut panel, RowId::Model);
         assert_eq!(
-            entry.handle_key(ModalKey::Esc),
-            ModalOutcome::Emit(ModalAction::OpenSettingsCategory(Category::Verification))
+            panel.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::OpenModelPicker)
+        );
+        select(&mut panel, RowId::Scope);
+        assert_eq!(
+            panel.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::OpenScopedModels)
+        );
+        select(&mut panel, RowId::Providers);
+        assert_eq!(
+            panel.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::OpenLoginMethod)
+        );
+        select(&mut panel, RowId::Permissions);
+        assert_eq!(
+            panel.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::OpenTrustMenu)
+        );
+        // Ports never respond to ←→ (nothing to slide).
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+    }
+
+    #[test]
+    fn reasoning_clicks_through_the_active_models_levels() {
+        let mut panel = panel();
+        select(&mut panel, RowId::Reasoning);
+        assert_eq!(
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::AdjustEffort(ReasoningEffort::High))
+        );
+        assert_eq!(
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::AdjustEffort(ReasoningEffort::XHigh))
+        );
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+    }
+
+    #[test]
+    fn theme_is_a_live_rotary_over_every_theme_id() {
+        let mut panel = panel();
+        select(&mut panel, RowId::Field(Field::Theme));
+        // terminal (index 0) -> gruvbox (index 1): each click saves.
+        assert_eq!(
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::Theme,
+                value: Some(crate::ui::theme::available()[1].to_string()),
+            })
+        );
+        // Rendered as the rotary form (6 ids never fit a labeled track).
+        let lines = panel.render_budgeted(80, 60);
+        let rendered = text(&lines);
+        assert!(
+            rendered.contains("gruvbox"),
+            "selected value printed:\n{rendered}"
         );
     }
 
     #[test]
-    fn theme_row_opens_enum_listing_all_theme_ids() {
-        let snap = snapshot();
-        // Theme is the last Display row (after alt-screen, scroll, reduced-motion).
-        let mut display = SubMenu::new(Category::Display, &snap);
-        display.handle_key(ModalKey::Down);
-        display.handle_key(ModalKey::Down);
-        display.handle_key(ModalKey::Down);
-        assert_eq!(
-            display.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenSettingsEnum(Field::Theme))
-        );
-        // The enum widget lists every available theme id in order.
-        let menu = EnumMenu::new(Field::Theme, &snap);
-        assert_eq!(
-            menu.selector.filtered_ids(),
-            crate::ui::theme::available()
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-        );
+    fn a_change_flashes_two_ticks_then_settles() {
+        let mut panel = panel();
+        select(&mut panel, RowId::Field(Field::DefaultApproval));
+        panel.handle_key(ModalKey::Right);
+        assert!(panel.flash.is_some(), "detent flash armed");
+        assert!(panel.tick(), "first tick still settling");
+        assert!(panel.tick(), "second tick settles");
+        assert!(!panel.tick(), "settled: no more repaints");
+        assert!(panel.flash.is_none());
     }
 
     #[test]
-    fn runtime_menu_exposes_independent_compaction_thresholds() {
+    fn reduced_motion_never_flashes() {
         let mut snap = snapshot();
-        snap.context_token_budget = 96_000;
-        snap.microcompaction = true;
-        snap.microcompaction_watermark = 12_000;
-        let rows = rows_for(Category::Runtime, &snap);
-
-        assert!(rows.iter().any(|row| matches!(
-            &row.action,
-            ModalAction::OpenSettingsEntry(Field::ContextTokenBudget)
-        ) && row.item.label == "Auto-compaction threshold"));
-        let micro = rows
-            .iter()
-            .find(|row| row.item.id == Field::Microcompaction.label())
-            .expect("runtime menu includes microcompaction");
-        assert_eq!(micro.item.detail.as_deref(), Some("on"));
-        assert_eq!(
-            micro.action,
-            ModalAction::SaveSetting {
-                field: Field::Microcompaction,
-                value: Some("false".to_string()),
-            }
-        );
-        let watermark = rows
-            .iter()
-            .find(|row| row.item.id == Field::MicrocompactionWatermark.label())
-            .expect("runtime menu includes microcompaction watermark");
-        assert_eq!(watermark.item.detail.as_deref(), Some("12000"));
-        assert_eq!(
-            watermark.action,
-            ModalAction::OpenSettingsEntry(Field::MicrocompactionWatermark)
-        );
+        snap.reduced_motion = true;
+        let mut panel = SettingsPanel::new(snap);
+        select(&mut panel, RowId::Field(Field::DefaultApproval));
+        panel.handle_key(ModalKey::Right);
+        assert!(panel.flash.is_none(), "reduced motion settles instantly");
     }
 
     #[test]
-    fn every_field_maps_back_to_a_category_that_lists_it() {
-        // A leaf's field.category() must contain a row that targets it, so
-        // post-save refresh returns to a menu that includes the field.
-        let snap = snapshot();
-        let fields = [
-            Field::AltScreen,
-            Field::ScrollSpeed,
-            Field::ReducedMotion,
-            Field::DefaultApproval,
-            Field::ContextTokenBudget,
-            Field::CompactionSummarizer,
-            Field::Microcompaction,
-            Field::MicrocompactionWatermark,
-            Field::BashToolMode,
-            Field::MaxToolRoundtrips,
-            Field::PromptCacheRetention,
-            Field::VerifyCommand,
-            Field::VerifyMaxAttempts,
-            Field::WorktreeRoot,
-            Field::Theme,
-        ];
-        for field in fields {
-            let rows = rows_for(field.category(), &snap);
-            let found = rows.iter().any(|row| match &row.action {
-                ModalAction::OpenSettingsEnum(f) | ModalAction::OpenSettingsEntry(f) => *f == field,
-                ModalAction::SaveSetting { field: f, .. } => *f == field,
-                _ => false,
-            });
-            assert!(found, "{field:?} not present in its category submenu");
-        }
+    fn watermark_goes_inert_while_microcompaction_is_off() {
+        let panel = panel();
+        assert!(!panel.snap.microcompaction);
+        let line = panel.control_line(RowId::Field(Field::MicrocompactionWatermark), false, 80);
+        // Inert hardware: every span dims, including the LED edge.
+        assert!(
+            line.spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::DIM)
+                    || span.content.trim().is_empty()),
+            "inert row renders fully dim: {line:?}"
+        );
+        // Still operable: adjusting emits a save.
+        let mut panel = self::panel();
+        select(&mut panel, RowId::Field(Field::MicrocompactionWatermark));
+        assert!(matches!(
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::MicrocompactionWatermark,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn footer_verbs_are_keymap_honest_per_archetype() {
+        let mut panel = panel();
+        select(&mut panel, RowId::Field(Field::DefaultApproval));
+        assert!(panel.footer().contains("\u{2190}\u{2192} set"));
+        assert!(!panel.footer().contains("\u{21b5}"));
+        select(&mut panel, RowId::Field(Field::ContextTokenBudget));
+        assert!(panel.footer().contains("adjust"));
+        assert!(panel.footer().contains("\u{21b5} type"));
+        select(&mut panel, RowId::Field(Field::VerifyCommand));
+        assert!(panel.footer().contains("\u{21b5} edit"));
+        select(&mut panel, RowId::Model);
+        assert!(panel.footer().contains("\u{21b5} open"));
+        // Editing swaps to the edit verbs.
+        select(&mut panel, RowId::Field(Field::VerifyCommand));
+        panel.handle_key(ModalKey::Enter);
+        assert!(panel.footer().contains("\u{21b5} save"));
+        assert!(panel.footer().contains("esc cancel"));
+    }
+
+    #[test]
+    fn narrow_width_degrades_the_track_to_its_rotary_form() {
+        let panel = panel();
+        // Wide: the reasoning row prints every level.
+        let wide = text(&[panel.control_line(RowId::Reasoning, false, 80)]);
+        assert!(wide.contains("minimal") && wide.contains("xhigh"));
+        // Narrow: position dots + the selected value only.
+        let narrow = text(&[panel.control_line(RowId::Reasoning, false, 46)]);
+        assert!(narrow.contains("medium"));
+        assert!(!narrow.contains("minimal"), "rotary form: {narrow}");
+    }
+
+    #[test]
+    fn windowing_keeps_the_cursor_visible_with_a_position_row() {
+        let mut panel = panel();
+        // Walk to the last control (worktree root) under a tight budget.
+        select(&mut panel, RowId::Field(Field::WorktreeRoot));
+        let lines = panel.render_budgeted(80, 14);
+        let rendered = text(&lines);
+        assert!(
+            rendered.contains("worktree root"),
+            "cursor row visible:\n{rendered}"
+        );
+        let total = panel.controls.len();
+        assert!(
+            rendered.contains(&format!("({total}/{total})")),
+            "house position row while scrolled:\n{rendered}"
+        );
+        // Untruncated on a tall terminal: no position row, every section shown.
+        let full = text(&panel.render_budgeted(80, 60));
+        assert!(!full.contains(&format!("({total}/{total})")));
+        assert!(full.contains("ENGINE") && full.contains("GIT"));
+    }
+
+    #[test]
+    fn navigation_wraps_over_controls_and_skips_silkscreen() {
+        let mut panel = panel();
+        assert_eq!(panel.selected(), RowId::Model);
+        panel.handle_key(ModalKey::Up);
+        assert_eq!(
+            panel.selected(),
+            RowId::Field(Field::WorktreeRoot),
+            "wraps to the last control, never a header"
+        );
+        panel.handle_key(ModalKey::Down);
+        assert_eq!(panel.selected(), RowId::Model);
+    }
+
+    #[test]
+    fn ladder_stepping_is_mechanical() {
+        assert_eq!(next_detent(&BUDGET_LADDER, 232_000, true), Some(300_000));
+        assert_eq!(next_detent(&BUDGET_LADDER, 232_000, false), Some(200_000));
+        // Off-ladder snaps to the neighbour, both directions.
+        assert_eq!(next_detent(&BUDGET_LADDER, 90_000, true), Some(96_000));
+        assert_eq!(next_detent(&BUDGET_LADDER, 90_000, false), Some(64_000));
+        // Stops.
+        assert_eq!(next_detent(&BUDGET_LADDER, 1_000_000, true), None);
+        assert_eq!(next_detent(&BUDGET_LADDER, 64_000, false), None);
+        // Fill position is the nearest detent.
+        assert_eq!(nearest_position(&BUDGET_LADDER, 232_000), 5);
+        assert_eq!(nearest_position(&BUDGET_LADDER, 90_000), 1);
+    }
+
+    #[test]
+    fn dial_values_print_in_the_one_house_token_format() {
+        assert_eq!(compact_value(232_000), "232k");
+        assert_eq!(compact_value(1_000_000), "1m");
+        assert_eq!(compact_value(3), "3");
+        // Honest compacting: a non-round value keeps its decimal, exactly as
+        // the divider and receipt would print it — never silently truncated.
+        assert_eq!(compact_value(12_500), "12.5k");
+    }
+
+    #[test]
+    fn port_return_reopens_on_the_port_row() {
+        let panel = SettingsPanel::with_selected(snapshot(), RowId::Scope);
+        assert_eq!(panel.selected(), RowId::Scope);
     }
 }

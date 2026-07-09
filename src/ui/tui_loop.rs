@@ -506,7 +506,7 @@ async fn session_loop<P: ChatProvider>(
             }
             IdleOutcome::OpenSettings => {
                 if let Some(sw) = switch.as_mut() {
-                    tui.screen.open_modal(picker::open_settings(sw));
+                    tui.screen.open_modal(picker::open_settings(harness, sw));
                 }
             }
             IdleOutcome::Submit(prompt) => {
@@ -557,7 +557,7 @@ async fn session_loop<P: ChatProvider>(
                         )
                         .await?;
                         tui.screen.end_turn();
-                        open_deferred_settings(tui, switch, steering.as_ref());
+                        open_deferred_settings(harness, tui, switch, steering.as_ref());
                         tui.draw()?;
                     }
                     RouteOutcome::Fall => {
@@ -577,7 +577,7 @@ async fn session_loop<P: ChatProvider>(
                         )
                         .await?;
                         tui.screen.end_turn();
-                        open_deferred_settings(tui, switch, steering.as_ref());
+                        open_deferred_settings(harness, tui, switch, steering.as_ref());
                         // Turn completion is a refresh trigger: the turn may
                         // have mutated the tree or task state.
                         git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
@@ -586,7 +586,7 @@ async fn session_loop<P: ChatProvider>(
                 }
             }
         }
-        open_deferred_settings(tui, switch, steering.as_ref());
+        open_deferred_settings(harness, tui, switch, steering.as_ref());
         // A model/effort switch (Ctrl+P, Shift+Tab, or a `/model` `/reasoning`
         // command) lands in this iteration; refresh the footer so the trailing
         // draw reflects the new selection immediately, not on the next keypress.
@@ -700,6 +700,7 @@ fn apply_recovery(outcome: RecoveryOutcome, tui: &mut TuiUi) {
 /// running. The running phase records only an intent; the modal opens here at a
 /// safe boundary, where model/settings actions already route.
 fn open_deferred_settings<P: ChatProvider>(
+    harness: &Harness<P>,
     tui: &mut TuiUi,
     switch: &mut Option<ModelSwitch<'_, P>>,
     steering: &SteeringQueue,
@@ -707,7 +708,7 @@ fn open_deferred_settings<P: ChatProvider>(
     if steering.take_settings()
         && let Some(sw) = switch.as_mut()
     {
-        tui.screen.open_modal(picker::open_settings(sw));
+        tui.screen.open_modal(picker::open_settings(harness, sw));
     }
 }
 
@@ -1437,7 +1438,7 @@ fn route_command<P: ChatProvider>(
                 return Ok(RouteOutcome::Fall);
             };
             tui.screen.commit_user(prompt);
-            tui.screen.open_modal(picker::open_settings(sw));
+            tui.screen.open_modal(picker::open_settings(harness, sw));
             Ok(RouteOutcome::Consumed)
         }
         "/approval" => {
@@ -1592,9 +1593,27 @@ fn route_command<P: ChatProvider>(
             }
             Ok(RouteOutcome::Consumed)
         }
+        "/reasoning" if rest.is_empty() => {
+            // Model and reasoning are ONE selector: a bare `/reasoning` opens
+            // the same unified picker as `/model` (rows pick the model, ←→
+            // clicks the effort detent) instead of a second bespoke list.
+            let Some(sw) = switch.as_mut() else {
+                return Ok(RouteOutcome::Fall);
+            };
+            tui.screen.commit_user(prompt);
+            let before = sw.selection().clone();
+            match picker::model_command("", harness, sw) {
+                ModelCommand::Open(modal) => tui.screen.open_modal(modal),
+                ModelCommand::Lines(lines) => {
+                    let after = sw.selection().clone();
+                    apply_model_switch_lines(tui, harness, Some(&before), Some(&after), lines);
+                }
+            }
+            Ok(RouteOutcome::Consumed)
+        }
         "/reasoning" => {
-            // Legacy text effort path is preserved as a compatible alias. It
-            // takes the whole `Option<ModelSwitch>` like the text driver does.
+            // `/reasoning <level>` stays the typed fast path (a compatible
+            // alias through the text driver, like the CLI).
             tui.screen.commit_user(prompt);
             let before = switch.as_ref().map(|sw| sw.selection().clone());
             if let Some(lines) = crate::cli::handle_model_command(prompt, harness, switch) {
@@ -2067,7 +2086,21 @@ async fn run_modal_phase<P: ChatProvider>(
     git_cache: &GitStatusCache,
     git_generation: &mut u64,
 ) -> Result<Option<SessionSource>> {
-    while tui.screen.focus() == FocusTarget::Modal {
+    // The settings panel is home: leaving a surface one of its ports opened
+    // (model picker, scoped models, trust, login) re-opens the panel on that
+    // port row instead of dropping back to the editor.
+    let mut settings_return: Option<crate::ui::settings_menu::RowId> = None;
+    loop {
+        if tui.screen.focus() != FocusTarget::Modal {
+            let (Some(row), Some(sw)) = (settings_return.take(), switch.as_mut()) else {
+                break;
+            };
+            tui.screen
+                .open_modal(picker::open_settings_at(harness, sw, row));
+            refresh_footer(tui, switch);
+            tui.draw()?;
+            continue;
+        }
         tokio::select! {
             maybe = input_rx.recv() => {
                 let Some(event) = maybe else {
@@ -2086,6 +2119,7 @@ async fn run_modal_phase<P: ChatProvider>(
                     }
                     _ => {}
                 }
+                let from_settings = matches!(tui.screen.modal, Some(Modal::Settings(_)));
                 let outcome = if let Event::Paste(text) = &event {
                     match tui.screen.modal.as_mut() {
                         Some(modal) => modal.paste_text(text),
@@ -2100,6 +2134,9 @@ async fn run_modal_phase<P: ChatProvider>(
                         None => ModalOutcome::Ignore,
                     }
                 };
+                if from_settings && let ModalOutcome::Emit(action) = &outcome {
+                    settings_return = settings_return_row(action);
+                }
                 let requested = apply_modal_outcome(
                     outcome,
                     harness,
@@ -2122,10 +2159,30 @@ async fn run_modal_phase<P: ChatProvider>(
                 refresh_footer(tui, switch);
                 tui.draw()?;
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => {
+                // Keep the tick grid live while a modal is open: the settings
+                // panel's detent flash settles here, and the start page's
+                // IrisMark keeps sweeping behind a docked picker.
+                if tui.screen.tick() {
+                    tui.draw()?;
+                }
+            }
         }
     }
     Ok(None)
+}
+
+/// The panel row a port action departs from, so the modal phase lands back on
+/// it when the opened surface closes (settings is home; §10.1).
+fn settings_return_row(action: &ModalAction) -> Option<crate::ui::settings_menu::RowId> {
+    use crate::ui::settings_menu::RowId;
+    match action {
+        ModalAction::OpenModelPicker => Some(RowId::Model),
+        ModalAction::OpenScopedModels => Some(RowId::Scope),
+        ModalAction::OpenLoginMethod => Some(RowId::Providers),
+        ModalAction::OpenTrustMenu => Some(RowId::Permissions),
+        _ => None,
+    }
 }
 
 /// Interpret one [`ModalOutcome`]. Returns a requested session swap (from the
@@ -2210,7 +2267,7 @@ async fn dispatch_action<P: ChatProvider>(
             .await?;
             tui.screen.end_turn();
             if !compact_ok {
-                open_deferred_settings(tui, switch, steering);
+                open_deferred_settings(harness, tui, switch, steering);
                 return Ok(None);
             }
             let action = ModalAction::ConfirmModelSwitch {
@@ -2238,7 +2295,7 @@ async fn dispatch_action<P: ChatProvider>(
                     tui.screen.open_modal(*modal);
                 }
             }
-            open_deferred_settings(tui, switch, steering);
+            open_deferred_settings(harness, tui, switch, steering);
         }
         ModalAction::ResumeSession(id) => {
             // Close the picker and hand the chosen session up to the loop, which
