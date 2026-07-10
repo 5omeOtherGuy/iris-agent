@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Run the release build for the clean, current primary `main` checkout.
 #
-# Install with a symlink so this script can continue to locate the repository:
-#   ln -s /path/to/iris-agent/scripts/iris-dev.sh ~/.local/bin/iris-dev
+# Install a standalone launcher so writes to ~/.local/bin cannot follow a
+# symlink and overwrite this tracked script:
+#   printf '#!/usr/bin/env bash\nexec /path/to/iris-agent/scripts/iris-dev.sh "$@"\n' > ~/.local/bin/iris-dev
+#   chmod +x ~/.local/bin/iris-dev
 #
 # The cached executable is rebuilt only when `main` or the Rust toolchain
 # changes. Pass --force-refresh as the first argument to rebuild unconditionally.
@@ -18,7 +20,9 @@ if [ "${1:-}" = "--force-refresh" ]; then
   shift
 fi
 
-# Follow symlinks so ~/.local/bin/iris-dev can point at this repo-owned file.
+# Follow symlinks for compatibility with older installations. New installs use
+# the standalone launcher above so this tracked file cannot be overwritten via
+# ~/.local/bin/iris-dev.
 SOURCE=${BASH_SOURCE[0]}
 while [ -L "$SOURCE" ]; do
   SOURCE_DIR=$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)

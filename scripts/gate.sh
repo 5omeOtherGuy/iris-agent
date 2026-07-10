@@ -56,6 +56,7 @@ run_step() {
 run_step "fmt (cargo fmt --all --check)"           cargo fmt --all --check                  || exit $?
 run_step "clippy (cargo clippy -D warnings)"       cargo clippy --all-targets -- -D warnings || exit $?
 run_step "test (cargo test --locked)"              cargo test --locked                      || exit $?
+run_step "script tests"                            bash scripts/sync-primary-tests.sh        || exit $?
 
-printf 'gate: PASS — fmt OK, clippy OK, test OK\n'
+printf 'gate: PASS — fmt OK, clippy OK, test OK, scripts OK\n'
 exit 0

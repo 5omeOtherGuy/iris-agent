@@ -43,6 +43,9 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      - name: Test maintenance scripts
+        run: bash scripts/sync-primary-tests.sh
+
       - name: Build
         run: cargo build --locked
 
