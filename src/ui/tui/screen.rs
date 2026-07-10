@@ -4077,7 +4077,7 @@ mod tests {
 
         // Approval-wait hides the whole indicator, meter included — the
         // existing suppression must not regress.
-        screen.show_approval();
+        screen.show_approval(false, false, false);
         assert!(
             screen.working_lines(80).is_empty(),
             "hidden while awaiting approval"
