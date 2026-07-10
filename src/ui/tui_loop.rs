@@ -1969,7 +1969,11 @@ async fn run_harness_op<P: ChatProvider>(
                     request_render(&mut sched, tui)?;
                 }
                 Some(request) = appr_rx.recv() => {
-                    tui.screen.show_approval();
+                    // The same offered decision set the loop uses for the block
+                    // footer travels into the screen, so the REVIEW posture's
+                    // decision echo is a single-source readout.
+                    tui.screen
+                        .show_approval(request.allow_always, request.allow_project);
                     pending = Some(PendingApproval {
                         call: request.call.clone(),
                         reply: request.reply,

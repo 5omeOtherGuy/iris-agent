@@ -21,6 +21,7 @@ use crate::ui::tui::activity::WorkPhase;
 
 use super::component::{Component, Container, take_cursor_position};
 use super::overlay::{FocusTarget, PaletteView, render_menu_lines};
+use super::panel::review_footer_extras;
 use super::session_menu::{MAX_DROPDOWN_ROWS, SessionMenu};
 use super::startup::StartPage;
 use super::text::strip_ansi_for_text;
@@ -712,6 +713,10 @@ fn working_lines(
     )]
 }
 
+/// The composer placeholder at rest — exact product casing (§9.4). Swapped for
+/// the review decision echo while a gated tool waits (`Screen::composer_placeholder`).
+const PLACEHOLDER_PROMPT: &str = "Give Iris a task...";
+
 /// Build a styled, empty editor for the bordered composer panel: dim
 /// placeholder and a reversed block cursor the widget draws itself (no hardware
 /// cursor needed). The surrounding border and hint row are painted by
@@ -729,7 +734,7 @@ pub(super) fn fresh_editor() -> TextArea<'static> {
             .add_modifier(Modifier::REVERSED),
     );
     editor.set_placeholder_style(dim_style());
-    editor.set_placeholder_text("Give Iris a task...");
+    editor.set_placeholder_text(PLACEHOLDER_PROMPT);
     editor
 }
 
@@ -750,6 +755,18 @@ pub(super) fn editor_visual_rows(editor: &TextArea<'_>, width: u16) -> u16 {
         .clamp(1, MAX_EDITOR_ROWS)
 }
 
+/// The decision keys a pending review actually offers, captured at
+/// `show_approval` time so the REVIEW posture's decision-echo placeholder (§8.5)
+/// is assembled from the SAME affordance the gated block's footer offers —
+/// never a hardcoded key list. `y approve` / `n deny` are always available;
+/// `a always` / `p project` appear only when the loop honors them. Meaningful
+/// only while `awaiting_approval`; reset to the empty offer on every exit path.
+#[derive(Clone, Copy, Default)]
+struct ReviewOffer {
+    allow_always: bool,
+    allow_project: bool,
+}
+
 /// UI state plus its rendering. Holds no terminal handle and no channels, so its
 /// behavior and rendered logical document are unit-testable without a TTY.
 pub(crate) struct Screen {
@@ -763,9 +780,16 @@ pub(crate) struct Screen {
     turn_divider: TurnDivider,
     /// Short status-row hint while a gated tool awaits the user's decision.
     /// True while a gated tool awaits the user's decision. The review renders in
-    /// the tool block (`▲ REVIEW`); this flag only gates the composer freeze, the
-    /// working-indicator suppression, and the IME-cursor hide.
+    /// the tool block (`▲ REVIEW`); this flag keys the REVIEW posture (§8.5) —
+    /// the composer freeze, the working-indicator suppression, the IME-cursor
+    /// hide, the statusline swap, the accent frame, and the decision-echo
+    /// placeholder.
     awaiting_approval: bool,
+    /// The offered decision set for the pending review, captured at
+    /// `show_approval` time so the decision-echo placeholder is built from the
+    /// SAME affordance the gated block's footer offers. Read only while
+    /// `awaiting_approval`.
+    review_offer: ReviewOffer,
     /// Sourced global status chrome (model / effort / cwd). The loop refreshes
     /// it from the live model selection; `None` falls back to the composer hint
     /// (e.g. before a provider is selected).
@@ -913,6 +937,7 @@ impl Screen {
             },
             turn_divider: TurnDivider::default(),
             awaiting_approval: false,
+            review_offer: ReviewOffer::default(),
             footer: None,
             switch_status: None,
             modal: None,
@@ -1310,6 +1335,30 @@ impl Screen {
             && self.session_menu.is_none()
     }
 
+    /// The composer placeholder text for the current posture. At rest it is the
+    /// product prompt (§9.4); while a gated tool waits (§8.5) it becomes a dim
+    /// decision echo assembled from the SAME affordance the block footer offers
+    /// (`review_footer_extras`) — never a hardcoded key list, so `a`/`p` appear
+    /// only when the loop actually offered them. A placeholder shows only on an
+    /// empty buffer, so a queued steering message is never overwritten; the
+    /// product prompt returns on any resolution.
+    fn composer_placeholder(&self) -> String {
+        if !self.awaiting_approval {
+            return PLACEHOLDER_PROMPT.to_string();
+        }
+        let sep = format!(" {} ", crate::ui::symbols::SEP);
+        let mut echo = String::from("review waiting");
+        for field in review_footer_extras(
+            self.review_offer.allow_always,
+            self.review_offer.allow_project,
+            false,
+        ) {
+            echo.push_str(&sep);
+            echo.push_str(&field.plain);
+        }
+        echo
+    }
+
     // --- transcript ---
 
     /// Apply one semantic event to the transcript.
@@ -1650,6 +1699,7 @@ impl Screen {
         self.phase = WorkPhase::Starting;
         self.turn_divider = TurnDivider::default();
         self.awaiting_approval = false;
+        self.review_offer = ReviewOffer::default();
         self.queued = 0;
         if let Some(footer) = &mut self.footer {
             footer.usage = None;
@@ -1677,6 +1727,7 @@ impl Screen {
         );
         self.spinner.stop();
         self.awaiting_approval = false;
+        self.review_offer = ReviewOffer::default();
     }
 
     /// Advance the spinner one frame. Returns whether anything animated (so the
@@ -1722,13 +1773,20 @@ impl Screen {
     /// records the final approval/denial outcome, not the transient prompt.
     /// Enter the awaiting-approval state. The review itself renders inside the
     /// gated tool block (the `▲ REVIEW` state, via the `ToolReview` event); this
-    /// only claims the input surface and marks the phase so the composer freezes
-    /// and the working indicator steps aside while the user decides.
-    pub(crate) fn show_approval(&mut self) {
+    /// claims the input surface, marks the phase so the composer freezes and the
+    /// working indicator steps aside, and carries the offered decision set (the
+    /// same `allow_always` / `allow_project` the loop uses to render the block
+    /// footer) so the REVIEW posture's decision echo (§8.5) is a single-source
+    /// readout, never a hardcoded key list.
+    pub(crate) fn show_approval(&mut self, allow_always: bool, allow_project: bool) {
         // The review takes the input surface: close any dropdown.
         self.session_menu = None;
         self.phase = WorkPhase::AwaitingApproval;
         self.awaiting_approval = true;
+        self.review_offer = ReviewOffer {
+            allow_always,
+            allow_project,
+        };
     }
 
     /// Fold a manual approval decision into the gated tool block's own footer
@@ -1747,6 +1805,7 @@ impl Screen {
     /// first) is never overwritten.
     pub(crate) fn clear_approval(&mut self, approved: bool) {
         self.awaiting_approval = false;
+        self.review_offer = ReviewOffer::default();
         if matches!(self.phase, WorkPhase::AwaitingApproval) {
             self.phase = if approved {
                 WorkPhase::PreparingTool
@@ -2090,26 +2149,44 @@ pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Lin
         .map(|effort| strip_ansi_for_text(effort).to_uppercase())
         .filter(|effort| !effort.is_empty());
 
+    // While a gated tool awaits the user's decision (§8.5) the line takes the
+    // REVIEW posture: the leading segment swaps `◉ CODE` for `▲ REVIEW` (the
+    // house REVIEW symbol, orange, bold label — the same readout the gated
+    // block's footer shows, echoed at the eye's resting place) and every other
+    // segment renders dim, so the line has one subject. The swap is a static
+    // state readout: ticks stay stopped during the wait (§2.1), no flash.
+    let review = screen.awaiting_approval;
     let mode_seg = || {
+        let (symbol, label) = if review {
+            (crate::ui::symbols::REVIEW, "REVIEW")
+        } else {
+            (crate::ui::symbols::ACTIVE, "CODE")
+        };
         vec![
-            Span::styled(format!("{} ", crate::ui::symbols::ACTIVE), prompt_style()),
+            Span::styled(format!("{symbol} "), prompt_style()),
             Span::styled(
-                "CODE".to_string(),
+                label.to_string(),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ]
     };
     // The model name is the model-picker button: underlined, per the spec.
     // A live detent flash renders the changed segment bright for two ticks —
-    // the switch's mechanical acknowledgment — then it settles back.
+    // the switch's mechanical acknowledgment — then it settles back. Under the
+    // REVIEW posture the button dims and drops its underline: it is not
+    // clickable while the composer is frozen (no hit-test targets it and the
+    // picker keybinds are idle-only), so it recedes behind the one lit subject.
     let model_span = || {
+        if review {
+            return Span::styled(model.clone(), dim_style());
+        }
         let mut style = Style::default().add_modifier(Modifier::UNDERLINED);
         if screen.detents.model > 0 {
             style = style.add_modifier(Modifier::BOLD);
         }
         Span::styled(model.clone(), style)
     };
-    let effort_style = if screen.detents.effort > 0 {
+    let effort_style = if !review && screen.detents.effort > 0 {
         Style::default()
     } else {
         dim_style()
@@ -2123,14 +2200,21 @@ pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Lin
     };
     let model_only = || vec![model_span()];
     let policy = screen.approval_policy;
-    let policy_label_style = if screen.detents.policy > 0 {
+    let policy_label_style = if !review && screen.detents.policy > 0 {
         Style::default()
     } else {
         dim_style()
     };
+    // The policy symbol keeps its semantic hue at rest; under REVIEW it dims
+    // with the rest of the line (the `▲ REVIEW` subject carries state instead).
+    let policy_symbol_style = if review {
+        dim_style()
+    } else {
+        policy.symbol_style()
+    };
     let policy_seg = || {
         vec![
-            Span::styled(format!("{} ", policy.symbol()), policy.symbol_style()),
+            Span::styled(format!("{} ", policy.symbol()), policy_symbol_style),
             Span::styled(policy.label().to_string(), policy_label_style),
         ]
     };
@@ -2562,14 +2646,25 @@ fn statusline_left(width: usize, segments: Vec<Vec<Span<'static>>>) -> Option<Ve
 
 /// The composer's top edge: a full-width hairline in the border role — the one
 /// rule separating the composer from the transcript (the composer has no box).
-fn composer_hairline(width: usize) -> Line<'static> {
-    Line::from(Span::styled("─".repeat(width.max(1)), border_style()))
+/// The composer's top edge — the only hard chrome on screen (§9.2). It is the
+/// machine's bezel lamp: the border tone at rest, the orange accent while a
+/// review waits (§2.2). Colour is reinforcement, not the sole signal (the
+/// REVIEW text carries state); one accent, no fill, no extra rows.
+fn composer_hairline(width: usize, review: bool) -> Line<'static> {
+    let style = if review {
+        prompt_style()
+    } else {
+        border_style()
+    };
+    Line::from(Span::styled("─".repeat(width.max(1)), style))
 }
 
 /// The composer's internal rule between the input rows and the bottom
-/// statusline: a lighter hairline (dim `╌` repeat, not border weight).
-fn composer_internal_rule(width: usize) -> Line<'static> {
-    Line::from(Span::styled("╌".repeat(width.max(1)), dim_style()))
+/// statusline: a lighter hairline (`╌`, dim at rest). It takes the same orange
+/// accent as the top edge while a review waits, so the two agree.
+fn composer_internal_rule(width: usize, review: bool) -> Line<'static> {
+    let style = if review { prompt_style() } else { dim_style() };
+    Line::from(Span::styled("╌".repeat(width.max(1)), style))
 }
 
 /// Middle-ellipsis truncation that preserves the final path segment (the
@@ -2784,6 +2879,11 @@ pub(super) fn render_editor_chrome(
     // Only emitted when the composer owns input focus (no turn/modal/approval),
     // located by the reversed block cursor `ratatui-textarea` draws for us.
     let mut cursor_cell: Option<(u16, u16)> = None;
+    // Repurpose the placeholder as the review decision echo while a gated tool
+    // waits (§8.5). A placeholder paints only on an empty buffer, so a queued
+    // steering message is never overwritten.
+    let placeholder = screen.composer_placeholder();
+    screen.editor.set_placeholder_text(placeholder);
     (&screen.editor).render(text_area, &mut buf);
     if screen.composer_focused() {
         cursor_cell = find_reversed_cell(&buf, text_area);
@@ -2793,7 +2893,7 @@ pub(super) fn render_editor_chrome(
     // statusline. Painted last so they are never overwritten by the
     // textarea/approval body at very small heights.
     if heights.editor > 0 {
-        let hairline = composer_hairline(usize::from(box_area.width));
+        let hairline = composer_hairline(usize::from(box_area.width), screen.awaiting_approval);
         buf.set_line(box_area.x, box_area.y, &hairline, box_area.width);
     }
     let status_y = heights.editor.saturating_sub(pad_rows).saturating_sub(1);
@@ -2809,7 +2909,8 @@ pub(super) fn render_editor_chrome(
         // The internal rule sits directly above the statusline, only when a
         // row remains for the input above it (hairline + input + rule + status).
         if status_y >= 3 {
-            let rule = composer_internal_rule(usize::from(box_area.width));
+            let rule =
+                composer_internal_rule(usize::from(box_area.width), screen.awaiting_approval);
             buf.set_line(
                 box_area.x,
                 editor_area.y + status_y - 1,
@@ -2985,6 +3086,201 @@ mod tests {
             .find(|span| span.content.as_ref().trim() == content)
             .unwrap_or_else(|| panic!("span {content:?} in statusline"))
             .style
+    }
+
+    /// The rendered composer's `(top edge, internal rule)` styles: the first
+    /// `─` row (the full border-frame hairline) and the first `╌` row (the
+    /// lighter internal rule).
+    fn composer_frame_styles(
+        screen: &mut Screen,
+    ) -> (ratatui::style::Style, ratatui::style::Style) {
+        let lines = super::render_editor_chrome(screen, 80, 12);
+        let find = |ch: char| {
+            lines
+                .iter()
+                .find_map(|line| {
+                    line.spans
+                        .iter()
+                        .find(|span| span.content.starts_with(ch))
+                        .map(|span| span.style)
+                })
+                .unwrap_or_else(|| panic!("composer frame row {ch:?}"))
+        };
+        (find('\u{2500}'), find('\u{254c}'))
+    }
+
+    /// Assert all three REVIEW-posture cues are in the expected state: the
+    /// statusline leading segment, the composer frame tone, and the placeholder.
+    fn assert_review_posture(screen: &mut Screen, active: bool) {
+        let status = composer_statusline(screen, 80)
+            .map(|l| line_text(&l))
+            .expect("statusline");
+        let placeholder = screen.composer_placeholder();
+        let (top, rule) = composer_frame_styles(screen);
+        if active {
+            assert!(
+                status.starts_with("\u{25b2} REVIEW"),
+                "statusline: {status:?}"
+            );
+            assert!(
+                placeholder.starts_with("review waiting"),
+                "placeholder: {placeholder:?}"
+            );
+            let accent = crate::ui::palette::orange();
+            assert_eq!(top.fg, Some(accent), "top edge accent");
+            assert_eq!(rule.fg, Some(accent), "internal rule accent");
+        } else {
+            assert!(
+                status.starts_with("\u{25c9} CODE"),
+                "statusline: {status:?}"
+            );
+            assert_eq!(placeholder, "Give Iris a task...", "placeholder");
+            assert_eq!(
+                top.fg,
+                Some(crate::ui::palette::border()),
+                "top edge is the border tone"
+            );
+            assert_eq!(
+                rule.fg,
+                Some(crate::ui::palette::muted()),
+                "internal rule is dim"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_frame_takes_the_accent_while_awaiting_approval() {
+        // Criterion 2: the frame is the accent while waiting, normal otherwise,
+        // and the top edge and internal rule agree.
+        let mut screen = footer_screen("~/repo");
+        let (top, rule) = composer_frame_styles(&mut screen);
+        assert_eq!(
+            top.fg,
+            Some(crate::ui::palette::border()),
+            "top edge is the border tone at rest"
+        );
+        assert_eq!(
+            rule.fg,
+            Some(crate::ui::palette::muted()),
+            "internal rule is dim at rest"
+        );
+
+        screen.show_approval(false, false);
+        let (top, rule) = composer_frame_styles(&mut screen);
+        let accent = crate::ui::palette::orange();
+        assert_eq!(
+            top.fg,
+            Some(accent),
+            "top edge takes the accent while waiting"
+        );
+        assert_eq!(
+            rule.fg,
+            Some(accent),
+            "internal rule agrees with the top edge"
+        );
+
+        screen.clear_approval(true);
+        let (top, rule) = composer_frame_styles(&mut screen);
+        assert_eq!(
+            top.fg,
+            Some(crate::ui::palette::border()),
+            "top edge reverts"
+        );
+        assert_eq!(rule.fg, Some(crate::ui::palette::muted()), "rule reverts");
+    }
+
+    #[test]
+    fn composer_placeholder_echoes_the_offered_decision_set() {
+        // Criterion 3: the empty-buffer placeholder is the decision echo built
+        // from the SAME affordance the block footer offers — `a`/`p` appear only
+        // when the loop offered them.
+        let mut screen = footer_screen("~/repo");
+        assert_eq!(screen.composer_placeholder(), "Give Iris a task...");
+
+        // {y, n}: base offer only.
+        screen.show_approval(false, false);
+        assert_eq!(
+            screen.composer_placeholder(),
+            "review waiting \u{250a} y approve \u{250a} n deny"
+        );
+
+        // {y, n, a, p}: the loop also offers always + project.
+        screen.clear_approval(false);
+        screen.show_approval(true, true);
+        assert_eq!(
+            screen.composer_placeholder(),
+            "review waiting \u{250a} y approve \u{250a} n deny \u{250a} a always \u{250a} p project"
+        );
+
+        // Only `a` on offer: `p` never appears.
+        screen.clear_approval(false);
+        screen.show_approval(true, false);
+        assert_eq!(
+            screen.composer_placeholder(),
+            "review waiting \u{250a} y approve \u{250a} n deny \u{250a} a always"
+        );
+
+        screen.clear_approval(false);
+        assert_eq!(screen.composer_placeholder(), "Give Iris a task...");
+    }
+
+    #[test]
+    fn review_placeholder_never_overwrites_a_queued_message() {
+        // Criterion 3: a non-empty buffer is untouched — the decision echo is a
+        // placeholder, which only paints on an empty buffer.
+        let mut screen = footer_screen("~/repo");
+        screen.editor.insert_str("wrap up and summarize the diff");
+        screen.show_approval(true, true);
+        let chrome = super::render_editor_chrome(&mut screen, 80, 12)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            chrome.contains("wrap up and summarize the diff"),
+            "{chrome:?}"
+        );
+        assert!(!chrome.contains("review waiting"), "{chrome:?}");
+    }
+
+    #[test]
+    fn approve_restores_all_three_review_cues() {
+        // Criterion 4: the approve exit path (`clear_approval(true)`).
+        let mut screen = footer_screen("~/repo");
+        screen.show_approval(true, true);
+        assert_review_posture(&mut screen, true);
+        screen.clear_approval(true);
+        assert_review_posture(&mut screen, false);
+    }
+
+    #[test]
+    fn deny_restores_all_three_review_cues() {
+        // Criterion 4: the deny/cancel exit path (`clear_approval(false)`).
+        let mut screen = footer_screen("~/repo");
+        screen.show_approval(true, true);
+        assert_review_posture(&mut screen, true);
+        screen.clear_approval(false);
+        assert_review_posture(&mut screen, false);
+    }
+
+    #[test]
+    fn start_turn_cleanup_restores_all_three_review_cues() {
+        // Criterion 4: the first cleanup clear (`start_turn`).
+        let mut screen = footer_screen("~/repo");
+        screen.show_approval(true, true);
+        assert_review_posture(&mut screen, true);
+        screen.start_turn();
+        assert_review_posture(&mut screen, false);
+    }
+
+    #[test]
+    fn end_turn_cleanup_restores_all_three_review_cues() {
+        // Criterion 4: the second cleanup clear (`end_turn` → `end_work_phase`).
+        let mut screen = footer_screen("~/repo");
+        screen.show_approval(true, true);
+        assert_review_posture(&mut screen, true);
+        screen.end_turn();
+        assert_review_posture(&mut screen, false);
     }
 
     #[test]
@@ -3613,6 +3909,121 @@ mod tests {
     }
 
     #[test]
+    fn statusline_takes_review_posture_while_awaiting_approval() {
+        use ratatui::style::Modifier;
+        let mut screen = footer_screen("~/repo");
+        screen.set_approval_policy(ApprovalPolicy::OnRequest);
+
+        // At rest the leading segment is `◉ CODE` and the model is the
+        // underlined picker button.
+        let rest = composer_statusline(&screen, 80)
+            .map(|l| line_text(&l))
+            .expect("statusline");
+        assert!(rest.starts_with("\u{25c9} CODE"), "{rest:?}");
+        assert!(
+            statusline_span_style(&screen, "GPT-5.5")
+                .add_modifier
+                .contains(Modifier::UNDERLINED),
+            "model is the underlined picker button at rest"
+        );
+
+        // While a gated tool waits, the leading segment swaps to `▲ REVIEW`.
+        screen.show_approval(false, false);
+        let review = composer_statusline(&screen, 80)
+            .map(|l| line_text(&l))
+            .expect("statusline");
+        assert!(review.starts_with("\u{25b2} REVIEW"), "{review:?}");
+        assert!(!review.contains("\u{25c9} CODE"), "{review:?}");
+
+        // `▲` is the orange house REVIEW symbol; `REVIEW` is bold ink — a state
+        // readout echoing the gated block's footer, not a new vocabulary.
+        assert_eq!(
+            statusline_span_style(&screen, "\u{25b2}").fg,
+            Some(crate::ui::palette::orange()),
+            "REVIEW symbol is orange"
+        );
+        let label = statusline_span_style(&screen, "REVIEW");
+        assert!(
+            label.add_modifier.contains(Modifier::BOLD),
+            "REVIEW label bold"
+        );
+        assert_eq!(label.fg, None, "REVIEW label is ink, not colored");
+
+        // Every other segment dims and the model button drops its underline
+        // (it is not clickable while the composer is frozen).
+        let model = statusline_span_style(&screen, "GPT-5.5");
+        assert!(
+            !model.add_modifier.contains(Modifier::UNDERLINED),
+            "model underline drops for the duration"
+        );
+        assert_eq!(model.fg, Some(crate::ui::palette::muted()), "model dims");
+        assert_eq!(
+            statusline_span_style(&screen, "HIGH").fg,
+            Some(crate::ui::palette::muted()),
+            "effort dims"
+        );
+        assert_eq!(
+            statusline_span_style(&screen, "on-request").fg,
+            Some(crate::ui::palette::muted()),
+            "policy label dims"
+        );
+    }
+
+    #[test]
+    fn statusline_review_posture_reverts_byte_identical() {
+        // Criterion 1: false → exact prior rendering (byte-identical spans).
+        let mut screen = footer_screen("~/repo");
+        screen.set_approval_policy(ApprovalPolicy::OnRequest);
+        let before = composer_statusline(&screen, 80);
+        screen.show_approval(false, false);
+        assert_ne!(
+            before,
+            composer_statusline(&screen, 80),
+            "the posture must actually change while waiting"
+        );
+        screen.clear_approval(false);
+        assert_eq!(
+            before,
+            composer_statusline(&screen, 80),
+            "the statusline reverts to byte-identical spans"
+        );
+    }
+
+    #[test]
+    fn statusline_minimum_form_under_review_is_review_and_model() {
+        // Criterion 6: the narrow-width minimum keeps `▲ REVIEW ─ MODEL`;
+        // `▲ REVIEW` inherits MODE's never-dropped slot.
+        let mut screen = footer_screen("~/repo");
+        screen.set_approval_policy(ApprovalPolicy::OnRequest);
+        screen.show_approval(false, false);
+        let status = composer_statusline(&screen, 20)
+            .map(|l| line_text(&l))
+            .expect("statusline");
+        assert_eq!(status, "\u{25b2} REVIEW \u{2500} GPT-5.5", "{status:?}");
+    }
+
+    #[test]
+    fn tick_stays_idle_while_awaiting_approval() {
+        // Criterion 5: a live detent flash would normally force settle redraws,
+        // but the wait short-circuits `tick()` to false before any of that —
+        // the loop stays CPU-idle waiting on the decision. No new animation.
+        let mut screen = footer_screen("~/repo");
+        screen.arm_detents();
+        screen.set_approval_policy(ApprovalPolicy::ReadOnly);
+        assert!(screen.tick(), "a live flash ticks at rest");
+
+        screen.set_approval_policy(ApprovalPolicy::OnRequest);
+        screen.show_approval(false, false);
+        assert!(!screen.tick(), "the wait is CPU-idle: tick returns false");
+        assert!(!screen.tick(), "and stays idle");
+
+        screen.clear_approval(true);
+        // Ticking resumes on resolution (the just-armed flash still has to
+        // settle), proving the idle was the wait, not a dead loop.
+        assert!(screen.tick(), "resolution frees the loop again");
+    }
+
+    #[test]
     fn switch_status_predicts_then_realizes_tokens_cache_and_reductions() {
         let mut screen = footer_screen("~/repo");
         screen.set_switch_status(SwitchStatus::new(
@@ -3827,7 +4238,7 @@ mod tests {
         // Approval is its own phase and, while shown, suppresses the working
         // animation so it never competes with the decision (the approval panel
         // is the primary surface).
-        screen.show_approval();
+        screen.show_approval(false, false);
         assert_eq!(screen.work_phase_label(), "Awaiting approval");
         assert!(
             screen.working_lines(80).is_empty(),
@@ -3870,7 +4281,7 @@ mod tests {
         // misleading "Preparing tool" label, since no tool is about to run.
         let mut screen = Screen::new();
         screen.start_turn();
-        screen.show_approval();
+        screen.show_approval(false, false);
         assert_eq!(screen.work_phase_label(), "Awaiting approval");
         screen.clear_approval(false);
         assert_eq!(
