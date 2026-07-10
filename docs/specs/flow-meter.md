@@ -37,17 +37,14 @@ move this TUI is for.
 
 ### 2.1 Placement
 
-Appended to the working indicator line (§7.7), after the token counters,
-separated by one space:
+The working indicator's fixed live-meter segment, immediately after elapsed:
 
 ```
-●···  1:27 ┊ ESC ┊ reading files ┊ ↑177k ↓5.7k ▊██▍··
+●···  1:27 ┊ ▊██▍·· ┊ reading files ┊ ↑177k ↓5.7k
 ```
 
-(Everything before the meter is unchanged.) The meter is **6 cells**. It is
-last on the line deliberately: the existing end-of-line truncation makes it
-the **first thing dropped** at narrow widths — telemetry counters outrank the
-meter. No new truncation logic; position does the work.
+The meter is **6 cells**. Keeping it next to the LED chase makes the two live
+instruments read as one cluster and gives the meter a stable place.
 
 ### 2.2 What it measures (honesty clause)
 

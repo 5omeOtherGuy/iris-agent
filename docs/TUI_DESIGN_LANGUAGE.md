@@ -61,7 +61,7 @@ halves are never merged onto one line again:
 │       Read  src/lib.rs           142 lines                                   │
 │       ─────────────────────────────────────  (hairline footer rule)    │
 │       DONE                              ↑1.4k ↓38 ┊ cache 16.8k ┊ ctx +0.9%  │
-│    ●··· 0:13 ┊ ESC ┊ ↑177k ↓5.7k             (working indicator, inline)     │
+│    ●··· 0:13 ┊ ······ ┊ ↑177k ↓5.7k            (working indicator, inline)     │
 │    ── 7.6s ┊ ↑18.2k ↓846 ───────────────────  (turn divider)                │
 │                                                                              │
 │  ────────────────────────────────────────────  (composer top edge — frame)  │
@@ -501,15 +501,15 @@ An **inline** LED-chase readout shown while the agent runs. Never framed, never
 a braille spinner, one line:
 
 ```
-●··· 1:27 ┊ ESC ┊ Responding ┊ ↑177k ↓5.7k ██▊▏··
+●··· 1:27 ┊ ██▊▏·· ┊ Responding ┊ ↑177k ↓5.7k
 ```
 
 The lit cell bounces across a 4-cell strip. One blank line above/below when
-adjacent to other blocks. Telemetry (`↑`/`↓`) and the `ESC` hint are optional.
-The trailing 6-cell **flow meter** (§6 motion 5) meters display-stream inflow
-on a fixed log scale — bright eighth-block fill, the chase's dim `·` for unlit
-cells, a dim `▏` peak tick — and sits last deliberately: end-of-line truncation
-drops it first, so the telemetry counters outrank it at narrow widths.
+adjacent to other blocks. Telemetry (`↑`/`↓`) is optional. The 6-cell **flow
+meter** (§6 motion 5) follows the elapsed time at a fixed position, keeping the
+working indicator's two live instruments together. It meters display-stream
+inflow on a fixed log scale — bright eighth-block fill, the chase's dim `·` for
+unlit cells, and a dim `▏` peak tick.
 
 ### 7.8 Turn divider
 A quiet unboxed rule rendered **after a tool-backed agent turn** (not after
