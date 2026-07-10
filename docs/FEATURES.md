@@ -61,9 +61,10 @@
   `SessionLog` appends v2 transcript entries with stable ids, `parentId`, and
   token estimates, plus compaction and model-selection audit entries;
   `SessionStore` lists/finds/opens sessions, rebuilds context through
-  compaction summaries, and `iris resume <id>` continues the same log.
-  Branching/rollback and an in-session resume picker are planned later.
-  [Partial]
+  compaction summaries, and `iris resume <id>` continues the same log. Complete
+  provider round trips flush before the next provider request; a final/error
+  turn-boundary flush remains the backstop. Branching/rollback and an
+  in-session resume picker are planned later. [Partial]
 
 ## Providers and auth
 

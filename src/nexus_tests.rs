@@ -107,6 +107,7 @@ fn test_harness<P: ChatProvider>(provider: P, workspace: &Path, tools: Tools) ->
 /// -- the checks the old in-`request_approval` asserts used to make.
 struct RecordingFrontend {
     events: RefCell<Vec<AgentEvent>>,
+    committed: RefCell<Vec<Vec<Message>>>,
     decision: Cell<ApprovalDecision>,
     events_at_review: RefCell<Option<Vec<AgentEvent>>>,
     /// The structured review facts the last `review` call received, so a test
@@ -118,6 +119,7 @@ impl RecordingFrontend {
     fn new(decision: ApprovalDecision) -> Self {
         Self {
             events: RefCell::new(Vec::new()),
+            committed: RefCell::new(Vec::new()),
             decision: Cell::new(decision),
             events_at_review: RefCell::new(None),
             last_ctx: RefCell::new(None),
@@ -129,6 +131,10 @@ impl AgentObserver for RecordingFrontend {
     fn on_event(&self, event: AgentEvent) -> Result<()> {
         self.events.borrow_mut().push(event);
         Ok(())
+    }
+
+    fn on_messages_committed(&self, messages: &[Message]) {
+        self.committed.borrow_mut().push(messages.to_vec());
     }
 }
 
@@ -874,6 +880,47 @@ fn tool_loop_reads_workspace_file_and_returns_result_to_model() -> Result<()> {
     // #15 contract: structured metadata rides alongside the text on the wire.
     assert!(tool_result.content.contains("\"metadata\""));
     assert!(tool_result.content.contains("\"total_lines\":1"));
+    Ok(())
+}
+
+#[test]
+fn round_trip_commit_callback_sees_paired_tool_result_before_follow_up() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "persist me")?;
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn {
+            tool_calls: vec![ToolCall {
+                id: "call_commit".to_string(),
+                thought_signature: None,
+                name: "read".to_string(),
+                arguments: json!({ "path": "note.txt" }),
+            }],
+            ..AssistantTurn::default()
+        }),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn(
+        "read the note",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+
+    let commits = frontend.committed.borrow();
+    assert_eq!(
+        commits.len(),
+        1,
+        "only the continuing round trip commits early"
+    );
+    let snapshot = &commits[0];
+    assert_eq!(snapshot.len(), 3, "user + assistant call + tool result");
+    assert_eq!(snapshot[1].role, Role::AssistantToolCall);
+    assert_eq!(snapshot[1].tool_call_id.as_deref(), Some("call_commit"));
+    assert_eq!(snapshot[2].role, Role::Tool);
+    assert_eq!(snapshot[2].tool_call_id.as_deref(), Some("call_commit"));
     Ok(())
 }
 
@@ -6468,6 +6515,19 @@ fn follow_up_injected_when_agent_would_stop() -> Result<()> {
             .any(|m| m.role == Role::User && m.content == "now write tests"),
         "follow-up must reach the continued turn: {:?}",
         seen[1]
+    );
+    let commits = frontend.committed.borrow();
+    assert_eq!(commits.len(), 1, "the continuing response commits early");
+    assert_eq!(commits[0].len(), 2);
+    assert_eq!(commits[0][0].role, Role::User);
+    assert_eq!(commits[0][0].content, "hi");
+    assert_eq!(commits[0][1].role, Role::Assistant);
+    assert_eq!(commits[0][1].content, "working");
+    assert!(
+        commits[0]
+            .iter()
+            .all(|message| message.content != "now write tests"),
+        "the commit boundary precedes follow-up injection"
     );
     Ok(())
 }

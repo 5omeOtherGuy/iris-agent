@@ -138,3 +138,28 @@ Per-session evidence:
 | Codex | 09 | 2 | 14,354 | pass/pass/pass | pass | pass | pass | — |
 
 No session was excluded. The full run completed in 1,030.02 seconds.
+
+## Slice 2 G4 smoke — 2026-07-10
+
+Base: `b446085` plus the slice 2 worktree. This slice changes persistence
+cadence, not trigger or compaction behavior, so the exit check used one live
+session per lane. Regeneration command:
+
+```sh
+IRIS_BENCH_LIVE=1 IRIS_AUTO_COMPACTION_SESSIONS=1 \
+  cargo test --locked auto_compaction_live_loop_ -- \
+  --ignored --nocapture --test-threads=1
+```
+
+Parent turns used the two protocol lanes. Every model-backed summary used
+`anthropic/claude-opus-4-6` with medium thinking. Both sessions forced two real
+compactions and rebuilt byte-identically after exit; no session was excluded.
+G1 remains inapplicable until slice 3.
+
+| lane | sessions | compactions | worst post-apply/start | G2 | G3 | G4 | G5 | real reads | exclusions |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `anthropic/claude-haiku-4-5` | 1 | 2 | 16,948 / 21,299 (79.6%) | 1/1 | 1/1 | 1/1 | 1/1 | 1/1 | 0 |
+| `openai-codex/gpt-5.4-mini` | 1 | 2 | 16,166 / 21,299 (75.9%) | 1/1 | 1/1 | 1/1 | 1/1 | 1/1 | 0 |
+
+The run completed in 103.30 seconds. No provider, auth, tool, worker,
+persistence, or resume errors occurred.

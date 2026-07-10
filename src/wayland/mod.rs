@@ -67,6 +67,25 @@ struct SessionSpanSource {
     transcript: Option<PathBuf>,
 }
 
+/// Forwards normal runtime events while intercepting Nexus's provider-round-trip
+/// commit hook. Persistence remains Wayland-owned and best-effort; Nexus sees
+/// only a message snapshot and never a session log or entry id.
+struct PersistingObserver<'a> {
+    inner: &'a dyn AgentObserver,
+    compaction: RefCell<&'a mut CompactionEngine>,
+}
+
+impl AgentObserver for PersistingObserver<'_> {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        self.inner.on_event(event)
+    }
+
+    fn on_messages_committed(&self, messages: &[Message]) {
+        self.compaction.borrow_mut().persist_messages(messages);
+        self.inner.on_messages_committed(messages);
+    }
+}
+
 impl SessionSpanReader for SessionSpanSource {
     fn recall_span(&self, from: u64, to: u64) -> Result<Vec<(Option<String>, Message)>> {
         match &self.transcript {
@@ -978,18 +997,23 @@ impl<P: ChatProvider> Harness<P> {
         };
         // The turn span covers the loop; `Instrument` carries it across awaits
         // (a held `enter()` guard does not).
-        let result = self
-            .agent
-            .submit_turn_with_context(
-                TurnInput::with_context(prompt, context),
-                obs,
-                gate,
-                &env,
-                token,
-                self.steering.as_deref(),
-            )
-            .instrument(tracing::info_span!("turn"))
-            .await;
+        let result = {
+            let observer = PersistingObserver {
+                inner: obs,
+                compaction: RefCell::new(&mut self.compaction),
+            };
+            self.agent
+                .submit_turn_with_context(
+                    TurnInput::with_context(prompt, context),
+                    &observer,
+                    gate,
+                    &env,
+                    token,
+                    self.steering.as_deref(),
+                )
+                .instrument(tracing::info_span!("turn"))
+                .await
+        };
         let changed_in_model_turn = self.agent.mutated_this_turn();
         // Persist whatever the turn produced even when it ended in an error, so
         // the transcript records the user prompt and any tool work. Best-effort:
@@ -1156,10 +1180,14 @@ impl<P: ChatProvider> Harness<P> {
                             output_sink: None,
                             mutation_guard: Some(&self.git_safety),
                         };
+                        let observer = PersistingObserver {
+                            inner: obs,
+                            compaction: RefCell::new(&mut self.compaction),
+                        };
                         self.agent
                             .submit_turn(
                                 &feedback,
-                                obs,
+                                &observer,
                                 gate,
                                 &env,
                                 token,
@@ -1194,24 +1222,7 @@ impl<P: ChatProvider> Harness<P> {
     /// Append messages not yet written to the transcript log, advancing the
     /// persisted cursor. No-op when no log is attached.
     fn persist_new_messages(&mut self) {
-        let Some(log) = self.compaction.session.as_mut() else {
-            return;
-        };
-        let messages = self.agent.messages();
-        while self.compaction.persisted < messages.len() {
-            match log.append(&messages[self.compaction.persisted]) {
-                Ok(id) => {
-                    // Track the assigned entry id so a later compaction can
-                    // reference this message as a coverage bound.
-                    self.compaction.entry_ids.push(Some(id));
-                    self.compaction.persisted += 1;
-                }
-                Err(error) => {
-                    tracing::warn!(error = %format!("{error:#}"), "failed to persist session message");
-                    return;
-                }
-            }
-        }
+        self.compaction.persist_messages(self.agent.messages());
     }
 
     /// If the current context exceeds the budget, compact at this safe turn
@@ -2593,6 +2604,10 @@ mod compaction_task_tests;
 #[cfg(test)]
 #[path = "background_compaction_tests.rs"]
 mod background_compaction_tests;
+
+#[cfg(test)]
+#[path = "incremental_persistence_tests.rs"]
+mod incremental_persistence_tests;
 
 #[cfg(test)]
 mod carry_tests {

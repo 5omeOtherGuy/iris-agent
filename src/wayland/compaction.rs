@@ -168,6 +168,28 @@ impl CompactionEngine {
             job.token.cancel();
         }
     }
+
+    /// Append every message not yet durable and capture its assigned entry id.
+    /// Called both at provider-round-trip boundaries and as the final turn/error
+    /// backstop; an append failure leaves the cursor at the first unwritten row
+    /// so a later boundary retries without duplicating earlier messages.
+    pub(super) fn persist_messages(&mut self, messages: &[Message]) {
+        let Some(log) = self.session.as_mut() else {
+            return;
+        };
+        while self.persisted < messages.len() {
+            match log.append(&messages[self.persisted]) {
+                Ok(id) => {
+                    self.entry_ids.push(Some(id));
+                    self.persisted += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "failed to persist session message");
+                    return;
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn framed_summary(plan: &CompactionPlan, text: &str) -> String {
