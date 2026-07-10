@@ -227,8 +227,7 @@ pub(crate) fn dim() -> Style {
 /// Render the shared search line + windowed rows for a [`Selector`] as overlay
 /// rows: `(line, selected)` pairs for [`overlay_menu`], which gives the selected
 /// row the surface fill (never a colored accent). The selected label is bold;
-/// metadata stays muted; an enabled/disabled mark uses the `◉`/`○` glyphs from
-/// the closed vocabulary (never `[x]`). `empty` is the no-match message.
+/// metadata stays muted. `empty` is the no-match message.
 pub(crate) fn selector_rows(selector: &Selector, empty: &str) -> Vec<(Line<'static>, bool)> {
     let mut out: Vec<(Line<'static>, bool)> = Vec::new();
     if selector.searchable() {
@@ -252,20 +251,6 @@ pub(crate) fn selector_rows(selector: &Selector, empty: &str) -> Vec<(Line<'stat
         } else {
             Style::default()
         };
-        if let Some(enabled) = row.item.enabled {
-            spans.push(Span::styled(
-                if enabled {
-                    format!("{} ", crate::ui::symbols::ACTIVE)
-                } else {
-                    format!("{} ", crate::ui::symbols::EMPTY)
-                },
-                if enabled {
-                    Style::default().fg(crate::ui::palette::orange())
-                } else {
-                    dim()
-                },
-            ));
-        }
         spans.push(Span::styled(row.item.label.clone(), base));
         if let Some(detail) = &row.item.detail {
             spans.push(Span::raw("  "));

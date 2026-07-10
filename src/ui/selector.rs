@@ -1,7 +1,7 @@
 //! Reusable selector state (Tier 3, presentation-only, TTY-free).
 //!
 //! A single list-with-search primitive shared by every picker in [`super::modal`]
-//! (model, scoped-models, effort, settings, login method/provider). It owns the
+//! (the large-context switch prompt, session resume, tasks). It owns the
 //! item list, the search string, the highlighted row, and the filtered view, and
 //! exposes a small windowing helper so the renderer only has to draw rows. It
 //! holds no terminal handle and performs no I/O, so the whole state machine is
@@ -24,9 +24,6 @@ pub(crate) struct SelectorItem {
     pub(crate) detail: Option<String>,
     /// Trailing marker drawn at the row end (e.g. `current`).
     pub(crate) trailing: Option<String>,
-    /// Optional enabled-column glyph for checkmark lists (scoped-models). `None`
-    /// hides the column entirely.
-    pub(crate) enabled: Option<bool>,
     /// Lowercased haystack used for fuzzy filtering.
     filter: String,
 }
@@ -41,7 +38,6 @@ impl SelectorItem {
             label,
             detail: None,
             trailing: None,
-            enabled: None,
             filter,
         }
     }
@@ -61,8 +57,9 @@ impl SelectorItem {
 }
 
 /// A list-with-search picker. `searchable` toggles the search row; `wrap`
-/// chooses wrap-around vs clamp at the list boundaries (pi-mono wraps the model
-/// list but clamps the provider list); `window` is the max rows shown at once.
+/// chooses wrap-around vs clamp at the list boundaries (the switch-context
+/// prompt wraps; the session and task pickers clamp); `window` is the max rows
+/// shown at once.
 ///
 /// Wrap policy (the single selection-navigation split, shared with the session
 /// dropdowns' `step_wrapped` and the slash palette): SPATIAL pickers/menus WRAP
