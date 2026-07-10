@@ -235,6 +235,17 @@ impl Detents {
         }
         live
     }
+
+    /// Drop every transient acknowledgment in one interaction. The armed gate
+    /// survives so later changes can flash again if reduced motion is disabled.
+    fn settle(&mut self) {
+        self.model = 0;
+        self.effort = 0;
+        self.policy = 0;
+        self.meter = 0;
+        self.exhale = 0;
+        self.exhale_top = 0;
+    }
 }
 
 impl Spinner {
@@ -344,6 +355,18 @@ impl FlowMeter {
         self.display = 0;
         self.peak = 0;
         self.hold = 0;
+    }
+
+    /// Apply the motion posture immediately. Entering reduced motion consumes
+    /// the current inflow sample and removes release/peak after-images in this
+    /// same interaction; data is retained, physics is not.
+    fn set_reduced_motion(&mut self, reduced_motion: bool) {
+        self.reduced_motion = reduced_motion;
+        if reduced_motion {
+            self.display = flow_level(std::mem::take(&mut self.accum));
+            self.peak = 0;
+            self.hold = 0;
+        }
     }
 
     /// Advance one loop tick: take the accumulator as one sample and run the
@@ -1045,6 +1068,15 @@ pub(crate) struct Screen {
     /// since it cannot carry OSC 8), so a mouse click resolves to a target via
     /// [`Screen::pager_link_at`].
     pub(crate) pager_links: Vec<crate::ui::hyperlink::LinkRegion>,
+    /// Foldable header targets from the last composed pager frame, keyed by
+    /// physical screen row. Composition records only transcript rows that
+    /// remain visible after sticky/search/follow overlays and excludes pinned
+    /// chrome, so pointer input can never reach content painted underneath.
+    pub(super) pager_header_hits: Vec<(u16, usize)>,
+    /// Physical row of the sticky prompt's disclosure in the last composed
+    /// pager frame. `None` when no band was painted (including when it yielded
+    /// to a selected/search-highlighted transcript row).
+    pub(super) pager_sticky_hit_row: Option<u16>,
     /// Previously submitted prompts for shell-style Up/Down recall (newest at end).
     prompt_history: Vec<String>,
     /// Current prompt-history cursor while browsing; `None` means editing a fresh draft.
@@ -1144,6 +1176,8 @@ impl Screen {
             search: None,
             reveal_line: None,
             pager_links: Vec::new(),
+            pager_header_hits: Vec::new(),
+            pager_sticky_hit_row: None,
             prompt_history: Vec::new(),
             prompt_history_cursor: None,
             sticky_prompt_expanded: false,
@@ -1330,7 +1364,17 @@ impl Screen {
     pub(crate) fn set_reduced_motion(&mut self, reduced_motion: bool) {
         self.reduced_motion = reduced_motion;
         self.spinner.reduced_motion = reduced_motion;
-        self.flow_meter.reduced_motion = reduced_motion;
+        self.flow_meter.set_reduced_motion(reduced_motion);
+        if reduced_motion {
+            self.spinner.frame = 0;
+            self.detents.settle();
+        }
+        if let Some(page) = &mut self.start_page {
+            page.set_reduced_motion(reduced_motion);
+        }
+        if let Some(modal) = &mut self.modal {
+            modal.set_reduced_motion(reduced_motion);
+        }
         // The stream escapement is motion too: reduced motion is pass-through.
         self.transcript.set_reduced_motion(reduced_motion);
     }
@@ -1749,9 +1793,7 @@ impl Screen {
     /// expansion (the same state the `o` key toggles in pager mode). Other rows
     /// fall through to transcript header/link/wheel handling.
     pub(crate) fn toggle_sticky_prompt_at_screen_row(&mut self, screen_row: u16) -> bool {
-        let (width, height) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
-        let bar_rows = session_bar_lines(self, width, height).len();
-        if usize::from(screen_row) != bar_rows {
+        if self.pager_sticky_hit_row != Some(screen_row) {
             return false;
         }
         self.toggle_sticky_prompt()
@@ -2041,10 +2083,9 @@ impl Screen {
             self.flow_meter.tick();
         }
         let modal_settling = self.modal.as_mut().is_some_and(|modal| modal.tick());
-        // The start page's IrisMark reuses the spinner tick machinery and holds
-        // still under reduced motion (StartPage::tick handles both cadence and
-        // freeze). It must keep ticking even in an inactive terminal pane: tmux
-        // users can see adjacent panes, and a frozen Iris pane reads as stalled.
+        // The start page reuses the loop tick only for its reactive power-on
+        // lamp test. Once settled it returns false, so an idle faceplate never
+        // redraws.
         let animated = if let Some(page) = &mut self.start_page {
             page.tick()
         } else {
@@ -2137,20 +2178,16 @@ impl Screen {
         self.transcript.toggle_latest_panel()
     }
 
-    /// Map a pager-mode screen row to the foldable header under it and toggle
-    /// that one block. Returns whether a header toggled (false for clicks
-    /// outside any header row). Frame layout: session-bar rows, then the
-    /// transcript window at the current scroll top, so the clicked visible line
-    /// is `scroll.top() + (row - bar_rows)`.
+    /// Toggle the foldable header rendered at a pager-mode screen row. Targets
+    /// come from the last composed frame rather than reconstructed layout math:
+    /// pinned chrome and overlays can replace transcript rows after slicing,
+    /// and a live resize can change every boundary before the next input.
     pub(crate) fn toggle_header_at_screen_row(&mut self, screen_row: u16) -> bool {
-        let (width, height) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
-        let bar_rows = session_bar_lines(self, width, height).len();
-        let row = usize::from(screen_row);
-        if row < bar_rows {
-            return false;
-        }
-        let line = self.scroll.top() + (row - bar_rows);
-        let Some(header) = self.transcript.header_row_at_visible_line(line) else {
+        let Some(header) = self
+            .pager_header_hits
+            .iter()
+            .find_map(|(row, header)| (*row == screen_row).then_some(*header))
+        else {
             return false;
         };
         let expanded = self.transcript.panel_expanded_at(header).unwrap_or(false);
@@ -2458,13 +2495,22 @@ fn context_meter_spans(filled: u64, flash: bool, exhale_top: u64) -> Vec<Span<'s
 /// segment carries its state symbol + label (never color alone). Location and
 /// context moved to the pane-top [`session_bar_lines`] and never appear here.
 /// Narrow widths drop, in order: policy → effort → minimum `◉ CODE ─ MODEL`.
-/// Returns `None` when there is no footer yet or even the minimum cannot fit.
+/// Scrollback focus has its own footer-independent readout. Otherwise returns
+/// `None` when there is no session footer yet or even the minimum cannot fit.
 pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Line<'static>> {
-    let footer = screen.footer.as_ref()?;
     let width = usize::from(box_width);
     if width < 6 {
         return None;
     }
+    // Pager focus moves the keyboard away from the prompt, so it owns the
+    // prompt's eye-resting readout even when the transcript has no selectable
+    // header. REVIEW still outranks it because approval keys freeze all other
+    // input paths.
+    if screen.pager_active && screen.scrollback_focus && !screen.awaiting_approval {
+        return scrollback_focus_statusline(width);
+    }
+
+    let footer = screen.footer.as_ref()?;
 
     let model = strip_ansi_for_text(&footer.model).to_uppercase();
     if model.is_empty() {
@@ -2597,6 +2643,44 @@ pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Lin
     let mut line = Line::from(spans);
     truncate_line(&mut line, width.max(1));
     Some(line)
+}
+
+/// Focus-owned composer readout for pager scrollback. Whole key fields drop
+/// monotonically with width; the focus identity survives down to `◉ HIST`.
+fn scrollback_focus_statusline(width: usize) -> Option<Line<'static>> {
+    let focus = |label: &'static str| {
+        vec![
+            Span::styled(
+                format!("{} ", crate::ui::symbols::ACTIVE),
+                Style::default().fg(crate::ui::palette::cyan()),
+            ),
+            Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
+        ]
+    };
+    let hint = |text: &'static str| vec![Span::styled(text, dim_style())];
+    let candidates = [
+        vec![
+            focus("SCROLLBACK"),
+            hint("↑↓ select"),
+            hint("←→ fold"),
+            hint("enter toggle"),
+            hint("tab prompt"),
+        ],
+        vec![
+            focus("SCROLLBACK"),
+            hint("↑↓ select"),
+            hint("enter toggle"),
+            hint("tab prompt"),
+        ],
+        vec![focus("SCROLLBACK"), hint("↑↓ select"), hint("tab prompt")],
+        vec![focus("SCROLLBACK"), hint("tab prompt")],
+        vec![focus("SCROLLBACK")],
+        vec![focus("HIST")],
+    ];
+    candidates
+        .into_iter()
+        .find_map(|segments| statusline_left(width, segments))
+        .map(Line::from)
 }
 
 /// One-line, composer-adjacent status for runtime model/reasoning switches. It
@@ -3344,10 +3428,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ApprovalPolicy, CONTEXT_METER_DOTS, FLOW_FULL_SCALE, FLOW_QUANTA, FlowMeter, Screen,
-        Spinner, SwitchCacheStatus, SwitchStatus, composer_statusline, context_meter_filled,
-        dim_style, display_width, flow_level, line_text, parse_context_window, prompt_style,
-        session_bar, session_bar_lines, switch_status_line, truncate_cwd_middle,
+        ApprovalPolicy, CONTEXT_METER_DOTS, FLASH_TICKS, FLOW_FULL_SCALE, FLOW_PEAK_HOLD_TICKS,
+        FLOW_QUANTA, FlowMeter, Screen, Spinner, SwitchCacheStatus, SwitchStatus,
+        composer_statusline, context_meter_filled, dim_style, display_width, flow_level, line_text,
+        parse_context_window, prompt_style, session_bar, switch_status_line, truncate_cwd_middle,
         working_indicator_line_with_activity,
     };
     use crate::nexus::{ContextPressureTier, ToolCall};
@@ -3413,11 +3497,15 @@ mod tests {
             screen.apply(UiEvent::Notice(format!("detail {i}")));
         }
         let (width, height) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
-        let total = screen.transcript_visible_total(width);
-        screen.scroll.sync(total, 5);
+        let _ = super::super::pager::compose_frame(
+            &mut screen,
+            ratatui::layout::Size::new(width, height),
+        );
         assert!(screen.scroll.top() > 0, "prompt must be pinned");
 
-        let sticky_row = session_bar_lines(&screen, width, height).len() as u16;
+        let sticky_row = screen
+            .pager_sticky_hit_row
+            .expect("composed sticky disclosure target");
         assert!(!screen.toggle_sticky_prompt_at_screen_row(sticky_row + 1));
         assert!(!screen.sticky_prompt_expanded);
         assert!(screen.toggle_sticky_prompt_at_screen_row(sticky_row));
@@ -4029,6 +4117,52 @@ mod tests {
         // still repaints to the post-reclaim total at the event.
         assert!(bar_text(&screen, 100).contains("CTX 120k"));
         assert_eq!(lit_dots(&screen), 4, "settles instantly");
+    }
+
+    #[test]
+    fn entering_reduced_motion_settles_every_live_motion_source_immediately() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        screen.spinner.frame = 3;
+        screen.detents.armed = true;
+        screen.detents.model = FLASH_TICKS;
+        screen.detents.effort = FLASH_TICKS;
+        screen.detents.policy = FLASH_TICKS;
+        screen.detents.meter = FLASH_TICKS;
+        screen.detents.exhale = FLASH_TICKS;
+        screen.detents.exhale_top = 8;
+        screen.flow_meter.display = FLOW_QUANTA;
+        screen.flow_meter.peak = FLOW_QUANTA;
+        screen.flow_meter.hold = FLOW_PEAK_HOLD_TICKS;
+        screen.flow_meter.observe_bytes(bytes_for_level(24));
+        screen.show_start_page(0, true);
+        assert!(
+            screen
+                .start_page
+                .as_ref()
+                .is_some_and(|page| page.booting())
+        );
+
+        screen.set_reduced_motion(true);
+
+        assert!(screen.spinner.active, "work remains active");
+        assert_eq!(screen.spinner.frame, 0, "chase settles to its datum");
+        assert_eq!(screen.detents.model, 0);
+        assert_eq!(screen.detents.effort, 0);
+        assert_eq!(screen.detents.policy, 0);
+        assert_eq!(screen.detents.meter, 0);
+        assert_eq!(screen.detents.exhale, 0);
+        assert_eq!(screen.detents.exhale_top, 0);
+        assert_eq!(screen.flow_meter.display, 24, "current data survives");
+        assert_eq!(screen.flow_meter.peak, 0);
+        assert_eq!(screen.flow_meter.hold, 0);
+        assert!(
+            screen
+                .start_page
+                .as_ref()
+                .is_some_and(|page| !page.booting()),
+            "lamp test is interrupted"
+        );
     }
 
     #[test]
@@ -4786,6 +4920,45 @@ mod tests {
             .map(|l| line_text(&l))
             .expect("statusline");
         assert!(!status.contains("mouse off"), "{status:?}");
+    }
+
+    #[test]
+    fn scrollback_focus_owns_the_statusline_even_without_a_selection() {
+        let mut screen = Screen::new();
+        screen.pager_active = true;
+        screen.scrollback_focus = true;
+        assert!(screen.selected_entry.is_none());
+
+        let full = composer_statusline(&screen, 80).expect("focus readout");
+        let text = line_text(&full);
+        assert!(text.starts_with("◉ SCROLLBACK"), "{text:?}");
+        assert!(text.contains("↑↓ select"), "{text:?}");
+        assert!(text.contains("enter toggle"), "{text:?}");
+        assert!(text.contains("tab prompt"), "{text:?}");
+        assert!(
+            !text.contains("CODE"),
+            "prompt cannot claim focus: {text:?}"
+        );
+        assert_eq!(
+            full.spans.first().and_then(|span| span.style.fg),
+            Some(crate::ui::palette::cyan()),
+            "focus lamp uses the interactive role"
+        );
+
+        let narrow = composer_statusline(&screen, 12).expect("compact focus readout");
+        assert_eq!(line_text(&narrow), "◉ SCROLLBACK");
+    }
+
+    #[test]
+    fn review_posture_outranks_scrollback_focus() {
+        let mut screen = footer_screen("~/repo");
+        screen.pager_active = true;
+        screen.scrollback_focus = true;
+        screen.show_approval(false, false, false);
+
+        let text = line_text(&composer_statusline(&screen, 80).expect("review readout"));
+        assert!(text.starts_with("▲ REVIEW"), "{text:?}");
+        assert!(!text.contains("SCROLLBACK"), "{text:?}");
     }
 
     #[test]

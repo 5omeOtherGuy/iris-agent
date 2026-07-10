@@ -37,11 +37,11 @@ use ratatui::crossterm::{execute, queue};
 use ratatui::layout::Size;
 use ratatui::text::Line;
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::Span;
 
 use super::screen::{Screen, filler_lines, render_editor_chrome, session_bar_lines};
-use super::wrap::{display_width, pad_line_left, truncate_to_width};
+use super::wrap::{display_width, ellipsize_to_width, pad_line_left, truncate_to_width};
 use super::{BOX_X_PADDING_U16, TEXT_COLUMN_X_PADDING, dim_style, panel_style};
 
 /// Iris-owned scrollback state for pager mode (ADR-0029).
@@ -433,6 +433,14 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     let top = screen.scroll.top();
 
     let mut body = screen.transcript_window(width, top, view_rows);
+    // Pointer ownership follows the composed frame, not the transcript slice.
+    // Start with only rows actually supplied by the transcript; filler, pinned
+    // tail chrome, and every later overlay remain non-interactive unless they
+    // explicitly register their own target.
+    let transcript_body_rows = body.len();
+    let mut transcript_hit_rows = vec![false; view_rows];
+    transcript_hit_rows[..transcript_body_rows.min(view_rows)].fill(true);
+    screen.pager_sticky_hit_row = None;
     if body.len() < view_rows {
         // Blank filler (or the centered start page) sits BETWEEN the
         // transcript and the tail, exactly as in the inline document.
@@ -461,19 +469,27 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     // above the viewport has scrolled past the top, pin it as a dim band under
     // the session bar so the reader always knows which prompt the visible content
     // answers. It reads as an extension of the top chrome, not a card floating in
-    // the transcript. Interactive overlays win the row: a selection or search
-    // match revealed exactly at the viewport top keeps its highlight instead of
-    // being covered.
-    let top_is_interactive = selected_line == Some(top)
-        || screen.search.as_ref().and_then(|state| state.line) == Some(top);
+    // the transcript. Interactive transcript state wins the entire band
+    // footprint: a selection or search hit under any expanded continuation or
+    // rule row keeps its highlight, and the card yields as one stable overlay.
     if view_rows >= 5
         && top > 0
-        && !top_is_interactive
         && let Some(text) = screen.transcript.sticky_prompt_text(top)
     {
         let band = sticky_prompt_band(text, width, view_rows, screen.sticky_prompt_expanded);
-        for (dst, line) in body.iter_mut().zip(band) {
-            *dst = line;
+        let band_end = top.saturating_add(band.len());
+        let search_line = screen.search.as_ref().and_then(|state| state.line);
+        let overlaps =
+            |line: Option<usize>| line.is_some_and(|line| line >= top && line < band_end);
+        if !overlaps(selected_line) && !overlaps(search_line) {
+            let painted = band.len().min(body.len());
+            for (dst, line) in body.iter_mut().zip(band) {
+                *dst = line;
+            }
+            transcript_hit_rows[..painted].fill(false);
+            if painted > 0 {
+                screen.pager_sticky_hit_row = u16::try_from(bar_rows).ok();
+            }
         }
     }
     // Bottom overlay row: an active search shows its position indicator;
@@ -482,13 +498,34 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     if view_rows > 0 {
         if let Some(state) = screen.search.as_ref() {
             body[view_rows - 1] = search_indicator_line(state, width);
+            transcript_hit_rows[view_rows - 1] = false;
         } else if !screen.scroll.is_following() {
             let below = screen.scroll.lines_below();
             if below > 0 {
                 body[view_rows - 1] = follow_indicator_line(below, width);
+                transcript_hit_rows[view_rows - 1] = false;
             }
         }
     }
+
+    // Resolve visible physical header rows now, after every overlay has claimed
+    // its cells. This same frame map is consumed by mouse input; it therefore
+    // survives arbitrary tail height, menu growth, and live terminal resizing
+    // without a second layout calculation drifting from what the user sees.
+    screen.pager_header_hits = transcript_hit_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, owns_transcript)| {
+            if !owns_transcript {
+                return None;
+            }
+            let header = screen
+                .transcript
+                .header_row_at_visible_line(top.saturating_add(offset))?;
+            let row = u16::try_from(bar_rows.saturating_add(offset)).ok()?;
+            Some((row, header))
+        })
+        .collect();
 
     let mut frame = Vec::with_capacity(height);
     frame.extend(bar.into_iter().take(bar_rows));
@@ -518,12 +555,13 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
 }
 
 /// The pinned prompt band -- the governing user prompt (the "job card") under
-/// the session bar. Collapsed, it is one row: `▸ ` / `› ` chrome in muted bold,
-/// the prompt's opening line in body ink (`panel_style`), and a right-aligned dim
-/// `+N` counting the wrapped rows it hides. A click on the row or `o` (in pager
-/// mode) expands it to the full prompt body on the transcript's hanging columns,
-/// closed by the session bar's own muted rule. ctrl+o never routes here -- it
-/// toggles transcript folds.
+/// the session bar. Collapsed, it is a compact prompt row plus a closing hairline:
+/// `▸ ` / `› ` chrome in muted bold, the prompt's opening line in body ink
+/// (`panel_style`), and a right-aligned dim `+N` counting the wrapped rows it
+/// hides. A click on the row or `o` (in pager mode) expands it to the full prompt
+/// body on the transcript's hanging columns. Both postures close with the session
+/// bar's own muted rule, so the governing prompt always reads as one bounded
+/// instrument surface. ctrl+o never routes here -- it toggles transcript folds.
 fn sticky_prompt_band(
     text: &str,
     width: u16,
@@ -603,40 +641,104 @@ fn sticky_prompt_band(
             pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
             rows.push(line);
         }
-        // The closing rule stays muted -- it is top chrome, not content.
-        let mut rule = Line::from(Span::styled("─".repeat(rule_measure), dim));
-        pad_line_left(&mut rule, inset);
-        rows.push(rule);
+    }
+    // The closing rule stays muted -- it is top chrome, not content. Keeping
+    // it in the collapsed posture prevents the one-line card from dissolving
+    // into transcript rows immediately below it.
+    let mut rule = Line::from(Span::styled("─".repeat(rule_measure), dim));
+    pad_line_left(&mut rule, inset);
+    rows.push(rule.clone());
+
+    if rows.len() <= max_rows {
+        return rows;
     }
 
-    rows.truncate(max_rows);
-    rows
+    // Expanded prompts can be taller than the entire transcript viewport. The
+    // old `truncate` silently removed both content and the closing boundary.
+    // Preserve the rule and spend the penultimate row on an honest hidden-row
+    // readout. The pager only mounts sticky bands with >=5 body rows; the 0–2
+    // branches are defensive and still prefer disclosure over silent loss.
+    let prompt_rows = rows.len().saturating_sub(1);
+    match max_rows {
+        0 => Vec::new(),
+        1 => vec![sticky_hidden_rows_line(prompt_rows, width)],
+        2 => vec![sticky_hidden_rows_line(prompt_rows, width), rule],
+        _ => {
+            let shown_prompt_rows = max_rows - 2;
+            let hidden = prompt_rows.saturating_sub(shown_prompt_rows);
+            rows.truncate(shown_prompt_rows);
+            rows.push(sticky_hidden_rows_line(hidden, width));
+            rows.push(rule);
+            rows
+        }
+    }
 }
 
-/// Dim centered search indicator: `find "query" k/N ; n older ; N newer`
-/// (or `no matches`).
+fn sticky_hidden_rows_line(hidden: usize, width: usize) -> Line<'static> {
+    let noun = if hidden == 1 { "row" } else { "rows" };
+    let budget = width
+        .saturating_sub(TEXT_COLUMN_X_PADDING)
+        .saturating_sub(4)
+        .max(1);
+    let label = ellipsize_to_width(&format!("… +{hidden} {noun}"), budget);
+    let mut line = Line::from(vec![Span::raw("    "), Span::styled(label, dim_style())]);
+    pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
+    line
+}
+
+/// Muted centered search indicator. Query text yields first, with a grapheme-
+/// safe ellipsis, while match position/state and closing quote stay legible.
 fn search_indicator_line(state: &super::screen::SearchState, width: u16) -> Line<'static> {
-    let label = if state.total == 0 {
-        format!("find {:?} ─ no matches", state.query)
-    } else {
-        format!(
-            "find {:?} ─ {}/{} {} n older {} N newer",
-            state.query,
-            state.position,
-            state.total,
-            crate::ui::symbols::SEP,
-            crate::ui::symbols::SEP
-        )
-    };
     let width = usize::from(width);
-    let pad = width.saturating_sub(super::wrap::display_width(&label)) / 2;
+    let query = state.query.escape_debug().to_string();
+    let suffixes = if state.total == 0 {
+        vec![" ─ no matches".to_string(), " no matches".to_string()]
+    } else {
+        vec![
+            format!(
+                " ─ {}/{} {} n older {} N newer",
+                state.position,
+                state.total,
+                crate::ui::symbols::SEP,
+                crate::ui::symbols::SEP
+            ),
+            format!(
+                " ─ {}/{} {} n/N",
+                state.position,
+                state.total,
+                crate::ui::symbols::SEP
+            ),
+            format!(" ─ {}/{}", state.position, state.total),
+            format!(" {}/{}", state.position, state.total),
+        ]
+    };
+    let prefix = "find \"";
+    let label = suffixes
+        .into_iter()
+        .find_map(|suffix| {
+            let fixed = display_width(prefix) + 1 + display_width(&suffix);
+            let minimum_query = usize::from(!query.is_empty());
+            (fixed + minimum_query <= width).then(|| {
+                let query = ellipsize_to_width(&query, width - fixed);
+                format!("{prefix}{query}\"{suffix}")
+            })
+        })
+        .unwrap_or_else(|| {
+            let fallback = if state.total == 0 {
+                "no matches".to_string()
+            } else {
+                format!("{}/{}", state.position, state.total)
+            };
+            ellipsize_to_width(&fallback, width)
+        });
+    let pad = width.saturating_sub(display_width(&label)) / 2;
     Line::from(vec![
         Span::raw(" ".repeat(pad)),
-        Span::styled(label, Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(label, dim_style()),
     ])
 }
 
-/// Dim centered `▾ N lines below` indicator shown while follow is
+/// Muted centered `▾ N lines below` indicator shown while follow is
 /// disengaged, on the row just above the pinned tail.
 fn follow_indicator_line(below: usize, width: u16) -> Line<'static> {
     let label = if below == 1 {
@@ -645,10 +747,11 @@ fn follow_indicator_line(below: usize, width: u16) -> Line<'static> {
         format!("{} {below} lines below", crate::ui::symbols::EXPANDED)
     };
     let width = usize::from(width);
-    let pad = width.saturating_sub(super::wrap::display_width(&label)) / 2;
+    let label = ellipsize_to_width(&label, width);
+    let pad = width.saturating_sub(display_width(&label)) / 2;
     Line::from(vec![
         Span::raw(" ".repeat(pad)),
-        Span::styled(label, Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(label, dim_style()),
     ])
 }
 
@@ -666,8 +769,10 @@ pub(super) fn render_frame(frame: &mut ratatui::Frame, lines: &[Line<'static>]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nexus::ToolCall;
     use crate::ui::UiEvent;
     use ratatui::backend::TestBackend;
+    use serde_json::json;
 
     /// The alt-screen active flag is process-global; the shared guard in
     /// `signals` serializes every test (in any module) that toggles it and
@@ -712,6 +817,90 @@ mod tests {
             "~/repo (main)".to_string(),
         );
         screen
+    }
+
+    fn shell_history(screen: &mut Screen, count: usize) {
+        for index in 0..count {
+            screen.apply(UiEvent::ToolResult {
+                call: ToolCall {
+                    id: format!("shell-{index}"),
+                    thought_signature: None,
+                    name: "bash".to_string(),
+                    arguments: json!({ "command": format!("printf row-{index}") }),
+                },
+                content: format!("row-{index}"),
+                exit_code: Some(0),
+                duration: None,
+            });
+        }
+    }
+
+    /// Put a real foldable header under `body_offset` without changing the
+    /// frame's pinned chrome. The caller can then paint an overlay on that row
+    /// and prove the click target follows the composed frame, not the hidden
+    /// transcript geometry.
+    fn align_header_under(
+        screen: &mut Screen,
+        size: Size,
+        body_offset: usize,
+        needs_rows_below: bool,
+    ) -> usize {
+        let _ = compose_frame(screen, size);
+        let max_top = screen.scroll.max_top();
+        let (header, line) = screen
+            .transcript
+            .panel_header_rows()
+            .into_iter()
+            .filter_map(|header| {
+                screen
+                    .transcript_line_of_row(header)
+                    .map(|line| (header, line))
+            })
+            .find(|(_, line)| {
+                *line >= body_offset
+                    && line.saturating_sub(body_offset) <= max_top
+                    && (!needs_rows_below || line.saturating_sub(body_offset) < max_top)
+            })
+            .expect("a header can be aligned under the overlay");
+        screen.scroll.top_offset = line - body_offset;
+        screen.scroll.follow = false;
+        header
+    }
+
+    #[test]
+    fn long_unicode_search_readout_keeps_state_and_uses_themed_muted_ink() {
+        let mut screen = footer_screen();
+        let query = format!("{} {} {}", "工具".repeat(12), "e\u{301}".repeat(8), "👨‍👩‍👧");
+        screen.start_search(&query);
+        let state = screen.search.as_ref().expect("search state");
+        let line = search_indicator_line(state, 30);
+        let text = super::super::wrap::line_text(&line);
+
+        assert!(text.contains('…'), "query cut was not disclosed: {text:?}");
+        assert!(
+            text.ends_with("\" ─ no matches"),
+            "state rail or closing quote was lost: {text:?}"
+        );
+        assert!(display_width(&text) <= 30, "readout overflowed: {text:?}");
+        let label = line.spans.last().expect("styled label");
+        assert_eq!(label.style.fg, Some(crate::ui::palette::muted()));
+        assert!(
+            !label.style.add_modifier.contains(Modifier::DIM),
+            "theme role replaces terminal DIM"
+        );
+    }
+
+    #[test]
+    fn follow_readout_uses_themed_muted_and_honest_narrow_fit() {
+        let full = follow_indicator_line(42, 80);
+        let label = full.spans.last().expect("styled label");
+        assert_eq!(label.style.fg, Some(crate::ui::palette::muted()));
+        assert!(!label.style.add_modifier.contains(Modifier::DIM));
+
+        let narrow = follow_indicator_line(42, 8);
+        let text = super::super::wrap::line_text(&narrow);
+        assert_eq!(display_width(&text), 8);
+        assert!(text.ends_with('…'), "narrow cut was silent: {text:?}");
     }
 
     /// Render composed lines through a real ratatui `Terminal<TestBackend>`
@@ -947,6 +1136,135 @@ mod tests {
         let frame = compose_frame(&mut screen, Size::new(80, 12)).lines;
         let rows = frame_rows(&frame, 80, 12);
         assert_eq!(rows[2], anchor, "anchor row survives a resize");
+    }
+
+    #[test]
+    fn burst_streaming_and_finalize_preserve_an_anchored_scrollback_frame() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        screen.set_reduced_motion(true);
+        for i in 0..240 {
+            screen.apply(UiEvent::Notice(format!("history anchor {i:03}")));
+        }
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "burst".to_string(),
+        });
+        screen.apply(UiEvent::AssistantTextDelta("warm stream\n".to_string()));
+        let size = Size::new(80, 24);
+        let _ = compose_frame(&mut screen, size);
+        screen.scroll.page_up();
+        screen.scroll.page_up();
+        let before = compose_frame(&mut screen, size).lines;
+        let bar_rows = session_bar_lines(&screen, 80, 24).len();
+        let anchor = frame_rows(&before, 80, 24)[bar_rows].clone();
+        let top = screen.scroll.top();
+        assert!(anchor.contains("history anchor"), "{anchor:?}");
+        assert!(!screen.scroll.is_following());
+
+        // One event-loop interval can drain hundreds of provider chunks. None
+        // may move a reader who explicitly left follow mode.
+        for i in 0..600 {
+            screen.apply(UiEvent::AssistantTextDelta(format!(
+                "burst output {i:03}\n"
+            )));
+        }
+        let during = compose_frame(&mut screen, size).lines;
+        let during_rows = frame_rows(&during, 80, 24);
+        assert_eq!(screen.scroll.top(), top, "burst changed the top offset");
+        assert_eq!(
+            during_rows[bar_rows], anchor,
+            "burst streaming moved the anchored frame"
+        );
+
+        screen.apply(UiEvent::AssistantTextEnd(String::new()));
+        let settled = compose_frame(&mut screen, size).lines;
+        let settled_rows = frame_rows(&settled, 80, 24);
+        assert_eq!(screen.scroll.top(), top, "finalize changed the top offset");
+        assert_eq!(
+            settled_rows[bar_rows], anchor,
+            "stream finalization moved the anchored frame"
+        );
+    }
+
+    #[test]
+    fn minimum_frame_handles_unicode_shell_resize_cancel_and_focus() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        screen.set_reduced_motion(true);
+        screen.start_turn();
+        let call = ToolCall {
+            id: "unicode-resize-shell".to_string(),
+            thought_signature: None,
+            name: "bash".to_string(),
+            arguments: json!({
+                "command": format!(
+                    "printf '{} {}'",
+                    "工具 e\u{301} 👨‍👩‍👧",
+                    "界".repeat(96)
+                )
+            }),
+        };
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolOutputDelta {
+            call_id: call.id.clone(),
+            chunk: format!("FIRST 工具 e\u{301} 👨‍👩‍👧 {}\n", "界".repeat(120)),
+        });
+
+        let minimum = Size::new(80, 24);
+        let before = compose_frame(&mut screen, minimum).lines;
+        assert_eq!(before.len(), 24, "minimum frame is fully composed");
+        assert!(
+            before
+                .iter()
+                .all(|line| display_width(&super::super::wrap::line_text(line)) <= 80),
+            "no logical row exceeds the minimum terminal width"
+        );
+        let _ = frame_rows(&before, 80, 24);
+
+        // Resize while the tool is live, append at the new width, then return
+        // to the declared minimum. The latest payload appears once and no
+        // cluster degrades to a replacement scalar.
+        let wide = compose_frame(&mut screen, Size::new(121, 31)).lines;
+        assert_eq!(wide.len(), 31);
+        screen.apply(UiEvent::ToolOutputDelta {
+            call_id: call.id.clone(),
+            chunk: "AFTER_RESIZE 工具 e\u{301} 👨‍👩‍👧\n".to_string(),
+        });
+        let back = compose_frame(&mut screen, minimum).lines;
+        let back_logical = back
+            .iter()
+            .map(super::super::wrap::line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let back_rows = frame_rows(&back, 80, 24);
+        let back_text = back_rows.join("\n");
+        assert_eq!(back_text.matches("AFTER_RESIZE").count(), 1, "{back_text}");
+        assert!(
+            back_logical.contains("工具"),
+            "CJK survives resize: {back_logical}"
+        );
+        assert!(
+            back_logical.contains("e\u{301}"),
+            "combining cluster survives: {back_logical}"
+        );
+        assert!(
+            !back_logical.contains('\u{fffd}'),
+            "no torn Unicode: {back_logical}"
+        );
+
+        screen.apply(UiEvent::ToolCancelled(call));
+        let cancelled = compose_frame(&mut screen, minimum).lines;
+        let cancelled_text = frame_rows(&cancelled, 80, 24).join("\n");
+        assert!(cancelled_text.contains("CANCELLED"), "{cancelled_text}");
+        assert!(!cancelled_text.contains("RUNNING"), "{cancelled_text}");
+
+        assert!(screen.toggle_scrollback_focus());
+        let focused = compose_frame(&mut screen, minimum).lines;
+        let focused_text = frame_rows(&focused, 80, 24).join("\n");
+        assert!(
+            focused_text.contains("SCROLLBACK"),
+            "focus owner and key posture remain visible at 80x24: {focused_text}"
+        );
     }
 
     #[test]
@@ -1342,13 +1660,14 @@ mod tests {
         let rows = frame_rows(&frame, 80, 24);
         assert!(
             rows[2].starts_with("    \u{25b8} \u{203a} second question about oranges"),
-            "collapsed band pins the governing prompt in one row: {:?}",
+            "collapsed band pins the governing prompt in its compact row: {:?}",
             rows[2]
         );
-        assert!(
-            !rows[3].contains("second question"),
-            "collapsed band does not consume extra prompt rows: {:?}",
-            rows[3]
+        assert_eq!(
+            rows[3], rows[1],
+            "collapsed job card needs the same quiet closing hairline as its open posture: \
+             band {:?} vs bar {:?}",
+            rows[3], rows[1]
         );
         assert!(
             screen.toggle_sticky_prompt(),
@@ -1429,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn sticky_prompt_band_collapses_long_prompt_to_one_row() {
+    fn sticky_prompt_band_collapses_long_prompt_to_header_and_rule() {
         let mut screen = footer_screen();
         screen.pager_active = true;
         let long = "word ".repeat(120);
@@ -1441,12 +1760,12 @@ mod tests {
         let rows = frame_rows(&frame, 72, 24);
         assert!(
             rows[2].starts_with("    \u{25b8} \u{203a} word word"),
-            "collapsed prompt is a single disclosure row: {:?}",
+            "collapsed prompt has one disclosure row: {:?}",
             rows[2]
         );
-        assert!(
-            !rows[3].contains("word word"),
-            "collapsed prompt does not spill into a second row: {:?}",
+        assert_eq!(
+            rows[3], rows[1],
+            "the second row is the stable closing hairline: {:?}",
             rows[3]
         );
 
@@ -1457,6 +1776,24 @@ mod tests {
             rows[3].contains("word word"),
             "expanded prompt reveals continuation rows: {:?}",
             rows[3]
+        );
+    }
+
+    #[test]
+    fn clipped_expanded_sticky_band_reports_hidden_rows_and_keeps_its_rule() {
+        let prompt = "precision instrument ".repeat(80);
+        let band = sticky_prompt_band(prompt.trim(), 48, 5, true);
+        let rows: Vec<String> = band.iter().map(super::super::wrap::line_text).collect();
+
+        assert_eq!(rows.len(), 5, "band obeys its exact viewport budget");
+        assert!(rows[0].contains("precision instrument"), "{rows:?}");
+        assert!(
+            rows[3].contains('…') && rows[3].contains("rows"),
+            "penultimate row honestly reports clipped prompt rows: {rows:?}"
+        );
+        assert!(
+            rows[4].trim().chars().all(|cell| cell == '─'),
+            "the stable closing hairline survives clipping: {rows:?}"
         );
     }
 
@@ -1569,6 +1906,166 @@ mod tests {
                 .any(|span| span.style.bg == Some(crate::ui::palette::surface())),
             "match at the top keeps its highlight"
         );
+    }
+
+    #[test]
+    fn expanded_sticky_band_yields_to_a_match_anywhere_under_its_footprint() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        screen.commit_user("question about pears");
+        for i in 0..30 {
+            screen.apply(UiEvent::Notice(format!("filler {i}")));
+        }
+        screen.apply(UiEvent::Notice("needle under the rule".to_string()));
+        for i in 0..60 {
+            screen.apply(UiEvent::Notice(format!("tail {i}")));
+        }
+        let size = Size::new(80, 24);
+        let _ = compose_frame(&mut screen, size);
+        assert_eq!(screen.start_search("needle under the rule"), Some(1));
+        let _ = compose_frame(&mut screen, size);
+        let match_line = screen.search.as_ref().unwrap().line.expect("line");
+        assert!(match_line > 0);
+
+        // Expanded one-line card occupies body rows 0..2 (prompt + rule). Put
+        // the active match on row 1: the old exact-top gate missed it and the
+        // closing rule painted over the highlight.
+        screen.sticky_prompt_expanded = true;
+        screen.scroll.jump_to_start();
+        screen.scroll.scroll_down(match_line - 1);
+        let frame = compose_frame(&mut screen, size).lines;
+        let rows = frame_rows(&frame, 80, 24);
+        assert!(rows[3].contains("needle under the rule"), "{:?}", rows[3]);
+        assert!(
+            frame[3]
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(crate::ui::palette::surface())),
+            "match under the band keeps its highlight"
+        );
+        assert!(
+            !rows[2].contains("question about pears"),
+            "the whole sticky band yields as one stable overlay"
+        );
+    }
+
+    #[test]
+    fn composed_hit_map_rejects_a_header_hidden_under_the_composer() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        shell_history(&mut screen, 32);
+        let size = Size::new(80, 24);
+        let warm = compose_frame(&mut screen, size);
+        let rows = frame_rows(&warm.lines, 80, 24);
+        let bar_rows = session_bar_lines(&screen, 80, 24).len();
+        let composer_row = rows
+            .iter()
+            .position(|row| row.contains("Give Iris a task"))
+            .expect("composer row");
+        let body_offset = composer_row - bar_rows;
+        let header = align_header_under(&mut screen, size, body_offset, false);
+        let frame = compose_frame(&mut screen, size);
+        let rows = frame_rows(&frame.lines, 80, 24);
+
+        assert!(rows[composer_row].contains("Give Iris a task"));
+        assert_eq!(
+            screen
+                .transcript
+                .header_row_at_visible_line(screen.scroll.top() + body_offset),
+            Some(header),
+            "the old arithmetic target is deliberately a real hidden header"
+        );
+        let before = screen.transcript.panel_expanded_at(header);
+        assert!(
+            !screen.toggle_header_at_screen_row(composer_row as u16),
+            "pinned composer chrome owns its row"
+        );
+        assert_eq!(screen.transcript.panel_expanded_at(header), before);
+    }
+
+    #[test]
+    fn composed_hit_map_rejects_headers_under_search_and_follow_readouts() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        shell_history(&mut screen, 36);
+        let size = Size::new(80, 24);
+        assert_eq!(screen.start_search("no-such-result"), Some(0));
+        screen.focus_prompt();
+        let warm = compose_frame(&mut screen, size);
+        let rows = frame_rows(&warm.lines, 80, 24);
+        let bar_rows = session_bar_lines(&screen, 80, 24).len();
+        let search_row = rows
+            .iter()
+            .position(|row| row.contains("no matches"))
+            .expect("search readout");
+        let body_offset = search_row - bar_rows;
+        let search_header = align_header_under(&mut screen, size, body_offset, false);
+        let frame = compose_frame(&mut screen, size);
+        let rows = frame_rows(&frame.lines, 80, 24);
+        assert!(rows[search_row].contains("no matches"));
+        assert_eq!(
+            screen
+                .transcript
+                .header_row_at_visible_line(screen.scroll.top() + body_offset),
+            Some(search_header)
+        );
+        let before = screen.transcript.panel_expanded_at(search_header);
+        assert!(!screen.toggle_header_at_screen_row(search_row as u16));
+        assert_eq!(screen.transcript.panel_expanded_at(search_header), before);
+
+        screen.start_search("");
+        let follow_header = align_header_under(&mut screen, size, body_offset, true);
+        let frame = compose_frame(&mut screen, size);
+        let rows = frame_rows(&frame.lines, 80, 24);
+        assert!(
+            rows[search_row].contains("lines below"),
+            "follow readout replaced the same body row: {:?}",
+            rows[search_row]
+        );
+        assert_eq!(
+            screen
+                .transcript
+                .header_row_at_visible_line(screen.scroll.top() + body_offset),
+            Some(follow_header)
+        );
+        let before = screen.transcript.panel_expanded_at(follow_header);
+        assert!(!screen.toggle_header_at_screen_row(search_row as u16));
+        assert_eq!(screen.transcript.panel_expanded_at(follow_header), before);
+    }
+
+    #[test]
+    fn sticky_continuation_owns_its_hit_region_instead_of_hidden_headers() {
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        screen.commit_user(&"governing prompt ".repeat(30));
+        shell_history(&mut screen, 28);
+        screen.sticky_prompt_expanded = true;
+        let size = Size::new(80, 24);
+        let bar_rows = session_bar_lines(&screen, 80, 24).len();
+        let header = align_header_under(&mut screen, size, 1, true);
+        assert!(screen.scroll.top() > 0, "a sticky prompt is pinned");
+        let frame = compose_frame(&mut screen, size);
+        let rows = frame_rows(&frame.lines, 80, 24);
+        let continuation_row = bar_rows + 1;
+
+        assert!(
+            rows[continuation_row].contains("governing prompt"),
+            "expanded continuation covers the transcript row: {:?}",
+            rows[continuation_row]
+        );
+        assert_eq!(
+            screen
+                .transcript
+                .header_row_at_visible_line(screen.scroll.top() + 1),
+            Some(header),
+            "a real foldable header is hidden under the continuation"
+        );
+        let before = screen.transcript.panel_expanded_at(header);
+        assert!(
+            !screen.toggle_header_at_screen_row(continuation_row as u16),
+            "the continuation consumes its own hit region"
+        );
+        assert_eq!(screen.transcript.panel_expanded_at(header), before);
     }
 
     #[test]

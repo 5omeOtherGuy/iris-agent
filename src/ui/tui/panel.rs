@@ -10,8 +10,8 @@ use similar::{ChangeTag, TextDiff};
 use super::rows::{ChromeRow, TranscriptRow, hrule_line};
 use super::text::strip_ansi_for_text;
 use super::wrap::{
-    display_width, line_text, pad_line_left, pad_line_right, push_wrapped_line, spans_width,
-    take_spans_to_width, truncate_line,
+    display_width, ellipsize_line, ellipsize_to_width, line_text, pad_line_left, pad_line_right,
+    push_wrapped_line, spans_width, take_spans_to_width, truncate_line,
 };
 use super::{
     BOX_X_PADDING, PANEL_BODY_INDENT, PANEL_FOOTER_INDENT, diff_add_bg, diff_del_bg, dim_style,
@@ -78,9 +78,8 @@ fn frameless_header_line(
         left.push(Span::styled(format!(" {lamp}"), prompt_style()));
     }
     let meta = strip_ansi_for_text(meta);
-    if !meta.is_empty() {
-        left.push(Span::styled(format!("  {meta}"), dim_style()));
-    }
+    let meta =
+        crate::ui::textengine::normalize_zwj_with(crate::ui::textengine::zwj_shaping(), &meta);
     let right = strip_ansi_for_text(right);
     let right = if right.is_empty() {
         Vec::new()
@@ -90,7 +89,27 @@ fn frameless_header_line(
     let right = take_spans_to_width(right, inner_width / 2);
     let right_width = spans_width(&right);
     let reserve = if right_width == 0 { 0 } else { right_width + 1 };
-    let left = take_spans_to_width(left, inner_width.saturating_sub(reserve));
+    let left_budget = inner_width.saturating_sub(reserve);
+    let mut left = take_spans_to_width(left, left_budget);
+    let identity_width = spans_width(&left);
+    let remaining = left_budget.saturating_sub(identity_width);
+    if !meta.is_empty() && remaining > 0 {
+        // Keep the family identity intact, then spend the remaining columns on
+        // target metadata. A clipped command/path always ends in the house
+        // ellipsis; the text engine keeps CJK, emoji, and combining clusters
+        // whole. At very narrow widths the separator yields before identity.
+        let gap = 2.min(remaining.saturating_sub(1));
+        let meta_budget = remaining.saturating_sub(gap);
+        if meta_budget > 0 {
+            if gap > 0 {
+                left.push(Span::raw(" ".repeat(gap)));
+            }
+            left.push(Span::styled(
+                ellipsize_to_width(meta.as_ref(), meta_budget),
+                dim_style(),
+            ));
+        }
+    }
     let left_width = spans_width(&left);
     let spacer = inner_width
         .saturating_sub(left_width)
@@ -151,7 +170,7 @@ pub(super) fn footer_rule_line(width: usize) -> Line<'static> {
 /// cell left of the body, its right edge on the block's right rail.
 pub(super) fn panel_footer_line(width: usize, mut line: Line<'static>) -> Line<'static> {
     let footer_width = panel_footer_content_width(width);
-    truncate_line(&mut line, footer_width);
+    ellipsize_line(&mut line, footer_width);
     let outer = panel_outer_padding(width);
     let mut spans = vec![Span::raw(" ".repeat(outer + PANEL_FOOTER_INDENT))];
     spans.extend(line.spans);
@@ -379,10 +398,21 @@ pub(super) struct PanelHeaderSpec<'a> {
     pub(super) started: Option<Instant>,
 }
 
-/// Render a unified diff as the edit-tool table from the visual spec:
-/// old/new line columns, a marker column, then code. File headers and hunk
-/// headers are structural data, not visible rows.
+/// Render a single-target EDIT diff: hunk anchors, one line-number lane, a
+/// marker lane, then code. The EDIT header already owns the path, so raw file
+/// headers stay suppressed.
 pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
+    diff_table_rows_inner(diff, false)
+}
+
+/// Render a task-level, potentially multi-file diff. Each file gains a clear
+/// section label before its hunks so change rows never lose their target when
+/// several files share one panel.
+pub(super) fn task_diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
+    diff_table_rows_inner(diff, true)
+}
+
+fn diff_table_rows_inner(diff: &str, show_files: bool) -> Vec<TranscriptRow> {
     let mut out = Vec::new();
     let mut old_line = 0usize;
     let mut new_line = 0usize;
@@ -391,12 +421,19 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
     while i < lines.len() {
         let line = lines[i];
         if is_diff_file_header(&lines, i) {
+            if show_files {
+                if !out.is_empty() {
+                    out.push(diff_section_gap());
+                }
+                out.push(diff_file_row(diff_file_path(&lines, i)));
+            }
             i += 2;
             continue;
         }
         if let Some((old_start, new_start)) = parse_hunk_header(line) {
             old_line = old_start;
             new_line = new_start;
+            out.push(diff_hunk_row(line));
             i += 1;
             continue;
         }
@@ -503,6 +540,65 @@ pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
         }
     }
     out
+}
+
+fn diff_section_gap() -> TranscriptRow {
+    TranscriptRow::chrome_with_text(
+        ChromeRow::Body {
+            line: Line::default(),
+            bg: None,
+        },
+        String::new(),
+        dim_style(),
+    )
+}
+
+fn diff_file_path<'a>(lines: &'a [&'a str], index: usize) -> &'a str {
+    let old = lines
+        .get(index)
+        .and_then(|line| line.strip_prefix("--- "))
+        .unwrap_or_default();
+    let new = lines
+        .get(index + 1)
+        .and_then(|line| line.strip_prefix("+++ "))
+        .unwrap_or_default();
+    let path = if new == "/dev/null" { old } else { new };
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+}
+
+fn diff_file_row(path: &str) -> TranscriptRow {
+    let plain = format!("FILE  {path}");
+    TranscriptRow::chrome_with_text(
+        ChromeRow::Body {
+            line: Line::from(vec![
+                Span::styled("FILE  ", dim_style().add_modifier(Modifier::BOLD)),
+                Span::styled(path.to_string(), panel_style()),
+            ]),
+            bg: None,
+        },
+        plain,
+        panel_style(),
+    )
+}
+
+fn diff_hunk_row(header: &str) -> TranscriptRow {
+    // Six cells align `@@` with the change-marker lane beneath the 4-cell line
+    // number column. Keep the canonical range text: it is compact, familiar,
+    // and the only honest location when context is sparse.
+    let plain = format!("      {header}");
+    TranscriptRow::chrome_with_text(
+        ChromeRow::Body {
+            line: Line::from(vec![
+                Span::raw("      "),
+                Span::styled(header.to_string(), dim_style()),
+            ]),
+            bg: None,
+        },
+        plain,
+        dim_style(),
+    )
 }
 
 /// Count content additions/removals in a unified diff, ignoring the `+++ `/`--- `
@@ -880,6 +976,41 @@ mod tests {
             "0.0s",
         ));
         assert!(collapsed.starts_with("  ▸ EXPLORE"), "{collapsed:?}");
+    }
+
+    #[test]
+    fn long_header_meta_ellipsizes_without_splitting_unicode() {
+        let meta = format!("{}{}", "工具".repeat(20), " e\u{301}clair");
+        let line = panel_header_line(34, true, "SHELL", &meta, "12.4s");
+        let text = line_text(&line);
+
+        assert!(
+            text.contains('…'),
+            "the clipped target must be disclosed: {text:?}"
+        );
+        assert!(
+            text.trim_end().ends_with("12.4s"),
+            "elapsed owns the rail: {text:?}"
+        );
+        assert!(display_width(&text) <= 34, "header overflowed: {text:?}");
+        assert!(
+            !text.ends_with('\u{301}'),
+            "a combining mark may never be orphaned by the cut: {text:?}"
+        );
+    }
+
+    #[test]
+    fn long_footer_discloses_its_cut_and_preserves_state() {
+        let line = Line::from(vec![
+            Span::styled("■ ERROR  ", err_style()),
+            Span::styled("工具".repeat(30), dim_style()),
+        ]);
+        let rendered = panel_footer_line(30, line);
+        let text = line_text(&rendered);
+
+        assert!(text.contains("■ ERROR"), "state was displaced: {text:?}");
+        assert!(text.ends_with('…'), "footer cut was silent: {text:?}");
+        assert!(display_width(&text) <= 30, "footer overflowed: {text:?}");
     }
 
     #[test]

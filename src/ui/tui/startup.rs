@@ -6,22 +6,17 @@
 //! on bottom) stays live around it.
 //!
 //! The logo IS an LED strip: one row of [`MARK_DOTS`] dots with a single lit
-//! orange head sweeping back and forth (ping-pong, never wrapping) and a 2-dot
-//! comet trail behind the travel direction. Under `IRIS_REDUCED_MOTION` the
-//! mark holds a single static lit dot at the center, matching how the working
-//! indicator freezes. The loop's spinner tick drives the animation; the head
-//! advances one dot per [`MARK_ADVANCE_INTERVAL`].
+//! orange datum at center. Motion belongs only to the reactive power-on lamp
+//! test; once the launcher is ready, the faceplate is mechanically still.
 //!
 //! **Power-on.** An interactive launch runs a brief quantized lamp test — the
 //! physical ritual of bench instruments, not a splash screen. The silkscreen
 //! row is printed hardware, so it is visible from the first frame; the LEDs
 //! fill left-to-right two dots per loop tick, hold all-lit for two ticks, then
-//! release into the idle ping-pong as the launcher menu goes live. The page's
+//! settle to the center datum as the launcher menu goes live. The page's
 //! height never changes across boot (hidden menu rows render as blank lines),
 //! so nothing reflows — the panel simply wakes. Any key completes the boot
 //! instantly; `IRIS_REDUCED_MOTION` never boots (the page starts settled).
-
-use std::time::{Duration, Instant};
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -36,9 +31,6 @@ use super::{dim_style, prompt_style};
 /// Number of LED cells in the IrisMark strip.
 pub(crate) const MARK_DOTS: usize = 12;
 
-/// Minimum wall-clock interval between head advances (~one dot per 130ms).
-const MARK_ADVANCE_INTERVAL: Duration = Duration::from_millis(130);
-
 /// Launcher menu width cap (marker + label + dotted leader + key hint).
 const MENU_WIDTH: usize = 44;
 
@@ -46,7 +38,7 @@ const MENU_WIDTH: usize = 44;
 /// they do not ease). Two dots per ~100ms tick fills the strip in ~600ms.
 const BOOT_FILL_PER_TICK: usize = 2;
 
-/// Loop ticks the strip holds all-lit before releasing into the idle sweep —
+/// Loop ticks the strip holds all-lit before settling to the center datum —
 /// the "lamp test" beat.
 const BOOT_HOLD_TICKS: u8 = 2;
 
@@ -59,7 +51,7 @@ const REV: &str = env!("CARGO_PKG_VERSION");
 
 /// Power-on lamp-test phase. `Fill` lights the strip left-to-right, `Hold`
 /// keeps every LED lit for [`BOOT_HOLD_TICKS`], `Done` is the settled page
-/// (idle ping-pong + live launcher).
+/// (static center datum + live launcher).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BootPhase {
     Fill { lit: usize },
@@ -88,18 +80,9 @@ const MENU_ITEMS: [(StartAction, &str, &str); 5] = [
     (StartAction::Quit, "Quit", "ctrl-q"),
 ];
 
-/// Start-page state: launcher selection plus the IrisMark ping-pong sweep.
+/// Start-page state: launcher selection plus the one-shot IrisMark lamp test.
 pub(crate) struct StartPage {
     selected: usize,
-    /// Head LED position, `0..MARK_DOTS`.
-    head: usize,
-    /// Sweep direction: `true` = rightward.
-    forward: bool,
-    /// Last head advance, so the ~130ms cadence is independent of the loop's
-    /// tick rate.
-    last_advance: Option<Instant>,
-    /// `IRIS_REDUCED_MOTION`: hold a single static lit dot at the center.
-    reduced_motion: bool,
     /// Recoverable Iris tasks in this workspace at launch (ADR-0031). Surfaced
     /// as a dim badge on the `Tasks` row instead of force-opening a picker, so
     /// the count is visible without a modal popping over the home menu.
@@ -117,10 +100,6 @@ impl StartPage {
     pub(crate) fn new(reduced_motion: bool, recoverable: usize, punctuation_chords: bool) -> Self {
         Self {
             selected: 0,
-            head: 0,
-            forward: true,
-            last_advance: None,
-            reduced_motion,
             recoverable,
             punctuation_chords,
             boot: if reduced_motion {
@@ -135,6 +114,15 @@ impl StartPage {
     /// an instrument, never an obstacle.
     pub(crate) fn skip_boot(&mut self) {
         self.boot = BootPhase::Done;
+    }
+
+    /// Apply the live reduced-motion preference. Entering reduced motion
+    /// interrupts the reactive lamp test immediately; leaving it never replays
+    /// startup motion on an already-live instrument.
+    pub(crate) fn set_reduced_motion(&mut self, reduced_motion: bool) {
+        if reduced_motion {
+            self.skip_boot();
+        }
     }
 
     /// Whether the lamp test is still running (menu rows hidden).
@@ -156,15 +144,9 @@ impl StartPage {
         MENU_ITEMS[self.selected].0
     }
 
-    /// Advance the animation for one loop tick. Returns whether the mark moved
-    /// (so the loop only redraws when something changed). Reduced motion never
-    /// animates; the ~130ms cadence gates advances between ticks. During the
-    /// power-on lamp test every loop tick is a boot step — the fill cadence is
-    /// the tick cadence, deliberately quantized.
+    /// Advance the reactive power-on sequence for one loop tick. Once settled,
+    /// the page never requests an idle redraw.
     pub(crate) fn tick(&mut self) -> bool {
-        if self.reduced_motion {
-            return false;
-        }
         match self.boot {
             BootPhase::Fill { lit } => {
                 let lit = (lit + BOOT_FILL_PER_TICK).min(MARK_DOTS);
@@ -173,7 +155,7 @@ impl StartPage {
                 } else {
                     BootPhase::Fill { lit }
                 };
-                return true;
+                true
             }
             BootPhase::Hold { ticks } => {
                 let ticks = ticks + 1;
@@ -182,47 +164,10 @@ impl StartPage {
                 } else {
                     BootPhase::Hold { ticks }
                 };
-                return true;
+                true
             }
-            BootPhase::Done => {}
+            BootPhase::Done => false,
         }
-        let now = Instant::now();
-        if let Some(last) = self.last_advance
-            && now.duration_since(last) < MARK_ADVANCE_INTERVAL
-        {
-            return false;
-        }
-        self.last_advance = Some(now);
-        self.advance();
-        true
-    }
-
-    /// One ping-pong step: the head sweeps 0..=MARK_DOTS-1 and reverses at the
-    /// ends, never wrapping.
-    fn advance(&mut self) {
-        if self.forward {
-            if self.head + 1 >= MARK_DOTS {
-                self.forward = false;
-                self.head = self.head.saturating_sub(1);
-            } else {
-                self.head += 1;
-            }
-        } else if self.head == 0 {
-            self.forward = true;
-            self.head = 1.min(MARK_DOTS - 1);
-        } else {
-            self.head -= 1;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn head(&self) -> usize {
-        self.head
-    }
-
-    #[cfg(test)]
-    pub(crate) fn advance_for_test(&mut self) {
-        self.advance();
     }
 
     #[cfg(test)]
@@ -270,41 +215,17 @@ impl StartPage {
         ]
     }
 
-    /// The IrisMark row: [`MARK_DOTS`] single-spaced LED cells. The head is
-    /// bright orange, trail-1 (one behind the travel direction) plain orange,
-    /// trail-2 dimmest; every other cell is a dim empty dot. Reduced motion
-    /// holds one static lit dot at the center.
+    /// The settled IrisMark row: [`MARK_DOTS`] single-spaced LED cells with one
+    /// bright orange center datum. It is static in every motion posture.
     fn mark_spans(&self) -> Vec<Span<'static>> {
         let head_style = prompt_style().add_modifier(Modifier::BOLD);
-        let trail_1_style = prompt_style();
-        // The comet fades in its own hue: trail-2 is a dim orange, not grey, so
-        // it stays part of the orange sweep and never collapses into the muted
-        // `○` empty dots behind it.
-        let trail_2_style = prompt_style().add_modifier(Modifier::DIM);
-        let (head, trail_1, trail_2) = if self.reduced_motion {
-            (Some(MARK_DOTS / 2), None, None)
-        } else {
-            let behind = |steps: usize| {
-                if self.forward {
-                    self.head.checked_sub(steps)
-                } else {
-                    let pos = self.head + steps;
-                    (pos < MARK_DOTS).then_some(pos)
-                }
-            };
-            (Some(self.head), behind(1), behind(2))
-        };
         let mut spans = Vec::with_capacity(MARK_DOTS * 2 - 1);
         for cell in 0..MARK_DOTS {
             if cell > 0 {
                 spans.push(Span::raw(" "));
             }
-            let span = if Some(cell) == head {
+            let span = if cell == MARK_DOTS / 2 {
                 Span::styled(symbols::RUNNING.to_string(), head_style)
-            } else if Some(cell) == trail_1 {
-                Span::styled(symbols::RUNNING.to_string(), trail_1_style)
-            } else if Some(cell) == trail_2 {
-                Span::styled(symbols::RUNNING.to_string(), trail_2_style)
             } else {
                 Span::styled(symbols::EMPTY.to_string(), dim_style())
             };
@@ -428,28 +349,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ping_pong_reverses_at_both_ends_and_never_wraps() {
+    fn settled_page_has_no_idle_animation() {
         let mut page = StartPage::new(false, 0, true);
-        let mut seen = vec![page.head()];
-        for _ in 0..(MARK_DOTS * 4) {
-            page.advance_for_test();
-            seen.push(page.head());
-        }
-        // Every step moves exactly one cell (never a wrap from 11 to 0).
-        for pair in seen.windows(2) {
-            assert_eq!(
-                pair[0].abs_diff(pair[1]),
-                1,
-                "head must move one dot per advance: {seen:?}"
-            );
-            assert!(pair[1] < MARK_DOTS, "{seen:?}");
-        }
-        // The sweep reaches the right end and comes back to the left end.
-        assert!(seen.contains(&(MARK_DOTS - 1)), "{seen:?}");
+        page.skip_boot();
+        let mark = line_text(&page.render(80)[0]);
         assert!(
-            seen.iter().filter(|&&h| h == 0).count() >= 2,
-            "the head returns to the left end: {seen:?}"
+            (0..100).all(|_| !page.tick()),
+            "idle page requested a redraw"
         );
+        assert_eq!(line_text(&page.render(80)[0]), mark);
     }
 
     #[test]
@@ -520,10 +428,13 @@ mod tests {
             assert!(page.booting());
             assert!(page.tick());
         }
-        // Done: idle sweep resumes, menu live, height unchanged.
+        // Done: static center datum, menu live, height unchanged.
         assert!(!page.booting());
         let lines = page.render(80);
         assert_eq!(lines.len(), settled_height);
+        let mark = line_text(&lines[0]);
+        assert_eq!(mark.matches('●').count(), 1, "{mark:?}");
+        assert!(!page.tick(), "settled faceplate stays still");
         assert!(line_text(&lines[3]).contains("New session"), "menu live");
     }
 
@@ -541,6 +452,17 @@ mod tests {
         let page = StartPage::new(true, 0, true);
         assert!(!page.booting(), "reduced motion starts settled");
         assert!(line_text(&page.render(80)[3]).contains("New session"));
+    }
+
+    #[test]
+    fn enabling_reduced_motion_interrupts_the_lamp_test() {
+        let mut page = StartPage::new(false, 0, true);
+        assert!(page.tick(), "lamp test started");
+        assert!(page.booting());
+        page.set_reduced_motion(true);
+        assert!(!page.booting());
+        assert!(!page.tick());
+        assert_eq!(line_text(&page.render(80)[0]).matches('●').count(), 1);
     }
 
     #[test]
@@ -653,15 +575,9 @@ mod tests {
     }
 
     #[test]
-    fn trail_follows_behind_the_travel_direction() {
-        let mut page = StartPage::new(false, 0, true);
-        page.skip_boot();
-        page.advance_for_test();
-        page.advance_for_test();
-        page.advance_for_test();
-        assert_eq!(page.head(), 3);
+    fn settled_datum_is_bold_orange_and_has_no_trail() {
+        let page = StartPage::new(true, 0, true);
         let mark = &page.render(40)[0];
-        // head bold-orange at cell 3; trail-1 at 2 (orange), trail-2 at 1.
         let cell_style = |cell: usize| {
             let mut lit = mark
                 .spans
@@ -669,12 +585,9 @@ mod tests {
                 .filter(|span| !span.content.trim().is_empty());
             lit.nth(cell).map(|span| span.style).expect("cell")
         };
-        assert!(cell_style(3).add_modifier.contains(Modifier::BOLD));
-        assert_eq!(cell_style(3).fg, Some(palette::orange()));
-        assert_eq!(cell_style(2).fg, Some(palette::orange()));
-        assert!(!cell_style(2).add_modifier.contains(Modifier::BOLD));
-        // trail-2 is a dim orange (the comet fades in its own hue), not grey.
-        assert_eq!(cell_style(1).fg, Some(palette::orange()));
-        assert!(cell_style(1).add_modifier.contains(Modifier::DIM));
+        let center = MARK_DOTS / 2;
+        assert!(cell_style(center).add_modifier.contains(Modifier::BOLD));
+        assert_eq!(cell_style(center).fg, Some(palette::orange()));
+        assert_eq!(line_text(mark).matches('●').count(), 1);
     }
 }

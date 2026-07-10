@@ -48,7 +48,9 @@ fn link_eq(a: &Option<Rc<str>>, b: &Option<Rc<str>>) -> bool {
 // Re-exported so existing `super::wrap::{display_width, ...}` imports keep
 // resolving while the implementations live in the engine.
 pub(crate) use crate::ui::textengine::wrap_to_width;
-pub(super) use crate::ui::textengine::{display_width, truncate_chars, truncate_to_width};
+pub(super) use crate::ui::textengine::{
+    display_width, ellipsize_to_width, truncate_clusters_with_ellipsis, truncate_to_width,
+};
 
 /// Clamp one logical tool-output line so it wraps to at most `max_rows` physical
 /// rows at `width` (accounting for panel body chrome), appending an ellipsis
@@ -56,7 +58,7 @@ pub(super) use crate::ui::textengine::{display_width, truncate_chars, truncate_t
 /// even when a single line (e.g. a minified blob) would otherwise wrap to far
 /// more rows than its slice budget.
 pub(super) fn clamp_output_line(raw: &str, width: usize, max_rows: usize) -> String {
-    let line = truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS);
+    let line = truncate_clusters_with_ellipsis(raw, MAX_TOOL_OUTPUT_LINE_CHARS);
     let usable = width.saturating_sub(PANEL_BODY_CHROME_WIDTH).max(1);
     let max_cols = usable.saturating_mul(max_rows.max(1));
     if display_width(&line) <= max_cols {
@@ -120,6 +122,31 @@ pub(super) fn truncate_line(line: &mut Line<'static>, max: usize) {
         }
     }
     line.spans = spans;
+}
+
+/// Fit a styled line to `max` columns and disclose any removed suffix with the
+/// house ellipsis. The cut remains span- and grapheme-safe; zero-width
+/// hyperlink markers survive through [`truncate_line`].
+pub(super) fn ellipsize_line(line: &mut Line<'static>, max: usize) {
+    if display_width(&line_text(line)) <= max {
+        return;
+    }
+    if max == 0 {
+        line.spans.clear();
+        return;
+    }
+    let style = line
+        .spans
+        .iter()
+        .rev()
+        .find(|span| !hyperlink::is_marker(span.content.as_ref()))
+        .map_or(line.style, |span| span.style);
+    if max == 1 {
+        line.spans = vec![Span::styled("\u{2026}", style)];
+        return;
+    }
+    truncate_line(line, max - 1);
+    line.spans.push(Span::styled("\u{2026}", style));
 }
 
 pub(super) fn spans_width(spans: &[Span<'static>]) -> usize {

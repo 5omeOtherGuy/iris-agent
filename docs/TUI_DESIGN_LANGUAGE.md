@@ -163,6 +163,13 @@ success/danger role at ~10% into the pane bg — plus tinted text and a `+`/`−
 marker. The marker and text carry the signal; the tone only groups the hunk.
 Never a saturated block.
 
+### 2.5 Terminal color depth
+
+Resolve color capability once before the first rich frame. Truecolor terminals
+use the selected theme; 256-color terminals quantize RGB roles to xterm indices;
+16-color terminals use semantic named colors and remove diff-row backgrounds.
+Identity, marker, and state label never depend on the richer palette.
+
 ---
 
 ## 3 · Type
@@ -259,8 +266,7 @@ STATE / ACTIVITY
   □  skipped / cancelled (muted)            ○  queued / empty meter slot (muted)
 
 TRANSCRIPT
-  ›  user message marker (ink) — the one   ▋  live caret (orange, thinking)
-     marked turn; the agent is unmarked
+  ›  user message marker (ink) — the one marked turn; the agent is unmarked
   ▾  expanded disclosure                    ▸  collapsed disclosure
   •  markdown list bullet (muted)           1. ordered list marker (muted)
 
@@ -331,9 +337,8 @@ itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
 - **Motion is physics, and it is quantized.** Every sanctioned motion is a
   discrete step on the loop's tick grid — machines step, they do not ease. The
   closed set:
-  1. the **LED-chase working indicator** (`●··· → ·●·· → ··●· → ···●`) and the
-     IrisMark's idle ping-pong sweep — the only *looping* motions, and they run
-     only while something is genuinely live;
+  1. the **LED-chase working indicator** (`●··· → ·●·· → ··●· → ···●`) — the
+     only looping motion, present only while work is genuinely live;
   2. the **edge-dot pulse** on the context meter / running symbol at high usage;
   3. the **power-on lamp test** (§12.5) — the start page's one-shot boot: the
      strip fills two LEDs per tick, holds all-lit for two ticks, releases. Runs
@@ -441,23 +446,23 @@ tool block's geometry** (§4, §8.1): the disclosure `▾`/`▸` sits in the gut
 (`↓tokens elapsed`) on the single right rail — so reasoning and tools scan on one
 grid, and the readout is never inset further than a tool's elapsed. Only the
 muted label tone and the `┊` body rail (at col 4, its text hanging at col 6) mark
-it as recessive. Folds by default (progressive disclosure); `ctrl+o` / header
-toggles `▾`⇄`▸`. While reasoning streams the header carries a **static orange
-`●` lamp** after the label (lit = receiving — a state light, not a motion; the
-moving text and caret carry the liveness) and a **live elapsed** readout on the
-right rail (the live counterpart of the settled `↓tokens elapsed`, and the only
-number honestly available live). Its live body is a bounded **tail window** — the
-last four wrapped rows on the `┊` rail, the bottom row ending in the `▋` caret at
-the stream edge — under a single honest `┊ … +N rows` elision counting the rows
-currently hidden (a readout, not a button). The live text feeds through the
-escapement (§6 motion 6), so the caret steps evenly in word-quanta on the tick
-grid instead of jumping on network bursts. `ctrl+o` opens the full live stream
-(window ⇄ full, remembered for the live phase only); a live trace of ≤ four rows
-shows whole and is not foldable. On commit the lamp drops and the block settles
-to the standard fold state (the caret exists only while printing). Finished
-reasoning may collapse to a line + token count. Short reasoning is shown whole and
-is not foldable (the arrow drops, but the gutter stays so the label holds its
-column).
+it as recessive. Every non-redacted settled trace is a real disclosure;
+`ctrl+o` / header toggles `▾`⇄`▸`. A summary+raw trace shows the summary closed
+and the raw trace open. A summary-only trace closes to its header and reveals
+the complete summary when opened. Redacted reasoning is the exception: it shows
+the provider-withheld placeholder and has no disclosure because no hidden text
+exists.
+
+While reasoning streams the header carries a **static orange `●` lamp** after
+the label (lit = receiving — a state light, not a motion) and a **live elapsed**
+readout on the right rail. Its body is a bounded tail window: the last four
+wrapped rows on the `┊` rail under one honest `┊ … +N rows` elision. There is no
+model-output caret; thinking and answer text share one output grammar. The
+escapement (§6 motion 6) advances text in word quanta. `ctrl+o` opens the full
+live stream; a live trace of four rows or fewer shows whole and offers no no-op
+toggle. One blank row bounds the block above and below from its first live frame
+through commit. On commit the lamp drops and the trace assumes its settled fold
+state without inserting another boundary row.
 
 ### 7.5 Plan list
 The agent's task checklist. **Unboxed** (narration, not a tool event): a muted
@@ -530,7 +535,9 @@ text, like the rest of the transcript. Every block is **header · body ·
 footer**, stacked, sharing one width at the 2-cell tool indent. The transcript
 families are **EXPLORE / SHELL / EDIT**. Approval is not a family — it is a
 lifecycle state a SHELL/EDIT block passes through in place (§8.5). Never invent
-another family; never render standalone `READ` / `GREP` / `LS` panels.
+another executable family; never render standalone `READ` / `GREP` / `LS`
+panels. The read-only task `DIFF` surface (§8.6) is session evidence, not a tool
+call family.
 
 ### 8.1 Shared block grammar
 ```
@@ -576,13 +583,14 @@ programmatically so a missing field can never leave a dangling `┊`.
 **Disclosure** — binary, whole-block. Expanded (`▾`) = header + body +
 footer; collapsed (`▸`) = header + footer, exactly two rows, body
 **unmounted** — no partial preview, no elision affordance. **Compact by
-default**: every foldable block **arrives collapsed** regardless of body
-size (the two rows still answer *what ran · on what · how long · outcome ·
-cost*). Two exceptions: a **running** block stays expanded on its bounded
-live tail (it collapses when it finalizes unless the user explicitly
-expanded it), and a **pending preview / review** (`◇ PREVIEW`, `REVIEW`)
-arrives expanded so its body can be inspected before deciding (it collapses
-once applied/settled). `ctrl+o` toggles **all** foldable
+default**: routine settled history arrives collapsed (the two rows still answer
+*what ran · on what · how long · outcome · cost*). Consequential evidence stays
+open: a **running** block exposes its bounded live tail; a pending preview/review
+exposes what the user is deciding; every diff-backed EDIT stays open through
+apply/failure; and a failed SHELL stays open on the output that explains it.
+Successful settled SHELL and EXPLORE history collapses unless the operator set a
+different fold state. Explicit user intent survives every in-place rebuild.
+`ctrl+o` toggles **all** foldable
 blocks at once — tool blocks and thinking rails: if any is collapsed it
 expands them all, otherwise it collapses them all. A **click on a block's
 header row** toggles that one block. State is per-block; an explicit user
@@ -618,13 +626,15 @@ Never break a read op into its own block — batch them here. The EXPLORE footer
 is state + diagnostics only (no family extras).
 
 ### 8.3 SHELL — command execution
-Header meta is the command. Body line types, in the recessive order below (the
-command is brightest, output recedes):
+Folded history carries the command as header meta. In the expanded posture the
+header carries only `SHELL` and elapsed; the full command moves to one bright
+body invocation row, so it is never duplicated or cramped. Body line types, in
+the recessive order below:
 
 | `type` | Rendering |
 |---|---|
 | `cmd` | Bright ink, medium weight, quiet muted `$ ` prompt (non-selectable). |
-| `out` | Recessive **stdout** grey, below the command. |
+| `out` | First row begins with a quiet `└`; continuations align beneath it in recessive **stdout** grey. |
 | `err` | **Danger** red (stderr). |
 | `note` | Muted aside. |
 
@@ -634,7 +644,8 @@ command reports its status in the **footer**: `EXIT <code>` (bold, uppercase,
 muted) then the honest result meta as a sibling field —
 `DONE  EXIT 0 ┊ 142 passed` / `ERROR  EXIT 101 ┊ cargo bench failed`. The
 footer state comes from the result (`exit 0` → done, else error); an unknown
-exit status is omitted, never guessed.
+exit status is omitted, never guessed. Failed commands remain expanded; an
+explicit operator fold still wins.
 
 ### 8.4 EDIT — mutation & diff preview
 **One canonical body:** the wrapped **block diff** (`DiffBlock`) for every file
@@ -642,6 +653,10 @@ type (code, prose, config, markdown). The footer carries the counts as ONE
 field (`+n` add-ink, `−n` del-ink, 1ch apart) plus a muted note (`new file`).
 Use `state="preview"` (**no elapsed**) for a pending apply; `state="done"`
 once applied.
+
+Diff-backed EDIT remains expanded across preview, review, running, done, denied,
+and error states unless the operator folds it. Mutation evidence does not vanish
+at the moment the write becomes real.
 
 ### 8.5 Approval — the gated block's own review lifecycle
 Approval is **not a family** and never a separate panel or docked box. A gated
@@ -676,12 +691,19 @@ duplicated in a second block.
   Those cues carry no new state; they key on the same `awaiting_approval` flag
   and revert with the block.
 
-### 8.6 Diff rendering (`DiffBlock`) — shared by EDIT & the in-block review
+### 8.6 Diff rendering (`DiffBlock`) — EDIT, review, and task DIFF
 Columns: **line number** (right-aligned, muted, non-selectable) · **marker**
 (1 cell) · **content** (wraps; continuations align under content). Markers:
 `+` addition (green + faint add-tone bg), `−` removal (red + faint del-tone bg,
 **Unicode minus**), `±` modified (accent), ` ` context (plain ink). Tone + text
 + marker together — never color alone.
+
+Retain dim `@@` hunk anchors: location is operational context, not git noise.
+Single-target EDIT gets its path from the header and suppresses raw `---`/`+++`
+rows. A read-only, multi-file task DIFF adds a quiet `FILE  path` section lane,
+one blank rail row between files, and the hunk anchor before each change set.
+Task DIFF is an evidence surface, not a fourth executable tool family, and stays
+expanded in history.
 
 ---
 
@@ -791,9 +813,10 @@ chrome — **not** a card floating in the transcript.
   at a glance. The chrome around it stays muted: the `▸`/`▾` disclosure and the
   `›` marker are muted **bold**, the closing rule is muted. Not orange, no fill;
   the surrounding tones still read the band as chrome, not the live turn.
-- **Honest when collapsed.** Collapsed, the band is one row; when wrapped rows
-  are hidden it ends in a right-aligned dim `+N` (the house `+N more` idiom,
-  shortened — the band has no room for prose). No marker when nothing is hidden.
+- **Honest when collapsed.** Collapsed, the band is one prompt row plus its
+  closing hairline; when wrapped rows are hidden the prompt ends in a
+  right-aligned dim `+N` (the house `+N more` idiom, shortened). No marker when
+  nothing is hidden.
 - **Toggle.** A click on the band row, or the key `o` while the scrollback list
   holds focus in pager mode (the list-state law, §9.1.1), expands it to the full
   wrapped prompt and collapses it again. **ctrl+o never routes here** — that is
@@ -801,10 +824,14 @@ chrome — **not** a card floating in the transcript.
   each new user message.
 - **Closed by the session bar's own hairline.** The band's bottom rule is the
   **same** inset dim `─` the session bar draws (col 2 → width−2), byte-for-byte —
-  never the composer's full-width border weight. Two matching hairlines bracket
-  the band as one top-chrome region.
-- Yields the top row to an interactive overlay (a selection or search match
-  revealed exactly at the viewport top keeps its highlight).
+  never the composer's full-width border weight. It remains present while
+  collapsed, so the compact card cannot dissolve into transcript rows.
+- **Honest when viewport-clipped.** Expanded content reserves its last two rows
+  for `… +N rows` and the closing hairline. The hidden count and boundary never
+  disappear below the pane.
+- The whole painted footprint yields when a selection or search match intersects
+  it. Pointer targets come from the composed frame: continuation and rule rows
+  consume their own region and never toggle a header painted underneath.
 
 ### 9.2 The composer
 
@@ -1103,7 +1130,7 @@ tasks (ADR-0031) are surfaced **here** — a dim `· N to recover` badge on the
 ```
 ~/demo ┊ git main                                     CTX 0/300k ○○○○○○○○○○
 
-                        ○ ○ ○ ● ○ ○ ○ ○ ○ ○ ○ ○        ← IrisMark (animated)
+                        ○ ○ ○ ○ ○ ● ○ ○ ○ ○ ○ ○        ← IrisMark (settled)
                         I R I S                 0.1.0  ← silkscreen (printed)
 
                         ◉ New session ················ ctrl-n
@@ -1119,13 +1146,10 @@ Give Iris a task...
 ```
 
 **IrisMark.** The logo IS an LED strip — no ASCII art, no figlet wordmark, no
-pictorial glyph. One row of 12 dots (`●`/`○` cells, single-spaced), centered. A
-single lit orange head sweeps back and forth (ping-pong: reverses at the ends,
-never wrapping), advancing one dot per ~130ms tick, with a 2-dot comet trail
-behind the travel direction (trail-1 non-bold orange, trail-2 dimmest; head
-bright orange). All other dots are dim `○`. It reuses the working indicator's
-tick machinery: it stops when the terminal is unfocused, and under
-`IRIS_REDUCED_MOTION` it holds a single static lit dot at the center.
+pictorial glyph. One row of 12 dots (`●`/`○` cells, single-spaced), centered.
+The one-shot power-on lamp test exercises the strip; once settled, one bright
+orange datum holds at the center and every other dot stays dim. The idle start
+page does not tick. Reduced motion starts directly in this settled posture.
 
 **Silkscreen.** One row directly under the strip — printed faceplate text, so
 it is visible from the first frame and never animates: the letter-spaced
@@ -1138,7 +1162,7 @@ surface and its only wordmark; still no ASCII art, no figlet.
 frame 0 shows the silkscreen printed, the strip dark, and the menu hidden
 (blank rows — the block's height never changes, so nothing reflows); the
 LEDs then fill left-to-right two per tick, hold all-lit for two ticks —
-every LED proves itself — and release into the idle ping-pong as the menu
+every LED proves itself — and release into the static center datum as the menu
 rows go live. Any key completes the boot instantly and still performs its
 normal action; the composer is live throughout; under reduced motion the
 page starts settled. The boot exists only here: launching with a task or a
@@ -1169,8 +1193,9 @@ starts the session with it.
    all share one width; no row overflows the block's rails.
    4a. **One marked voice.** The transcript marks the user's turn with a `›` in
    the gutter and nothing else; the agent speaks unmarked (§7.1–7.2).
-5. **Three tool families only** (EXPLORE / SHELL / EDIT). No standalone
-   READ/GREP/LS/DIFF panels; approval is an in-block lifecycle state, never a
+5. **Three executable tool families only** (EXPLORE / SHELL / EDIT). No
+   standalone READ/GREP/LS panels; the read-only task DIFF is an evidence
+   surface, not a tool family. Approval is an in-block lifecycle state, never a
    separate panel.
 6. **Chrome is for tools.** Conversation, thinking, plans, and notices are never
    boxed. Boxes are never used for prose. **Overlays are frameless too** — menus,
@@ -1183,8 +1208,8 @@ starts the session with it.
 10. **Closed symbol set.** No glyph outside §5; `…`/`−`/`┊` (not `...`/`-`/`|`);
     no emoji.
 11. **Composer is unconditional.** No show/hide/reveal/collapse mechanic.
-12. **Motion** is only the closed quantized set of §6 — LED chase (working
-    indicator + IrisMark), edge pulse, the start page's one-shot lamp test,
+12. **Motion** is only the closed quantized set of §6 — the live working LED
+    chase, edge pulse, the start page's one-shot lamp test,
     and the two-tick detent flash — all stepped on the tick grid, all
     reduced-motion safe, and none of them ambient.
 
@@ -1202,4 +1227,4 @@ starts the session with it.
 - ✗ Emoji, gradients, rounded corners, drop shadows in the transcript, glass/blur.
 - ✗ ASCII `|` separators, ASCII `-` removals, or `...` ellipses.
 - ✗ Asserting efficiency/savings the runtime has not measured.
-- ✗ A fifth tool family, or a standalone READ/GREP/LS/DIFF panel.
+- ✗ A fifth executable tool family, or a standalone READ/GREP/LS panel.

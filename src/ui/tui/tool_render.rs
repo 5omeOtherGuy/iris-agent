@@ -40,7 +40,9 @@ use super::panel::FooterField;
 use super::rows::{ChromeRow, TranscriptRow};
 use super::shell_command::{self, ShellCommand};
 use super::text::{ansi_spans, strip_ansi_for_text};
-use super::wrap::{clamp_output_line, display_width, truncate_chars, wrapped_row_estimate};
+use super::wrap::{
+    clamp_output_line, display_width, truncate_clusters_with_ellipsis, wrapped_row_estimate,
+};
 use super::{
     MAX_TOOL_OUTPUT_LINE_CHARS, PANEL_BODY_CHROME_WIDTH, dim_style, err_style, panel_style,
     stdout_style,
@@ -137,9 +139,37 @@ pub(super) trait ToolRenderer: Sync {
 
     /// Family extras for the block footer, rendered as `┊`-joined sibling
     /// fields after the state label (SHELL: `EXIT <code>` + result meta).
-    /// Default: none (EXPLORE/EDIT-generic footers are state + diagnostics).
-    fn footer_extras(&self, _call: &ToolCall, _outcome: &ToolOutcome) -> Vec<FooterField> {
-        Vec::new()
+    /// Every failure keeps one cleaned cause line visible even while folded.
+    fn footer_extras(&self, _call: &ToolCall, outcome: &ToolOutcome) -> Vec<FooterField> {
+        error_footer_fields(outcome)
+    }
+}
+
+/// One bounded, control-free error cause for an always-visible footer. The
+/// state token already says ERROR, so this field carries only the first useful
+/// line of cause; the body retains the complete message when expanded.
+pub(super) fn error_footer_field(message: &str) -> FooterField {
+    // Split before cleaning: `clean_text` intentionally removes control
+    // characters, including newline, and would otherwise weld two diagnostic
+    // lines together.
+    let first = message
+        .lines()
+        .map(strip_ansi_for_text)
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_else(|| "tool failed".to_string());
+    let first = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first = if first.is_empty() {
+        "tool failed".to_string()
+    } else {
+        truncate_clusters_with_ellipsis(&first, MAX_TOOL_OUTPUT_LINE_CHARS)
+    };
+    FooterField::styled(first, dim_style())
+}
+
+fn error_footer_fields(outcome: &ToolOutcome<'_>) -> Vec<FooterField> {
+    match outcome {
+        ToolOutcome::Error { message, .. } => vec![error_footer_field(message)],
+        _ => Vec::new(),
     }
 }
 
@@ -354,7 +384,6 @@ impl ToolRenderer for ShellRenderer {
                 if !streamed.is_empty() {
                     body.output_tail(streamed);
                 }
-                body.line("$ \u{2588}", panel_style());
             }
             // The exit status is no longer a body row: it moves to the block
             // footer as `EXIT <code>` (+ result meta) via `footer_extras`.
@@ -383,21 +412,21 @@ impl ToolRenderer for ShellRenderer {
     /// cancelled run, a timeout, or an exited session shell
     /// (`src/tools/bash/mod.rs`), each of which already says so in `content`.
     fn footer_extras(&self, call: &ToolCall, outcome: &ToolOutcome) -> Vec<FooterField> {
-        let ToolOutcome::Done {
+        let mut fields = error_footer_fields(outcome);
+        if let ToolOutcome::Done {
             content,
             exit_code: Some(code),
         } = outcome
-        else {
-            return Vec::new();
-        };
-        let mut fields = vec![FooterField::styled(
-            format!("EXIT {code}"),
-            dim_style().add_modifier(ratatui::style::Modifier::BOLD),
-        )];
-        if let Some(meta) =
-            summarize_output(call, content, Some(*code)).map(|summary| summary.render())
         {
-            fields.push(FooterField::styled(meta, dim_style()));
+            fields.push(FooterField::styled(
+                format!("EXIT {code}"),
+                dim_style().add_modifier(ratatui::style::Modifier::BOLD),
+            ));
+            if let Some(meta) =
+                summarize_output(call, content, Some(*code)).map(|summary| summary.render())
+            {
+                fields.push(FooterField::styled(meta, dim_style()));
+            }
         }
         fields
     }
@@ -621,7 +650,7 @@ impl PanelBody {
     /// not under `$`), keeping its leading operator. Bounded like output rows so
     /// a pathological segment cannot balloon the stored row.
     fn command_continuation(&mut self, text: &str) {
-        let text = truncate_chars(text, MAX_TOOL_OUTPUT_LINE_CHARS);
+        let text = truncate_clusters_with_ellipsis(text, MAX_TOOL_OUTPUT_LINE_CHARS);
         self.line(&format!("  {text}"), panel_style());
     }
 
@@ -641,7 +670,7 @@ impl PanelBody {
 
     /// One dim heredoc body / closing-delimiter row.
     fn payload_line(&mut self, text: &str) {
-        let clamped = truncate_chars(text, MAX_TOOL_OUTPUT_LINE_CHARS);
+        let clamped = truncate_clusters_with_ellipsis(text, MAX_TOOL_OUTPUT_LINE_CHARS);
         self.line(&format!("  {clamped}"), dim_style());
     }
 
@@ -659,7 +688,7 @@ impl PanelBody {
     /// its own right-aligned row so a long command is never truncated to make
     /// room. `Some(0)` ("no timeout") and `None` omit the field entirely.
     fn command_row(&mut self, command: &str, timeout: Option<u64>) {
-        let command = truncate_chars(command, MAX_TOOL_OUTPUT_LINE_CHARS);
+        let command = truncate_clusters_with_ellipsis(command, MAX_TOOL_OUTPUT_LINE_CHARS);
         let left = format!("$ {command}");
         // The `$ ` prompt is quiet chrome (muted); the command itself is the
         // brightest thing in the body (ShellOutput `cmd` line grammar).
@@ -736,15 +765,15 @@ impl PanelBody {
     /// hard-wrapping so leading indentation/aligned columns survive. `first`
     /// selects the `  \u{2514} ` head gutter vs the `    ` continuation gutter.
     fn output_line(&mut self, raw: &str, first: bool) {
-        let line = truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS);
-        let legacy = if first {
-            format!("  \u{2514} {line}")
-        } else {
-            format!("    {line}")
-        };
+        let line = truncate_clusters_with_ellipsis(raw, MAX_TOOL_OUTPUT_LINE_CHARS);
+        // One dim connector separates invocation from result without adding a
+        // label or rule. Continuations align under the result text, so the eye
+        // can scan command → output in a single downward motion.
+        let prefix = if first { "\u{2514} " } else { "  " };
+        let plain = format!("{prefix}{}", strip_ansi_for_text(&line));
         self.push_line(
-            tool_output_line("", &line, stdout_style()),
-            strip_ansi_for_text(&legacy),
+            tool_output_line(prefix, &line, stdout_style()),
+            plain,
             stdout_style(),
         );
     }
@@ -781,8 +810,10 @@ impl PanelBody {
         let mut physical = 0usize;
         let mut take = 0usize;
         for raw in lines.iter().rev() {
-            let rows =
-                wrapped_row_estimate(&truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS), width);
+            let rows = wrapped_row_estimate(
+                &truncate_clusters_with_ellipsis(raw, MAX_TOOL_OUTPUT_LINE_CHARS),
+                width,
+            );
             if take > 0 && physical + rows > budget {
                 break;
             }
@@ -799,9 +830,9 @@ impl PanelBody {
         }
         // The earlier-lines marker, then the most recent tail.
         self.hidden_lines_marker(start, true);
-        for raw in &lines[start..] {
+        for (offset, raw) in lines[start..].iter().enumerate() {
             let clamped = clamp_output_line(raw, width, budget);
-            self.output_line(&clamped, false);
+            self.output_line(&clamped, offset == 0);
         }
     }
 }
@@ -1006,7 +1037,11 @@ mod tests {
             .iter()
             .find(|row| row.text.contains("clobber") || row.text.contains("owned"))
             .expect("sanitized output row");
-        assert!(output.text.contains("a   bclobbersafe"), "{}", output.text);
+        assert!(
+            output.text.contains("a       bclobbersafe"),
+            "{}",
+            output.text
+        );
         assert!(!output.text.contains("owned"), "{}", output.text);
         for forbidden in ['\t', '\r', '\x1b', '\x07'] {
             assert!(
@@ -1333,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_running_skips_no_output_when_stream_empty() {
+    fn shell_running_has_one_command_row_when_stream_is_empty() {
         let renderer = resolve(&call("bash", json!({ "command": "echo hi" })));
         let ctx = RenderCtx::for_width(80);
         let rows = renderer.body(
@@ -1342,7 +1377,7 @@ mod tests {
             &ToolOutcome::Running { streamed: "" },
         );
         let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
-        assert_eq!(texts, vec!["$ echo hi", "$ \u{2588}"]);
+        assert_eq!(texts, vec!["$ echo hi"]);
     }
 
     #[test]
@@ -1378,6 +1413,31 @@ mod tests {
             texts.iter().any(|t| t.contains("linking")),
             "expected streamed tail before error, got {texts:?}"
         );
+    }
+
+    #[test]
+    fn failure_footer_keeps_one_clean_cause_line_for_every_renderer() {
+        let generic_call = call("zonk", json!({}));
+        let generic = resolve(&generic_call).footer_extras(
+            &generic_call,
+            &ToolOutcome::Error {
+                message: "\u{1b}[31mpermission   denied\u{1b}[0m\nsecond line",
+                streamed: "",
+            },
+        );
+        assert_eq!(generic.len(), 1);
+        assert_eq!(generic[0].plain, "permission denied");
+
+        let shell_call = call("bash", json!({ "command": "make" }));
+        let shell = resolve(&shell_call).footer_extras(
+            &shell_call,
+            &ToolOutcome::Error {
+                message: "linker failed\nfull diagnostic",
+                streamed: "partial output",
+            },
+        );
+        assert_eq!(shell.len(), 1);
+        assert_eq!(shell[0].plain, "linker failed");
     }
 
     #[test]
@@ -1539,6 +1599,29 @@ mod tests {
         assert!(
             rows.iter().any(|r| r.text.contains("line 199")),
             "the tail is stored"
+        );
+    }
+
+    #[test]
+    fn pathological_tool_lines_report_the_defensive_cap() {
+        let renderer = resolve(&call("bash", json!({ "command": "界".repeat(2_100) })));
+        let ctx = RenderCtx::for_width(80);
+        let rows = renderer.body(
+            &ctx,
+            &call("bash", json!({ "command": "界".repeat(2_100) })),
+            &ToolOutcome::Done {
+                content: &"e\u{301}".repeat(2_100),
+                exit_code: Some(0),
+            },
+        );
+
+        let command = rows.first().expect("command row");
+        let output = rows.last().expect("output row");
+        assert!(command.text.ends_with('…'), "command cap was silent");
+        assert!(output.text.ends_with('…'), "output cap was silent");
+        assert!(
+            !command.text.ends_with('\u{301}') && !output.text.ends_with('\u{301}'),
+            "caps stay on grapheme boundaries"
         );
     }
 

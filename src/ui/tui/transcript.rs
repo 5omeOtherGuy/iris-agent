@@ -13,7 +13,7 @@ use crate::ui::{TurnErrorKind, UiEvent};
 use super::pane;
 use super::panel::{
     FooterField, PanelHeaderSpec, PanelState, ToolDiag, diff_counts, diff_table_rows,
-    edit_footer_extras, join_meta_fields, panel_state,
+    edit_footer_extras, join_meta_fields, panel_state, task_diff_table_rows,
 };
 use super::rows::{ChromeRow, FoldVis, Measure, TranscriptRow, is_separator_row};
 use super::streaming::{Escapement, StreamController};
@@ -21,7 +21,7 @@ use super::tool_render::{self, RenderCtx, ToolOutcome, ToolPanelKind};
 use super::wrap::line_text;
 use super::{
     MAX_EXEC_STREAM_BYTES, MAX_TRANSCRIPT_ROWS, TEXT_COLUMN_X_PADDING, dim_style, err_style,
-    format_elapsed_compact, prompt_style, tool_header_style, turn_divider_label,
+    format_elapsed_compact, tool_header_style, turn_divider_label,
 };
 
 /// Reasoning-rail label. Uppercase like the other structural labels; the rail
@@ -107,13 +107,13 @@ fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
     }
 }
 
-/// Render the live reasoning body to physical (wrapped) rail lines, the orange
-/// `▋` live caret on the last row — the visible print head, which advances in
-/// even word-steps because the text feeding it is paced by the escapement
-/// (§7.4). Markdown is rendered at the same `content_width` the committed block
-/// uses (so finalizing never reflows), then each rail row is wrapped at the frame
-/// `width`. Shared by the tail-window builder and the ctrl+o foldability probe so
-/// the two always agree on the wrapped-row count.
+/// Render the live reasoning body to physical (wrapped) rail lines. Arrival is
+/// already acknowledged by the lit header lamp and paced text; a model-output
+/// caret would be asymmetric with the assistant answer stream. Markdown is
+/// rendered at the same `content_width` the committed block uses (so finalizing
+/// never reflows), then each rail row is wrapped at the frame `width`. Shared by
+/// the tail-window builder and the ctrl+o foldability probe so the two always
+/// agree on the wrapped-row count.
 fn reasoning_preview_body_lines(
     text: &str,
     content_width: usize,
@@ -122,11 +122,7 @@ fn reasoning_preview_body_lines(
     let theme = MarkdownTheme::thinking()
         .with_code_highlighting()
         .with_hyperlinks();
-    let mut md = render_markdown_themed(text, &theme, content_width);
-    if let Some(last) = md.last_mut() {
-        last.spans
-            .push(Span::styled(crate::ui::symbols::CARET, prompt_style()));
-    }
+    let md = render_markdown_themed(text, &theme, content_width);
     let mut body = Vec::new();
     for line in md {
         rail_body_row(line).render_rows(width, &mut body);
@@ -137,8 +133,9 @@ fn reasoning_preview_body_lines(
 /// Build the transient live-reasoning preview as physical lines: the `THINKING`
 /// rail header (the lit `●` lamp + live `elapsed`), a bounded **tail window** of
 /// the last [`LIVE_TAIL_ROWS`] wrapped body rows under an honest `┊ … +N rows`
-/// elision when rows are hidden, the `▋` caret at the stream edge, then a
-/// trailing blank (the `RailEnd`). `full` (ctrl+o during streaming, §2.3) renders
+/// elision when rows are hidden, with the same conditional leading separator
+/// and trailing `RailEnd` blank the committed block owns. `full` (ctrl+o during
+/// streaming, §2.3) renders
 /// the whole live stream instead of the window; the block is foldable — and the
 /// header shows the `▾` arrow — only when the body exceeds the tail (nothing
 /// hidden ⇒ no arrow, no elision, no no-op affordance).
@@ -148,6 +145,7 @@ fn live_reasoning_preview_lines(
     width: usize,
     elapsed: &str,
     full: bool,
+    leading_separator: bool,
 ) -> Vec<Line<'static>> {
     let body = reasoning_preview_body_lines(text, content_width, width);
     let foldable = body.len() > LIVE_TAIL_ROWS;
@@ -157,6 +155,9 @@ fn live_reasoning_preview_lines(
         body.len().saturating_sub(LIVE_TAIL_ROWS)
     };
     let mut out = Vec::new();
+    if leading_separator {
+        out.push(Line::default());
+    }
     TranscriptRow::chrome(ChromeRow::RailHeader {
         expanded: true,
         label: THINKING_LABEL.to_string(),
@@ -345,7 +346,7 @@ pub(super) struct Transcript {
     live_reasoning_raw: Option<String>,
     /// Word-quantized drain buffer pacing the reasoning-summary stream: raw
     /// deltas are held and released in even beats into `live_reasoning_summary`
-    /// on the loop's tick grid, so the `▋` reasoning caret steps evenly instead
+    /// on the loop's tick grid, so text advances in even reactive steps instead
     /// of jumping on network bursts. Bypassed under reduced motion.
     reasoning_escapement: Escapement,
     /// The same pacing for the raw-reasoning channel (drains into
@@ -537,6 +538,12 @@ impl Transcript {
             .filter(|text| !text.trim().is_empty())
             .unwrap_or(collapsed_text);
         let has_distinct_expanded_body = !redacted && expanded_text.trim() != collapsed_text.trim();
+        // Every non-redacted committed trace is a real disclosure. When the
+        // provider supplies raw reasoning, its summary remains the closed-state
+        // preview. When only one reasoning channel exists, the closed state is
+        // header-only and the open state reveals that channel. Redacted traces
+        // stay non-foldable because no hidden content exists to recover.
+        let foldable = !redacted && !expanded_text.trim().is_empty();
         let collapsed_groups: Vec<Vec<Line<'static>>> = if redacted {
             vec![vec![Line::from(Span::styled(
                 REDACTED_THINKING_BODY,
@@ -561,31 +568,33 @@ impl Transcript {
             expanded: false,
             label: THINKING_LABEL.to_string(),
             right: elapsed.unwrap_or_default(),
-            foldable: has_distinct_expanded_body,
+            foldable,
             // Settled: the print head is gone, so the lamp is dark.
             lamp: false,
         }));
-        for (index, group) in collapsed_groups.into_iter().enumerate() {
-            if index > 0 {
-                block.push(rail_body_row(Line::default()).with_fold(
-                    if has_distinct_expanded_body {
-                        FoldVis::WhenCollapsed
-                    } else {
-                        FoldVis::Always
-                    },
-                ));
-            }
-            for line in group {
-                block.push(
-                    rail_body_row(line).with_fold(if has_distinct_expanded_body {
-                        FoldVis::WhenCollapsed
-                    } else {
-                        FoldVis::Always
-                    }),
-                );
+        if has_distinct_expanded_body || redacted {
+            for (index, group) in collapsed_groups.into_iter().enumerate() {
+                if index > 0 {
+                    block.push(rail_body_row(Line::default()).with_fold(
+                        if has_distinct_expanded_body {
+                            FoldVis::WhenCollapsed
+                        } else {
+                            FoldVis::Always
+                        },
+                    ));
+                }
+                for line in group {
+                    block.push(
+                        rail_body_row(line).with_fold(if has_distinct_expanded_body {
+                            FoldVis::WhenCollapsed
+                        } else {
+                            FoldVis::Always
+                        }),
+                    );
+                }
             }
         }
-        if has_distinct_expanded_body {
+        if foldable {
             for (index, group) in expanded_groups.into_iter().enumerate() {
                 if index > 0 {
                     block.push(rail_body_row(Line::default()).with_fold(FoldVis::WhenExpanded));
@@ -599,9 +608,10 @@ impl Transcript {
 
         match self.stream_answer_start {
             Some(start) => {
-                // Splice above the (possibly already-committed) answer, with a
-                // trailing blank separating the rail from the answer below.
-                block.push(TranscriptRow::new(String::new(), Style::default()));
+                // Splice above the (possibly already-committed) answer.
+                // `RailEnd` already renders the one trailing blank that
+                // separates the rail from the answer; adding another separator
+                // here produced a visible two-row hole at finalization.
                 let n = block.len();
                 // Keep every retained row-index anchor at or after the insert
                 // point valid (pager prompt anchors, any open-panel body rows).
@@ -886,7 +896,7 @@ impl Transcript {
     }
 
     /// Beat both reasoning escapements: release a word-quantum of held reasoning
-    /// into the live buffers so the preview and its `▋` caret step evenly.
+    /// into the live buffers so the preview advances evenly.
     /// Returns whether either advanced.
     fn beat_reasoning(&mut self, now: Instant) -> bool {
         let mut advanced = false;
@@ -1092,11 +1102,12 @@ impl Transcript {
         for row in &mut body {
             row.fold = FoldVis::WhenExpanded;
         }
-        // Compact by default: a RUNNING block (live tail) and a pending REVIEW
-        // block (the user must see what they are authorizing) arrive expanded.
-        // Finalized blocks arrive collapsed; an explicit user expand is
-        // reapplied by the rebuild path.
-        let expanded = matches!(outcome, ToolOutcome::Running { .. } | ToolOutcome::Review);
+        // RUNNING and REVIEW need their live/decision context. A failed SHELL
+        // also remains open: the command output is the primary diagnostic and
+        // must not disappear at the state transition. Successful settled
+        // history stays compact; explicit user intent wins in rebuild paths.
+        let expanded = matches!(outcome, ToolOutcome::Running { .. } | ToolOutcome::Review)
+            || (state == PanelState::Error && renderer.kind() == ToolPanelKind::Shell);
         self.push_tool_header(renderer, call, state, duration, started, expanded);
         self.rows.extend(body);
         let mut extras = renderer.footer_extras(call, &outcome);
@@ -1696,14 +1707,10 @@ impl Transcript {
         let meta = renderer.header_meta(call);
         let plain = renderer.plain_meta(call);
         let diff_rows = diff_table_rows(diff);
-        // EXCEPTION to compact-by-default: a pending EDIT preview/review exists
-        // to be reviewed, so it (and the running edit) arrives EXPANDED; it
-        // collapses once the edit is finalized (state Done/Error). An explicit
-        // user fold is reapplied by the rebuild path.
-        let expanded = matches!(
-            state,
-            PanelState::Preview | PanelState::Review | PanelState::Running
-        );
+        // A diff is consequential evidence, not routine output. Keep it open
+        // through preview, execution, and every settled outcome. The rebuild
+        // path still reapplies an explicit user fold.
+        let expanded = true;
         self.push_panel_header_with_expanded(
             PanelHeaderSpec {
                 title: "EDIT",
@@ -1771,7 +1778,11 @@ impl Transcript {
         let (added, removed) = diff_counts(diff);
         let note = diff.contains("--- /dev/null").then_some("new file");
         let diag = self.tool_diags.get(&call.id).cloned();
-        let mut extras = edit_footer_extras(added, removed, note);
+        let mut extras = Vec::new();
+        if let Some(message) = error {
+            extras.push(tool_render::error_footer_field(message));
+        }
+        extras.extend(edit_footer_extras(added, removed, note));
         extras.extend(self.approval_footer_fields(&call.id, state));
         self.push_block_footer(state, extras, diag.as_ref(), Some(&call.id));
     }
@@ -1804,7 +1815,7 @@ impl Transcript {
                 dim_style(),
             ));
         }
-        self.rows.extend(diff_table_rows(diff));
+        self.rows.extend(task_diff_table_rows(diff));
         for row in &mut self.rows[body_from..] {
             row.fold = FoldVis::WhenExpanded;
         }
@@ -3099,20 +3110,24 @@ impl Transcript {
     }
 
     /// The foldable header row whose visible physical-line span covers `line`
-    /// (a whole header row is the click target, not just the disclosure
-    /// glyph). Requires a warm wrap cache; `None` outside any header.
+    /// (a whole header row is the click target, not just the disclosure glyph).
+    /// Requires a warm wrap cache. Cumulative visible counts locate the owning
+    /// logical row in O(log rows); pager composition calls this once per visible
+    /// body row, so it must never rebuild the O(transcript) header list.
     pub(super) fn header_row_at_visible_line(&self, line: usize) -> Option<usize> {
-        self.panel_header_rows().into_iter().find(|&header| {
-            let Some(start) = self.visible_line_of_row(header) else {
-                return false;
-            };
-            let span = self
-                .wrapped_cache
-                .rows
-                .get(header)
-                .map_or(1, |layout| layout.lines.len().max(1));
-            (start..start + span).contains(&line)
-        })
+        let row = self
+            .wrapped_cache
+            .rows
+            .partition_point(|layout| layout.visible_cum <= line);
+        let layout = self.wrapped_cache.rows.get(row)?;
+        if !layout.visible {
+            return None;
+        }
+        matches!(
+            self.rows.get(row).and_then(|row| row.chrome.as_ref()),
+            Some(ChromeRow::Header { .. } | ChromeRow::RailHeader { .. })
+        )
+        .then_some(row)
     }
 
     /// Case-insensitive substring search over searchable transcript content,
@@ -3373,8 +3388,18 @@ impl Transcript {
                 let content_width = width
                     .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
                     .max(1);
-                let lines =
-                    live_reasoning_preview_lines(text, content_width, width, &elapsed, full);
+                // Match `push_blank` before the trace commits: mount the block
+                // boundary in its first live frame so finalization never inserts
+                // a surprise row above THINKING.
+                let leading_separator = self.rows.last().is_some_and(|row| !is_separator_row(row));
+                let lines = live_reasoning_preview_lines(
+                    text,
+                    content_width,
+                    width,
+                    &elapsed,
+                    full,
+                    leading_separator,
+                );
                 self.streaming_render = Some(StreamingRender {
                     key,
                     width,
