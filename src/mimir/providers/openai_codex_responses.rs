@@ -1669,6 +1669,12 @@ fn extract_openai_usage(value: &Value, model: &str) -> Option<ProviderUsage> {
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    // GPT-5.6+ reports prompt-cache writes; older families omit the field.
+    let cache_write_input_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let reasoning_output_tokens = usage
         .get("output_tokens_details")
         .and_then(|details| details.get("reasoning_tokens"))
@@ -1684,7 +1690,7 @@ fn extract_openai_usage(value: &Value, model: &str) -> Option<ProviderUsage> {
         input_tokens,
         output_tokens,
         cache_read_input_tokens,
-        cache_write_input_tokens: 0,
+        cache_write_input_tokens,
         reasoning_output_tokens,
         total_tokens,
         // OpenAI Responses does not break cache creation down by tier.
