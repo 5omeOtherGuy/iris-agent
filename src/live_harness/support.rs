@@ -102,6 +102,20 @@ impl TempDir {
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
+        // Tags are built from ids like `S1::anthropic/claude-sonnet-4-6@low`;
+        // sanitize to a single path component so `create_dir` never sees a
+        // separator (a `/` in the tag made the parent-less nested path fail
+        // with NotFound on the first live pilot run).
+        let tag: String = tag
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
         let path = std::env::temp_dir().join(format!("iris-live-harness-{tag}-{nanos}"));
         std::fs::create_dir(&path).expect("create temp dir");
         Self { path }
@@ -192,4 +206,23 @@ pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .build()
         .expect("current-thread runtime")
         .block_on(future)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TempDir;
+
+    #[test]
+    fn temp_dir_sanitizes_path_separators_and_symbols_in_tags() {
+        // Regression: the first live pilot run panicked NotFound because a
+        // cell id containing `/` produced a nested, parent-less temp path.
+        let dir = TempDir::new("campaign-S1::anthropic/claude-sonnet-4-6@low#run1");
+        assert!(dir.path.is_dir());
+        let name = dir.path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with(
+                "iris-live-harness-campaign-S1--anthropic-claude-sonnet-4-6-low-run1-"
+            )
+        );
+    }
 }
