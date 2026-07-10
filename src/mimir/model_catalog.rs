@@ -34,6 +34,24 @@ use crate::mimir::selection::{ModelSelection, OpenAiCompatibleConfig, ProviderId
 // it. The context-window label is the soft routing cap shown in the picker
 // badge.
 const ENTRIES: &[(ProviderId, &str, &str, &str)] = &[
+    (
+        ProviderId::OpenAiCodex,
+        "gpt-5.6-sol",
+        "GPT 5.6 Sol",
+        "372k",
+    ),
+    (
+        ProviderId::OpenAiCodex,
+        "gpt-5.6-terra",
+        "GPT 5.6 Terra",
+        "372k",
+    ),
+    (
+        ProviderId::OpenAiCodex,
+        "gpt-5.6-luna",
+        "GPT 5.6 Luna",
+        "372k",
+    ),
     (ProviderId::OpenAiCodex, "gpt-5.5", "GPT 5.5", "300k"),
     (ProviderId::OpenAiCodex, "gpt-5.4", "GPT 5.4", "300k"),
     (
@@ -306,6 +324,7 @@ fn catalog_context_window(qualified: &str) -> Option<u64> {
         "128k" => Some(128_000),
         "200k" => Some(200_000),
         "300k" => Some(300_000),
+        "372k" => Some(372_000),
         "1M" => Some(1_000_000),
         _ => None,
     })
@@ -440,15 +459,15 @@ mod tests {
             })
         );
 
-        let codex = settings(Some("openai-codex"), Some("gpt-5.4-mini"), None);
+        let codex = settings(Some("openai-codex"), Some("gpt-5.6-sol"), None);
         let codex = ModelSelection::resolve(&codex).unwrap();
         assert_eq!(
             effective_context_window(&codex, 8_192),
             Some(EffectiveContextWindow {
-                raw: 300_000,
+                raw: 372_000,
                 max_output_reserve: 128_000,
                 summary_reserve: 8_192,
-                effective: 163_808,
+                effective: 235_808,
                 source: ContextWindowSource::Catalog,
             })
         );
@@ -477,6 +496,9 @@ mod tests {
 
     #[test]
     fn display_name_uses_catalog_then_falls_back_to_id() {
+        assert_eq!(display_name("openai-codex/gpt-5.6-sol"), "GPT 5.6 Sol");
+        assert_eq!(display_name("openai-codex/gpt-5.6-terra"), "GPT 5.6 Terra");
+        assert_eq!(display_name("openai-codex/gpt-5.6-luna"), "GPT 5.6 Luna");
         assert_eq!(display_name("openai-codex/gpt-5.5"), "GPT 5.5");
         assert_eq!(display_name("openai-codex/gpt-5.4"), "GPT 5.4");
         assert_eq!(display_name("openai-codex/gpt-5.4-mini"), "GPT 5.4 Mini");
@@ -496,6 +518,13 @@ mod tests {
 
     #[test]
     fn ctx_label_returns_catalog_value_or_none() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(
+                ctx_label(&format!("openai-codex/{model}")),
+                Some("372k"),
+                "{model} must expose its real Codex context window to the picker and meter"
+            );
+        }
         assert_eq!(ctx_label("openai-codex/gpt-5.5"), Some("300k"));
         assert_eq!(ctx_label("openai-codex/gpt-5.4"), Some("300k"));
         assert_eq!(ctx_label("openai-codex/gpt-5.3-codex-spark"), Some("300k"));

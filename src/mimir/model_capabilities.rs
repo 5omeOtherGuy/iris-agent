@@ -46,6 +46,18 @@ const ALL_LEVELS: &[ReasoningEffort] = &[
     ReasoningEffort::High,
     ReasoningEffort::XHigh,
 ];
+/// Ordered normalization scale used only to carry an effort between models.
+/// `max` is currently native only to the GPT-5.6 Codex family; other providers
+/// keep their existing six-level capability sets and clamp it at their top.
+const ORDERED_LEVELS: &[ReasoningEffort] = &[
+    ReasoningEffort::Off,
+    ReasoningEffort::Minimal,
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+    ReasoningEffort::Max,
+];
 const OFF_LEVELS: &[ReasoningEffort] = &[ReasoningEffort::Off];
 const STANDARD_LEVELS: &[ReasoningEffort] = &[
     ReasoningEffort::Off,
@@ -86,6 +98,31 @@ const OPENAI_CODEX_OPTIONS: &[ReasoningOption] = &[
         "xhigh",
         "OpenAI reasoning.effort xhigh",
     ),
+];
+const OPENAI_CODEX_5_6_OPTIONS: &[ReasoningOption] = &[
+    option(ReasoningEffort::Off, "off", "omit reasoning"),
+    option(
+        ReasoningEffort::Minimal,
+        "minimal",
+        "OpenAI reasoning.effort low",
+    ),
+    option(ReasoningEffort::Low, "low", "OpenAI reasoning.effort low"),
+    option(
+        ReasoningEffort::Medium,
+        "medium",
+        "OpenAI reasoning.effort medium",
+    ),
+    option(
+        ReasoningEffort::High,
+        "high",
+        "OpenAI reasoning.effort high",
+    ),
+    option(
+        ReasoningEffort::XHigh,
+        "xhigh",
+        "OpenAI reasoning.effort xhigh",
+    ),
+    option(ReasoningEffort::Max, "max", "OpenAI reasoning.effort max"),
 ];
 const OPENAI_NO_REASONING_OPTIONS: &[ReasoningOption] = &[option(
     ReasoningEffort::Off,
@@ -215,6 +252,7 @@ const ANTHROPIC_ADAPTIVE_OPTIONS: &[ReasoningOption] = &[
 /// sets.
 pub(crate) fn supported_levels(provider: ProviderId, model: &str) -> &'static [ReasoningEffort] {
     match provider {
+        ProviderId::OpenAiCodex if is_openai_codex_5_6_model(model) => ORDERED_LEVELS,
         ProviderId::OpenAiCodex => ALL_LEVELS,
         // The built-in OpenAI API lane uses Chat Completions models that do not
         // accept `reasoning_effort`. OpenAI-compatible endpoints remain opt-in
@@ -229,12 +267,17 @@ pub(crate) fn supported_levels(provider: ProviderId, model: &str) -> &'static [R
 /// Provider-native selectable rows for the current model.
 pub(crate) fn level_options(provider: ProviderId, model: &str) -> &'static [ReasoningOption] {
     match provider {
+        ProviderId::OpenAiCodex if is_openai_codex_5_6_model(model) => OPENAI_CODEX_5_6_OPTIONS,
         ProviderId::OpenAiCodex => OPENAI_CODEX_OPTIONS,
         ProviderId::OpenAi => openai_level_options(model),
         ProviderId::OpenAiCompatible => OPENAI_CHAT_OPTIONS,
         ProviderId::Anthropic => anthropic_level_options(model),
         ProviderId::Antigravity => antigravity_level_options(model),
     }
+}
+
+fn is_openai_codex_5_6_model(model: &str) -> bool {
+    matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna")
 }
 
 /// Provider-native label for a normalized level. If the level is not native for
@@ -287,6 +330,13 @@ pub(crate) fn parse_persisted_level(
     model: &str,
     value: &str,
 ) -> Result<ReasoningEffort> {
+    // Anthropic has long used its native `max` label for Iris's existing
+    // `xhigh` normalized tier. GPT-5.6 Codex adds a distinct normalized `max`,
+    // so resolve this one ambiguous token through the model-native table first
+    // and preserve existing Anthropic settings.
+    if value.trim().eq_ignore_ascii_case("max") {
+        return parse_level(provider, model, value);
+    }
     if let Ok(level) = ReasoningEffort::parse(value) {
         return Ok(level);
     }
@@ -453,15 +503,18 @@ pub(crate) fn clamp(provider: ProviderId, model: &str, level: ReasoningEffort) -
     if supported.contains(&level) {
         return level;
     }
-    let Some(idx) = ALL_LEVELS.iter().position(|candidate| *candidate == level) else {
+    let Some(idx) = ORDERED_LEVELS
+        .iter()
+        .position(|candidate| *candidate == level)
+    else {
         return supported.first().copied().unwrap_or(level);
     };
-    for candidate in &ALL_LEVELS[idx..] {
+    for candidate in &ORDERED_LEVELS[idx..] {
         if supported.contains(candidate) {
             return *candidate;
         }
     }
-    for candidate in ALL_LEVELS[..idx].iter().rev() {
+    for candidate in ORDERED_LEVELS[..idx].iter().rev() {
         if supported.contains(candidate) {
             return *candidate;
         }
@@ -559,6 +612,13 @@ mod tests {
             join_display_levels(ProviderId::OpenAiCodex, "gpt-5.5"),
             "off, minimal, low, medium, high, xhigh"
         );
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(
+                join_display_levels(ProviderId::OpenAiCodex, model),
+                "off, minimal, low, medium, high, xhigh, max",
+                "{model} must expose its native max effort in every picker"
+            );
+        }
         assert_eq!(
             join_display_levels(ProviderId::Anthropic, "claude-sonnet-5"),
             "off, low, medium, high, xhigh, max"
@@ -694,34 +754,34 @@ mod tests {
 
     #[test]
     fn cycle_effort_wraps_within_supported_levels() {
-        // Codex supports off..xhigh (6 levels): high -> xhigh -> wrap to off.
+        // GPT-5.6 Codex models support off..max: xhigh -> max -> wrap to off.
         assert_eq!(
             cycle_effort(
                 ProviderId::OpenAiCodex,
-                "gpt-5.5",
-                ReasoningEffort::High,
+                "gpt-5.6-sol",
+                ReasoningEffort::XHigh,
                 true
             ),
-            Some(ReasoningEffort::XHigh)
+            Some(ReasoningEffort::Max)
         );
         assert_eq!(
             cycle_effort(
                 ProviderId::OpenAiCodex,
-                "gpt-5.5",
-                ReasoningEffort::XHigh,
+                "gpt-5.6-sol",
+                ReasoningEffort::Max,
                 true
             ),
             Some(ReasoningEffort::Off)
         );
-        // Backward from off wraps to the top (xhigh).
+        // Backward from off wraps to the native top (max).
         assert_eq!(
             cycle_effort(
                 ProviderId::OpenAiCodex,
-                "gpt-5.5",
+                "gpt-5.6-sol",
                 ReasoningEffort::Off,
                 false
             ),
-            Some(ReasoningEffort::XHigh)
+            Some(ReasoningEffort::Max)
         );
         // OpenAI-compatible exposes off/low/medium/high; high wraps to off.
         assert_eq!(
@@ -808,6 +868,19 @@ mod tests {
             clamp(ProviderId::OpenAiCodex, "gpt-5.5", ReasoningEffort::XHigh),
             ReasoningEffort::XHigh
         );
+        // `max` is native to the GPT-5.6 family only; carrying it to an older
+        // Codex model lands on its highest supported effort.
+        assert_eq!(
+            clamp(ProviderId::OpenAiCodex, "gpt-5.5", ReasoningEffort::Max),
+            ReasoningEffort::XHigh
+        );
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(
+                clamp(ProviderId::OpenAiCodex, model, ReasoningEffort::Max),
+                ReasoningEffort::Max,
+                "{model} keeps max"
+            );
+        }
         // A supported level is unchanged everywhere.
         assert_eq!(
             clamp(

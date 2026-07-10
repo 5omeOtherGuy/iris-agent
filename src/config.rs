@@ -63,7 +63,7 @@ pub(crate) struct Settings {
     /// plans flush once provider-visible context reaches this independent token
     /// threshold. Absent -> [`Settings::microcompaction_watermark`] default.
     pub(crate) microcompaction_watermark: Option<u64>,
-    /// Default reasoning/thinking effort (`off|minimal|low|medium|high|xhigh`),
+    /// Default reasoning/thinking effort (`off|minimal|low|medium|high|xhigh|max`),
     /// parsed into a normalized level by `mimir::selection`. Absent -> no
     /// preference, so adapters omit all reasoning fields (today's wire). Not a
     /// security-sensitive redirect, so a project file may tune it (like

@@ -812,6 +812,7 @@ fn codex_reasoning(reasoning: Option<ReasoningEffort>) -> Option<Value> {
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High => "high",
         ReasoningEffort::XHigh => "xhigh",
+        ReasoningEffort::Max => "max",
     };
     Some(json!({ "effort": effort, "summary": "auto" }))
 }

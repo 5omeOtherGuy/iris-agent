@@ -248,9 +248,10 @@ fn antigravity_thinking_level(model: &str, reasoning: ReasoningEffort) -> Option
         return match reasoning {
             ReasoningEffort::Off => None,
             ReasoningEffort::Minimal | ReasoningEffort::Low => Some("low"),
-            ReasoningEffort::Medium | ReasoningEffort::High | ReasoningEffort::XHigh => {
-                Some("high")
-            }
+            ReasoningEffort::Medium
+            | ReasoningEffort::High
+            | ReasoningEffort::XHigh
+            | ReasoningEffort::Max => Some("high"),
         };
     }
     match reasoning {
@@ -258,7 +259,7 @@ fn antigravity_thinking_level(model: &str, reasoning: ReasoningEffort) -> Option
         ReasoningEffort::Minimal => Some("minimal"),
         ReasoningEffort::Low => Some("low"),
         ReasoningEffort::Medium => Some("medium"),
-        ReasoningEffort::High | ReasoningEffort::XHigh => Some("high"),
+        ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => Some("high"),
     }
 }
 

@@ -97,7 +97,7 @@ impl ProviderId {
     /// the model default.
     pub(crate) fn default_model(self) -> &'static str {
         match self {
-            ProviderId::OpenAiCodex => "gpt-5.5",
+            ProviderId::OpenAiCodex => "gpt-5.6-sol",
             ProviderId::OpenAi => "gpt-4.1",
             ProviderId::Anthropic => "claude-sonnet-4-6",
             ProviderId::Antigravity => "gemini-3.5-flash",
@@ -141,6 +141,7 @@ pub(crate) enum ReasoningEffort {
     Medium,
     High,
     XHigh,
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -170,13 +171,14 @@ impl ReasoningEffort {
 
     /// Every level, in increasing order. Used to round-trip parsing in tests.
     #[cfg(test)]
-    pub(crate) const ALL: [ReasoningEffort; 6] = [
+    pub(crate) const ALL: [ReasoningEffort; 7] = [
         ReasoningEffort::Off,
         ReasoningEffort::Minimal,
         ReasoningEffort::Low,
         ReasoningEffort::Medium,
         ReasoningEffort::High,
         ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
     ];
 
     /// Parse a level from a string (case-insensitive). Exact tokens only. A bad
@@ -190,8 +192,9 @@ impl ReasoningEffort {
             "medium" => Ok(ReasoningEffort::Medium),
             "high" => Ok(ReasoningEffort::High),
             "xhigh" => Ok(ReasoningEffort::XHigh),
+            "max" => Ok(ReasoningEffort::Max),
             other => Err(UsageError::new(format!(
-                "unsupported reasoning level '{other}'; supported: off, minimal, low, medium, high, xhigh"
+                "unsupported reasoning level '{other}'; supported: off, minimal, low, medium, high, xhigh, max"
             ))
             .into()),
         }
@@ -206,6 +209,7 @@ impl ReasoningEffort {
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
             ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Max => "max",
         }
     }
 }
@@ -1059,7 +1063,7 @@ mod tests {
         let s = settings(None, None, None, None);
         let resolved = ModelSelection::resolve(&s).unwrap();
         assert_eq!(resolved.provider, ProviderId::OpenAiCodex);
-        assert_eq!(resolved.model, "gpt-5.5");
+        assert_eq!(resolved.model, "gpt-5.6-sol");
         assert_eq!(resolved.base_url, "https://chatgpt.com/backend-api");
         assert_eq!(resolved.reasoning, None);
         assert_eq!(resolved.cache_retention, PromptCacheRetention::Short);
@@ -1080,7 +1084,7 @@ mod tests {
 
         // Blank settings fall back to the default.
         let s = settings(None, Some("   "), None, None);
-        assert_eq!(ModelSelection::resolve(&s).unwrap().model, "gpt-5.5");
+        assert_eq!(ModelSelection::resolve(&s).unwrap().model, "gpt-5.6-sol");
 
         // Env wins over settings (model + codex base url).
         unsafe {
@@ -1134,6 +1138,13 @@ mod tests {
             ModelSelection::resolve(&hand_edited).unwrap().reasoning,
             Some(ReasoningEffort::XHigh),
             "non-normalized provider-native labels remain accepted for hand-edited settings"
+        );
+
+        let codex_5_6 = settings(Some("openai-codex"), Some("gpt-5.6-sol"), None, Some("max"));
+        assert_eq!(
+            ModelSelection::resolve(&codex_5_6).unwrap().reasoning,
+            Some(ReasoningEffort::Max),
+            "GPT-5.6 Codex settings preserve native max as a distinct effort"
         );
 
         let manual = settings(
