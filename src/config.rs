@@ -666,6 +666,16 @@ impl Settings {
         }
     }
 
+    /// Whether the model sees the request-only compaction tool. Project-safe:
+    /// it schedules the existing governor and grants no provider, filesystem,
+    /// shell, or approval capability.
+    pub(crate) fn compaction_model_tool(&self) -> bool {
+        self.compaction
+            .as_ref()
+            .and_then(|value| value.model_tool)
+            .unwrap_or(false)
+    }
+
     /// Whether opt-in microcompaction is enabled (ADR-0048, #378). Default off
     /// (absent/false), so a session folds spent tool results only when the user
     /// (or a project file) turns it on. The harness reads this once at startup;
@@ -1745,6 +1755,19 @@ mod tests {
             settings.compaction_provider_native().unwrap(),
             ProviderNativeMode::Auto
         );
+    }
+
+    #[test]
+    fn compaction_model_tool_defaults_off_and_project_may_enable_it() {
+        assert!(!Settings::default().compaction_model_tool());
+
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(&global, r#"{ "compaction": { "modelTool": false } }"#).unwrap();
+        fs::write(&project, r#"{ "compaction": { "modelTool": true } }"#).unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        assert!(settings.compaction_model_tool());
     }
 
     #[test]

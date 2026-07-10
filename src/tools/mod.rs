@@ -38,6 +38,7 @@ mod read;
 mod read_output;
 pub(crate) mod recall;
 mod registry;
+mod request_compaction;
 mod skim;
 mod text;
 mod write;
@@ -97,6 +98,10 @@ pub(crate) struct ToolState {
     /// it is a per-run value with no process-global mutable state -- parallel
     /// tests each carry their own and never race on it.
     pub(crate) reduce_output: bool,
+    /// One-shot model request consumed only by Wayland's context governor at a
+    /// pair-closed boundary. Shared atomically with the compaction engine so
+    /// the concrete tool sets intent but never owns context mutation.
+    pub(crate) compaction_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ToolState {
@@ -110,6 +115,7 @@ impl ToolState {
             // `with_reduce_output`, so the switch is structurally incapable of
             // leaking into a normal run -- no env var or global is consulted.
             reduce_output: true,
+            compaction_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -315,7 +321,7 @@ mod tests {
     fn bash_tool_mode_keeps_only_bash_edit_and_session_plumbing() {
         use super::built_in_tools_for;
         // Off is byte-identical to the default surface.
-        let off_tools = built_in_tools_for(false);
+        let off_tools = built_in_tools_for(false, false);
         let full_tools = built_in_tools();
         let off: Vec<&str> = off_tools.iter().map(|t| t.name()).collect();
         let full: Vec<&str> = full_tools.iter().map(|t| t.name()).collect();
@@ -323,7 +329,7 @@ mod tests {
         // On deactivates the shell-replaceable filesystem tools entirely: they
         // are absent from the registry (`by_name`), not merely hidden, so a
         // stray call fails as an unknown tool.
-        let on = built_in_tools_for(true);
+        let on = built_in_tools_for(true, false);
         let names: Vec<&str> = on.iter().map(|t| t.name()).collect();
         assert_eq!(names, vec!["bash", "edit", "read_output", "recall"]);
         for gone in ["read", "write", "grep", "find", "ls"] {

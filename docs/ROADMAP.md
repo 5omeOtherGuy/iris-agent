@@ -1470,7 +1470,11 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    and the Anthropic compact beta adapter. The route remains default-off: the
    required Haiku 4.5 live probe returned a provider `400 invalid_request_error`.
    OpenAI v2's live Codex mini probe succeeds but remains probe-only because its
-   opaque item has no portable text.
+   opaque item has no portable text. Slice 8 adds the default-off,
+   project-tunable `request_compaction` model tool. It only schedules the
+   existing governor, validates an empty argument object, and consumes one
+   request at the next safe continuation boundary even when automatic
+   thresholds are disabled.
 7. Prebuilt-binary distribution ([#199](https://github.com/5omeOtherGuy/iris-agent/issues/199),
    [#233](https://github.com/5omeOtherGuy/iris-agent/issues/233)) is wired and now
    validated locally ([#252](https://github.com/5omeOtherGuy/iris-agent/issues/252)):

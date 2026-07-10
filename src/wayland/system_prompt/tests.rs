@@ -278,7 +278,7 @@ fn available_tools_preserves_registration_order() {
 
 #[test]
 fn bash_tool_mode_prompt_advertises_shell_operations_not_native_file_tools() {
-    let tools = built_in_tools_for(true);
+    let tools = built_in_tools_for(true, false);
     let body = available_tools_body(&tools);
     for name in ["bash", "edit", "read_output", "recall"] {
         assert!(body.contains(&format!("- {name}:")), "missing tool {name}");

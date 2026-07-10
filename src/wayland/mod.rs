@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread;
 
@@ -394,6 +395,7 @@ impl<P: ChatProvider> Harness<P> {
         let skills = skills::SkillCatalog::load(&workspace, budget);
         let mut state = state;
         state.skill_read_roots = skills.resource_roots();
+        let model_compaction_requested = state.compaction_requested.clone();
         let last_skills_instructions = last_skills_instructions(agent.messages());
         // Stamp the current session id onto the guard up front (ADR-0031), so a
         // task adopted during startup recovery (before the first turn) records
@@ -405,7 +407,13 @@ impl<P: ChatProvider> Harness<P> {
             agent,
             workspace,
             state: RefCell::new(state),
-            compaction: CompactionEngine::new(session, persisted, entry_ids, budget),
+            compaction: CompactionEngine::new(
+                session,
+                persisted,
+                entry_ids,
+                budget,
+                model_compaction_requested,
+            ),
             skills,
             last_skills_instructions,
             reported_skill_warnings: HashSet::new(),
