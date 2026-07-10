@@ -31,6 +31,11 @@ const THINKING_LABEL: &str = "THINKING";
 /// Placeholder for reasoning the provider withheld; the original text is never
 /// available and is never rendered.
 const REDACTED_THINKING_BODY: &str = "[reasoning withheld by provider]";
+/// The live thinking body is a bounded **tail window** while it streams: only
+/// the last N wrapped rows show, under an honest `┊ … +N rows` elision, so a
+/// thousand-row reasoning trace reads as a ticker and never floods the pane
+/// (§7.4). `ctrl+o` opens the full live stream (spec §2.3).
+const LIVE_TAIL_ROWS: usize = 4;
 
 /// The always-visible footer row of a frameless block: the state label as the
 /// row's actor (no `┊` between it and what follows — a 2-space layout gap
@@ -102,37 +107,77 @@ fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
     }
 }
 
-/// Build the transient thinking-preview rows for live reasoning text: the
-/// `THINKING` rail header plus dim rail-body lines of the rendered markdown,
-/// ending in the orange `▋` live caret — the visible print head, which advances
-/// in even word-steps because the text feeding it is paced by the escapement
-/// (§7.4). Shown expanded (`▾ THINKING`) and whole while it streams — a live,
-/// growing trace shows everything, exactly as a running tool block stays open on
-/// its tail — then replaced by the committed block (caretless: the print head
-/// exists only while printing), which arrives collapsed, once the trace
-/// finalizes. The markdown is rendered at the same `content_width` the committed
-/// block uses, so finalizing never reflows the already-shown lines.
-fn live_reasoning_preview_rows(text: &str, content_width: usize) -> Vec<TranscriptRow> {
+/// Render the live reasoning body to physical (wrapped) rail lines, the orange
+/// `▋` live caret on the last row — the visible print head, which advances in
+/// even word-steps because the text feeding it is paced by the escapement
+/// (§7.4). Markdown is rendered at the same `content_width` the committed block
+/// uses (so finalizing never reflows), then each rail row is wrapped at the frame
+/// `width`. Shared by the tail-window builder and the ctrl+o foldability probe so
+/// the two always agree on the wrapped-row count.
+fn reasoning_preview_body_lines(
+    text: &str,
+    content_width: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
     let theme = MarkdownTheme::thinking()
         .with_code_highlighting()
         .with_hyperlinks();
-    let mut rows = Vec::new();
-    rows.push(TranscriptRow::chrome(ChromeRow::RailHeader {
-        expanded: true,
-        label: THINKING_LABEL.to_string(),
-        right: String::new(),
-        foldable: true,
-    }));
-    let mut lines = render_markdown_themed(text, &theme, content_width);
-    if let Some(last) = lines.last_mut() {
+    let mut md = render_markdown_themed(text, &theme, content_width);
+    if let Some(last) = md.last_mut() {
         last.spans
             .push(Span::styled(crate::ui::symbols::CARET, prompt_style()));
     }
-    for line in lines {
-        rows.push(rail_body_row(line));
+    let mut body = Vec::new();
+    for line in md {
+        rail_body_row(line).render_rows(width, &mut body);
     }
-    rows.push(TranscriptRow::chrome(ChromeRow::RailEnd));
-    rows
+    body
+}
+
+/// Build the transient live-reasoning preview as physical lines: the `THINKING`
+/// rail header (the lit `●` lamp + live `elapsed`), a bounded **tail window** of
+/// the last [`LIVE_TAIL_ROWS`] wrapped body rows under an honest `┊ … +N rows`
+/// elision when rows are hidden, the `▋` caret at the stream edge, then a
+/// trailing blank (the `RailEnd`). `full` (ctrl+o during streaming, §2.3) renders
+/// the whole live stream instead of the window; the block is foldable — and the
+/// header shows the `▾` arrow — only when the body exceeds the tail (nothing
+/// hidden ⇒ no arrow, no elision, no no-op affordance).
+fn live_reasoning_preview_lines(
+    text: &str,
+    content_width: usize,
+    width: usize,
+    elapsed: &str,
+    full: bool,
+) -> Vec<Line<'static>> {
+    let body = reasoning_preview_body_lines(text, content_width, width);
+    let foldable = body.len() > LIVE_TAIL_ROWS;
+    let hidden = if full {
+        0
+    } else {
+        body.len().saturating_sub(LIVE_TAIL_ROWS)
+    };
+    let mut out = Vec::new();
+    TranscriptRow::chrome(ChromeRow::RailHeader {
+        expanded: true,
+        label: THINKING_LABEL.to_string(),
+        right: elapsed.to_string(),
+        foldable,
+        lamp: true,
+    })
+    .render_rows(width, &mut out);
+    if hidden > 0 {
+        let noun = if hidden == 1 { "row" } else { "rows" };
+        rail_body_row(Line::from(Span::styled(
+            format!("\u{2026} +{hidden} {noun}"),
+            dim_style(),
+        )))
+        .render_rows(width, &mut out);
+    }
+    out.extend(body.into_iter().skip(hidden));
+    // The RailEnd: one blank line of breathing room (no border), matching the
+    // committed block's rail terminator.
+    out.push(Line::default());
+    out
 }
 
 /// The currently-streaming exec block (issue #90 sub-item 1). `bash` is
@@ -254,6 +299,13 @@ struct StreamingRender {
     /// assistant-answer active tail). The two sources are mutually exclusive per
     /// frame; the flag keeps a source switch from reusing a stale memo.
     is_reasoning: bool,
+    /// Reasoning-only: the ctrl+o tail-window/full-stream state these lines were
+    /// built for, so a fold toggle re-renders (answer path: always `false`).
+    full: bool,
+    /// Reasoning-only: the live `elapsed` readout baked into the header, so the
+    /// header re-renders as the counter ticks even when the body did not grow
+    /// (answer path: empty).
+    elapsed: String,
 }
 
 #[derive(Debug)]
@@ -301,6 +353,11 @@ pub(super) struct Transcript {
     /// The same pacing for the raw-reasoning channel (drains into
     /// `live_reasoning_raw`); summary and raw are distinct provider channels.
     raw_reasoning_escapement: Escapement,
+    /// ctrl+o intent for the LIVE reasoning preview (§2.3): `false` = the bounded
+    /// tail window (default), `true` = the full live stream. Remembered for the
+    /// live phase only — reset when the trace commits, so the settled block starts
+    /// from the standard fold state. Only meaningful while reasoning streams.
+    live_reasoning_full: bool,
     /// Reduced-motion posture (mirrors `Screen::reduced_motion`): when set, the
     /// stream escapements are bypassed so arrival renders immediately.
     reduced_motion: bool,
@@ -506,6 +563,8 @@ impl Transcript {
             label: THINKING_LABEL.to_string(),
             right: elapsed.unwrap_or_default(),
             foldable: has_distinct_expanded_body,
+            // Settled: the print head is gone, so the lamp is dark.
+            lamp: false,
         }));
         for (index, group) in collapsed_groups.into_iter().enumerate() {
             if index > 0 {
@@ -645,6 +704,9 @@ impl Transcript {
         self.flush_reasoning_escapements();
         let summary = self.live_reasoning_summary.take().unwrap_or_default();
         let raw = self.live_reasoning_raw.take().unwrap_or_default();
+        // The live phase is over: the committed block starts from the standard
+        // settled fold state, not the live ctrl+o intent (§2.3).
+        self.live_reasoning_full = false;
         if summary.is_empty() && raw.is_empty() {
             return;
         };
@@ -855,6 +917,35 @@ impl Transcript {
         self.stream.has_work()
             || !self.reasoning_escapement.is_empty()
             || !self.raw_reasoning_escapement.is_empty()
+    }
+
+    /// The live reasoning trace shown in the transient preview: the streamed
+    /// summary if any, else the raw channel — the same source preference the
+    /// committed block uses. `None` when no reasoning is streaming.
+    fn live_reasoning_text(&self) -> Option<&str> {
+        self.live_reasoning_summary
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| {
+                self.live_reasoning_raw
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+            })
+    }
+
+    /// Whether the live reasoning preview has a genuinely hidden body (its wrapped
+    /// rows exceed the tail window at the current width), so it participates in
+    /// `ctrl+o` as a foldable block. A trace of ≤ [`LIVE_TAIL_ROWS`] rows shows
+    /// whole and offers no no-op toggle (§2.3, the house rule).
+    fn live_reasoning_foldable(&self) -> bool {
+        let Some(text) = self.live_reasoning_text() else {
+            return false;
+        };
+        let content_width = self.markdown_content_width();
+        // `markdown_content_width` returns the content width the memo renders at
+        // (`frame − 2·pad`); reconstruct the frame width the rail rows wrap at.
+        let width = content_width + TEXT_COLUMN_X_PADDING.saturating_mul(2);
+        reasoning_preview_body_lines(text, content_width, width).len() > LIVE_TAIL_ROWS
     }
 
     /// Apply the reduced-motion posture to the live stream: pacing is motion, so
@@ -2847,24 +2938,40 @@ impl Transcript {
     /// ANY is currently collapsed, else collapse them all. Returns whether any
     /// header changed; dirties from the first affected row via
     /// [`Self::set_panel_expanded_at`].
+    ///
+    /// The LIVE reasoning preview participates as one more foldable block (§2.3):
+    /// its tail window is the "collapsed" position and the full live stream the
+    /// "expanded" one, so the same all-or-nothing decision opens or closes it in
+    /// step. It only joins when it has a genuinely hidden body (> tail rows) —
+    /// a short live trace offers no no-op toggle.
     pub(super) fn toggle_all_panels(&mut self) -> bool {
         let headers: Vec<usize> = self
             .panel_header_rows()
             .into_iter()
             .filter(|&header| self.header_is_foldable(header))
             .collect();
-        if headers.is_empty() {
+        let live_foldable = self.live_reasoning_foldable();
+        if headers.is_empty() && !live_foldable {
             return false;
         }
-        // Expand all if any foldable block is currently collapsed.
+        // Expand all if any foldable block is currently collapsed — the live
+        // preview counts as collapsed while it shows the bounded tail window.
         let expand = headers
             .iter()
-            .any(|&header| self.panel_expanded_at(header) == Some(false));
+            .any(|&header| self.panel_expanded_at(header) == Some(false))
+            || (live_foldable && !self.live_reasoning_full);
         let mut changed = false;
         for header in headers {
             if self.set_panel_expanded_at(header, expand) {
                 changed = true;
             }
+        }
+        if live_foldable && self.live_reasoning_full != expand {
+            self.live_reasoning_full = expand;
+            // The transient preview re-derives from the live buffers; drop the
+            // memo so the next frame renders the new tail-window/full-stream shape.
+            self.streaming_render = None;
+            changed = true;
         }
         changed
     }
@@ -3195,44 +3302,47 @@ impl Transcript {
                     width,
                     lines,
                     is_reasoning: false,
+                    full: false,
+                    elapsed: String::new(),
                 });
             }
             return;
         }
-        let preview_text = self
-            .live_reasoning_summary
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-            .or_else(|| {
-                self.live_reasoning_raw
-                    .as_deref()
-                    .filter(|text| !text.trim().is_empty())
+        // The live reasoning header carries a live `elapsed` readout that ticks
+        // even when the body has not grown, and the tail window/full-stream state
+        // flips on ctrl+o — so both join the memo key alongside the buffer length.
+        let elapsed = self
+            .provider_turn_started
+            .map(|started| format_elapsed_compact(started.elapsed()))
+            .unwrap_or_default();
+        let full = self.live_reasoning_full;
+        // Key on both buffers: either stream can grow, so a longer buffer means
+        // new content to re-render.
+        let key = (
+            self.live_reasoning_summary.as_deref().map_or(0, str::len),
+            self.live_reasoning_raw.as_deref().map_or(0, str::len),
+        );
+        if let Some(text) = self.live_reasoning_text() {
+            let fresh = self.streaming_render.as_ref().is_some_and(|memo| {
+                memo.is_reasoning
+                    && memo.key == key
+                    && memo.width == width
+                    && memo.full == full
+                    && memo.elapsed == elapsed
             });
-        if let Some(text) = preview_text {
-            // Key on both buffers: either stream can grow, so a longer buffer
-            // means new content to re-render.
-            let key = (
-                self.live_reasoning_summary.as_deref().map_or(0, str::len),
-                self.live_reasoning_raw.as_deref().map_or(0, str::len),
-            );
-            let fresh = self
-                .streaming_render
-                .as_ref()
-                .is_some_and(|memo| memo.is_reasoning && memo.key == key && memo.width == width);
             if !fresh {
                 let content_width = width
                     .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
                     .max(1);
-                let rows = live_reasoning_preview_rows(text, content_width);
-                let mut lines = Vec::new();
-                for row in &rows {
-                    row.render_rows(width, &mut lines);
-                }
+                let lines =
+                    live_reasoning_preview_lines(text, content_width, width, &elapsed, full);
                 self.streaming_render = Some(StreamingRender {
                     key,
                     width,
                     lines,
                     is_reasoning: true,
+                    full,
+                    elapsed,
                 });
             }
             return;

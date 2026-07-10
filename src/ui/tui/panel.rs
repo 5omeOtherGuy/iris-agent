@@ -55,6 +55,7 @@ fn frameless_header_line(
     arrow: Option<&str>,
     label: &str,
     label_style: Style,
+    lamp: Option<&str>,
     meta: &str,
     right: &str,
 ) -> Line<'static> {
@@ -71,6 +72,11 @@ fn frameless_header_line(
         // the hierarchy lever (DESIGN-LANGUAGE: label = bold).
         Span::styled(label.to_string(), label_style),
     ];
+    // The live-receiving lamp (`●`, orange) rides right after the label: a state
+    // light, not a motion — lit while reasoning streams, dropped on commit (§7.4).
+    if let Some(lamp) = lamp {
+        left.push(Span::styled(format!(" {lamp}"), prompt_style()));
+    }
     let meta = strip_ansi_for_text(meta);
     if !meta.is_empty() {
         left.push(Span::styled(format!("  {meta}"), dim_style()));
@@ -120,6 +126,7 @@ pub(super) fn panel_header_line(
         Some(arrow),
         title,
         panel_style().add_modifier(Modifier::BOLD),
+        None,
         meta,
         elapsed,
     )
@@ -203,12 +210,15 @@ pub(super) fn panel_body_lines(
 /// tools scan on one grid; only the muted label tone and the `┊` body rail
 /// (ThinkingBlock) mark it as recessive. No box. A non-foldable (short) block
 /// drops the disclosure arrow but keeps the gutter, so its label stays put.
+/// `lamp` lights a static orange `●` after the label while reasoning streams
+/// (the live-receiving lamp, §7.4); the settled block passes `false`.
 pub(super) fn rail_header_line(
     width: usize,
     expanded: bool,
     foldable: bool,
     label: &str,
     right: &str,
+    lamp: bool,
 ) -> Line<'static> {
     let arrow = foldable.then_some(if expanded {
         symbols::EXPANDED
@@ -220,6 +230,7 @@ pub(super) fn rail_header_line(
         arrow,
         label,
         dim_style().add_modifier(Modifier::BOLD),
+        lamp.then_some(symbols::RUNNING),
         "",
         right,
     )
@@ -879,7 +890,14 @@ mod tests {
         // the disclosure gutter (col 2), the label column (col 4), and the right
         // rail (width−2) line up exactly.
         let tool = line_text(&panel_header_line(80, true, "EXPLORE", "", "1.2s"));
-        let rail = line_text(&rail_header_line(80, true, true, "THINKING", "↓2.4k 12s"));
+        let rail = line_text(&rail_header_line(
+            80,
+            true,
+            true,
+            "THINKING",
+            "↓2.4k 12s",
+            false,
+        ));
         assert!(tool.starts_with("  \u{25be} EXPLORE"), "{tool:?}");
         assert!(rail.starts_with("  \u{25be} THINKING"), "{rail:?}");
         assert_eq!(display_width(tool.trim_end()), 78, "{tool:?}");
@@ -887,7 +905,35 @@ mod tests {
         assert!(tool.trim_end().ends_with("1.2s"), "{tool:?}");
         assert!(rail.trim_end().ends_with("12s"), "{rail:?}");
         // A non-foldable short trace keeps the gutter, so its label stays put.
-        let short = line_text(&rail_header_line(80, true, false, "THINKING", ""));
+        let short = line_text(&rail_header_line(80, true, false, "THINKING", "", false));
         assert!(short.starts_with("    THINKING"), "{short:?}");
+    }
+
+    #[test]
+    fn live_rail_header_lights_an_orange_lamp_after_the_label() {
+        // §7.4: while reasoning streams the header carries a static orange `●`
+        // lamp right after the label, plus the live elapsed on the right rail.
+        let line = rail_header_line(80, true, true, "THINKING", "14s", true);
+        let text = line_text(&line);
+        assert!(text.starts_with("  \u{25be} THINKING \u{25cf}"), "{text:?}");
+        assert!(text.trim_end().ends_with("14s"), "{text:?}");
+        // The lamp is the orange accent (a point signal), never the muted label
+        // tone — a state light paired with its symbol.
+        let lamp = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains('\u{25cf}'))
+            .expect("a lamp span");
+        assert_eq!(
+            lamp.style.fg,
+            Some(crate::ui::palette::orange()),
+            "the lamp is the orange accent"
+        );
+        // Unlit (settled) carries no lamp.
+        let settled = line_text(&rail_header_line(80, true, true, "THINKING", "14s", false));
+        assert!(
+            !settled.contains('\u{25cf}'),
+            "no lamp when unlit: {settled}"
+        );
     }
 }

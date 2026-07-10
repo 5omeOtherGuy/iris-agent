@@ -305,6 +305,9 @@ pub(super) enum ChromeRow {
         /// Whether the block folds (drives the `▾`/`▸` disclosure arrow; a
         /// short trace shown whole has no arrow and ignores ctrl+o).
         foldable: bool,
+        /// The live-receiving lamp: a static orange `●` after the label while
+        /// reasoning streams (§7.4). Drops when the block commits.
+        lamp: bool,
     },
     /// The end marker of a reasoning rail — the rail analogue of `Bottom`. Bounds
     /// the block for `panel_end_from`/the visibility reset and renders as a single
@@ -384,7 +387,8 @@ impl ChromeRow {
                 label,
                 right,
                 foldable,
-            } => rail_header_line(width, *expanded, *foldable, label, right),
+                lamp,
+            } => rail_header_line(width, *expanded, *foldable, label, right, *lamp),
             ChromeRow::RailEnd => Line::default(),
         }
     }

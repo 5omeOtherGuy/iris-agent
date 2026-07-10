@@ -367,8 +367,10 @@ itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
      so pacing changes *when* a word shows, never *what* the finished message
      says.
   No braille spinners, no rainbow meters, no easing, no fades, no ambient
-  motion. Everything above degrades to its **static settled state** under
-  `prefers-reduced-motion: reduce` / `IRIS_REDUCED_MOTION` — for the
+  motion. The live-reasoning `●` lamp (§7.4) is a **state light, not a motion** —
+  a static glyph, either lit (receiving) or dark (settled) — so it adds no new
+  entry to this closed set. Everything above degrades to its **static settled
+  state** under `prefers-reduced-motion: reduce` / `IRIS_REDUCED_MOTION` — for the
   escapement, reduced motion is a **pass-through**: streamed text renders on
   arrival, the raw truth.
 - **Interaction states are quiet.** Hover/selected rows in overlays use the
@@ -436,12 +438,22 @@ tool block's geometry** (§4, §8.1): the disclosure `▾`/`▸` sits in the gut
 grid, and the readout is never inset further than a tool's elapsed. Only the
 muted label tone and the `┊` body rail (at col 4, its text hanging at col 6) mark
 it as recessive. Folds by default (progressive disclosure); `ctrl+o` / header
-toggles `▾`⇄`▸`. Live reasoning pulses (`●` in the label, `▋` caret at the tail);
-live reasoning text feeds through the escapement (§6 motion 6), so the caret
-steps evenly in word-quanta on the tick grid instead of jumping on network
-bursts. Finished reasoning may collapse to a line + token count. Short reasoning
-is shown whole and is not foldable (the arrow drops, but the gutter stays so the
-label holds its column).
+toggles `▾`⇄`▸`. While reasoning streams the header carries a **static orange
+`●` lamp** after the label (lit = receiving — a state light, not a motion; the
+moving text and caret carry the liveness) and a **live elapsed** readout on the
+right rail (the live counterpart of the settled `↓tokens elapsed`, and the only
+number honestly available live). Its live body is a bounded **tail window** — the
+last four wrapped rows on the `┊` rail, the bottom row ending in the `▋` caret at
+the stream edge — under a single honest `┊ … +N rows` elision counting the rows
+currently hidden (a readout, not a button). The live text feeds through the
+escapement (§6 motion 6), so the caret steps evenly in word-quanta on the tick
+grid instead of jumping on network bursts. `ctrl+o` opens the full live stream
+(window ⇄ full, remembered for the live phase only); a live trace of ≤ four rows
+shows whole and is not foldable. On commit the lamp drops and the block settles
+to the standard fold state (the caret exists only while printing). Finished
+reasoning may collapse to a line + token count. Short reasoning is shown whole and
+is not foldable (the arrow drops, but the gutter stays so the label holds its
+column).
 
 ### 7.5 Plan list
 The agent's task checklist. **Unboxed** (narration, not a tool event): a muted
