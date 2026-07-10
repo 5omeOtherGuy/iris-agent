@@ -5189,9 +5189,12 @@ fn auto_compaction_emits_typed_event_with_ids_and_token_estimates() -> Result<()
                 covered_messages,
                 original_tokens_estimate,
                 summary_tokens_estimate,
+                context_tokens_after_apply: _,
                 budget,
                 generation,
                 carried_paths: _,
+                origin: _,
+                worker_usage: _,
             } => Some((
                 compaction_id,
                 covered_from,

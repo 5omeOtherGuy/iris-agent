@@ -186,16 +186,19 @@ impl SessionLog {
         carry_paths: &[String],
         token_estimate: Option<u64>,
     ) -> Result<String> {
-        self.append_compaction_with_task_state(
+        self.append_compaction_with_metadata(
             covered_from,
             covered_to,
             summary,
             carry_paths,
             None,
             token_estimate,
+            crate::nexus::CompactionOrigin::Excerpts,
+            None,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn append_compaction_with_task_state(
         &mut self,
         covered_from: &str,
@@ -204,6 +207,30 @@ impl SessionLog {
         carry_paths: &[String],
         task_state: Option<&CompactionTaskState>,
         token_estimate: Option<u64>,
+    ) -> Result<String> {
+        self.append_compaction_with_metadata(
+            covered_from,
+            covered_to,
+            summary,
+            carry_paths,
+            task_state,
+            token_estimate,
+            crate::nexus::CompactionOrigin::Excerpts,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_compaction_with_metadata(
+        &mut self,
+        covered_from: &str,
+        covered_to: &str,
+        summary: &str,
+        carry_paths: &[String],
+        task_state: Option<&CompactionTaskState>,
+        token_estimate: Option<u64>,
+        origin: crate::nexus::CompactionOrigin,
+        worker_usage: Option<&crate::nexus::ProviderUsage>,
     ) -> Result<String> {
         let id = self.next_id();
         // Generation ordinal (ADR-0047): 1-based count of compactions in this
@@ -229,6 +256,8 @@ impl SessionLog {
             // it is recomputable from compaction-entry order, so its absence
             // never changes how a pre-ADR-0047 session rebuilds.
             "generation": generation,
+            "origin": origin.as_str(),
+            "workerUsage": worker_usage,
         });
         // Additive optional carry (ADR-0044): only written when non-empty, so an
         // empty carry leaves the serialized entry byte-identical to a pre-carry
@@ -1861,7 +1890,7 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nexus::{Message, ModelOrigin, ToolCall};
+    use crate::nexus::{CompactionOrigin, Message, ModelOrigin, ProviderUsage, ToolCall};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct TempDir {
@@ -3059,6 +3088,50 @@ mod tests {
         assert!(entry["tokenEstimate"].is_null());
         // The first compaction in the session persists generation 1 (ADR-0047).
         assert_eq!(entry["generation"], 1);
+        assert_eq!(entry["origin"], "excerpts");
+        assert!(entry["workerUsage"].is_null());
+    }
+
+    #[test]
+    fn append_compaction_persists_worker_usage_and_origin() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        let usage = ProviderUsage {
+            provider: "anthropic".to_string(),
+            model: "claude-haiku-4-5".to_string(),
+            input_tokens: 120,
+            output_tokens: 30,
+            cache_read_input_tokens: 80,
+            cache_write_input_tokens: 20,
+            reasoning_output_tokens: 0,
+            total_tokens: 150,
+            cache_creation: None,
+        };
+
+        log.append_compaction_with_metadata(
+            &from,
+            &to,
+            "summary text",
+            &[],
+            None,
+            None,
+            CompactionOrigin::Subagent,
+            Some(&usage),
+        )
+        .unwrap();
+
+        let entries = lines(log.path());
+        let entry = entries.last().unwrap();
+        assert_eq!(entry["origin"], "subagent");
+        assert_eq!(entry["workerUsage"]["provider"], "anthropic");
+        assert_eq!(entry["workerUsage"]["model"], "claude-haiku-4-5");
+        assert_eq!(entry["workerUsage"]["inputTokens"], 120);
+        assert_eq!(entry["workerUsage"]["outputTokens"], 30);
+        assert_eq!(entry["workerUsage"]["cacheReadInputTokens"], 80);
+        assert_eq!(entry["workerUsage"]["cacheWriteInputTokens"], 20);
+        assert_eq!(entry["workerUsage"]["totalTokens"], 150);
     }
 
     #[test]

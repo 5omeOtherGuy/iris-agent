@@ -110,7 +110,8 @@
   OpenAI Codex additionally supports `IRIS_MODEL` and `IRIS_CODEX_BASE_URL` env
   overrides. `contextTokenBudget` configures the auto-compaction threshold,
   `compactionSummarizer` picks who writes compaction summaries
-  (`provider`/`excerpts`), `defaultReasoning` sets startup thinking/effort, and
+  (`subagent`/`provider`/`excerpts`), `defaultReasoning` sets startup
+  thinking/effort, and
   `enabledModels` scopes Ctrl+P model cycling from global/user config only.
   [Partial]
 - **Provider-native prompt cache controls** — global-only `promptCacheRetention`
@@ -130,7 +131,8 @@
   recoverable from session JSONL with `recall(tool_call_id="...")`. Four cache
   timing policies choose explicit breaks, inferred-cold windows, pressure, or
   immediate safe boundaries. The legacy `microcompaction` setting resolves to
-  the conservative policy. [Implemented]
+  the ADR-0048 conservative `toolResultCompaction` policy and retains its
+  independent 64,000-token watermark. [Implemented]
 - **Anthropic-native tool clearing** — explicit `anthropicNative` or `auto`
   backends map the public `clear_tool_uses_20250919` trigger, keep, minimum,
   excluded-tool, and tool-input controls. Provider selection rejects overlapping
@@ -292,13 +294,13 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   Wayland harness compacts at safe turn boundaries, retaining recent context and
   preserving tool-call/result pairs. Branch-aware compaction is planned later.
   [Implemented]
-- **Provider-backed summaries** — the default `compactionSummarizer: provider`
-  asks the active model for a structured handoff summary (goal, state, key
-  facts, next steps), reusing the cached context prefix and normal tool
-  declarations; failures, empty answers, or non-shrinking summaries fall back
-  to the deterministic bounded excerpts (`compactionSummarizer: excerpts` keeps
-  the deterministic stand-in only). Cancellation skips compaction for the turn.
-  (ADR-0041) [Implemented]
+- **Background summaries** — the default `compactionSummarizer: subagent` uses
+  a read-only worker and falls back through a direct provider request to
+  deterministic bounded excerpts. The parent alone validates, persists, and
+  applies the summary. Compaction entries and events record the provider-neutral
+  origin plus reported worker token/cache usage. `provider` skips the read-only
+  worker; `excerpts` makes the deterministic floor explicit. Cancellation skips
+  compaction for the turn. (ADR-0041) [Implemented]
 - **Manual `/compact`** — compacts on demand at the inter-turn boundary in the
   TUI (turn-style spinner, Ctrl-C cancel) and the text path, keeping a small
   recent tail and reporting the token shrink; works without a budget.

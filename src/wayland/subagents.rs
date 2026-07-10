@@ -120,6 +120,8 @@ pub(crate) struct SubagentResult {
     pub(crate) summary: String,
     pub(crate) output_handles: Vec<SubagentOutputHandle>,
     pub(crate) events: Vec<SubagentLifecycleEvent>,
+    /// Aggregate usage across the worker's provider round trips when reported.
+    pub(crate) usage: Option<crate::nexus::ProviderUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,7 +237,7 @@ impl<P: ChatProvider> SubagentBackend<P> {
         let agent = Agent::new(provider, tools)
             .with_max_tool_roundtrips(request.budgets.max_tool_roundtrips);
         let mut harness = Harness::new(agent, workspace, ToolState::new(), None, None);
-        let observer = ChildObserver;
+        let observer = ChildObserver::default();
         let gate = DenyGate;
         let run = harness
             .submit_turn(&request.prompt, &observer, &gate, &token)
@@ -266,6 +268,7 @@ impl<P: ChatProvider> SubagentBackend<P> {
                     summary,
                     output_handles: Vec::new(),
                     events: worker.events.clone(),
+                    usage: observer.usage.borrow().clone(),
                 };
                 worker.result = Some(result.clone());
                 Ok(result)
@@ -280,6 +283,7 @@ impl<P: ChatProvider> SubagentBackend<P> {
                     summary: message,
                     output_handles: Vec::new(),
                     events: worker.events.clone(),
+                    usage: observer.usage.borrow().clone(),
                 };
                 worker.result = Some(result.clone());
                 Ok(result)
@@ -304,6 +308,7 @@ impl<P> Worker<P> {
             summary: summary.to_string(),
             output_handles: Vec::new(),
             events: self.events.clone(),
+            usage: None,
         }
     }
 
@@ -392,11 +397,53 @@ fn final_assistant_text(messages: &[Message]) -> String {
 }
 
 #[derive(Default)]
-struct ChildObserver;
+struct ChildObserver {
+    usage: RefCell<Option<crate::nexus::ProviderUsage>>,
+}
 
 impl AgentObserver for ChildObserver {
-    fn on_event(&self, _event: AgentEvent) -> Result<()> {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        if let AgentEvent::ProviderTurnCompleted {
+            usage: Some(usage), ..
+        } = event
+        {
+            let mut total = self.usage.borrow_mut();
+            match total.as_mut() {
+                Some(total) => merge_provider_usage(total, &usage),
+                None => *total = Some(usage),
+            }
+        }
         Ok(())
+    }
+}
+
+fn merge_provider_usage(
+    total: &mut crate::nexus::ProviderUsage,
+    usage: &crate::nexus::ProviderUsage,
+) {
+    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+    total.cache_read_input_tokens = total
+        .cache_read_input_tokens
+        .saturating_add(usage.cache_read_input_tokens);
+    total.cache_write_input_tokens = total
+        .cache_write_input_tokens
+        .saturating_add(usage.cache_write_input_tokens);
+    total.reasoning_output_tokens = total
+        .reasoning_output_tokens
+        .saturating_add(usage.reasoning_output_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+    match (&mut total.cache_creation, &usage.cache_creation) {
+        (Some(total), Some(usage)) => {
+            total.ephemeral_5m_input_tokens = total
+                .ephemeral_5m_input_tokens
+                .saturating_add(usage.ephemeral_5m_input_tokens);
+            total.ephemeral_1h_input_tokens = total
+                .ephemeral_1h_input_tokens
+                .saturating_add(usage.ephemeral_1h_input_tokens);
+        }
+        (slot @ None, Some(usage)) => *slot = Some(usage.clone()),
+        _ => {}
     }
 }
 
