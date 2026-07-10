@@ -45,7 +45,14 @@ OpenAI Codex uses a `compaction_trigger` input item to obtain one encrypted
 compaction item. Because that item is opaque, the same worker makes a separate
 Responses request for a portable text summary before returning success. A
 native request rejected for a model disables that capability for the process;
-the portable provider worker remains available.
+the portable provider worker remains available. The two requests share the
+normal retry and one-refresh authentication policy, and their reported usage is
+combined on the durable compaction entry. OpenAI publishes no minimum input
+floor for this route, so the model-aware Wayland ladder owns timing.
+
+For both native adapters, an ordinary unsupported-feature `400` disables the
+model for the process. A classified context-overflow `400` does not: overflow
+describes this request size, not a missing model capability.
 
 ## Alternatives Considered
 
