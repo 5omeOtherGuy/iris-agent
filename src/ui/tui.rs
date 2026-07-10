@@ -7378,6 +7378,7 @@ mod tests {
             compaction_start_pct: 72,
             compaction_hard_pct: 90,
             compaction_keep_recent_tokens: 8_000,
+            compaction_hard_wait_ms: 120_000,
             compaction_reactive: true,
             compaction_worker_input: "transcript".to_string(),
             resolved_ladder: None,
@@ -7451,7 +7452,7 @@ mod tests {
         // session bar) and the window scrolls with the house position row.
         assert!(rendered.contains("SETTINGS"), "{rendered}");
         assert!(rendered.contains("ENGINE"), "{rendered}");
-        assert!(rendered.contains("(1/30)"), "{rendered}");
+        assert!(rendered.contains("(1/31)"), "{rendered}");
         assert!(!rendered.contains("worktree root"), "windowed:\n{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }

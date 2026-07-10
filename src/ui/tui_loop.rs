@@ -5502,6 +5502,7 @@ mod tests {
             compaction_start_pct: 72,
             compaction_hard_pct: 90,
             compaction_keep_recent_tokens: 8_000,
+            compaction_hard_wait_ms: 120_000,
             compaction_reactive: true,
             compaction_worker_input: "transcript".to_string(),
             resolved_ladder: None,

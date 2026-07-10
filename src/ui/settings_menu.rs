@@ -88,6 +88,7 @@ pub(crate) enum Field {
     CompactionStart,
     CompactionHard,
     CompactionKeepRecentTokens,
+    CompactionHardWait,
     CompactionReactive,
     CompactionSummarizer,
     CompactionWorkerInput,
@@ -217,6 +218,7 @@ const SECTIONS: &[Section] = &[
             RowId::Field(Field::CompactionStart),
             RowId::Field(Field::CompactionHard),
             RowId::Field(Field::CompactionKeepRecentTokens),
+            RowId::Field(Field::CompactionHardWait),
             RowId::Field(Field::CompactionReactive),
             RowId::Field(Field::CompactionSummarizer),
             RowId::Field(Field::CompactionWorkerInput),
@@ -269,6 +271,11 @@ const WATERMARK_LADDER: [u64; 10] = [
 const TAIL_LADDER: [u64; 10] = [
     2_000, 4_000, 6_000, 8_000, 12_000, 16_000, 24_000, 32_000, 48_000, 64_000,
 ];
+/// Hard-tier bounded-wait detents for `compaction.hardWaitMs`, in 30 s steps
+/// from 30 s to the 300 s (5 min) cap. The default 120000 ms is step 4.
+const HARD_WAIT_LADDER: [u64; 10] = [
+    30_000, 60_000, 90_000, 120_000, 150_000, 180_000, 210_000, 240_000, 270_000, 300_000,
+];
 /// Whole-percent detents for the warn/start/hard threshold dials. The printed
 /// value is always the honest percent; the ladder only drives the LED fill and
 /// the neighbouring-detent step.
@@ -286,6 +293,9 @@ fn dial_bounds(field: Field) -> (u64, u64) {
         // enforced by the config save, which restores the persisted value on a
         // rejected combination.
         Field::CompactionWarn | Field::CompactionStart | Field::CompactionHard => (1, 99),
+        // Hard wait clamps to the ladder span; the config save clamps to the
+        // same 300000 ms cap independently.
+        Field::CompactionHardWait => (30_000, 300_000),
         Field::ScrollSpeed => (1, 100),
         Field::VerifyMaxAttempts => (1, 10),
         _ => (0, u64::MAX),
@@ -298,6 +308,7 @@ fn ladder(field: Field) -> &'static [u64] {
         Field::MicrocompactionWatermark => &WATERMARK_LADDER,
         Field::CompactionKeepRecentTokens => &TAIL_LADDER,
         Field::CompactionWarn | Field::CompactionStart | Field::CompactionHard => &PERCENT_LADDER,
+        Field::CompactionHardWait => &HARD_WAIT_LADDER,
         _ => &UNIT_LADDER,
     }
 }
@@ -405,6 +416,8 @@ pub(crate) struct Snapshot {
     pub(crate) compaction_hard_pct: u64,
     /// The configured protected-tail size (`compaction.keepRecentTokens`).
     pub(crate) compaction_keep_recent_tokens: u64,
+    /// The hard-tier bounded wait in milliseconds (`compaction.hardWaitMs`).
+    pub(crate) compaction_hard_wait_ms: u64,
     /// Reactive deterministic-recovery toggle (`compaction.reactive`).
     pub(crate) compaction_reactive: bool,
     /// Background worker input mode (`compaction.worker.input`).
@@ -501,6 +514,7 @@ impl Snapshot {
             Field::CompactionStart => self.compaction_start_pct,
             Field::CompactionHard => self.compaction_hard_pct,
             Field::CompactionKeepRecentTokens => self.compaction_keep_recent_tokens,
+            Field::CompactionHardWait => self.compaction_hard_wait_ms,
             Field::SemanticRetainPerPath => self.semantic_retain_per_path,
             Field::ToolClearingKeepRecent => self.tool_clearing_keep_recent,
             Field::ScrollSpeed => u64::from(self.scroll_speed),
@@ -517,6 +531,9 @@ impl Snapshot {
             Field::CompactionStart => self.compaction_start_pct = value.clamp(1, 99),
             Field::CompactionHard => self.compaction_hard_pct = value.clamp(1, 99),
             Field::CompactionKeepRecentTokens => self.compaction_keep_recent_tokens = value.max(1),
+            Field::CompactionHardWait => {
+                self.compaction_hard_wait_ms = value.clamp(30_000, 300_000)
+            }
             Field::SemanticRetainPerPath => self.semantic_retain_per_path = value.max(1),
             Field::ToolClearingKeepRecent => self.tool_clearing_keep_recent = value.max(1),
             Field::ScrollSpeed => self.scroll_speed = value.min(u64::from(u16::MAX)) as u16,
@@ -579,6 +596,7 @@ fn archetype(row: RowId) -> Archetype {
             | Field::CompactionStart
             | Field::CompactionHard
             | Field::CompactionKeepRecentTokens
+            | Field::CompactionHardWait
             | Field::SemanticRetainPerPath
             | Field::ToolClearingKeepRecent
             | Field::ScrollSpeed
@@ -613,6 +631,7 @@ fn label(row: RowId) -> &'static str {
             Field::CompactionStart => "start at",
             Field::CompactionHard => "hard at",
             Field::CompactionKeepRecentTokens => "retain tail",
+            Field::CompactionHardWait => "hard wait",
             Field::CompactionReactive => "reactive",
             Field::CompactionSummarizer => "summarizer",
             Field::CompactionWorkerInput => "worker input",
@@ -627,6 +646,27 @@ fn label(row: RowId) -> &'static str {
             Field::VerifyMaxAttempts => "attempts",
             Field::WorktreeRoot => "worktree root",
         },
+    }
+}
+
+/// A dial's printed value, in the field's own idiom. Most dials print the house
+/// count token (`232k`); the hard-wait dial prints a duration (`2m`, `90s`) so
+/// the milliseconds read as a wall-clock the operator judges the turn-block by.
+fn dial_value_label(field: Field, value: u64) -> String {
+    match field {
+        Field::CompactionHardWait => hard_wait_label(value),
+        _ => compact_value(value),
+    }
+}
+
+/// A hard-wait duration in the terse house idiom: whole minutes print `Nm`
+/// (`120000` -> `2m`), otherwise bare seconds `Ns` (`90000` -> `90s`).
+fn hard_wait_label(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    if seconds != 0 && seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -1814,6 +1854,7 @@ impl SettingsPanel {
                 | Field::CompactionStart
                 | Field::CompactionHard
                 | Field::CompactionKeepRecentTokens
+                | Field::CompactionHardWait
                 | Field::CompactionReactive
                 | Field::CompactionSummarizer
                 | Field::CompactionWorkerInput,
@@ -2019,6 +2060,7 @@ impl SettingsPanel {
                         spans,
                         ladder(field),
                         value,
+                        &dial_value_label(field, value),
                         dial_unit(field),
                         flashing,
                         inert,
@@ -2493,6 +2535,7 @@ fn push_dial(
     spans: &mut Vec<Span<'static>>,
     ladder: &[u64],
     value: u64,
+    value_label: &str,
     unit: &str,
     flashing: bool,
     inert: bool,
@@ -2523,7 +2566,7 @@ fn push_dial(
     if flashing {
         value_style = value_style.add_modifier(Modifier::BOLD);
     }
-    spans.push(Span::styled(compact_value(value), value_style));
+    spans.push(Span::styled(value_label.to_string(), value_style));
     if !unit.is_empty() {
         spans.push(Span::styled(unit.to_string(), dim()));
     }
@@ -2644,6 +2687,7 @@ mod tests {
             compaction_start_pct: 72,
             compaction_hard_pct: 90,
             compaction_keep_recent_tokens: 8_000,
+            compaction_hard_wait_ms: 120_000,
             compaction_reactive: true,
             compaction_worker_input: "transcript".to_string(),
             resolved_ladder: Some(ResolvedLadder {
@@ -2733,12 +2777,15 @@ mod tests {
         assert!(rendered.contains("start at"), "{rendered}");
         assert!(rendered.contains("hard at"), "{rendered}");
         assert!(rendered.contains("retain tail"), "{rendered}");
+        assert!(rendered.contains("hard wait"), "{rendered}");
         assert!(rendered.contains("reactive"), "{rendered}");
         assert!(rendered.contains("worker input"), "{rendered}");
         // Percent dials print the honest percent + `%` unit.
         assert!(rendered.contains("60%"), "{rendered}");
         assert!(rendered.contains("72%"), "{rendered}");
         assert!(rendered.contains("90%"), "{rendered}");
+        // The hard-wait dial prints its default (120000 ms) as a duration.
+        assert!(rendered.contains("2m"), "{rendered}");
         // The renamed context-cap row and tool-result labels.
         assert!(rendered.contains("context cap"), "{rendered}");
         assert!(rendered.contains("tool result compaction"), "{rendered}");
@@ -2812,6 +2859,7 @@ mod tests {
         // The dependent knobs are inert; the master switch never is.
         assert!(panel.is_inert(RowId::Field(Field::CompactionWarn)));
         assert!(panel.is_inert(RowId::Field(Field::CompactionKeepRecentTokens)));
+        assert!(panel.is_inert(RowId::Field(Field::CompactionHardWait)));
         assert!(panel.is_inert(RowId::Field(Field::CompactionReactive)));
         assert!(panel.is_inert(RowId::Field(Field::CompactionSummarizer)));
         assert!(panel.is_inert(RowId::Field(Field::CompactionWorkerInput)));
@@ -2940,6 +2988,50 @@ mod tests {
         assert!(panel.edit.as_ref().is_some_and(|e| e.error.is_some()));
         assert_eq!(panel.handle_key(ModalKey::Esc), ModalOutcome::Redraw);
         assert!(panel.edit.is_none());
+    }
+
+    #[test]
+    fn hard_wait_dial_steps_persist_milliseconds_and_render_duration() {
+        let mut panel = panel();
+        select_top(&mut panel, RowId::Field(Field::CompactionHardWait));
+        // The default lands on step 4 (120000 ms); one click right is step 5.
+        assert_eq!(
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::CompactionHardWait,
+                value: Some("150000".to_string()),
+            })
+        );
+        assert_eq!(panel.snap.compaction_hard_wait_ms, 150_000);
+        // Non-whole-minute detents print bare seconds; whole minutes print `Nm`.
+        assert!(text(&panel.render_budgeted(120, 80)).contains("150s"));
+        panel.snap.compaction_hard_wait_ms = 300_000;
+        // At the 300000 ms cap the dial is pinned; right is a no-op, and the
+        // value renders as `5m`.
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+        assert!(text(&panel.render_budgeted(120, 80)).contains("5m"));
+    }
+
+    #[test]
+    fn hard_wait_dial_enter_clamps_a_typed_value_to_the_cap() {
+        let mut panel = panel();
+        select_top(&mut panel, RowId::Field(Field::CompactionHardWait));
+        assert_eq!(panel.handle_key(ModalKey::Enter), ModalOutcome::Redraw);
+        for _ in 0.."120000".len() {
+            panel.handle_key(ModalKey::Backspace);
+        }
+        for ch in "999999".chars() {
+            panel.handle_key(ModalKey::Char(ch));
+        }
+        // A hand-typed value past the cap clamps to 300000 ms before it persists.
+        assert_eq!(
+            panel.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::CompactionHardWait,
+                value: Some("300000".to_string()),
+            })
+        );
+        assert_eq!(panel.snap.compaction_hard_wait_ms, 300_000);
     }
 
     #[test]
