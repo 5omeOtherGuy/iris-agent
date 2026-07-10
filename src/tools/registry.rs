@@ -34,14 +34,14 @@ use crate::nexus::{Tool, ToolEnv, ToolFuture, ToolOutput, Tools};
 
 use super::{
     Preview, ToolState, bash, edit, find, grep, ls, path, read, read_output, recall,
-    render_preview, write,
+    render_preview, request_compaction, write,
 };
 
 /// Construct the workspace tools the CLI injects into the agent. The order is
 /// the provider-declaration order (`read, bash, edit, write, grep, find, ls`),
 /// with the Iris-specific `read_output` (issue #205) appended last.
 pub(crate) fn built_in_tools() -> Tools {
-    built_in_tools_for(false)
+    built_in_tools_for(false, false)
 }
 
 /// Construct the tool set for the configured bash-tool-mode setting
@@ -55,26 +55,31 @@ pub(crate) fn built_in_tools() -> Tools {
 /// compacted transcript turns back in -- neither is reachable via the shell.
 /// The system prompt's generated tool blocks adapt automatically (the
 /// guidelines fall back to the bash-only file-operations bullet).
-pub(crate) fn built_in_tools_for(bash_tool_mode: bool) -> Tools {
-    if bash_tool_mode {
-        return Tools::new(vec![
+pub(crate) fn built_in_tools_for(bash_tool_mode: bool, model_compaction_tool: bool) -> Tools {
+    let mut tools: Vec<Box<dyn Tool>> = if bash_tool_mode {
+        vec![
             Box::new(BashTool),
             Box::new(EditTool),
             Box::new(ReadOutputTool),
             Box::new(RecallTool),
-        ]);
+        ]
+    } else {
+        vec![
+            Box::new(ReadTool),
+            Box::new(BashTool),
+            Box::new(EditTool),
+            Box::new(WriteTool),
+            Box::new(GrepTool),
+            Box::new(FindTool),
+            Box::new(LsTool),
+            Box::new(ReadOutputTool),
+            Box::new(RecallTool),
+        ]
+    };
+    if model_compaction_tool {
+        tools.push(Box::new(RequestCompactionTool));
     }
-    Tools::new(vec![
-        Box::new(ReadTool),
-        Box::new(BashTool),
-        Box::new(EditTool),
-        Box::new(WriteTool),
-        Box::new(GrepTool),
-        Box::new(FindTool),
-        Box::new(LsTool),
-        Box::new(ReadOutputTool),
-        Box::new(RecallTool),
-    ])
+    Tools::new(tools)
 }
 
 /// Boxed `read_output` tool for integration tests that pair it with a custom
@@ -519,6 +524,33 @@ impl Tool for RecallTool {
     }
 }
 
+struct RequestCompactionTool;
+impl Tool for RequestCompactionTool {
+    fn name(&self) -> &str {
+        "request_compaction"
+    }
+    fn description(&self) -> &str {
+        request_compaction::DESCRIPTION
+    }
+    fn parameters(&self) -> Value {
+        request_compaction::parameters()
+    }
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let state = env
+                .state
+                .try_borrow()
+                .map_err(|_| anyhow!("tool state is busy; compaction request was not scheduled"))?;
+            request_compaction::execute(args, &state)
+        })
+    }
+}
+
 struct LsTool;
 impl Tool for LsTool {
     fn name(&self) -> &str {
@@ -728,6 +760,55 @@ mod tests {
             output_sink: sink,
             mutation_guard: None,
         }
+    }
+
+    #[test]
+    fn request_compaction_is_opt_in_and_only_schedules_the_boundary() {
+        let absent = built_in_tools_for(false, false);
+        assert!(absent.by_name("request_compaction").is_none());
+
+        let tools = built_in_tools_for(false, true);
+        let tool = tools.by_name("request_compaction").unwrap();
+        assert!(
+            built_in_tools_for(true, true)
+                .by_name("request_compaction")
+                .is_some()
+        );
+        assert_eq!(
+            tool.parameters(),
+            json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        );
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        let state = std::cell::RefCell::new(ToolState::new());
+        let env = bash_env(&root, &state, None);
+        let error = current_thread_runtime()
+            .block_on(tool.execute(
+                &json!({ "focus": "not supported" }),
+                &env,
+                CancellationToken::new(),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("accepts no arguments"));
+        assert!(
+            !state
+                .borrow()
+                .compaction_requested
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let output = current_thread_runtime()
+            .block_on(tool.execute(&json!({}), &env, CancellationToken::new()))
+            .unwrap();
+        assert_eq!(
+            output.content,
+            "Compaction is scheduled for the next safe boundary; it has not happened yet."
+        );
+        assert!(
+            state
+                .borrow()
+                .compaction_requested
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 
     #[test]

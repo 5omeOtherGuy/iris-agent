@@ -149,6 +149,9 @@ pub(super) struct CompactionEngine {
     pub(super) hard_wait: std::time::Duration,
     pub(super) max_consecutive_failures: u32,
     pub(super) reactive_enabled: bool,
+    /// One-shot flag set by the opt-in model tool and consumed only by
+    /// [`CompactionEngine::govern`] at a safe boundary.
+    pub(super) model_compaction_requested: Arc<AtomicBool>,
     pub(super) in_turn: bool,
     pub(super) model_compactions_this_turn: u8,
     pub(super) consecutive_failures: u32,
@@ -184,6 +187,7 @@ impl CompactionEngine {
         persisted: usize,
         entry_ids: Vec<Option<String>>,
         budget: Option<u64>,
+        model_compaction_requested: Arc<AtomicBool>,
     ) -> Self {
         let resume_last_activity_ms = session
             .as_ref()
@@ -207,6 +211,7 @@ impl CompactionEngine {
             hard_wait: std::time::Duration::from_millis(10_000),
             max_consecutive_failures: 3,
             reactive_enabled: true,
+            model_compaction_requested,
             in_turn: false,
             model_compactions_this_turn: 0,
             consecutive_failures: 0,

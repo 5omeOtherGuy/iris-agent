@@ -1657,6 +1657,82 @@ fn hard_tier_bounds_wait_then_cancels_and_applies_deterministic_fallback() {
 }
 
 #[test]
+fn model_request_compacts_at_the_next_boundary_even_when_automatic_is_off() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut seeded = seed_harness(&root.path, &workspace.path);
+    seeded.harness.set_summarizer(SummarizerKind::Excerpts);
+    seeded.harness.set_compaction_trigger(
+        32_768,
+        CompactionTriggerConfig {
+            enabled: false,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.85,
+            keep_recent_tokens: 100,
+            hard_wait_ms: 10,
+            max_consecutive_failures: 3,
+            reactive: true,
+        },
+    );
+    seeded
+        .harness
+        .state
+        .borrow()
+        .compaction_requested
+        .store(true, Ordering::SeqCst);
+    assert_eq!(compaction_entries(&seeded.path).len(), 0);
+
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+    let messages = seeded.harness.messages().to_vec();
+    let task_state = seeded.harness.compaction_task_state();
+    let directive = block_on(seeded.harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 1,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: seeded.harness.output_store.as_ref(),
+            task_state: task_state.as_ref(),
+            observer: &obs,
+        },
+        &token,
+    ))
+    .unwrap();
+    let ContextDirective::Replace { messages } = directive else {
+        panic!("model request should apply only at the governed boundary");
+    };
+    assert_eq!(compaction_entries(&seeded.path).len(), 1);
+
+    let second = block_on(seeded.harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 2,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: seeded.harness.output_store.as_ref(),
+            task_state: task_state.as_ref(),
+            observer: &obs,
+        },
+        &token,
+    ))
+    .unwrap();
+    assert!(matches!(second, ContextDirective::Proceed));
+    assert_eq!(
+        compaction_entries(&seeded.path).len(),
+        1,
+        "the one-shot model request must be consumed"
+    );
+}
+
+#[test]
 fn turn_cancellation_preempts_the_governor_hard_wait_without_applying() {
     let root = temp_dir();
     let workspace = temp_dir();

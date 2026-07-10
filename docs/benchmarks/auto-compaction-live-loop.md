@@ -476,3 +476,17 @@ Portable-path Haiku LVP:
 The run completed in 426.37 seconds. Every model-backed summary used
 `anthropic/claude-opus-4-6` with medium thinking. No provider, auth, tool,
 worker, persistence, recall, metadata, or resume error occurred.
+
+## Slice 8 model-tool verification — 2026-07-10
+
+Live protocol: not applicable. `compaction.modelTool` is default-off, and the
+scripted LVP neither enables nor calls model-only control tools. Running it
+would regenerate the unchanged default path and add provider cost without
+exercising slice 8.
+
+Deterministic coverage drives the tool itself, verifies the exact
+scheduled-not-done result, rejects non-empty arguments before setting state,
+and proves the one-shot request creates no entry until the next pair-closed
+governor boundary. That boundary compacts successfully even with automatic
+thresholds disabled. The final post-slice-9 LVP pair will cover the accumulated
+default behavior.

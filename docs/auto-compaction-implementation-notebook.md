@@ -23,6 +23,8 @@ this file keeps implementation issues and decisions that span slices.
   recovery ladder, and induced-overflow live coverage merged in PR #530.
 - Slice 6: durable compaction inspection, lifecycle/chip states, and the live TUI
   milestone merged in PR #534.
+- Slice 7: portable provider-block persistence, Anthropic compact adapter, and
+  probe-gated OpenAI v2 capability merged in PR #537.
 
 ## Slice 5 — reactive recovery
 
@@ -119,7 +121,7 @@ from fetched `origin/main` in its own worktree.
 
 ## Slice 7 — provider-native route
 
-Status: implementation complete; verification in progress.
+Status: merged in PR #537.
 
 Decision: provider blocks are additive continuity hints, never the portable
 truth. Every native entry persists self-sufficient text, one opaque adapter
@@ -181,3 +183,36 @@ no exclusions. Worst non-hard blocking was 16.2 ms; worst post-apply context was
 17,103/21,299. G2–G5 and the real-read check passed in every session. Three
 summary workers reported a 0.999 cache-read/input ratio and seven reported
 0.000. Every worker was `anthropic/claude-opus-4-6` at medium thinking.
+
+## Slice 8 — model tool
+
+Status: implementation complete; verification in progress.
+
+Decision: `request_compaction` is a concrete, default-off Tier-3 tool, not a
+Nexus special case. `compaction.modelTool` is project-tunable because the tool
+grants no provider, filesystem, shell, or approval capability. The production
+tool registry appends it only when enabled, including in bash-tool mode.
+
+Decision: the tool accepts exactly an empty object and returns:
+`Compaction is scheduled for the next safe boundary; it has not happened yet.`
+Extra or malformed arguments fail before the flag is set. The wording prevents
+the model from assuming its current context was already rewritten.
+
+Decision: the tool and engine share one session-local `Arc<AtomicBool>` owned
+through `ToolState` and `CompactionEngine`. Tool execution only sets it. The
+governor consumes it once at the next continuing, pair-closed boundary. This
+adds no tool-name branch to Nexus and preserves parent-owned apply.
+
+Edge case: a model request is independent of automatic pressure thresholds.
+With `compaction.enabled=false`, the next governed boundary still runs the
+normal configured compaction route. If the context is already at start/hard
+pressure, the ordinary ladder owns the stronger action. If no pair-safe range
+exists, Iris emits an honest notice and makes no entry.
+
+Verification: focused tests prove default-off/project opt-in, registry
+visibility in both tool modes, empty-argument validation, scheduled-not-done
+output, no entry before the boundary, one durable apply at the boundary with
+automatic thresholds off, and one-shot consumption. The standard LVP does not
+enable or call this default-off tool, so live provider traffic is not applicable
+for this slice; the final post-slice-9 protocols cover the unchanged default
+path.

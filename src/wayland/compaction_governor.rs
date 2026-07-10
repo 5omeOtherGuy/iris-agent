@@ -227,11 +227,13 @@ impl CompactionEngine {
         tracing::trace!(round_trip = cx.round_trip, "evaluating context boundary");
         let workspace = apply_cx.workspace;
         let obs = apply_cx.observer;
-        if !cx.turn_continues
-            || !self.trigger_v2
-            || !self.automatic_enabled
-            || self.session.is_none()
-        {
+        if !cx.turn_continues || !self.trigger_v2 || self.session.is_none() {
+            return Ok(ContextDirective::Proceed);
+        }
+        let model_requested = self
+            .model_compaction_requested
+            .swap(false, Ordering::SeqCst);
+        if !self.automatic_enabled && !model_requested {
             return Ok(ContextDirective::Proceed);
         }
         let Some(ladder) = self.ladder else {
@@ -253,25 +255,78 @@ impl CompactionEngine {
             message_count: anchor.message_count,
         });
         let measurement = measure_context(cx.messages, anchor, 0);
-        if let Some(tier) = self.pressure.crossing(measurement.tokens, &ladder) {
-            obs.on_event(AgentEvent::ContextPressure {
-                tier,
-                measured: measurement.tokens,
-                effective_window: ladder.effective_window,
-                source: measurement.source,
-            })?;
-        }
-        if ladder.deterministic_only && !self.tiny_notice_emitted {
-            self.tiny_notice_emitted = true;
-            obs.on_event(AgentEvent::Notice(format!(
-                "context window {} is too small for background summarization; automatic compaction will use deterministic excerpts.",
-                ladder.effective_window
-            )))?;
+        if self.automatic_enabled {
+            if let Some(tier) = self.pressure.crossing(measurement.tokens, &ladder) {
+                obs.on_event(AgentEvent::ContextPressure {
+                    tier,
+                    measured: measurement.tokens,
+                    effective_window: ladder.effective_window,
+                    source: measurement.source,
+                })?;
+            }
+            if ladder.deterministic_only && !self.tiny_notice_emitted {
+                self.tiny_notice_emitted = true;
+                obs.on_event(AgentEvent::Notice(format!(
+                    "context window {} is too small for background summarization; automatic compaction will use deterministic excerpts.",
+                    ladder.effective_window
+                )))?;
+            }
         }
 
         let initial_tier = ladder.tier(measurement.tokens);
         let mut current = cx.messages.to_vec();
         let mut changed = false;
+        if model_requested
+            && matches!(
+                initial_tier,
+                ContextPressureTier::Normal | ContextPressureTier::Warn
+            )
+        {
+            let plans = self.pending_folds(&current, workspace);
+            if !plans.is_empty() {
+                current =
+                    self.flush_folds(&current, &plans, FoldTrigger::CompactionBoundary, obs)?;
+                changed = true;
+            }
+            if self.background.is_some() {
+                return Ok(if changed {
+                    ContextDirective::Replace { messages: current }
+                } else {
+                    ContextDirective::Proceed
+                });
+            }
+            let Some(plan) = self.plan(&current, ladder.keep_recent_tokens) else {
+                obs.on_event(AgentEvent::Notice(
+                    "model-requested compaction found no pair-safe history to compact.".to_string(),
+                ))?;
+                return Ok(if changed {
+                    ContextDirective::Replace { messages: current }
+                } else {
+                    ContextDirective::Proceed
+                });
+            };
+            let model_backed = !ladder.deterministic_only
+                && self.has_model_worker()
+                && !self.model_compaction_cap_reached(CompactionOrigin::Subagent)
+                && self.consecutive_failures < self.max_consecutive_failures;
+            if model_backed {
+                self.start_background(&current, plan, workspace, obs, None)?;
+                return Ok(if changed {
+                    ContextDirective::Replace { messages: current }
+                } else {
+                    ContextDirective::Proceed
+                });
+            }
+            self.emit_breaker_notice(obs)?;
+            let directive = self.apply_excerpts(&current, plan, apply_cx)?;
+            return Ok(match directive {
+                ContextDirective::Replace { messages } => ContextDirective::Replace { messages },
+                ContextDirective::Proceed if changed => {
+                    ContextDirective::Replace { messages: current }
+                }
+                ContextDirective::Proceed => ContextDirective::Proceed,
+            });
+        }
         if initial_tier == ContextPressureTier::Start {
             let plans = self.pending_folds(&current, workspace);
             if !plans.is_empty() {

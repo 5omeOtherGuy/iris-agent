@@ -333,6 +333,12 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   is implemented but the required Haiku 4.5 live probe is currently rejected by
   the provider. The OpenAI v2 probe succeeds but returns opaque state only.
   (ADR-0056) [Partial]
+- **Model-requested compaction** — project-safe `compaction.modelTool=true`
+  advertises `request_compaction`. The tool accepts no arguments, sets only a
+  session-local one-shot flag, and reports that work is scheduled. Wayland
+  consumes the flag at the next pair-closed governor boundary; the parent-owned
+  compaction path remains the only mutation point. Automatic thresholds may be
+  disabled independently. [Implemented]
 - **Manual `/compact [focus]`** — uses the same one-slot worker pipeline at the
   inter-turn boundary. It attaches to an existing job, supports a bounded focus
   instruction, keeps a small recent tail, and works without a budget.
