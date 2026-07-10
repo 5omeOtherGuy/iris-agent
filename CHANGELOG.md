@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/5omeOtherGuy/iris-agent/releases/tag/v0.1.0) - 2026-07-09
+
+_0.1.0 was version-cut on 2026-06-17; the v0.1.0 tag, prebuilt binaries, and
+crates.io publish followed on 2026-07-09 and include everything merged in
+between, so those changes are recorded here rather than under a later
+version._
+
 ### Changed
 
 - The tool-block footer state is now a **proportional-prominence** token: the
@@ -35,6 +42,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete them freely. Users who relied on custom fragments should move that
   steering into `AGENTS.md`.
 
+- Design-system upgrade across the TUI pane: gated tool calls now render a
+  `▲ REVIEW` review line (review glyph + label, a `$ ` prompt for shell
+  actions) instead of a bare `approve …`; reasoning ("thinking") renders as a
+  chromeless muted `┊ THINKING` left rail rather than a bordered panel, keeping
+  its `ctrl+o` fold; and `EDIT` diff previews gain a quiet `+added −removed`
+  footer tinted to the diff inks (with a `┊ new file` note for new files).
+- Centralized the state/marker symbol vocabulary in `src/ui/symbols.rs` and the
+  terminal-relative color roles in `src/ui/palette.rs` (adding the `▲` review
+  glyph and a named `interactive`/Cyan role) as the single source of truth,
+  replacing scattered glyph and `Color::Cyan` literals.
+- Refreshed README, roadmap, and feature inventory against merged PR and git
+  history through PR #177.
+- Clarified current user-visible TUI behavior: state-specific panel symbols,
+  preview/full output folding, GFM table/task-list/strikethrough rendering,
+  collapsed thinking blocks, Unicode-aware wrapping, and generic safe fallback
+  rendering for unknown tools.
+- Clarified current harness/tool limits: no default bash timeout, no fixed
+  default tool-roundtrip cap, full safe-parallel batches for read-only search
+  tools, 50 KiB inline display threshold, and retained memory-safety rails.
+
 ### Added
 
 - Repurposed the per-cwd trust store as a persistent project permission policy
@@ -52,38 +79,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   always re-prompt and can never be granted; policy loosens only through
   deliberate user action. Legacy tri-state `"trusted"`/`"untrusted"` entries in
   `trust.json` are ignored (fail closed) and overwritten on the next grant.
-
-### Fixed
-
-- Made the prebuilt-binary release self-sufficient from a manually pushed tag.
-  `release.yml` now builds the shell installer (a cargo-dist global artifact the
-  build matrix never produced) and creates the GitHub release with all archives,
-  checksums, and the installer via `gh release create`. `release-plz.toml` sets
-  `publish = false` and `git_release_enable = false` so release-plz only opens
-  the version/CHANGELOG PR and does not race to create the release or publish to
-  crates.io. crates.io is now an explicit later opt-in documented in
-  `docs/RELEASING.md`. Previously a release depended on the token-gated
-  release-plz job creating the release, and a tag it pushed with the default
-  `GITHUB_TOKEN` would not have triggered the binary build at all.
-
-- Corrected install documentation to state that prebuilt binaries, `install.sh`,
-  crates.io installs, and prebuilt self-update become usable only after the
-  first public release/publish; the current pre-release install path is
-  `cargo install --git ... --locked` or a source checkout.
-- `install.sh` no longer corrupts the archive path during install. POSIX `sh`
-  has no local scope, so `verify_checksum` assigned a bare `archive` that
-  clobbered the caller's, and the extract step then received a doubled path so
-  every prebuilt install failed. Found running the installer end-to-end for the
-  first time (issue #252).
-- Added the `[profile.dist]` build profile that cargo-dist requires. Without it
-  `dist build` and the release workflow failed with "profile `dist` is not
-  defined" (issue #252).
-- Mutating built-in tools (`bash`, `edit`, `write`) now require approval by
-  default, independent of the workspace path/sandbox opt-in. In print mode this
-  means they are denied unless `--approve` is passed, so headless runs cannot
-  execute them silently.
-
-### Added
 
 - Validated the prebuilt-binary release path without cutting a public release
   (issue #252, follows #199/#233): `scripts/validate-dist.sh` builds a real host
@@ -150,32 +145,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added ADR-0022 for default-short provider-native prompt-cache and
   default-off context-management integration.
 
-### Changed
-
-- Design-system upgrade across the TUI pane: gated tool calls now render a
-  `▲ REVIEW` review line (review glyph + label, a `$ ` prompt for shell
-  actions) instead of a bare `approve …`; reasoning ("thinking") renders as a
-  chromeless muted `┊ THINKING` left rail rather than a bordered panel, keeping
-  its `ctrl+o` fold; and `EDIT` diff previews gain a quiet `+added −removed`
-  footer tinted to the diff inks (with a `┊ new file` note for new files).
-- Centralized the state/marker symbol vocabulary in `src/ui/symbols.rs` and the
-  terminal-relative color roles in `src/ui/palette.rs` (adding the `▲` review
-  glyph and a named `interactive`/Cyan role) as the single source of truth,
-  replacing scattered glyph and `Color::Cyan` literals.
-- Refreshed README, roadmap, and feature inventory against merged PR and git
-  history through PR #177.
-- Clarified current user-visible TUI behavior: state-specific panel symbols,
-  preview/full output folding, GFM table/task-list/strikethrough rendering,
-  collapsed thinking blocks, Unicode-aware wrapping, and generic safe fallback
-  rendering for unknown tools.
-- Clarified current harness/tool limits: no default bash timeout, no fixed
-  default tool-roundtrip cap, full safe-parallel batches for read-only search
-  tools, 50 KiB inline display threshold, and retained memory-safety rails.
-
-## [0.1.0](https://github.com/5omeOtherGuy/iris-agent/releases/tag/v0.1.0) - 2026-06-17
-
-### Added
-
 - *(grep)* add output modes with structured metadata telemetry
 - *(wayland)* move persistence + execution surface to a Tier-2 harness (Step C)
 - *(nexus)* inject tools via Tool trait, resolve by name (Step B)
@@ -208,6 +177,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(auth)* add OpenAI Codex device login
 
 ### Fixed
+
+- Made the prebuilt-binary release self-sufficient from a manually pushed tag.
+  `release.yml` now builds the shell installer (a cargo-dist global artifact the
+  build matrix never produced) and creates the GitHub release with all archives,
+  checksums, and the installer via `gh release create`. `release-plz.toml` sets
+  `publish = false` and `git_release_enable = false` so release-plz only opens
+  the version/CHANGELOG PR and does not race to create the release or publish to
+  crates.io. crates.io is now an explicit later opt-in documented in
+  `docs/RELEASING.md`. Previously a release depended on the token-gated
+  release-plz job creating the release, and a tag it pushed with the default
+  `GITHUB_TOKEN` would not have triggered the binary build at all.
+
+- Corrected install documentation to state that prebuilt binaries, `install.sh`,
+  crates.io installs, and prebuilt self-update become usable only after the
+  first public release/publish; the current pre-release install path is
+  `cargo install --git ... --locked` or a source checkout.
+- `install.sh` no longer corrupts the archive path during install. POSIX `sh`
+  has no local scope, so `verify_checksum` assigned a bare `archive` that
+  clobbered the caller's, and the extract step then received a doubled path so
+  every prebuilt install failed. Found running the installer end-to-end for the
+  first time (issue #252).
+- Added the `[profile.dist]` build profile that cargo-dist requires. Without it
+  `dist build` and the release workflow failed with "profile `dist` is not
+  defined" (issue #252).
+- Mutating built-in tools (`bash`, `edit`, `write`) now require approval by
+  default, independent of the workspace path/sandbox opt-in. In print mode this
+  means they are denied unless `--approve` is passed, so headless runs cannot
+  execute them silently.
 
 - *(maintenance)* address M1 review cleanup
 - *(ui)* show real bash command in approval; re-prompt destructive always-allowed calls

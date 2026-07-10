@@ -1170,6 +1170,8 @@ fn update_via_cargo() -> Result<()> {
     // release and gate on semver so we never downgrade or install a
     // prerelease/testing build, then `cargo install --tag <release>`.
     let current = env!("CARGO_PKG_VERSION");
+    selfupdate::voice::masthead("update");
+    selfupdate::voice::step("check", &format!("running v{current} · source build"));
     let release = selfupdate::latest_release()?;
     match selfupdate::decide_update(
         current,
@@ -1178,27 +1180,39 @@ fn update_via_cargo() -> Result<()> {
         release.draft,
     ) {
         selfupdate::UpdateAction::UpToDate => {
-            println!("Already on the latest release (v{current}).");
+            selfupdate::voice::done(
+                "current",
+                &format!("already on the latest release (v{current})"),
+            );
             Ok(())
         }
         selfupdate::UpdateAction::Ahead => {
-            println!(
-                "Running v{current}, newer than the latest release ({}); nothing to do.",
-                release.tag_name
+            selfupdate::voice::done(
+                "ahead",
+                &format!(
+                    "running v{current}, newer than the latest release ({}) · nothing to do",
+                    release.tag_name
+                ),
             );
             Ok(())
         }
         selfupdate::UpdateAction::Skip => {
-            println!(
-                "Latest release ({}) is not an installable stable release; iris update only installs stable releases.",
-                release.tag_name
+            selfupdate::voice::skip(
+                "skipped",
+                &format!(
+                    "latest release ({}) is not stable · iris update installs stable releases only",
+                    release.tag_name
+                ),
             );
             Ok(())
         }
         selfupdate::UpdateAction::Update => {
-            println!(
-                "Updating Iris to {} from {UPDATE_REPO} ...",
-                release.tag_name
+            selfupdate::voice::step(
+                "cargo",
+                &format!(
+                    "install {UPDATE_PACKAGE} {} from {UPDATE_REPO}",
+                    release.tag_name
+                ),
             );
             let status = update_command(&release.tag_name).status().context(
                 "failed to run cargo; install Rust/Cargo or update with cargo install manually",
@@ -1206,6 +1220,7 @@ fn update_via_cargo() -> Result<()> {
             if !status.success() {
                 bail!("cargo install failed with {status}");
             }
+            selfupdate::voice::done("updated", &format!("v{current} → {}", release.tag_name));
             Ok(())
         }
     }

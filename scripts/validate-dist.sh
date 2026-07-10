@@ -23,6 +23,11 @@ set -euo pipefail
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
 TARGET=$(rustc -vV | sed -n 's/^host: //p')
+# The crate version the built binary reports; the equal-tag case below must
+# offer exactly this version, or `iris update` correctly answers "ahead"
+# instead of "already on the latest" and the check would rot on version bumps.
+CUR_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+[ -n "$CUR_VERSION" ] || { echo "cannot read crate version from Cargo.toml" >&2; exit 1; }
 ARC="iris-agent-$TARGET.tar.gz"
 PORT_HTTP=8411
 PORT_API=8412
@@ -112,7 +117,7 @@ sleep 1
 BASE="http://127.0.0.1:$PORT_HTTP"
 
 IDIR="$WORK/bin"
-if IRIS_VERSION=v0.1.0 IRIS_RELEASE_BASE_URL="$BASE" IRIS_INSTALL_DIR="$IDIR" sh install.sh >/dev/null 2>&1 &&
+if IRIS_VERSION="v$CUR_VERSION" IRIS_RELEASE_BASE_URL="$BASE" IRIS_INSTALL_DIR="$IDIR" sh install.sh >/dev/null 2>&1 &&
 	"$IDIR/iris" --help >/dev/null 2>&1; then
 	ok "install.sh installed a runnable iris"
 else
@@ -127,7 +132,7 @@ echo "deadbeef  $ARC" >"$BAD/$ARC.sha256"
 (cd "$BAD" && exec python3 -m http.server "$((PORT_HTTP + 50))" >/dev/null 2>&1) &
 SERVERS+=($!)
 sleep 1
-if IRIS_VERSION=v0.1.0 IRIS_RELEASE_BASE_URL="http://127.0.0.1:$((PORT_HTTP + 50))" \
+if IRIS_VERSION="v$CUR_VERSION" IRIS_RELEASE_BASE_URL="http://127.0.0.1:$((PORT_HTTP + 50))" \
 	IRIS_INSTALL_DIR="$WORK/bin_bad" sh install.sh >/dev/null 2>&1; then
 	bad "corrupted checksum should have failed install.sh"
 else
@@ -188,7 +193,7 @@ else
 fi
 
 # Case B: equal tag -> already latest, untouched.
-printf 'v0.1.0\n' >"$API_SERVE/TAG"
+printf 'v%s\n' "$CUR_VERSION" >"$API_SERVE/TAG"
 IB="$WORK/instB"
 mkdir -p "$IB"
 cp "$S" "$IB/iris"
