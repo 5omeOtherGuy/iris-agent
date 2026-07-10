@@ -1477,8 +1477,10 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    thresholds are disabled. Slice 9 extends ADR-0045 with worker,
    trigger/boundary, focus, recall-loop, cache, and provider-native arms. The
    measured defaults are now 0.60/0.72/0.90 with an 8,000-token retained tail;
-   the final two consecutive live protocol pairs remain the program closeout
-   gate.
+   the program closeout gate passed on 2026-07-10 with two consecutive full
+   Haiku/Codex protocol runs. All evaluated sessions passed G1–G5 and exact
+   resume; run 2 used one permitted, verbatim-recorded Codex G1 timing
+   exclusion.
 7. Prebuilt-binary distribution ([#199](https://github.com/5omeOtherGuy/iris-agent/issues/199),
    [#233](https://github.com/5omeOtherGuy/iris-agent/issues/233)) is wired and now
    validated locally ([#252](https://github.com/5omeOtherGuy/iris-agent/issues/252)):
