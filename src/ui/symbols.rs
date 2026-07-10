@@ -49,6 +49,10 @@ pub(crate) const EXPANDED: &str = "\u{25be}";
 /// `▸` — collapsed disclosure (capped preview; hidden lines elided).
 pub(crate) const COLLAPSED: &str = "\u{25b8}";
 
+/// `▋` — the inline edit caret: the register buffer and the settings faceplate's
+/// scope type-to-filter echo. Painted the selection color (orange) at its site.
+pub(crate) const CARET: &str = "\u{258b}";
+
 /// `+` — added line (diff).
 pub(crate) const ADDED: &str = "+";
 
@@ -58,6 +62,25 @@ pub(crate) const REMOVED: &str = "\u{2212}";
 /// `┊` — soft metadata separator (working indicator, turn divider, workspace
 /// label, reasoning left rail). Not an ASCII pipe.
 pub(crate) const SEP: &str = "\u{250a}";
+
+/// `·` (U+00B7) — unlit meter cell: a slot that could light but is dark right
+/// now. Shared by the LED chase's dark cells (`●···`, composed locally in
+/// `WORKING_FRAMES`) and the flow meter's unlit cells, so the two instruments
+/// speak one vocabulary (§5).
+pub(crate) const UNLIT: &str = "\u{b7}";
+
+/// ` ▏▎▍▌▋▊▉█` — the flow meter's left-anchored eighth-block fill ramp
+/// (U+2588–U+258F), indexed by how many of a cell's eight quanta are lit.
+/// Index 0 is never rendered: a cell with no lit eighths shows [`UNLIT`] (or
+/// the peak tick), not a blank.
+pub(crate) const FLOW_FILL: [char; 9] = [
+    ' ', '\u{258f}', '\u{258e}', '\u{258d}', '\u{258c}', '\u{258b}', '\u{258a}', '\u{2589}',
+    '\u{2588}',
+];
+
+/// `▏` — the flow meter's peak-hold tick: the 1/8-fill glyph doubling (dim, in
+/// an unlit cell) as the mark for the decaying high-water quantum (§5).
+pub(crate) const FLOW_PEAK: char = FLOW_FILL[1];
 
 /// `⇡` — commits ahead of the last-fetched upstream (git dropdown status
 /// line). One job only; `↑` remains input-token telemetry.

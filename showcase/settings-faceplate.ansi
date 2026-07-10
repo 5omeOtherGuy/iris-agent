@@ -1,0 +1,42 @@
+  ~/projects/iris-agent/.…/tui-showcase[38;2;88;91;112m ┊ git worktree-tui-showcase[38;2;250;179;135m ±9[38;2;88;91;112m [WT][39m  [38;2;88;91;112mCTX [39m0[38;2;88;91;112m/300k[39m [38;2;88;91;112m○○○○○○○○○○[39m
+  [38;2;88;91;112m────────────────────────────────────────────────────────────────────────────────────────────────[39m
+
+    [1mSETTINGS[0m                                                    [2miris 0.1.0[0m
+
+    [2mENGINE[0m
+    [1m[48;2;49;50;68m  model             [0;2m[48;2;49;50;68m▸ [0m[48;2;49;50;68mgpt-5.5[2m ┊ openai-codex[0m[48;2;49;50;68m                          [49m
+      reasoning         [2m○ off[0m  [2m○ minimal[0m  [2m○ low[0m  [38;2;250;179;135m◉ [39mmedium  [2m○ high[0m  [2m○ xhigh[0m
+      model scope       [2m▸ all models[0m
+      providers         [2m▸ 3 connected[0m
+
+    [2mSAFETY[0m
+      approvals         [2m○ strict[0m  [38;2;250;179;135m◉ [39mauto  [2m○ never[0m
+      skip approvals    [38;2;250;179;135m◉ [39moff  [2m○ on  dangerous ┊ session only[0m
+      permissions       [2m▸ per-tool + bash grants[0m
+
+    [2mMEMORY[0m
+      compact at        ●●●●●[38;2;250;179;135m●[2m[39m○○○○[0m  232k[2m tokens[0m
+      summarizer        [2m○ excerpts[0m  [2m○ provider[0m  [38;2;250;179;135m◉ [39msubagent
+      microcompaction   [2m○ off[0m  [38;2;250;179;135m◉ [39mon
+      watermark         ●●●●[38;2;250;179;135m●[2m[39m○○○○○[0m  32k[2m tokens[0m
+      prompt cache      [2m○ none[0m  [38;2;250;179;135m◉ [39mshort  [2m○ long[0m
+
+    [2mCHECKS[0m
+      verify            [2mnot set[0m
+      attempts          ●●[38;2;250;179;135m●[2m[39m○○○○○○○[0m  3
+
+    [2mPANEL[0m
+      theme             [2m○○○○○[0m[38;2;250;179;135m◉[2m[39m○○○○○○[0m  catppuccin-mocha
+      alt screen        [38;2;250;179;135m◉ [39mauto  [2m○ always[0m  [2m○ never[0m
+      scroll speed      ●●[38;2;250;179;135m●[2m[39m○○○○○○○[0m  3[2m lines[0m
+      reduced motion    [38;2;250;179;135m◉ [39moff  [2m○ on[0m
+
+    [2mGIT[0m
+      worktree root     [2m../wt (default)[0m
+
+    [38;2;88;91;112m↑↓ select · ↵ open · esc close[39m
+
+  [38;2;108;112;134m────────────────────────────────────────────────────────────────────────────────────────────────[39m
+     [7m[38;2;250;179;135m [0m[38;2;88;91;112mGive Iris a task...[39m
+  [38;2;88;91;112m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌[39m
+  [38;2;250;179;135m◉ [1m[39mCODE[0m[38;2;88;91;112m ─ [4m[39mGPT-5.5[0m[38;2;88;91;112m MEDIUM ─ [38;2;166;227;161m◆ [38;2;88;91;112mauto[39m

@@ -63,11 +63,12 @@ pub(crate) use overlay::{FocusTarget, overlay_menu};
 use panel::PanelState;
 #[cfg(test)]
 use rows::{ChromeRow, TranscriptRow, hrule_line};
+pub(crate) use screen::compact_count;
+use screen::render_document_with_hints;
 pub(crate) use screen::{
     ApprovalPolicy, ContextAccounting, Screen, SwitchCacheStatus, SwitchStatus,
 };
 pub(crate) use screen::{BarSegment, session_bar_hit};
-use screen::{compact_count, render_document_with_hints};
 #[cfg(test)]
 use screen::{
     composer_statusline, editor_visual_rows, fresh_editor, render_document,
@@ -110,8 +111,28 @@ const MAX_TRANSCRIPT_ROWS: usize = 10_000;
 /// Tuned to Codex's compact exec cell: a finalized result keeps a head and a
 /// tail slice with a `… +N lines` marker between (see [`Transcript::push_tool_output`]).
 /// The model still receives the full output; only the terminal preview is
-/// bounded, and the omitted logical-line count is reported.
+/// bounded, and the omitted logical-line count is reported. This is now the
+/// FLOOR of the viewport-aware preview budget ([`preview_row_budget`]); a pane
+/// ≤ 40 rows still previews exactly this many rows, so nothing regresses on
+/// small terminals.
 const MAX_TOOL_OUTPUT_ROWS: usize = 8;
+/// Ceiling of the viewport-aware preview budget: a tool-output preview never
+/// claims more than this many physical rows no matter how tall the pane is.
+const PREVIEW_ROWS_CEILING: usize = 24;
+
+/// Viewport-aware tool-output preview budget: `clamp(pane_height / 5, 8, 24)`
+/// rows (reactive-density spec §2). A print-time decision — `pane_height` is the
+/// last-known terminal height at the moment the block's rows are built, and the
+/// result is immutable in scrollback (a block keeps the budget it was printed
+/// at; see docs/TUI_DESIGN_LANGUAGE.md §8.1). Divisor rationale: at height/5 the
+/// preview claims at most a fifth of the viewport, so a tool block never
+/// dominates the pane — the conversation keeps the floor. The floor is the
+/// historical fixed [`MAX_TOOL_OUTPUT_ROWS`] (8), so a pane ≤ 40 rows is
+/// byte-identical to before; taller panes let the preview breathe to the
+/// ceiling. `pane_height == 0` (before the first frame) yields the floor.
+fn preview_row_budget(pane_height: usize) -> usize {
+    (pane_height / 5).clamp(MAX_TOOL_OUTPUT_ROWS, PREVIEW_ROWS_CEILING)
+}
 /// Frameless body hang: the block body hangs one 2-cell step under the header
 /// label — the same step the reasoning rail's `┊` body and a user turn's `›`
 /// body take, so every block's body lands on ONE shared text column. (Was a
@@ -139,6 +160,14 @@ const TEXT_COLUMN_X_PADDING_U16: u16 = TEXT_COLUMN_X_PADDING as u16;
 /// Secondary guard: truncate any single output line to this many characters
 /// before wrapping, so one pathological line cannot dominate the row budget.
 const MAX_TOOL_OUTPUT_LINE_CHARS: usize = 2000;
+
+/// Prose measure (reactive-density spec §3): prose-classed text wraps to
+/// `min(content_width, PROSE_MEASURE)` columns so an ultrawide pane does not
+/// stretch a paragraph past a readable line length (the eye loses the line on
+/// the way back). Mechanical output — code, tool bodies, diffs, tables, rules,
+/// session chrome — keeps the full pane width. On any pane ≤ 96 columns the
+/// measure is a no-op (`min` picks the pane), so nothing regresses there.
+const PROSE_MEASURE: usize = 96;
 
 /// Cap on the live exec stream buffer re-rendered under the gutter on each
 /// delta. Only the tail (flood-capped to `MAX_TOOL_OUTPUT_ROWS`) is shown and
@@ -529,8 +558,12 @@ impl TuiUi {
 
     pub(crate) fn reset_screen(&mut self) {
         let pager_active = self.screen.pager_active;
+        // The run meter survives a session swap: the exit receipt's scope is
+        // the process run, so `/new` must not restart its clock or counters.
+        let meter = self.screen.take_session_meter();
         self.screen = Screen::new();
         self.screen.pager_active = pager_active;
+        self.screen.restore_session_meter(meter);
     }
 }
 
@@ -626,6 +659,21 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Drive stream beats on the tick grid until the escapement has released all
+    /// held text into the visible tail and the paced backlog has settled. The
+    /// escapement (issue: the escapement spec) advances the tail by word-quanta
+    /// per tick, so a test inspecting the mid-stream tail must first let those
+    /// beats run — this reproduces the loop's cadence without a live loop.
+    fn settle_stream(screen: &mut Screen) {
+        let mut now = std::time::Instant::now();
+        for _ in 0..256 {
+            now += std::time::Duration::from_millis(100);
+            if !screen.commit_stream_tick(now) {
+                break;
+            }
+        }
     }
 
     fn synthetic_render_perf_screen() -> Screen {
@@ -942,7 +990,11 @@ mod tests {
         screen.apply(UiEvent::AssistantTextDelta("Hel".to_string()));
         screen.apply(UiEvent::AssistantTextDelta("lo".to_string()));
         assert_eq!(screen.transcript.rows.len(), 0);
+        // The tail advances on the tick beat, not on the delta: let the
+        // escapement release "Hello" into the tail, then it renders as one line.
+        settle_stream(&mut screen);
         assert_eq!(screen.wrapped_lines(80).len(), 1);
+        assert_eq!(screen.transcript.rows.len(), 0, "tail still uncommitted");
         screen.apply(UiEvent::AssistantTextEnd("Hello".to_string()));
         let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert_eq!(texts, vec!["Hello".to_string(), String::new()]);
@@ -1013,8 +1065,19 @@ mod tests {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantTextDelta(markdown.to_string()));
 
+        // Let the escapement release the whole delta and pace the closed blocks;
+        // the still-open list item stays in the mutable tail (never committed
+        // early), and the whole thing renders live like the finalized version.
+        settle_stream(&mut screen);
         let live = screen.wrapped_lines(80);
-        assert!(screen.transcript.rows.is_empty());
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .all(|r| !row_text(r).contains("- one")),
+            "the open list item is held in the tail, not committed early"
+        );
         let live_document = render_document(&mut screen, Size::new(80, 12))
             .iter()
             .map(line_text)
@@ -1045,6 +1108,8 @@ mod tests {
         for markdown in ["```rust\nlet x = **", "half **bold"] {
             let mut screen = Screen::new();
             screen.apply(UiEvent::AssistantTextDelta(markdown.to_string()));
+            // Release the held delta into the tail; the open block never commits.
+            settle_stream(&mut screen);
             let lines = screen.wrapped_lines(80);
             assert!(!lines.is_empty(), "partial markdown vanished: {markdown:?}");
             assert!(screen.transcript.rows.is_empty());
@@ -1059,11 +1124,13 @@ mod tests {
         // is dropped on every stream start/end transition).
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantTextDelta("alpha".to_string()));
+        settle_stream(&mut screen);
         let live_a = screen.wrapped_lines(80);
         assert!(live_a.iter().any(|l| line_text(l).contains("alpha")));
         screen.apply(UiEvent::AssistantTextEnd(String::new()));
 
         screen.apply(UiEvent::AssistantTextDelta("gamma".to_string()));
+        settle_stream(&mut screen);
         let live_b = screen.wrapped_lines(80);
         assert!(
             live_b.iter().any(|l| line_text(l).contains("gamma")),
@@ -1080,14 +1147,16 @@ mod tests {
     fn streaming_render_memo_tracks_growth_and_width() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantTextDelta("one two three".to_string()));
+        settle_stream(&mut screen);
         // Unchanged stream renders identically across repeated frames (the
         // memo-hit path must be byte-stable with the fresh render).
         let first = screen.wrapped_lines(80);
         let second = screen.wrapped_lines(80);
         assert_eq!(line_signature(&first), line_signature(&second));
 
-        // A delta grows the buffer: the next frame must show the new tail.
+        // A delta grows the buffer: once its beat releases, the tail shows it.
         screen.apply(UiEvent::AssistantTextDelta(" four".to_string()));
+        settle_stream(&mut screen);
         let grown = screen.wrapped_lines(80);
         assert!(grown.iter().any(|l| line_text(l).contains("four")));
 
@@ -1133,6 +1202,8 @@ mod tests {
         screen.apply(UiEvent::AssistantTextDelta(
             "Second in progress".to_string(),
         ));
+        // Let the escapement release the second block into the tail.
+        settle_stream(&mut screen);
         let committed2: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert!(
             !committed2.iter().any(|t| t.contains("Second in progress")),
@@ -1207,6 +1278,9 @@ mod tests {
             committed_mid.iter().all(|t| !t.contains("Col A")),
             "table committed incrementally would snap: {committed_mid:?}"
         );
+        // Let the escapement finish beating the table into the tail: this test
+        // pins finalize-reflow identity, not pacing.
+        settle_stream(&mut screen);
         // The live (tail) render already shows the complete table.
         let before: Vec<_> = screen
             .wrapped_lines(80)
@@ -1240,12 +1314,13 @@ mod tests {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         let mut src = String::new();
-        for i in 0..20 {
+        for i in 0..200 {
             src.push_str(&format!("Para {i}.\n\n"));
         }
         screen.apply(UiEvent::AssistantTextDelta(src));
-        // A single tick with a deep backlog (>= depth threshold) enters CatchUp
-        // and drains it, rather than committing one line.
+        // A single tick with a firehose-deep backlog: the escapement fast-
+        // forwards (half the buffer in one beat), the collector queue goes
+        // deep, and the drain enters CatchUp — rather than committing one line.
         assert!(screen.commit_stream_tick(std::time::Instant::now()));
         let committed = screen
             .transcript
@@ -1310,7 +1385,7 @@ mod tests {
         screen.apply(UiEvent::AssistantTextDelta(
             "The answer paragraph.\n\n".to_string(),
         ));
-        assert!(screen.commit_stream_tick(std::time::Instant::now()));
+        settle_stream(&mut screen);
         assert!(
             screen
                 .transcript
@@ -1421,17 +1496,19 @@ mod tests {
         // that is entirely in-flight is still reachable/visible.
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
-        // Three complete blocks, held in the tail (no commit tick).
+        // Three complete blocks. Before any beat they are held in the escapement
+        // (nothing anywhere yet); the beat then releases them.
         screen.apply(UiEvent::AssistantTextDelta(
             "Tail A.\n\nTail B.\n\nTail C.\n\n".to_string(),
         ));
         assert!(
             screen.transcript.rows.is_empty(),
-            "the tail is not committed without a tick"
+            "nothing is committed or shown before the first beat"
         );
+        settle_stream(&mut screen);
         // The pager sizes its scrollable range from `transcript_visible_total`
-        // (committed rows + streaming preview), not `render().total_lines`.
-        // With nothing committed, the whole visible total is the active tail, so
+        // (committed rows + streaming preview), not `render().total_lines`. The
+        // paced tail (committed prefix + un-emitted tail) must all be counted, so
         // a regression that dropped the tail from the pager total would read 0.
         let visible_total = screen.transcript_visible_total(80);
         assert!(
@@ -1567,6 +1644,402 @@ mod tests {
         );
     }
 
+    // --- The escapement: even beats for the live stream ---
+
+    /// Count occurrences of `needle` in the rendered document (committed rows +
+    /// the transient stream/reasoning tail).
+    fn rendered_needle_count(screen: &mut Screen, needle: &str) -> usize {
+        rendered_text(screen, 90, 60).matches(needle).count()
+    }
+
+    #[test]
+    fn streamed_tail_advances_by_the_beat_quantum_not_the_whole_burst() {
+        // Criterion 2: feed a large burst in one delta — the visible tail grows
+        // only by the beat quantum per tick, never the whole burst at once.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(90);
+        let burst = "word ".repeat(100); // 500 bytes, one open paragraph
+        screen.apply(UiEvent::AssistantTextDelta(burst.clone()));
+        // Nothing is shown before the first beat (held in the escapement).
+        assert_eq!(
+            rendered_needle_count(&mut screen, "word"),
+            0,
+            "no tail before the first beat"
+        );
+        // One beat releases a bounded quantum — some words, but not all 100.
+        let base = std::time::Instant::now();
+        screen.commit_stream_tick(base);
+        let after_one = rendered_needle_count(&mut screen, "word");
+        assert!(
+            after_one > 0 && after_one < 100,
+            "the tail grew by a quantum, not the whole burst: {after_one}"
+        );
+        // Each further beat advances it monotonically until fully drained.
+        screen.commit_stream_tick(base + std::time::Duration::from_millis(100));
+        let after_two = rendered_needle_count(&mut screen, "word");
+        assert!(
+            after_two > after_one,
+            "the tail keeps advancing per beat: {after_one} -> {after_two}"
+        );
+        settle_stream(&mut screen);
+        assert_eq!(
+            rendered_needle_count(&mut screen, "word"),
+            100,
+            "the whole burst drains across beats"
+        );
+        // The committed pipeline is untouched: an open paragraph never commits.
+        assert!(
+            screen.transcript.rows.is_empty(),
+            "the open tail is never committed by the escapement"
+        );
+    }
+
+    #[test]
+    fn pacing_changes_when_a_line_shows_never_what_the_message_is() {
+        // Criterion 3: the finalized message is byte-identical with the
+        // escapement pacing on vs bypassed (reduced motion) — pacing changes
+        // WHEN a line shows, never WHAT the finished message says.
+        let deltas = [
+            "# Heading\n\n",
+            "A paragraph with `code` and **bold**.\n\n",
+            "- item one\n- item two\n\n",
+            "| a | b |\n| --- | --- |\n| 1 | 2 |\n\n",
+            "Final tail line.\n",
+        ];
+        // Paced: escapement on, streamed with per-delta ticks, then finalize.
+        let mut paced = Screen::new();
+        let _ = paced.wrapped_lines(80);
+        let base = std::time::Instant::now();
+        for (i, d) in deltas.iter().enumerate() {
+            paced.apply(UiEvent::AssistantTextDelta((*d).to_string()));
+            paced.commit_stream_tick(base + std::time::Duration::from_millis(i as u64 * 100));
+        }
+        paced.apply(UiEvent::AssistantTextEnd(String::new()));
+
+        // Bypassed: reduced motion, same deltas, no ticks.
+        let mut bypass = Screen::new();
+        bypass.set_reduced_motion(true);
+        let _ = bypass.wrapped_lines(80);
+        for d in deltas {
+            bypass.apply(UiEvent::AssistantTextDelta(d.to_string()));
+        }
+        bypass.apply(UiEvent::AssistantTextEnd(String::new()));
+
+        let paced_rows: Vec<String> = paced.transcript.rows.iter().map(row_text).collect();
+        let bypass_rows: Vec<String> = bypass.transcript.rows.iter().map(row_text).collect();
+        assert_eq!(
+            paced_rows, bypass_rows,
+            "the finished message is byte-identical regardless of pacing"
+        );
+        assert_eq!(
+            line_signature(&paced.wrapped_lines(80)),
+            line_signature(&bypass.wrapped_lines(80)),
+            "rendered finished message differs between paced and bypassed"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_shows_arrival_in_the_same_frame() {
+        // Criterion 6: reduced motion is pass-through — arrival == display in the
+        // same frame, with no beat needed.
+        let mut screen = Screen::new();
+        screen.set_reduced_motion(true);
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "instant answer tail".to_string(),
+        ));
+        assert!(
+            rendered_text(&mut screen, 80, 12).contains("instant answer tail"),
+            "reduced-motion answer renders on arrival, no beat"
+        );
+
+        let mut screen2 = Screen::new();
+        screen2.set_reduced_motion(true);
+        let _ = screen2.wrapped_lines(80);
+        screen2.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen2.apply(UiEvent::AssistantReasoningDelta(
+            "instant reasoning trace".to_string(),
+        ));
+        assert!(
+            rendered_text(&mut screen2, 80, 12).contains("instant reasoning trace"),
+            "reduced-motion reasoning renders on arrival, no beat"
+        );
+    }
+
+    #[test]
+    fn entering_reduced_motion_flushes_held_stream_text() {
+        // Criterion 4 (§2.2): entering reduced motion flushes any escapement-held
+        // text immediately.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "held mid-stream text".to_string(),
+        ));
+        assert!(
+            !rendered_text(&mut screen, 80, 12).contains("held mid-stream text"),
+            "held before entering reduced motion"
+        );
+        screen.set_reduced_motion(true);
+        assert!(
+            rendered_text(&mut screen, 80, 12).contains("held mid-stream text"),
+            "entering reduced motion flushed the held tail"
+        );
+    }
+
+    #[test]
+    fn only_the_commit_tick_beats_the_escapement_no_second_timer() {
+        // Criterion 7: the drain is driven by the existing tick/commit cadence
+        // ONLY. The animation tick (`screen.tick`) must not advance the tail —
+        // there is no second timer.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "held until the commit tick".to_string(),
+        ));
+        for _ in 0..5 {
+            let _ = screen.tick();
+        }
+        assert!(
+            !rendered_text(&mut screen, 80, 12).contains("held until"),
+            "screen.tick (animation) must not beat the escapement"
+        );
+        // Only commit_stream_tick — the same cadence that paces scrollback —
+        // advances the tail.
+        assert!(screen.commit_stream_tick(std::time::Instant::now()));
+        assert!(
+            rendered_text(&mut screen, 80, 12).contains("held until"),
+            "commit_stream_tick is the single beat driver"
+        );
+    }
+
+    #[test]
+    fn approval_gate_flushes_pending_text_before_the_review_block() {
+        // Criterion 4 (§2.2): an approval gate opening flushes — the user must
+        // review against complete context, so the pending assistant text is
+        // visible above the REVIEW block.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(100);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "Rationale for the proposed change.\n\n".to_string(),
+        ));
+        // The gated tool opens its REVIEW block; the block's own begin_block
+        // finalizes (flushes) the stream so the text lands above it.
+        let call = call_args("bash", json!({ "command": "rm -rf build" }));
+        screen.apply(UiEvent::ToolReview {
+            call,
+            allow_always: true,
+            allow_project: false,
+            dirty_gate: false,
+            reason: None,
+        });
+        let out = rendered_text(&mut screen, 100, 30);
+        let text_at = out
+            .find("Rationale for the proposed change.")
+            .expect("pending text visible before review");
+        let review_at = out.find("REVIEW").expect("review block rendered");
+        assert!(
+            text_at < review_at,
+            "pending assistant text renders above the REVIEW block: {out}"
+        );
+    }
+
+    #[test]
+    fn show_approval_flushes_the_pending_tail() {
+        // Criterion 4 (§2.2): the show_approval entry point itself flushes the
+        // escapement into the tail, independent of the block-rendering path.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "pending answer tail".to_string(),
+        ));
+        assert!(
+            !rendered_text(&mut screen, 80, 12).contains("pending answer tail"),
+            "held before the gate opens"
+        );
+        screen.show_approval(true, false, false);
+        assert!(
+            rendered_text(&mut screen, 80, 12).contains("pending answer tail"),
+            "the approval gate released the held tail"
+        );
+    }
+
+    #[test]
+    fn session_reset_flushes_the_pending_stream() {
+        // Criterion 4 (§2.2): a session reset (`/new`) flushes — the stream is
+        // finalized, its text committed, and no escapement backlog is stranded.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "answer before the reset.\n\n".to_string(),
+        ));
+        screen.apply(UiEvent::SessionStarted);
+        assert!(
+            !screen.transcript.stream.is_active() && !screen.has_stream_work(),
+            "the session reset flushed and finalized the stream"
+        );
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|r| row_text(r).contains("answer before the reset.")),
+            "the held text was flushed, not stranded"
+        );
+    }
+
+    #[test]
+    fn cancel_flushes_the_held_answer_tail_without_an_end() {
+        // Criterion 4 (§2.2): a terminal provider event (cancel) flushes the
+        // answer stream even when no AssistantTextEnd precedes it.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "partial answer held in the escapement.\n\n".to_string(),
+        ));
+        screen.apply(UiEvent::ProviderTurnCancelled {
+            turn_id: "t1".to_string(),
+        });
+        assert!(
+            !screen.transcript.stream.is_active() && !screen.has_stream_work(),
+            "cancel finalized the stream"
+        );
+        let committed = screen
+            .transcript
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            committed
+                .matches("partial answer held in the escapement.")
+                .count(),
+            1,
+            "the held tail is committed exactly once on cancel: {committed}"
+        );
+    }
+
+    #[test]
+    fn completion_flushes_the_held_answer_tail_without_an_end() {
+        // Criterion 4 (§2.2): provider turn completion flushes the answer
+        // stream even when no AssistantTextEnd precedes it — same defensive
+        // guard as cancel/error, not a reliance on Nexus event ordering.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "partial answer held in the escapement.\n\n".to_string(),
+        ));
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "t1".to_string(),
+            response_id: None,
+            usage: None,
+        });
+        assert!(
+            !screen.transcript.stream.is_active() && !screen.has_stream_work(),
+            "completion finalized the stream"
+        );
+        let committed = screen
+            .transcript
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            committed
+                .matches("partial answer held in the escapement.")
+                .count(),
+            1,
+            "the held tail is committed exactly once on completion: {committed}"
+        );
+    }
+
+    #[test]
+    fn reasoning_burst_paces_across_beats_and_flushes_on_end() {
+        // Criterion 5: a reasoning delta burst renders across beats (not all at
+        // once), and reasoning end flushes the trace.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(90);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        let burst = "reasoning ".repeat(30); // 300 bytes
+        screen.apply(UiEvent::AssistantReasoningDelta(burst));
+        // Held until the beat: nothing shown yet.
+        assert_eq!(
+            rendered_needle_count(&mut screen, "reasoning"),
+            0,
+            "reasoning is held until the beat"
+        );
+        // One beat releases a bounded quantum of the trace, not all of it.
+        screen.commit_stream_tick(std::time::Instant::now());
+        let after_one = rendered_needle_count(&mut screen, "reasoning");
+        assert!(
+            after_one > 0 && after_one < 30,
+            "reasoning renders across beats, not all at once: {after_one}"
+        );
+        settle_stream(&mut screen);
+        assert_eq!(
+            rendered_needle_count(&mut screen, "reasoning"),
+            30,
+            "the whole reasoning burst drains across beats"
+        );
+        // Still transient — not committed to scrollback until the trace ends.
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .all(|r| !row_text(r).contains("reasoning")),
+            "reasoning preview stays transient before its end"
+        );
+        // Reasoning end (a non-reasoning event) flushes + commits the trace.
+        screen.apply(UiEvent::TurnComplete);
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|r| row_text(r).contains("reasoning")),
+            "reasoning flushed and committed on end"
+        );
+    }
+
+    #[test]
+    fn reasoning_flushes_and_commits_on_provider_error() {
+        // Criterion 4 (§2.2): a provider error flushes the reasoning trace.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(
+            "partial thought held".to_string(),
+        ));
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .all(|r| !row_text(r).contains("partial thought held")),
+            "held before the error"
+        );
+        screen.apply(UiEvent::ProviderTurnError {
+            turn_id: "t1".to_string(),
+            message: "boom".to_string(),
+        });
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|r| row_text(r).contains("partial thought held")),
+            "reasoning flushed and committed on error"
+        );
+    }
+
     // --- Slice 3: provider-neutral live reasoning deltas ---
 
     #[test]
@@ -1580,6 +2053,9 @@ mod tests {
         // the frame but NOT yet committed to scrollback.
         screen.apply(UiEvent::AssistantReasoningDelta("Weighing ".to_string()));
         screen.apply(UiEvent::AssistantReasoningDelta("the options.".to_string()));
+        // The reasoning caret steps on the tick beat: let the escapement release
+        // the held reasoning into the preview.
+        settle_stream(&mut screen);
         let preview = rendered_text(&mut screen, 80, 16);
         assert!(
             preview.contains("THINKING"),
@@ -1606,6 +2082,8 @@ mod tests {
                 .any(|r| row_text(r).contains("Weighing the options.")),
             "reasoning committed on first answer delta"
         );
+        // Release the held answer into the tail so it renders below the trace.
+        settle_stream(&mut screen);
         let out = rendered_text(&mut screen, 80, 16);
         let thinking_at = out.find("THINKING").expect("thinking");
         let answer_at = out.find("Here is the answer.").expect("answer");
@@ -1799,7 +2277,8 @@ mod tests {
         screen.apply(UiEvent::AssistantReasoningSectionBreak);
         screen.apply(UiEvent::AssistantReasoningDelta("Second part.".to_string()));
         // A leading section break (before any text) is a no-op; the two parts
-        // both render in the live preview.
+        // both render in the live preview once their beats release.
+        settle_stream(&mut screen);
         let preview = rendered_text(&mut screen, 80, 16);
         assert!(preview.contains("First part."), "{preview}");
         assert!(preview.contains("Second part."), "{preview}");
@@ -1848,6 +2327,358 @@ mod tests {
         assert!(
             header.contains("↓2.4k"),
             "telemetry on committed header: {header}"
+        );
+    }
+
+    // --- The living thought: the streaming thinking block (living-thought spec) ---
+
+    /// Build a reasoning trace of `n` fixed-width tokens that each wrap to exactly
+    /// one rail row at width 30 (content 22, rail text area 20): an 18-cell token
+    /// fits alone, two do not — so `n` tokens render as `n` wrapped body rows.
+    fn reasoning_rows(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("ROW{i:02}xxxxxxxxxxxxx"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The THINKING header line of the current frame at width 30.
+    fn thinking_header(screen: &mut Screen) -> String {
+        rendered_lines(screen, 30, 30)
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains("THINKING"))
+            .expect("a THINKING header row")
+    }
+
+    #[test]
+    fn live_thinking_header_lights_the_lamp_and_elapsed_then_drops_on_commit() {
+        // Criterion 1: streaming shows `▾ THINKING ●` + live elapsed; commit drops
+        // the lamp and patches `↓tokens elapsed`.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(reasoning_rows(40)));
+        settle_stream(&mut screen);
+        let header = thinking_header(&mut screen);
+        assert!(header.contains('\u{25be}'), "foldable arrow ▾: {header}");
+        assert!(header.contains('\u{25cf}'), "lit lamp ●: {header}");
+        assert!(
+            header.trim_end().ends_with('s') && header.chars().any(|c| c.is_ascii_digit()),
+            "live elapsed on the right rail: {header}"
+        );
+        assert!(
+            !header.contains('\u{2193}'),
+            "no fabricated ↓tokens live: {header}"
+        );
+        // Commit: the lamp drops, the settled telemetry (`↓tokens elapsed`) lands.
+        screen.apply(UiEvent::AssistantTextDelta("Answer.".to_string()));
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "t1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 10_000,
+                output_tokens: 3_000,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 2_400,
+                total_tokens: 13_000,
+                cache_creation: None,
+            }),
+        });
+        settle_stream(&mut screen);
+        let settled = thinking_header(&mut screen);
+        assert!(
+            !settled.contains('\u{25cf}'),
+            "lamp is dark once settled: {settled}"
+        );
+        assert!(
+            settled.contains("\u{2193}2.4k"),
+            "settled telemetry: {settled}"
+        );
+    }
+
+    #[test]
+    fn live_thinking_body_is_a_bounded_tail_window_with_honest_elision() {
+        // Criterion 2 / 7: a 40-row live stream renders 4 tail rows + `┊ … +36
+        // rows`, the tail row carries the `▋` caret at the stream edge, and the
+        // caret advances as more arrives.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(reasoning_rows(40)));
+        settle_stream(&mut screen);
+        let lines: Vec<String> = rendered_lines(&mut screen, 30, 30)
+            .iter()
+            .map(line_text)
+            .collect();
+        // Exactly four rail body rows (the `┊` rail, minus the elision) render.
+        let rail_rows: Vec<&String> = lines
+            .iter()
+            .filter(|t| t.contains('\u{250a}') && !t.contains('\u{2026}'))
+            .collect();
+        assert_eq!(rail_rows.len(), 4, "four tail rows: {lines:?}");
+        // The honest elision names the hidden count, and it is a rail readout.
+        assert!(
+            lines
+                .iter()
+                .any(|t| t.contains('\u{250a}') && t.contains("\u{2026} +36 rows")),
+            "honest elision row: {lines:?}"
+        );
+        // The tail is the LAST four rows; earlier rows are hidden.
+        assert!(
+            lines.iter().any(|t| t.contains("ROW39")),
+            "tail edge: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|t| t.contains("ROW36")),
+            "tail window: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|t| t.contains("ROW35")),
+            "earlier rows are hidden: {lines:?}"
+        );
+        // The caret rides the stream edge — the last tail row.
+        let edge = lines
+            .iter()
+            .find(|t| t.contains("ROW39"))
+            .expect("the stream-edge row");
+        assert!(
+            edge.contains('\u{258b}'),
+            "▋ caret at the stream edge: {edge}"
+        );
+    }
+
+    #[test]
+    fn live_thinking_caret_advances_with_arrival() {
+        // Criterion 2: the caret position advances as text arrives — the edge
+        // row is a later token after more has streamed.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(reasoning_rows(6)));
+        settle_stream(&mut screen);
+        let first_edge = rendered_lines(&mut screen, 30, 30)
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains('\u{258b}'))
+            .expect("a caret row");
+        assert!(
+            first_edge.contains("ROW05"),
+            "caret at first edge: {first_edge}"
+        );
+        // More arrives (appended, so the edge token is later).
+        screen.apply(UiEvent::AssistantReasoningDelta(
+            " ZED00xxxxxxxxxxxxx ZED01xxxxxxxxxxxxx".to_string(),
+        ));
+        settle_stream(&mut screen);
+        let next_edge = rendered_lines(&mut screen, 30, 30)
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains('\u{258b}'))
+            .expect("a caret row");
+        assert!(
+            next_edge.contains("ZED01"),
+            "caret advanced to the new edge: {next_edge}"
+        );
+        assert_ne!(first_edge, next_edge, "the caret row moved with arrival");
+    }
+
+    #[test]
+    fn short_live_thinking_shows_whole_and_is_not_foldable() {
+        // Criterion 2 / 3: a 3-row live stream renders whole, no elision, a caret
+        // on the last row, no disclosure arrow, and it does not participate in
+        // ctrl+o (no no-op toggle).
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(reasoning_rows(3)));
+        settle_stream(&mut screen);
+        let lines: Vec<String> = rendered_lines(&mut screen, 30, 30)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            lines.iter().any(|t| t.contains("ROW00")),
+            "whole trace: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|t| t.contains("ROW02")),
+            "whole trace: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|t| t.contains("rows") && t.contains('\u{2026}')),
+            "no elision for a short trace: {lines:?}"
+        );
+        let header = thinking_header(&mut screen);
+        assert!(
+            header.contains('\u{25cf}'),
+            "lamp still lit on a short trace: {header}"
+        );
+        assert!(
+            !header.contains('\u{25be}') && !header.contains('\u{25b8}'),
+            "a ≤4-row live trace has no disclosure arrow: {header}"
+        );
+        // Nothing hidden ⇒ ctrl+o offers no no-op toggle.
+        assert!(
+            !screen.toggle_all_panels(),
+            "short live trace is not foldable"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_toggles_live_thinking_between_tail_window_and_full_stream() {
+        // Criterion 3: ctrl+o during streaming toggles tail window ⇄ full stream.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(reasoning_rows(40)));
+        settle_stream(&mut screen);
+        let windowed: Vec<String> = rendered_lines(&mut screen, 30, 60)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            !windowed.iter().any(|t| t.contains("ROW00")),
+            "windowed: earliest row hidden: {windowed:?}"
+        );
+        // ctrl+o opens the full live stream: every row shows, no elision.
+        assert!(screen.toggle_all_panels(), "ctrl+o toggles the live block");
+        let full: Vec<String> = rendered_lines(&mut screen, 30, 60)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            full.iter().any(|t| t.contains("ROW00")),
+            "full stream: {full:?}"
+        );
+        assert!(
+            full.iter().any(|t| t.contains("ROW39")),
+            "full stream: {full:?}"
+        );
+        assert!(
+            !full
+                .iter()
+                .any(|t| t.contains("\u{2026} +") && t.contains("rows")),
+            "no elision in the full stream: {full:?}"
+        );
+        assert!(
+            full.iter().any(|t| t.contains('\u{258b}')),
+            "caret in full stream: {full:?}"
+        );
+        // ctrl+o again returns to the bounded tail window.
+        assert!(screen.toggle_all_panels(), "ctrl+o toggles back");
+        let rewindowed: Vec<String> = rendered_lines(&mut screen, 30, 60)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            !rewindowed.iter().any(|t| t.contains("ROW00")),
+            "back to the tail window: {rewindowed:?}"
+        );
+        assert!(
+            rewindowed.iter().any(|t| t.contains("\u{2026} +36 rows")),
+            "elision returns: {rewindowed:?}"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_live_thinking_renders_the_same_bounded_window() {
+        // Criterion 4: reduced motion changes no behavior here — the lamp, caret,
+        // window, and elision render identically; elapsed still updates (it is
+        // data). Under reduced motion arrival renders immediately (no beats).
+        let mut screen = Screen::new();
+        screen.set_reduced_motion(true);
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(reasoning_rows(40)));
+        let lines: Vec<String> = rendered_lines(&mut screen, 30, 30)
+            .iter()
+            .map(line_text)
+            .collect();
+        let rail_rows = lines
+            .iter()
+            .filter(|t| t.contains('\u{250a}') && !t.contains('\u{2026}'))
+            .count();
+        assert_eq!(
+            rail_rows, 4,
+            "bounded tail window under reduced motion: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|t| t.contains("\u{2026} +36 rows")),
+            "elision under reduced motion: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|t| t.contains("ROW39") && t.contains('\u{258b}')),
+            "caret at the edge under reduced motion: {lines:?}"
+        );
+        let header = thinking_header(&mut screen);
+        assert!(
+            header.contains('\u{25cf}'),
+            "lamp under reduced motion: {header}"
+        );
+        assert!(
+            header.trim_end().ends_with('s') && header.chars().any(|c| c.is_ascii_digit()),
+            "elapsed still updates under reduced motion: {header}"
+        );
+    }
+
+    #[test]
+    fn redacted_reasoning_has_no_live_body_caret_or_elision() {
+        // Criterion 6: redacted reasoning never streams a body — no live rows
+        // beyond the placeholder, no caret, no elision, no lamp.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoning {
+            text: String::new(),
+            redacted: true,
+        });
+        let lines: Vec<String> = rendered_lines(&mut screen, 30, 20)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            lines.iter().any(|t| t.contains("withheld")),
+            "placeholder: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|t| t.contains('\u{258b}')),
+            "no live caret for redacted reasoning: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|t| t.contains('\u{2026}') && t.contains("rows")),
+            "no elision for redacted reasoning: {lines:?}"
+        );
+        let header = lines
+            .iter()
+            .find(|t| t.contains("THINKING"))
+            .expect("a THINKING header");
+        assert!(
+            !header.contains('\u{25cf}'),
+            "no lamp for redacted reasoning: {header}"
         );
     }
 
@@ -1903,12 +2734,15 @@ mod tests {
         screen.commit_user("a user prompt that wraps across the narrow test width");
         check(&mut screen, &mut incremental);
 
-        // Streaming frames: transient rows after committed history.
+        // Streaming frames: transient rows after committed history. Beat the
+        // escapement so the paced tail is actually present to diff.
         screen.apply(UiEvent::AssistantTextDelta(
             "streaming **tail** ".to_string(),
         ));
+        settle_stream(&mut screen);
         check(&mut screen, &mut incremental);
         screen.apply(UiEvent::AssistantTextDelta("grows".to_string()));
+        settle_stream(&mut screen);
         check(&mut screen, &mut incremental);
         screen.apply(UiEvent::AssistantTextEnd(String::new()));
         check(&mut screen, &mut incremental);
@@ -2248,10 +3082,12 @@ mod tests {
     }
 
     #[test]
-    fn shell_review_renders_in_block_with_affordance() {
+    fn shell_review_renders_in_block_with_indicator() {
         // A gated SHELL call renders its review INSIDE its own tool block: the
-        // `REVIEW` state, the `$ command` body, and the decision affordance on
-        // the block's footer — never a separate approval panel or docked box.
+        // `REVIEW` state, the `$ command` body, and a dim awaiting-decision
+        // note on the block's footer — never a separate approval panel or
+        // docked box, and never the decision keymap (that renders once, at the
+        // composer, §8.5).
         let mut screen = Screen::new();
         screen.apply(UiEvent::ToolReview {
             call: call_args("bash", json!({ "command": "echo hi" })),
@@ -2264,10 +3100,35 @@ mod tests {
         assert!(rendered.contains("REVIEW"), "{rendered}");
         assert!(rendered.contains("SHELL"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
-        assert!(rendered.contains("y approve"), "{rendered}");
-        assert!(rendered.contains("n deny"), "{rendered}");
+        assert!(rendered.contains("awaiting decision"), "{rendered}");
+        assert!(!rendered.contains("y approve"), "{rendered}");
+        assert!(!rendered.contains("n deny"), "{rendered}");
         // The approval lives in the tool block: no separate APPROVAL panel.
         assert!(!rendered.contains("APPROVAL"), "{rendered}");
+    }
+
+    #[test]
+    fn review_keymap_lives_only_in_the_composer_echo() {
+        // The de-duplication contract: with a review pending AND the loop's
+        // approval posture raised, the offered keymap renders exactly once —
+        // in the composer placeholder — while the block carries the dim
+        // awaiting-decision note.
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolReview {
+            call: call_args("bash", json!({ "command": "echo hi" })),
+            allow_always: false,
+            allow_project: false,
+            dirty_gate: false,
+            reason: None,
+        });
+        screen.show_approval(false, false, false);
+        let rendered = rendered_text(&mut screen, 80, 14);
+        assert_eq!(
+            rendered.matches("y approve").count(),
+            1,
+            "keymap once, at the composer: {rendered}"
+        );
+        assert!(rendered.contains("awaiting decision"), "{rendered}");
     }
 
     #[test]
@@ -2325,7 +3186,7 @@ mod tests {
         assert!(rendered.contains("$ printf 'global:"), "{rendered}");
         // Timeout is right-bound invocation metadata in the SHELL body.
         assert!(rendered.contains("timeout 120s"), "{rendered}");
-        assert!(rendered.contains("n deny"), "{rendered}");
+        assert!(rendered.contains("awaiting decision"), "{rendered}");
     }
 
     #[test]
@@ -2490,8 +3351,8 @@ mod tests {
         assert!(rendered.contains("RUNNING"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
         assert!(
-            !rendered.contains("y approve"),
-            "affordance gone: {rendered}"
+            !rendered.contains("awaiting decision"),
+            "indicator gone: {rendered}"
         );
         assert!(!rendered.contains("REVIEW"), "no stale REVIEW: {rendered}");
         assert!(!rendered.contains("approved this"), "no note: {rendered}");
@@ -2518,7 +3379,7 @@ mod tests {
         });
         let rendered = rendered_text(&mut screen, 100, 20);
         assert!(rendered.contains("REVIEW"), "{rendered}");
-        assert!(rendered.contains("y approve"), "{rendered}");
+        assert!(rendered.contains("awaiting decision"), "{rendered}");
         // The review arrives expanded: the diff body IS the review surface.
         assert!(rendered.contains("new"), "diff body kept: {rendered}");
         assert_eq!(
@@ -2536,7 +3397,7 @@ mod tests {
     fn review_reason_shows_danger_toned_caution() {
         // A danger-toned caution (destructive / dirty paths /
         // unsandboxed) rides the review footer in the danger role, ahead of the
-        // decision affordance, so the safety fact survives the decision point.
+        // awaiting-decision note, so the safety fact survives the decision point.
         let mut screen = Screen::new();
         screen.apply(UiEvent::ToolReview {
             call: call_args("bash", json!({ "command": "rm -rf build" })),
@@ -2550,7 +3411,7 @@ mod tests {
         let marker = span_matching(line, |span| span.content.as_ref().contains("destructive"));
         assert_eq!(marker.style.fg, err_style().fg, "danger-toned reason");
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(rendered.contains("y approve"), "{rendered}");
+        assert!(rendered.contains("awaiting decision"), "{rendered}");
     }
 
     #[test]
@@ -2568,6 +3429,14 @@ mod tests {
             rendered.contains("Touches uncommitted user changes: src/main.rs"),
             "{rendered}"
         );
+        // The dirty-scoped `always` label renders at the composer echo (the
+        // keymap's one home), not on the block footer.
+        assert!(
+            !rendered.contains("a all dirty files (this task)"),
+            "{rendered}"
+        );
+        screen.show_approval(true, false, true);
+        let rendered = rendered_text(&mut screen, 140, 14);
         assert!(
             rendered.contains("a all dirty files (this task)"),
             "{rendered}"
@@ -3002,6 +3871,37 @@ mod tests {
     }
 
     #[test]
+    fn pane_chrome_shows_the_review_posture_while_awaiting_approval() {
+        // Golden frame (review-posture spec, criterion 7): composer + statusline
+        // in the waiting state — the `▲ REVIEW` swap and the decision-echo
+        // placeholder, all keyed on `awaiting_approval`.
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "sonnet 3.5".to_string(),
+            Some("high".to_string()),
+            "~/workspace/user-auth".to_string(),
+        );
+        screen.show_approval(true, true, false);
+        let rendered = rendered_text(&mut screen, 100, 12);
+
+        // The leading segment swaps to `▲ REVIEW`; the policy segment still
+        // reads `▲ on-request` (now dimmed) and `◉ CODE` is gone.
+        assert!(
+            rendered.contains("▲ REVIEW ─ SONNET 3.5 HIGH ─ ▲ on-request"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("◉ CODE"), "{rendered}");
+
+        // The empty composer echoes the offered decision set as a dim
+        // placeholder, in place of the product prompt.
+        assert!(
+            rendered.contains("review waiting ┊ y approve ┊ n deny ┊ a always ┊ p project"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Give Iris a task..."), "{rendered}");
+    }
+
+    #[test]
     fn keyboard_enhancement_pushed_only_when_supported() -> io::Result<()> {
         // Unsupported terminal: never push (safe fallback to plain key events).
         let mut out: Vec<u8> = Vec::new();
@@ -3175,7 +4075,7 @@ mod tests {
             "~/repo".to_string(),
         );
         screen.apply(UiEvent::SessionStarted);
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
         render_perf_cycle(&mut screen, &mut surface, size).expect("start-page frame");
         // New session selected / first prompt submitted -> start page dismissed.
         screen.leave_start_page();
@@ -3308,7 +4208,9 @@ mod tests {
             ..Default::default()
         }));
         screen.apply(UiEvent::SessionStarted);
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
+        // Settle the power-on lamp test; this test pins the settled page.
+        screen.start_page.as_mut().expect("start page").skip_boot();
 
         let height = 24u16;
         let lines = rendered_lines(&mut screen, 80, height);
@@ -3321,7 +4223,8 @@ mod tests {
             texts[0].trim_end().ends_with("CTX 0/300k ○○○○○○○○○○"),
             "{texts:?}"
         );
-        // The IrisMark LED strip sits above the launcher menu.
+        // The IrisMark LED strip sits above the launcher menu, with the
+        // silkscreen identity row (wordmark + rev) printed directly beneath it.
         let mark_idx = texts
             .iter()
             .position(|line| line.contains('●') && line.contains('○') && !line.contains("CTX"))
@@ -3331,6 +4234,11 @@ mod tests {
             .position(|line| line.contains("New session"))
             .expect("launcher menu");
         assert!(mark_idx < menu_idx, "{texts:?}");
+        assert!(
+            texts[mark_idx + 1].contains("I R I S")
+                && texts[mark_idx + 1].contains(env!("CARGO_PKG_VERSION")),
+            "silkscreen under the strip: {texts:?}"
+        );
         // All five rows, in order, with their key hints and the house idiom:
         // ◉ marker on the selected row, dotted leaders, no hairline dividers.
         assert!(texts[menu_idx].contains("◉ New session"), "{texts:?}");
@@ -4112,6 +5020,69 @@ mod tests {
         assert!(rendered.contains("hi"), "{rendered}");
         assert!(rendered.contains("┊ interleaved note"), "{rendered}");
         assert!(!rendered.contains("RUNNING"), "{rendered}");
+    }
+
+    #[test]
+    fn settled_explore_collapses_when_the_group_closes() {
+        let mut screen = Screen::new();
+        let call = call_args("read", json!({ "path": "src/lib.rs" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "l1\nl2\nl3".to_string(),
+            exit_code: None,
+            duration: Some(Duration::from_millis(5)),
+        });
+        // While the group is open the live block stays expanded.
+        let rendered = rendered_text(&mut screen, 100, 16);
+        assert!(
+            rendered.contains("Read"),
+            "open group shows its ops: {rendered}"
+        );
+
+        // The next top-level block closes the group: compact by default, the
+        // settled explore collapses to header + footer.
+        screen.apply(UiEvent::AssistantText("done".to_string()));
+        let rendered = rendered_text(&mut screen, 100, 16);
+        assert!(rendered.contains("▸ EXPLORE"), "collapsed: {rendered}");
+        assert!(
+            !rendered.contains("Read  "),
+            "op rows unmounted when collapsed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn user_expanded_explore_survives_the_group_close() {
+        let mut screen = Screen::new();
+        let call = call_args("read", json!({ "path": "src/lib.rs" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "l1".to_string(),
+            exit_code: None,
+            duration: Some(Duration::from_millis(5)),
+        });
+        // The user explicitly re-affirms the open block's expansion…
+        let header = screen
+            .transcript
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.chrome.as_ref(),
+                    Some(ChromeRow::Header {
+                        title: "EXPLORE",
+                        ..
+                    })
+                )
+            })
+            .expect("explore header");
+        screen.transcript.set_panel_expanded_at(header, true);
+        // …so the group close honors that intent instead of collapsing.
+        screen.apply(UiEvent::AssistantText("done".to_string()));
+        let rendered = rendered_text(&mut screen, 100, 16);
+        assert!(rendered.contains("▾ EXPLORE"), "{rendered}");
+        assert!(rendered.contains("Read"), "{rendered}");
     }
 
     #[test]
@@ -5334,10 +6305,11 @@ mod tests {
                     line_text(&line)
                 );
             }
-            // Streaming path.
+            // Streaming path: beat the escapement so the table is in the tail.
             let mut screen = Screen::new();
             let _ = screen.wrapped_lines(width);
             screen.apply(UiEvent::AssistantTextDelta(md.to_string()));
+            settle_stream(&mut screen);
             for line in rendered_lines(&mut screen, width, 24) {
                 let w = super::wrap::display_width(&line_text(&line));
                 assert!(
@@ -6102,30 +7074,16 @@ mod tests {
 
     #[test]
     fn shrinking_palette_and_modal_content_clears_old_rows() -> std::io::Result<()> {
-        use crate::mimir::model_catalog::CatalogModel;
-        use crate::mimir::selection::ProviderId;
-        use crate::ui::modal::{Modal, ModelPicker};
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::{HatchTarget, SettingsPanel};
 
         let mut surface = TerminalSurface::new(Vec::new());
         let mut screen = Screen::new();
-        screen.open_modal(Modal::Model(ModelPicker::new(
-            vec![
-                CatalogModel {
-                    provider: ProviderId::OpenAiCodex,
-                    id: "gpt-5.5".to_string(),
-                    ctx_label: None,
-                },
-                CatalogModel {
-                    provider: ProviderId::Anthropic,
-                    id: "claude-sonnet-4-6".to_string(),
-                    ctx_label: None,
-                },
-            ],
-            "openai-codex/gpt-5.5",
-            "openai-codex/gpt-5.5",
-            crate::mimir::selection::ReasoningEffort::Medium,
-        )));
-        surface.render(Size::new(60, 14), &rendered_lines(&mut screen, 60, 14))?;
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::with_expanded(
+            faceplate_snapshot(),
+            HatchTarget::Model,
+        ))));
+        surface.render(Size::new(60, 22), &rendered_lines(&mut screen, 60, 22))?;
         assert!(
             surface
                 .state()
@@ -6135,7 +7093,7 @@ mod tests {
         );
 
         screen.close_modal();
-        let stats = surface.render(Size::new(60, 14), &rendered_lines(&mut screen, 60, 14))?;
+        let stats = surface.render(Size::new(60, 22), &rendered_lines(&mut screen, 60, 22))?;
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
         assert_ne!(stats.kind, RenderKind::Unchanged);
         assert!(!replay.contains("GPT 5.5"), "{replay:?}");
@@ -6180,98 +7138,285 @@ mod tests {
 
     #[test]
     fn modal_render_survives_a_tiny_terminal() {
-        use crate::mimir::model_catalog::CatalogModel;
-        use crate::mimir::selection::ProviderId;
-        use crate::ui::modal::{Modal, ModelPicker};
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::{HatchTarget, SettingsPanel};
 
-        for width in [10u16, 16, 24, 40] {
-            for height in [2u16, 3, 4] {
-                let mut screen = Screen::new();
-                screen.open_modal(Modal::Model(ModelPicker::new(
-                    vec![CatalogModel {
-                        provider: ProviderId::OpenAiCodex,
-                        id: "gpt-5.5".to_string(),
-                        ctx_label: None,
-                    }],
-                    "openai-codex/gpt-5.5",
-                    "openai-codex/gpt-5.5",
-                    crate::mimir::selection::ReasoningEffort::Medium,
-                )));
-                let _ = rendered_lines(&mut screen, width, height);
+        // Every hatch, at every degenerate width/height: rendering must never
+        // panic (the adversarial narrow-and-short pass, §6).
+        for target in [
+            HatchTarget::Model,
+            HatchTarget::Scope,
+            HatchTarget::Permissions,
+            HatchTarget::Login,
+        ] {
+            for width in [10u16, 16, 24, 40] {
+                for height in [2u16, 3, 4, 20] {
+                    let mut screen = Screen::new();
+                    screen.open_modal(Modal::Settings(Box::new(SettingsPanel::with_expanded(
+                        faceplate_snapshot(),
+                        target,
+                    ))));
+                    let _ = rendered_lines(&mut screen, width, height);
+                }
             }
         }
     }
 
     #[test]
-    fn open_modal_renders_plain_picker_above_composer() {
-        use crate::mimir::model_catalog::CatalogModel;
-        use crate::mimir::selection::ProviderId;
-        use crate::ui::modal::{Modal, ModelPicker};
+    fn model_hatch_renders_above_the_composer_on_a_tall_pane() {
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::{HatchTarget, SettingsPanel};
 
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText("prior reply".to_string()));
-        let models = vec![
-            CatalogModel {
-                provider: ProviderId::OpenAiCodex,
-                id: "gpt-5.5".to_string(),
-                ctx_label: None,
-            },
-            CatalogModel {
-                provider: ProviderId::Anthropic,
-                id: "claude-sonnet-4-6".to_string(),
-                ctx_label: None,
-            },
-        ];
-        screen.open_modal(Modal::Model(ModelPicker::new(
-            models,
-            "openai-codex/gpt-5.5",
-            "openai-codex/gpt-5.5",
-            crate::mimir::selection::ReasoningEffort::Medium,
-        )));
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::with_expanded(
+            faceplate_snapshot(),
+            HatchTarget::Model,
+        ))));
 
-        let rendered = rendered_text(&mut screen, 60, 14);
+        // Golden (a): the model hatch open on a tall pane — the ▾ marker, the
+        // candidate rows, and the reasoning track, all above the composer.
+        let rendered = rendered_text(&mut screen, 80, 30);
         assert!(rendered.contains("prior reply"), "{rendered}");
+        assert!(rendered.contains("SETTINGS"), "masthead:\n{rendered}");
+        assert!(
+            rendered.contains(crate::ui::symbols::EXPANDED),
+            "▾:\n{rendered}"
+        );
         assert!(rendered.contains("GPT 5.5"), "{rendered}");
         assert!(rendered.contains("Sonnet 4.6"), "{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
         let model_idx = rendered.find("GPT 5.5").expect("model row");
         let editor_idx = rendered.find("Give Iris a task").expect("composer row");
         assert!(model_idx < editor_idx, "{rendered}");
-        assert!(!rendered.contains("Select model"), "{rendered}");
+        // The old modal titles are gone.
+        assert!(!rendered.contains("MODEL & REASONING"), "{rendered}");
+        assert!(!rendered.contains("Model & reasoning"), "{rendered}");
     }
 
     #[test]
-    fn open_modal_has_room_for_model_picker_footer() {
-        use crate::mimir::model_catalog;
-        use crate::ui::modal::{Modal, ModelPicker};
+    fn scope_hatch_windows_on_a_short_pane() {
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::{HatchTarget, SettingsPanel};
 
+        // Golden (b): the scope hatch windowed on a short pane — the masthead is
+        // pinned, the house (n/N) position row prints, the composer survives.
         let mut screen = Screen::new();
-        screen.open_modal(Modal::Model(ModelPicker::new(
-            model_catalog::all(),
-            "anthropic/claude-opus-4-8",
-            "anthropic/claude-opus-4-8",
-            crate::mimir::selection::ReasoningEffort::XHigh,
-        )));
-
-        let rendered = rendered_text(&mut screen, 80, 17);
-        assert!(rendered.contains("Sonnet 5"), "{rendered}");
-        assert!(rendered.contains("effort (max)"), "{rendered}");
-        assert!(rendered.contains("SELECT MODEL"), "{rendered}");
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::with_expanded(
+            faceplate_snapshot(),
+            HatchTarget::Scope,
+        ))));
+        let rendered = rendered_text(&mut screen, 80, 18);
+        assert!(
+            rendered.contains("SETTINGS"),
+            "masthead pinned:\n{rendered}"
+        );
+        assert!(rendered.contains("ENGINE"), "{rendered}");
+        assert!(
+            rendered.contains(crate::ui::symbols::EXPANDED),
+            "▾:\n{rendered}"
+        );
+        assert!(rendered.contains('('), "position row:\n{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }
 
     #[test]
-    fn open_modal_reclaims_composer_bottom_padding() {
-        use crate::mimir::model_catalog;
-        use crate::ui::modal::{Modal, ModelPicker};
+    fn permissions_hatch_renders_a_bash_grant() {
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::{HatchTarget, SettingsPanel};
+
+        // Golden (c): the permissions hatch with a bash grant — the per-tool
+        // switches, the revoke-only bash row, and the read-only sandbox line.
+        let mut snap = faceplate_snapshot();
+        snap.policy.bash_exact = vec!["cargo test".to_string()];
+        snap.policy.sandbox = Some("workspace-write".to_string());
+        let mut screen = Screen::new();
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::with_expanded(
+            snap,
+            HatchTarget::Permissions,
+        ))));
+        let rendered = rendered_text(&mut screen, 90, 30);
+        assert!(
+            rendered.contains(crate::ui::symbols::EXPANDED),
+            "▾:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("ask") && rendered.contains("always"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("bash: cargo test"), "{rendered}");
+        assert!(rendered.contains("revoke"), "{rendered}");
+        assert!(rendered.contains("workspace-write"), "sandbox:\n{rendered}");
+        assert!(rendered.contains("Give Iris a task"), "{rendered}");
+    }
+
+    fn faceplate_model_choice(
+        provider: crate::mimir::selection::ProviderId,
+        model_id: &str,
+        is_current: bool,
+        is_default: bool,
+    ) -> crate::ui::settings_menu::ModelChoice {
+        let qualified = format!("{}/{}", provider.as_str(), model_id);
+        crate::ui::settings_menu::ModelChoice {
+            display: crate::mimir::model_catalog::display_name(&qualified),
+            provider_label: provider.display_name().to_string(),
+            levels: crate::mimir::model_capabilities::level_options(provider, model_id)
+                .iter()
+                .map(|option| (option.level, option.label))
+                .collect(),
+            provider,
+            model_id: model_id.to_string(),
+            is_current,
+            is_default,
+            qualified,
+        }
+    }
+
+    fn faceplate_snapshot() -> crate::ui::settings_menu::Snapshot {
+        use crate::mimir::selection::{ProviderId, ReasoningEffort};
+        crate::ui::settings_menu::Snapshot {
+            default_model: "openai-codex/gpt-5.5".to_string(),
+            reasoning_levels: vec![
+                (ReasoningEffort::Low, "low"),
+                (ReasoningEffort::Medium, "medium"),
+                (ReasoningEffort::High, "high"),
+            ],
+            reasoning: ReasoningEffort::Medium,
+            catalog: vec![
+                faceplate_model_choice(ProviderId::OpenAiCodex, "gpt-5.5", true, true),
+                faceplate_model_choice(ProviderId::Anthropic, "claude-sonnet-4-6", false, false),
+            ],
+            scope_candidates: vec![
+                crate::ui::settings_menu::ScopeChoice {
+                    qualified: "openai-codex/gpt-5.5".to_string(),
+                    provider_label: "OpenAI Codex".to_string(),
+                },
+                crate::ui::settings_menu::ScopeChoice {
+                    qualified: "anthropic/claude-sonnet-4-6".to_string(),
+                    provider_label: "Anthropic".to_string(),
+                },
+            ],
+            scope_enabled: None,
+            scope_persisted: None,
+            providers: vec![
+                crate::ui::settings_menu::ProviderStatus {
+                    id: "openai-codex".to_string(),
+                    name: "OpenAI Codex".to_string(),
+                    badge: "subscription".to_string(),
+                    oauth_capable: true,
+                    api_key_capable: false,
+                    credentialed: true,
+                },
+                crate::ui::settings_menu::ProviderStatus {
+                    id: "anthropic".to_string(),
+                    name: "Anthropic".to_string(),
+                    badge: "\u{2014}".to_string(),
+                    oauth_capable: true,
+                    api_key_capable: true,
+                    credentialed: false,
+                },
+            ],
+            policy: crate::ui::settings_menu::PolicySnapshot::default(),
+            default_approval: "auto".to_string(),
+            skip_permissions: false,
+            context_token_budget: 232_000,
+            compaction_summarizer: "subagent".to_string(),
+            microcompaction: true,
+            microcompaction_watermark: 32_000,
+            compaction_aggressiveness: "conservative".to_string(),
+            compaction_cache_timing: "cacheAware".to_string(),
+            semantic_retain_per_path: 1,
+            tool_clearing_keep_recent: 8,
+            prompt_cache_retention: "short".to_string(),
+            verify_command: None,
+            verify_max_attempts: 3,
+            theme: "terminal".to_string(),
+            alt_screen: "auto".to_string(),
+            scroll_speed: 3,
+            reduced_motion: false,
+            worktree_root: None,
+        }
+    }
+
+    #[test]
+    fn settings_panel_docks_the_whole_faceplate_on_a_tall_viewport() {
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::SettingsPanel;
 
         let mut screen = Screen::new();
-        screen.open_modal(Modal::Model(ModelPicker::new(
-            model_catalog::all(),
-            "anthropic/claude-opus-4-8",
-            "anthropic/claude-opus-4-8",
-            crate::mimir::selection::ReasoningEffort::XHigh,
-        )));
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::new(
+            faceplate_snapshot(),
+        ))));
+        let rendered = rendered_text(&mut screen, 100, 50);
+        // Masthead silkscreen + every section printed at once.
+        assert!(rendered.contains("SETTINGS"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("iris {}", env!("CARGO_PKG_VERSION"))),
+            "{rendered}"
+        );
+        for section in ["ENGINE", "SAFETY", "MEMORY", "CHECKS", "PANEL", "GIT"] {
+            assert!(rendered.contains(section), "{section} visible:\n{rendered}");
+        }
+        // The control archetypes: a printed switch scale, a 10-LED dial with
+        // its honest value, and a `▸` port.
+        assert!(rendered.contains("○ low  ◉ medium  ○ high"), "{rendered}");
+        assert!(rendered.contains("●●●●●●○○○○  232k tokens"), "{rendered}");
+        assert!(rendered.contains("▸ gpt-5.5 ┊ openai-codex"), "{rendered}");
+        // Nothing windowed: no position row on a tall viewport.
+        assert!(!rendered.contains("(1/23)"), "{rendered}");
+        // The composer stays protected below the panel.
+        assert!(rendered.contains("Give Iris a task"), "{rendered}");
+    }
+
+    #[test]
+    fn settings_panel_windows_honestly_under_the_session_bar_on_short_viewports() {
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::SettingsPanel;
+
+        let mut screen = Screen::new();
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::new(
+            faceplate_snapshot(),
+        ))));
+        let rendered = rendered_text(&mut screen, 80, 20);
+        // The masthead is pinned (never scrolled out, never painted under the
+        // session bar) and the window scrolls with the house position row.
+        assert!(rendered.contains("SETTINGS"), "{rendered}");
+        assert!(rendered.contains("ENGINE"), "{rendered}");
+        assert!(rendered.contains("(1/23)"), "{rendered}");
+        assert!(!rendered.contains("worktree root"), "windowed:\n{rendered}");
+        assert!(rendered.contains("Give Iris a task"), "{rendered}");
+    }
+
+    #[test]
+    fn settings_detent_flash_settles_through_the_screen_tick() {
+        use crate::ui::modal::{Modal, ModalKey};
+        use crate::ui::settings_menu::SettingsPanel;
+
+        let mut screen = Screen::new();
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::new(
+            faceplate_snapshot(),
+        ))));
+        // Click the reasoning switch one detent right (row 1 on the panel).
+        let modal = screen.modal.as_mut().expect("panel open");
+        modal.handle_key(ModalKey::Down);
+        modal.handle_key(ModalKey::Right);
+        // The flash decays on the shared tick grid, forcing repaints until the
+        // element settles — the same cadence as the statusline detents.
+        assert!(screen.tick(), "first tick still settling");
+        assert!(screen.tick(), "second tick settles");
+        assert!(!screen.tick(), "settled: no more repaints");
+    }
+
+    #[test]
+    fn open_modal_reclaims_composer_bottom_padding() {
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::{HatchTarget, SettingsPanel};
+
+        let mut screen = Screen::new();
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::with_expanded(
+            faceplate_snapshot(),
+            HatchTarget::Model,
+        ))));
 
         let lines = rendered_lines(&mut screen, 80, 17)
             .into_iter()
@@ -6459,6 +7604,184 @@ mod tests {
     }
 
     #[test]
+    fn turn_divider_sums_token_flows_across_the_tool_loop() {
+        let usage = |input: u64, output: u64| ProviderUsage {
+            provider: "anthropic".to_string(),
+            model: "opus-4.8".to_string(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: input + output,
+            cache_creation: None,
+        };
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let call = call_args("bash", json!({ "command": "echo hi" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        // Provider turn 1 proposes the tool…
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(usage(6_800, 35)),
+        });
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: "hi".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(3)),
+        });
+        // …provider turn 2 answers. The divider reports the whole task's
+        // flows (6.8k+8k sent, 35+40 received), matching its whole-task
+        // elapsed — never just the last provider turn.
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_2".to_string(),
+            response_id: None,
+            usage: Some(usage(8_000, 40)),
+        });
+        screen.end_turn();
+        let lines: Vec<String> = screen.wrapped_lines(90).iter().map(line_text).collect();
+        assert!(
+            lines.iter().any(|line| line.contains("↑14.8k ↓75")),
+            "divider sums the task's provider turns: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn session_receipt_sums_every_provider_turn_and_reports_cache_share() {
+        let usage = |input: u64, output: u64, cached: u64| ProviderUsage {
+            provider: "anthropic".to_string(),
+            model: "opus-4.8".to_string(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: cached,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: input + output,
+            cache_creation: None,
+        };
+        let mut screen = Screen::new();
+        // Before any turn: no receipt — a receipt for nothing is noise.
+        assert_eq!(screen.session_receipt(), None);
+
+        // One task spanning two provider turns (a tool loop), then a second
+        // task: the receipt sums ALL provider turns, unlike the per-task
+        // divider, and reports the cached share of sent tokens.
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(usage(10_000, 500, 8_000)),
+        });
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_2".to_string(),
+            response_id: None,
+            usage: Some(usage(20_000, 1_500, 19_000)),
+        });
+        screen.end_turn();
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_3".to_string(),
+            response_id: None,
+            usage: Some(usage(30_000, 1_000, 27_000)),
+        });
+        screen.end_turn();
+
+        let receipt = screen.session_receipt().expect("receipt after turns");
+        assert!(
+            receipt.starts_with(&format!("iris {} ┊ ", env!("CARGO_PKG_VERSION"))),
+            "{receipt}"
+        );
+        assert!(receipt.contains(" ┊ 2 turns ┊ "), "{receipt}");
+        assert!(receipt.contains(" ┊ ↑60k ↓3k ┊ "), "{receipt}");
+        // 54k cached of 60k sent = 90%.
+        assert!(receipt.ends_with(" ┊ cache 90%"), "{receipt}");
+    }
+
+    #[test]
+    fn session_receipt_counts_user_turns_not_background_compactions() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        screen.apply(UiEvent::Notice("compacted context".to_string()));
+        screen.end_background_work();
+        assert_eq!(
+            screen.session_receipt(),
+            None,
+            "compaction-only work must not print a user-turn receipt"
+        );
+
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 1_000,
+                output_tokens: 20,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 1_020,
+                cache_creation: None,
+            }),
+        });
+        screen.end_turn();
+
+        let receipt = screen.session_receipt().expect("receipt after user turn");
+        assert!(receipt.contains(" ┊ 1 turn ┊ "), "{receipt}");
+    }
+
+    #[test]
+    fn session_receipt_survives_a_session_swap() {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "turn_1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 5_000,
+                output_tokens: 100,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 5_100,
+                cache_creation: None,
+            }),
+        });
+        screen.end_turn();
+
+        // `/new` swaps to a fresh screen; the run meter rides across, so the
+        // exit receipt still covers the whole process run.
+        let meter = screen.take_session_meter();
+        let mut fresh = Screen::new();
+        fresh.restore_session_meter(meter);
+        let receipt = fresh.session_receipt().expect("receipt after swap");
+        assert!(receipt.contains("1 turn"), "{receipt}");
+        assert!(receipt.contains("↑5k ↓100"), "{receipt}");
+    }
+
+    #[test]
+    fn session_receipt_omits_unmeasured_fields() {
+        let mut screen = Screen::new();
+        // A turn that reported no usage at all (e.g. provider error): the
+        // receipt still records time + turns but claims nothing unmeasured.
+        screen.start_turn();
+        screen.apply(UiEvent::ProviderTurnError {
+            turn_id: "turn_1".to_string(),
+            message: "rate limited".to_string(),
+        });
+        screen.end_turn();
+        let receipt = screen.session_receipt().expect("receipt after a turn");
+        assert!(receipt.contains(" ┊ 1 turn"), "{receipt}");
+        assert!(!receipt.contains('↑'), "no token claim: {receipt}");
+        assert!(!receipt.contains("cache"), "no cache claim: {receipt}");
+    }
+
+    #[test]
     fn provider_turn_error_counts_as_runtime_work_for_divider() {
         let mut screen = Screen::new();
         screen.start_turn();
@@ -6571,10 +7894,11 @@ mod tests {
             "no cyan selection accent: {exit:?}"
         );
         let model = line_matching(&lines, |line| line_text(line).contains("/model"));
-        // Descriptions align in one column across rows.
+        // Descriptions align in one column across rows (match on the leading
+        // words, which survive any right-edge truncation).
         assert_eq!(
             line_text(exit).find("End the session"),
-            line_text(model).find("Show or switch provider/model")
+            line_text(model).find("Model & reasoning")
         );
         assert!(
             model
@@ -6663,6 +7987,232 @@ mod tests {
             lines.iter().any(|l| l.contains("earlier lines")),
             "missing dropped-earlier-lines indicator: {lines:?}"
         );
+    }
+
+    // --- reactive density: preview budget breathes with height (spec §2) ---
+
+    #[test]
+    fn preview_row_budget_clamps_height_over_five() {
+        // Criterion 1 (the clamp): heights 20/24/40/60/120/200 → 8/8/8/12/24/24.
+        // The floor 8 is the historical fixed cap (a pane ≤ 40 rows is
+        // byte-identical to before); the ceiling 24 keeps a preview from
+        // swallowing an ultra-tall pane.
+        assert_eq!(preview_row_budget(20), 8);
+        assert_eq!(preview_row_budget(24), 8);
+        assert_eq!(preview_row_budget(40), 8);
+        assert_eq!(preview_row_budget(60), 12);
+        assert_eq!(preview_row_budget(120), 24);
+        assert_eq!(preview_row_budget(200), 24);
+        // Before the first frame (height 0) the budget is the floor, never zero.
+        assert_eq!(preview_row_budget(0), 8);
+    }
+
+    /// Stream 30 short lines into a live SHELL tail with the pane height threaded
+    /// through the real render path (`render_document` → `note_pane_height`)
+    /// BEFORE the deltas, so the tail is built against `height`. Returns the
+    /// rendered line texts.
+    fn live_shell_tail_lines(height: u16) -> Vec<String> {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        // Prime last_height + last_width via the production compose path.
+        let _ = rendered_lines(&mut screen, 80, height);
+        let call = call_args("bash", json!({ "command": "seq" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        for i in 0..30 {
+            screen.apply(UiEvent::ToolOutputDelta {
+                call_id: call.id.clone(),
+                chunk: format!("Xrow{i:02}\n"),
+            });
+        }
+        rendered_lines(&mut screen, 80, height)
+            .iter()
+            .map(line_text)
+            .collect()
+    }
+
+    #[test]
+    fn live_preview_tail_previews_full_budget_on_a_tall_pane() {
+        // Criterion 1 (row-level): a 30-line output at height 120 previews 24
+        // rows + the earlier-lines elision marker.
+        let lines = live_shell_tail_lines(120);
+        let shown = lines.iter().filter(|l| l.contains("Xrow")).count();
+        assert_eq!(shown, 24, "height 120 should preview 24 rows: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("earlier lines hidden")),
+            "missing elision marker: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn live_preview_tail_stays_at_the_floor_on_a_small_pane() {
+        // Criterion 1 (row-level): at height 24 the same output previews 8 rows —
+        // today's exact behavior (the floor is the status quo).
+        let lines = live_shell_tail_lines(24);
+        let shown = lines.iter().filter(|l| l.contains("Xrow")).count();
+        assert_eq!(shown, 8, "height 24 should preview 8 rows: {lines:?}");
+    }
+
+    #[test]
+    fn printed_preview_keeps_its_size_across_a_resize() {
+        // Criterion 5: a block printed at height 24 (8 preview rows) keeps its
+        // size when the pane later grows to 120 — rows are immutable in
+        // scrollback, so a resize never reflows a printed block. Only the NEXT
+        // block built uses the new height (proven by the tall-pane test above).
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let _ = rendered_lines(&mut screen, 80, 24);
+        let call = call_args("bash", json!({ "command": "seq" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        for i in 0..30 {
+            screen.apply(UiEvent::ToolOutputDelta {
+                call_id: call.id.clone(),
+                chunk: format!("Xrow{i:02}\n"),
+            });
+        }
+        let before = rendered_lines(&mut screen, 80, 24)
+            .iter()
+            .filter(|l| line_text(l).contains("Xrow"))
+            .count();
+        assert_eq!(before, 8, "small pane previews the floor budget");
+        // Grow the pane; with no new output the printed tail must not rebuild.
+        let after = rendered_lines(&mut screen, 80, 120)
+            .iter()
+            .filter(|l| line_text(l).contains("Xrow"))
+            .count();
+        assert_eq!(
+            after, 8,
+            "a printed block must keep its size across a resize"
+        );
+    }
+
+    // --- reactive density: the prose measure (spec §3) ---
+
+    #[test]
+    fn prose_wraps_at_the_measure_while_code_keeps_full_width() {
+        // Criterion 3: on a 200-column pane an assistant paragraph rags at the
+        // 96-column measure (+ text-column indent) while a wide code fence in the
+        // SAME message keeps the full pane width (mechanical never reflows).
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let _ = rendered_lines(&mut screen, 200, 40);
+        let para = "lorem ".repeat(40); // ~240 cols, spaces let it wrap freely
+        let code_line = format!("XCODE{}", "x".repeat(120)); // 125 cols
+        let md = format!("{para}\n\n```\n{code_line}\n```");
+        screen.apply(UiEvent::AssistantText(md));
+        let lines: Vec<String> = rendered_lines(&mut screen, 200, 40)
+            .iter()
+            .map(line_text)
+            .collect();
+        let prose: Vec<&String> = lines.iter().filter(|l| l.contains("lorem")).collect();
+        assert!(
+            prose.len() >= 2,
+            "paragraph should wrap to several rows: {lines:?}"
+        );
+        for row in &prose {
+            assert!(
+                row.chars().count() <= PROSE_MEASURE + TEXT_COLUMN_X_PADDING,
+                "prose row exceeds the measure ({} cols): {row:?}",
+                row.chars().count()
+            );
+        }
+        let code = lines
+            .iter()
+            .find(|l| l.contains(&code_line))
+            .unwrap_or_else(|| panic!("wide code line not intact: {lines:?}"));
+        assert!(
+            code.chars().count() > PROSE_MEASURE,
+            "code row should exceed the measure ({} cols)",
+            code.chars().count()
+        );
+    }
+
+    #[test]
+    fn prose_continuations_align_under_content_at_the_measure() {
+        // Criterion 4: a wrapped paragraph's continuation rows hang under the
+        // same text column as the first — the measure moves only the wrap point,
+        // never the marker/indent (no marker drift).
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let _ = rendered_lines(&mut screen, 200, 40);
+        screen.apply(UiEvent::AssistantText("lorem ".repeat(40)));
+        let prose: Vec<String> = rendered_lines(&mut screen, 200, 40)
+            .iter()
+            .map(line_text)
+            .filter(|l| l.contains("lorem"))
+            .collect();
+        assert!(prose.len() >= 2, "paragraph should wrap: {prose:?}");
+        let indent = |s: &str| s.len() - s.trim_start().len();
+        let first = indent(&prose[0]);
+        for row in &prose {
+            assert_eq!(indent(row), first, "continuation drifted: {prose:?}");
+        }
+    }
+
+    #[test]
+    fn notice_wraps_at_the_prose_measure() {
+        // Criterion 3: a notice is prose — it wraps at the 96-col measure on a
+        // wide pane, not the full pane.
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let _ = rendered_lines(&mut screen, 200, 40);
+        screen.apply(UiEvent::Notice("NOTICEWORD ".repeat(30)));
+        let notice: Vec<String> = rendered_lines(&mut screen, 200, 40)
+            .iter()
+            .map(line_text)
+            .filter(|l| l.contains("NOTICEWORD"))
+            .collect();
+        assert!(notice.len() >= 2, "notice should wrap: {notice:?}");
+        for row in &notice {
+            assert!(
+                row.chars().count() <= PROSE_MEASURE + TEXT_COLUMN_X_PADDING,
+                "notice row exceeds the measure ({} cols): {row:?}",
+                row.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn mechanical_output_uses_full_width_past_the_measure() {
+        // Criterion 3: a SHELL body line and a diff line keep the full pane
+        // width on a 200-column pane — mechanical content is never clamped to 96.
+        // Render the specific body rows directly so the assertion is independent
+        // of each block's arrival fold state.
+        let full_width = |row: &TranscriptRow| -> bool {
+            row.render(200)
+                .iter()
+                .any(|l| line_text(l).chars().count() > PROSE_MEASURE)
+        };
+
+        let wide = "S".repeat(150);
+        let mut screen = Screen::new();
+        let _ = rendered_lines(&mut screen, 200, 40); // prime width
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "cat wide" })),
+            content: wide.clone(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(5)),
+        });
+        let shell_row = screen
+            .transcript
+            .rows
+            .iter()
+            .find(|r| r.text.contains(&wide))
+            .expect("SHELL body row present");
+        assert!(full_width(shell_row), "SHELL body did not keep full width");
+
+        let added = format!("+DIFFWIDE{}", "d".repeat(120));
+        let diff = format!("--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n{added}\n");
+        screen.apply(UiEvent::TaskDiff {
+            summary: vec!["1 file changed, +1/-0".to_string()],
+            diff,
+        });
+        let diff_row = screen
+            .transcript
+            .rows
+            .iter()
+            .find(|r| r.text.contains("DIFFWIDE"))
+            .expect("diff body row present");
+        assert!(full_width(diff_row), "diff row did not keep full width");
     }
 
     #[test]

@@ -858,33 +858,12 @@ pub(crate) fn save_tool_result_compaction_keep_recent_tool_uses(keep: u64) -> Re
     )
 }
 
-/// Persist the bash-tool-mode toggle in the global settings file. A boolean,
-/// validated at the `/settings` boundary; takes effect at the next session
-/// start (the tool set is constructed once at startup).
-pub(crate) fn save_bash_tool_mode(enabled: bool) -> Result<()> {
-    update_global(&[("bashToolMode", Value::Bool(enabled))])
-}
-
 /// Persist the durable task workflow toggle in the project settings file for
 /// `cwd`. This is intentionally project-scoped: teams may opt a repository into
 /// the review/rollback workflow, while the dirty-tree safety floor stays
 /// non-configurable.
 pub(crate) fn save_project_tasks(cwd: &Path, enabled: bool) -> Result<()> {
     update_project(cwd, &[("tasks", Value::Bool(enabled))])
-}
-
-/// Persist (or clear) the tool round-trip soft cap in the global settings file.
-/// `None` removes `maxToolRoundtrips` (unbounded loop); a value is clamped to a
-/// sane positive range.
-pub(crate) fn save_max_tool_roundtrips(cap: Option<usize>) -> Result<()> {
-    let value = match cap {
-        Some(cap) => {
-            let cap = (cap as u64).clamp(MIN_TOOL_ROUNDTRIPS, MAX_TOOL_ROUNDTRIPS);
-            Value::from(cap)
-        }
-        None => Value::Null,
-    };
-    update_global(&[("maxToolRoundtrips", value)])
 }
 
 /// Persist (or clear) the worktree-root preference in the global settings file.
@@ -930,9 +909,6 @@ pub(crate) fn save_verify_max_attempts(attempts: u32) -> Result<()> {
 /// Sane lower/upper bounds for a persisted context token budget.
 const MIN_CONTEXT_TOKEN_BUDGET: u64 = 1_000;
 const MAX_CONTEXT_TOKEN_BUDGET: u64 = 100_000_000;
-/// Sane lower/upper bounds for a persisted tool round-trip cap.
-const MIN_TOOL_ROUNDTRIPS: u64 = 1;
-const MAX_TOOL_ROUNDTRIPS: u64 = 1_000;
 
 /// A trimmed non-empty string as a JSON string, or `Value::Null` (the
 /// `update_global` "remove this key" sentinel) for an absent/blank value.
@@ -1001,7 +977,13 @@ fn update_global_block(block: &str, updates: &[(&str, Value)]) -> Result<()> {
             nested.insert((*key).to_string(), value.clone());
         }
     }
-    object.insert(block.to_string(), Value::Object(nested));
+    // Clearing a block's last key removes the block: a settings file never
+    // accumulates empty `{}` residue from cleared values.
+    if nested.is_empty() {
+        object.remove(block);
+    } else {
+        object.insert(block.to_string(), Value::Object(nested));
+    }
     write_object_atomically(&path, &object)
 }
 
@@ -1107,8 +1089,23 @@ fn global_path() -> Option<PathBuf> {
     if let Ok(path) = env::var("IRIS_CONFIG_PATH") {
         return Some(PathBuf::from(path));
     }
-    let home = env::var("HOME").ok().filter(|home| !home.is_empty())?;
-    Some(Path::new(&home).join(".iris/settings.json"))
+    // A test that has not opted into a real path via `ConfigPathGuard` /
+    // `IRIS_CONFIG_PATH` must NEVER be ABLE to touch the developer's real
+    // settings file: persisting code paths (model-switch defaults, login,
+    // scoped saves) run inside unit tests, and without a guard they would
+    // fall through to the real `$HOME` — silently rewriting the settings of
+    // whoever runs the suite. Unguarded reads and writes land in a
+    // process-scoped scratch file instead; tests asserting on file content
+    // keep opting in through the guard.
+    #[cfg(test)]
+    {
+        Some(std::env::temp_dir().join(format!("iris-test-settings-{}.json", std::process::id())))
+    }
+    #[cfg(not(test))]
+    {
+        let home = env::var("HOME").ok().filter(|home| !home.is_empty())?;
+        Some(Path::new(&home).join(".iris/settings.json"))
+    }
 }
 
 fn project_path(cwd: &Path) -> PathBuf {
@@ -1497,16 +1494,6 @@ mod tests {
         fs::write(&project, r#"{ "bashToolMode": true }"#).unwrap();
         let settings = Settings::load_from(Some(&global), &project).unwrap();
         assert!(settings.bash_tool_mode());
-
-        // Round-trip through the save helper.
-        let path = dir.path.join("settings.json");
-        let _guard = ConfigPathGuard::set(&path);
-        save_bash_tool_mode(true).unwrap();
-        let saved = Settings::load_from(Some(&path), &dir.path.join("none.json")).unwrap();
-        assert!(saved.bash_tool_mode());
-        save_bash_tool_mode(false).unwrap();
-        let saved = Settings::load_from(Some(&path), &dir.path.join("none.json")).unwrap();
-        assert!(!saved.bash_tool_mode());
     }
 
     #[test]
@@ -2142,7 +2129,6 @@ mod tests {
         assert!(error.contains("compaction.enabled=false"), "{error}");
         save_context_token_budget(DEFAULT_SUMMARY_RESERVE).unwrap();
         save_microcompaction_watermark(999_999_999).unwrap();
-        save_max_tool_roundtrips(Some(99_999)).unwrap();
         save_worktree_root(Some("  ../trees  ")).unwrap();
         // Nested block saves preserve sibling + unknown nested keys.
         save_alt_screen("always").unwrap();
@@ -2165,7 +2151,6 @@ mod tests {
             object.get("microcompactionWatermark"),
             Some(&Value::from(100_000_000))
         );
-        assert_eq!(object.get("maxToolRoundtrips"), Some(&Value::from(1_000)));
         assert_eq!(
             object.get("worktreeRoot"),
             Some(&Value::String("../trees".into()))
@@ -2193,20 +2178,15 @@ mod tests {
         let path = dir.path.join("settings.json");
         fs::write(
             &path,
-            r#"{ "maxToolRoundtrips": 20, "worktreeRoot": "../wt", "verify": { "command": "x", "maxAttempts": 2 } }"#,
+            r#"{ "worktreeRoot": "../wt", "verify": { "command": "x", "maxAttempts": 2 } }"#,
         )
         .unwrap();
         let _guard = ConfigPathGuard::set(&path);
 
-        save_max_tool_roundtrips(None).unwrap();
         save_worktree_root(None).unwrap();
         save_verify_command(None).unwrap();
 
         let object = read_object(&path).unwrap();
-        assert!(
-            !object.contains_key("maxToolRoundtrips"),
-            "cleared to unbounded"
-        );
         assert!(!object.contains_key("worktreeRoot"), "cleared to default");
         let verify = object.get("verify").and_then(Value::as_object).unwrap();
         assert!(!verify.contains_key("command"), "command cleared");
@@ -2214,6 +2194,22 @@ mod tests {
             verify.get("maxAttempts"),
             Some(&Value::from(2)),
             "sibling kept"
+        );
+    }
+
+    #[test]
+    fn clearing_a_blocks_last_key_removes_the_block() {
+        // No `{}` residue: a settings file a user cleared through the panel
+        // reads as if the value was never set.
+        let dir = temp_dir();
+        let path = dir.path.join("settings.json");
+        fs::write(&path, r#"{ "verify": { "command": "x" } }"#).unwrap();
+        let _guard = ConfigPathGuard::set(&path);
+        save_verify_command(None).unwrap();
+        let object = read_object(&path).unwrap();
+        assert!(
+            !object.contains_key("verify"),
+            "emptied block removed: {object:?}"
         );
     }
 

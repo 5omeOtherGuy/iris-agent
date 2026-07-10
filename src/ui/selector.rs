@@ -1,7 +1,7 @@
 //! Reusable selector state (Tier 3, presentation-only, TTY-free).
 //!
 //! A single list-with-search primitive shared by every picker in [`super::modal`]
-//! (model, scoped-models, effort, settings, login method/provider). It owns the
+//! (the large-context switch prompt, session resume, tasks). It owns the
 //! item list, the search string, the highlighted row, and the filtered view, and
 //! exposes a small windowing helper so the renderer only has to draw rows. It
 //! holds no terminal handle and performs no I/O, so the whole state machine is
@@ -24,9 +24,6 @@ pub(crate) struct SelectorItem {
     pub(crate) detail: Option<String>,
     /// Trailing marker drawn at the row end (e.g. `current`).
     pub(crate) trailing: Option<String>,
-    /// Optional enabled-column glyph for checkmark lists (scoped-models). `None`
-    /// hides the column entirely.
-    pub(crate) enabled: Option<bool>,
     /// Lowercased haystack used for fuzzy filtering.
     filter: String,
 }
@@ -41,7 +38,6 @@ impl SelectorItem {
             label,
             detail: None,
             trailing: None,
-            enabled: None,
             filter,
         }
     }
@@ -58,16 +54,12 @@ impl SelectorItem {
         self.trailing = Some(trailing.into());
         self
     }
-
-    pub(crate) fn enabled(mut self, enabled: bool) -> Self {
-        self.enabled = Some(enabled);
-        self
-    }
 }
 
 /// A list-with-search picker. `searchable` toggles the search row; `wrap`
-/// chooses wrap-around vs clamp at the list boundaries (pi-mono wraps the model
-/// list but clamps the provider list); `window` is the max rows shown at once.
+/// chooses wrap-around vs clamp at the list boundaries (the switch-context
+/// prompt wraps; the session and task pickers clamp); `window` is the max rows
+/// shown at once.
 ///
 /// Wrap policy (the single selection-navigation split, shared with the session
 /// dropdowns' `step_wrapped` and the slash palette): SPATIAL pickers/menus WRAP
@@ -110,15 +102,6 @@ impl Selector {
         selector
     }
 
-    /// Replace the item list (e.g. after a scoped-models toggle/reorder),
-    /// preserving the search string and keeping the highlight on the same id
-    /// when it still exists.
-    pub(crate) fn replace_items(&mut self, items: Vec<SelectorItem>) {
-        let keep = self.selected().map(|item| item.id.clone());
-        self.items = items;
-        self.refilter(keep.as_deref());
-    }
-
     /// Recompute the filtered view. When `keep_id` is set and still visible after
     /// filtering, the cursor is moved onto it; otherwise the cursor clamps into
     /// range (0 for a fresh filter).
@@ -146,17 +129,6 @@ impl Selector {
             self.cursor = 0;
         } else if self.cursor >= self.filtered.len() {
             self.cursor = self.filtered.len() - 1;
-        }
-    }
-
-    /// Move the highlight to the row with `id` if it is currently visible.
-    pub(crate) fn select_id(&mut self, id: &str) {
-        if let Some(position) = self
-            .filtered
-            .iter()
-            .position(|&index| self.items[index].id == id)
-        {
-            self.cursor = position;
         }
     }
 
@@ -281,14 +253,6 @@ impl Selector {
             })
             .collect()
     }
-
-    /// All currently filtered items (used by Ctrl+A/Ctrl+X "all matching" ops).
-    pub(crate) fn filtered_ids(&self) -> Vec<String> {
-        self.filtered
-            .iter()
-            .map(|&index| self.items[index].id.clone())
-            .collect()
-    }
 }
 
 /// Case-insensitive subsequence match: every char of `needle` appears in
@@ -393,18 +357,6 @@ mod tests {
         clamping.down();
         clamping.down();
         assert_eq!(clamping.cursor(), 2, "clamp at bottom");
-    }
-
-    #[test]
-    fn replace_items_keeps_cursor_on_same_id() {
-        let mut selector = Selector::new(items(), true, true, 10);
-        selector.down(); // anthropic
-        assert_eq!(selector.selected_id(), Some("anthropic/claude-sonnet-4-6"));
-        // Reorder: move anthropic to the front; cursor should follow it.
-        let mut reordered = items();
-        reordered.swap(0, 1);
-        selector.replace_items(reordered);
-        assert_eq!(selector.selected_id(), Some("anthropic/claude-sonnet-4-6"));
     }
 
     #[test]

@@ -21,81 +21,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 use crate::mimir::auth;
 use crate::mimir::auth::storage::{AuthStore, CredentialKind};
-use crate::mimir::model_catalog;
 use crate::mimir::selection::ProviderId;
-use crate::ui::modal::{
-    LoginMethod, MethodSelect, Modal, ProviderPurpose, ProviderRow, ProviderSelect,
-};
-
-/// Either open a modal, or show status lines (e.g. nothing to do).
-#[derive(Debug)]
-pub(crate) enum LoginStep {
-    Open(Modal),
-    Lines(Vec<String>),
-}
-
-/// Open the `/login` method selector (subscription vs API key).
-pub(crate) fn open_login() -> Modal {
-    Modal::LoginMethod(MethodSelect::new())
-}
-
-/// Build the provider selector for a chosen auth method.
-pub(crate) fn provider_select(method: LoginMethod, auth: &AuthStore) -> LoginStep {
-    match method {
-        LoginMethod::Subscription => {
-            let providers = subscription_providers(auth);
-            LoginStep::Open(Modal::Providers(ProviderSelect::new(
-                ProviderPurpose::Login,
-                providers,
-                "No subscription providers available.",
-            )))
-        }
-        LoginMethod::ApiKey => LoginStep::Open(Modal::Providers(ProviderSelect::new(
-            ProviderPurpose::ApiKeyLogin,
-            api_key_providers(auth),
-            "No API key providers available.",
-        ))),
-    }
-}
-
-/// OAuth/subscription providers with their no-secret status badge.
-fn subscription_providers(auth: &AuthStore) -> Vec<ProviderRow> {
-    let mut rows: Vec<ProviderRow> = [
-        ProviderId::OpenAiCodex,
-        ProviderId::Anthropic,
-        ProviderId::Antigravity,
-    ]
-    .iter()
-    .map(|provider| ProviderRow {
-        id: provider.as_str().to_string(),
-        name: provider.display_name().to_string(),
-        badge: model_catalog::provider_status(auth, *provider)
-            .badge()
-            .to_string(),
-    })
-    .collect();
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
-    rows
-}
-
-fn api_key_providers(auth: &AuthStore) -> Vec<ProviderRow> {
-    let mut rows: Vec<ProviderRow> = [
-        ProviderId::Anthropic,
-        ProviderId::OpenAi,
-        ProviderId::OpenAiCompatible,
-    ]
-    .iter()
-    .map(|provider| ProviderRow {
-        id: provider.as_str().to_string(),
-        name: provider.display_name().to_string(),
-        badge: model_catalog::provider_status(auth, *provider)
-            .badge()
-            .to_string(),
-    })
-    .collect();
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
-    rows
-}
+use crate::ui::modal::Modal;
 
 pub(crate) fn open_api_key_dialog(provider_id: &str) -> Modal {
     Modal::ApiKeyDialog(crate::ui::modal::ApiKeyDialog::new(
@@ -131,42 +58,6 @@ fn save_default_after_api_key_login(provider: ProviderId) {
     if !already_default {
         let _ = config::save_default_model(provider.as_str(), provider.default_model());
     }
-}
-
-/// Open the `/logout` selector over only providers with stored credentials.
-/// Returns status lines (not a picker) when nothing is stored, matching
-/// pi-mono's "only /login credentials are removed" message.
-pub(crate) fn open_logout(auth: &AuthStore) -> LoginStep {
-    let stored = match auth.stored_credentials() {
-        Ok(stored) => stored,
-        Err(error) => {
-            return LoginStep::Lines(vec![format!("could not read credentials: {error:#}")]);
-        }
-    };
-    if stored.is_empty() {
-        return LoginStep::Lines(vec![
-            "No stored credentials to remove. /logout only removes credentials saved by /login; \
-             environment variables and external config are unchanged."
-                .to_string(),
-        ]);
-    }
-    let providers: Vec<ProviderRow> = stored
-        .into_iter()
-        .map(|cred| ProviderRow {
-            name: provider_display_name(&cred.provider_id),
-            badge: match cred.kind {
-                CredentialKind::OAuth => "subscription".to_string(),
-                CredentialKind::ApiKey => "API key".to_string(),
-                CredentialKind::Unknown => "stored".to_string(),
-            },
-            id: cred.provider_id,
-        })
-        .collect();
-    LoginStep::Open(Modal::Providers(ProviderSelect::new(
-        ProviderPurpose::Logout,
-        providers,
-        "No providers logged in. Use /login first.",
-    )))
 }
 
 /// Apply a `/logout`: remove only the stored credential for `provider_id`.
@@ -383,23 +274,6 @@ mod tests {
     }
 
     #[test]
-    fn subscription_list_marks_configured_and_unconfigured_without_secrets() {
-        let (auth, path) = temp_auth();
-        auth.set_oauth_credentials("openai-codex", oauth()).unwrap();
-        let rows = subscription_providers(&auth);
-        let codex = rows.iter().find(|r| r.id == "openai-codex").unwrap();
-        assert_eq!(codex.badge, "✓ configured");
-        let antigravity = rows.iter().find(|r| r.id == "antigravity").unwrap();
-        assert_eq!(antigravity.badge, "unconfigured");
-        // No secret material leaks into any row (name or badge).
-        assert!(
-            rows.iter()
-                .all(|r| !r.badge.contains(SECRET) && !r.name.contains(SECRET))
-        );
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
-    }
-
-    #[test]
     fn browser_open_command_is_platform_correct_and_carries_full_url() {
         let url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=abc&scope=x+y";
         let (mac_prog, mac_args) = browser_open_command("macos", url);
@@ -427,45 +301,17 @@ mod tests {
     }
 
     #[test]
-    fn api_key_method_lists_api_key_providers_without_secrets() {
-        let (auth, path) = temp_auth();
-        auth.set_api_key_credentials("openai", SECRET).unwrap();
-        match provider_select(LoginMethod::ApiKey, &auth) {
-            LoginStep::Open(Modal::Providers(_)) => {}
-            other => panic!("expected provider picker, got {other:?}"),
-        }
-        let rows = api_key_providers(&auth);
-        assert!(
-            rows.iter()
-                .any(|row| row.id == "openai" && row.badge == "✓ API key")
-        );
-        assert!(rows.iter().any(|row| row.id == "anthropic"));
-        assert!(rows.iter().any(|row| row.id == "openai-compatible"));
-        assert!(
-            rows.iter()
-                .all(|row| !row.name.contains(SECRET) && !row.badge.contains(SECRET))
-        );
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
-    }
-
-    #[test]
-    fn logout_lists_only_stored_and_removes_only_those() {
+    fn logout_removes_only_stored_credentials_and_reports_the_kind() {
         let (auth, path) = temp_auth();
         auth.set_oauth_credentials("anthropic", oauth()).unwrap();
-        // Logout list contains the stored provider.
-        match open_logout(&auth) {
-            LoginStep::Open(Modal::Providers(_)) => {}
-            _ => panic!("expected provider selector"),
-        }
+        assert!(auth.has_credentials("anthropic").unwrap());
         // Removing it reports the OAuth phrasing and clears the store.
         let lines = apply_logout("anthropic", &auth);
         assert!(lines[0].contains("Logged out of Anthropic"), "{lines:?}");
         assert!(!auth.has_credentials("anthropic").unwrap());
-        // Now empty -> status, not a picker.
-        match open_logout(&auth) {
-            LoginStep::Lines(lines) => assert!(lines[0].contains("No stored credentials")),
-            _ => panic!("expected empty status"),
-        }
+        // A second logout of the now-empty store reports "no stored credentials".
+        let lines = apply_logout("anthropic", &auth);
+        assert!(lines[0].contains("No stored credentials"), "{lines:?}");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

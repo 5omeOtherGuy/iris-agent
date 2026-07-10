@@ -13,6 +13,11 @@
 //!   keeps the remainder as a single mutable active tail, and paces the
 //!   stable-line drain with the adaptive [`chunking`] policy on the loop's
 //!   commit tick.
+//! - [`escapement`] sits one step earlier, between raw delta arrival and the
+//!   whole pipeline: it releases arrivals in even, word-quantized beats on the
+//!   loop's tick grid so the visible tail advances by word-steps instead of raw
+//!   network bursts. It feeds the collector from the SAME drained output it
+//!   feeds the tail, so committed lines never lag the tail they came from.
 //!
 //! Portions are derived from OpenAI Codex (Apache-2.0); see the per-file
 //! SPDX headers, the root `NOTICE`, and `LICENSE-APACHE`.
@@ -20,6 +25,8 @@
 mod chunking;
 mod collector;
 mod controller;
+mod escapement;
 mod table_holdback;
 
 pub(super) use controller::StreamController;
+pub(super) use escapement::Escapement;

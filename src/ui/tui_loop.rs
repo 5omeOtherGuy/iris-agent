@@ -46,6 +46,7 @@ use crate::ui::UiEvent;
 use crate::ui::login::{self, LoginBackend, LoginOutcome, LoginUpdate, OAuthLoginBackend};
 use crate::ui::modal::{LoginDialog, Modal, ModalAction, ModalKey, ModalOutcome};
 use crate::ui::picker::{self, ActionResult, ModelCommand};
+use crate::ui::settings_menu;
 use crate::ui::slash::{self, SlashAction, SlashCommand};
 use crate::ui::steering::SteeringQueue;
 use crate::ui::tui::{
@@ -200,7 +201,19 @@ pub(crate) fn run<P: ChatProvider>(
         start_page,
         resumed_session.as_deref(),
     ));
+    let receipt = tui.screen.session_receipt();
     tui.shutdown();
+    // The exit receipt: one dim, measured line printed AFTER teardown so it
+    // lands on the normal screen in both modes — in pager mode it is the only
+    // trace of the run left in scrollback; inline it closes the transcript.
+    if let Some(receipt) = receipt {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            println!("\x1b[2m{receipt}\x1b[0m");
+        } else {
+            println!("{receipt}");
+        }
+    }
     result
 }
 
@@ -277,6 +290,10 @@ struct ApprovalRequest {
     call: ToolCall,
     allow_always: bool,
     allow_project: bool,
+    /// Whether the `always` choice is the dirty-tree variant (`a all dirty
+    /// files (this task)`), so the composer's decision echo renders the same
+    /// affordance label the block footer does.
+    dirty_gate: bool,
     reply: oneshot::Sender<ApprovalDecision>,
 }
 
@@ -352,7 +369,8 @@ async fn session_loop<P: ChatProvider>(
     // The start page (IrisMark + launcher) shows only for an interactive launch
     // with no task and no resume target; a startup resume picker supersedes it.
     if start_page && startup_modal.is_none() {
-        tui.screen.show_start_page(recoverable);
+        let punctuation_chords = tui.keyboard_enhanced();
+        tui.screen.show_start_page(recoverable, punctuation_chords);
     }
     refresh_footer(tui, switch);
     apply_recovery(recovery, tui);
@@ -363,6 +381,10 @@ async fn session_loop<P: ChatProvider>(
     if let Some(modal) = startup_modal {
         tui.screen.open_modal(modal);
     }
+    // Startup initialization is settled: arm the detent flashes so that from
+    // the first frame on, a changed statusline segment / meter LED announces
+    // itself with one quantized blink.
+    tui.screen.arm_detents();
     tui.draw()?;
     // Draw once before starting the blocking input reader so the banner/picker
     // is visible immediately and the terminal surface has its initial dimensions.
@@ -502,7 +524,7 @@ async fn session_loop<P: ChatProvider>(
             }
             IdleOutcome::OpenSettings => {
                 if let Some(sw) = switch.as_mut() {
-                    tui.screen.open_modal(picker::open_settings(sw));
+                    tui.screen.open_modal(picker::open_settings(harness, sw));
                 }
             }
             IdleOutcome::Submit(prompt) => {
@@ -552,8 +574,8 @@ async fn session_loop<P: ChatProvider>(
                             &mut git_generation,
                         )
                         .await?;
-                        tui.screen.end_turn();
-                        open_deferred_settings(tui, switch, steering.as_ref());
+                        tui.screen.end_background_work();
+                        open_deferred_settings(harness, tui, switch, steering.as_ref());
                         tui.draw()?;
                     }
                     RouteOutcome::Fall => {
@@ -573,7 +595,7 @@ async fn session_loop<P: ChatProvider>(
                         )
                         .await?;
                         tui.screen.end_turn();
-                        open_deferred_settings(tui, switch, steering.as_ref());
+                        open_deferred_settings(harness, tui, switch, steering.as_ref());
                         // Turn completion is a refresh trigger: the turn may
                         // have mutated the tree or task state.
                         git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
@@ -582,7 +604,7 @@ async fn session_loop<P: ChatProvider>(
                 }
             }
         }
-        open_deferred_settings(tui, switch, steering.as_ref());
+        open_deferred_settings(harness, tui, switch, steering.as_ref());
         // A model/effort switch (Ctrl+P, Shift+Tab, or a `/model` `/reasoning`
         // command) lands in this iteration; refresh the footer so the trailing
         // draw reflects the new selection immediately, not on the next keypress.
@@ -639,6 +661,11 @@ fn perform_swap<P: ChatProvider>(
     tui.screen.apply(UiEvent::SessionStarted);
     tui.screen
         .set_approval_policy(effective_approval_policy(harness));
+    // The fresh Screen starts with disarmed detents (startup rule); this swap
+    // IS the swapped session's startup, so re-arm once its chrome is settled —
+    // the loop's trailing refresh_footer sets the first footer (never a
+    // flash), and later changes announce themselves again.
+    tui.screen.arm_detents();
     let notice = match source {
         SessionSource::Fresh => "Started a new session.".to_string(),
         SessionSource::Resume(_) => {
@@ -692,6 +719,7 @@ fn apply_recovery(outcome: RecoveryOutcome, tui: &mut TuiUi) {
 /// running. The running phase records only an intent; the modal opens here at a
 /// safe boundary, where model/settings actions already route.
 fn open_deferred_settings<P: ChatProvider>(
+    harness: &Harness<P>,
     tui: &mut TuiUi,
     switch: &mut Option<ModelSwitch<'_, P>>,
     steering: &SteeringQueue,
@@ -699,7 +727,7 @@ fn open_deferred_settings<P: ChatProvider>(
     if steering.take_settings()
         && let Some(sw) = switch.as_mut()
     {
-        tui.screen.open_modal(picker::open_settings(sw));
+        tui.screen.open_modal(picker::open_settings(harness, sw));
     }
 }
 
@@ -1453,10 +1481,11 @@ fn route_command<P: ChatProvider>(
                 return Ok(RouteOutcome::Fall);
             };
             tui.screen.commit_user(prompt);
-            match picker::open_scoped(sw) {
-                ModelCommand::Open(modal) => tui.screen.open_modal(modal),
-                ModelCommand::Lines(lines) => apply_notices(tui, lines),
-            }
+            tui.screen.open_modal(picker::open_settings_expanded(
+                harness,
+                sw,
+                settings_menu::HatchTarget::Scope,
+            ));
             Ok(RouteOutcome::Consumed)
         }
         "/settings" => {
@@ -1464,7 +1493,7 @@ fn route_command<P: ChatProvider>(
                 return Ok(RouteOutcome::Fall);
             };
             tui.screen.commit_user(prompt);
-            tui.screen.open_modal(picker::open_settings(sw));
+            tui.screen.open_modal(picker::open_settings(harness, sw));
             Ok(RouteOutcome::Consumed)
         }
         "/skills" if rest.is_empty() => {
@@ -1511,11 +1540,15 @@ fn route_command<P: ChatProvider>(
         "/trust" | "/permissions" if rest.is_empty() => {
             // Modal actions dispatch through picker::apply_action, which takes
             // the switch; keep the same guard as the other pickers.
-            if switch.as_ref().is_none() {
+            let Some(sw) = switch.as_mut() else {
                 return Ok(RouteOutcome::Fall);
-            }
+            };
             tui.screen.commit_user(prompt);
-            tui.screen.open_modal(picker::open_trust(harness));
+            tui.screen.open_modal(picker::open_settings_expanded(
+                harness,
+                sw,
+                settings_menu::HatchTarget::Permissions,
+            ));
             Ok(RouteOutcome::Consumed)
         }
         "/resume" if rest.is_empty() => {
@@ -1618,24 +1651,50 @@ fn route_command<P: ChatProvider>(
             Ok(RouteOutcome::Consumed)
         }
         "/login" if rest.is_empty() => {
+            let Some(sw) = switch.as_mut() else {
+                return Ok(RouteOutcome::Fall);
+            };
             tui.screen.commit_user(prompt);
-            tui.screen.open_modal(login::open_login());
+            tui.screen.open_modal(picker::open_settings_expanded(
+                harness,
+                sw,
+                settings_menu::HatchTarget::Login,
+            ));
             Ok(RouteOutcome::Consumed)
         }
         "/logout" if rest.is_empty() => {
+            let Some(sw) = switch.as_mut() else {
+                return Ok(RouteOutcome::Fall);
+            };
             tui.screen.commit_user(prompt);
-            match AuthStore::from_env() {
-                Ok(auth) => match login::open_logout(&auth) {
-                    login::LoginStep::Open(modal) => tui.screen.open_modal(modal),
-                    login::LoginStep::Lines(lines) => apply_notices(tui, lines),
-                },
-                Err(error) => apply_notices(tui, vec![format!("auth unavailable: {error:#}")]),
+            tui.screen.open_modal(picker::open_settings_expanded(
+                harness,
+                sw,
+                settings_menu::HatchTarget::Logout,
+            ));
+            Ok(RouteOutcome::Consumed)
+        }
+        "/reasoning" if rest.is_empty() => {
+            // Model and reasoning are ONE selector: a bare `/reasoning` opens
+            // the same unified picker as `/model` (rows pick the model, ←→
+            // clicks the effort detent) instead of a second bespoke list.
+            let Some(sw) = switch.as_mut() else {
+                return Ok(RouteOutcome::Fall);
+            };
+            tui.screen.commit_user(prompt);
+            let before = sw.selection().clone();
+            match picker::model_command("", harness, sw) {
+                ModelCommand::Open(modal) => tui.screen.open_modal(modal),
+                ModelCommand::Lines(lines) => {
+                    let after = sw.selection().clone();
+                    apply_model_switch_lines(tui, harness, Some(&before), Some(&after), lines);
+                }
             }
             Ok(RouteOutcome::Consumed)
         }
         "/reasoning" => {
-            // Legacy text effort path is preserved as a compatible alias. It
-            // takes the whole `Option<ModelSwitch>` like the text driver does.
+            // `/reasoning <level>` stays the typed fast path (a compatible
+            // alias through the text driver, like the CLI).
             tui.screen.commit_user(prompt);
             let before = switch.as_ref().map(|sw| sw.selection().clone());
             if let Some(lines) = crate::cli::handle_model_command(prompt, harness, switch) {
@@ -1982,7 +2041,15 @@ async fn run_harness_op<P: ChatProvider>(
                     request_render(&mut sched, tui)?;
                 }
                 Some(request) = appr_rx.recv() => {
-                    tui.screen.show_approval();
+                    // The same offered decision set the loop uses for the block
+                    // footer travels into the screen — including the dirty-gate
+                    // variant of `always` — so the REVIEW posture's decision
+                    // echo cannot diverge from the block footer.
+                    tui.screen.show_approval(
+                        request.allow_always,
+                        request.allow_project,
+                        request.dirty_gate,
+                    );
                     pending = Some(PendingApproval {
                         call: request.call.clone(),
                         reply: request.reply,
@@ -2113,6 +2180,14 @@ async fn run_modal_phase<P: ChatProvider>(
     git_cache: &GitStatusCache,
     git_generation: &mut u64,
 ) -> Result<Option<SessionSource>> {
+    // The faceplate is home. Its ports are hatches, not doors — but three
+    // genuine dialog-guards (the large-context advisory, the OAuth login
+    // dialog, the API-key dialog) still overlay it. When one does, stash the
+    // panel's view; when the guard resolves — any path — refresh the snapshot
+    // (a login can grow the catalog) and reopen the faceplate expanded, cursor
+    // intact, BEFORE the next draw so the dock never collapses for a frame
+    // (§2.5, the invariant that killed the jank in fa93453).
+    let mut settings_stash: Option<crate::ui::settings_menu::PanelView> = None;
     while tui.screen.focus() == FocusTarget::Modal {
         tokio::select! {
             maybe = input_rx.recv() => {
@@ -2132,6 +2207,12 @@ async fn run_modal_phase<P: ChatProvider>(
                     }
                     _ => {}
                 }
+                // Capture the faceplate's view before the key is handled, in
+                // case the action about to fire hands off to a dialog-guard.
+                let from_settings_view = match &tui.screen.modal {
+                    Some(Modal::Settings(panel)) => Some(panel.view()),
+                    _ => None,
+                };
                 let outcome = if let Event::Paste(text) = &event {
                     match tui.screen.modal.as_mut() {
                         Some(modal) => modal.paste_text(text),
@@ -2146,6 +2227,11 @@ async fn run_modal_phase<P: ChatProvider>(
                         None => ModalOutcome::Ignore,
                     }
                 };
+                if let (Some(view), ModalOutcome::Emit(action)) = (&from_settings_view, &outcome)
+                    && leaves_faceplate_for_guard(action)
+                {
+                    settings_stash = Some(view.clone());
+                }
                 let requested = apply_modal_outcome(
                     outcome,
                     harness,
@@ -2163,15 +2249,54 @@ async fn run_modal_phase<P: ChatProvider>(
                 if requested.is_some() {
                     return Ok(requested);
                 }
+                // The faceplate is home: when a dialog-guard it handed off to has
+                // resolved (focus left the modal region), refresh the snapshot
+                // and reopen the panel expanded BEFORE drawing, so the dock never
+                // collapses for a frame on the way back.
+                if tui.screen.focus() != FocusTarget::Modal
+                    && let Some(view) = settings_stash.take()
+                    && let Some(sw) = switch.as_mut()
+                {
+                    tui.screen
+                        .open_modal(picker::refresh_settings_panel(view, None, harness, sw));
+                }
+                // Once the panel itself is in front again, nothing is pending.
+                if matches!(tui.screen.modal, Some(Modal::Settings(_))) {
+                    settings_stash = None;
+                }
                 // The picker may have switched model/effort; refresh the
                 // footer before drawing so it never shows a stale model.
                 refresh_footer(tui, switch);
                 tui.draw()?;
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => {
+                // Keep the tick grid live while a modal is open: the settings
+                // panel's detent flash settles here, and the start page's
+                // IrisMark keeps sweeping behind a docked picker.
+                if tui.screen.tick() {
+                    tui.draw()?;
+                }
+            }
         }
     }
     Ok(None)
+}
+
+/// Whether a faceplate action hands off to a dialog-guard that overlays the
+/// panel, so the modal phase should stash the view and reopen the faceplate when
+/// the guard resolves (§2.5). Model select/cycle only leave when they trip the
+/// large-context advisory; otherwise they refresh the panel in place (a Keep or
+/// a Replace that is still the faceplate), and the "panel in front" check clears
+/// the stash harmlessly.
+fn leaves_faceplate_for_guard(action: &ModalAction) -> bool {
+    matches!(
+        action,
+        ModalAction::SelectModel { .. }
+            | ModalAction::ConfirmModelSwitch { .. }
+            | ModalAction::CycleModel { .. }
+            | ModalAction::BeginLogin(_)
+            | ModalAction::OpenApiKeyDialog(_)
+    )
 }
 
 /// Interpret one [`ModalOutcome`]. Returns a requested session swap (from the
@@ -2254,9 +2379,9 @@ async fn dispatch_action<P: ChatProvider>(
                 git_generation,
             )
             .await?;
-            tui.screen.end_turn();
+            tui.screen.end_background_work();
             if !compact_ok {
-                open_deferred_settings(tui, switch, steering);
+                open_deferred_settings(harness, tui, switch, steering);
                 return Ok(None);
             }
             let action = ModalAction::ConfirmModelSwitch {
@@ -2269,7 +2394,9 @@ async fn dispatch_action<P: ChatProvider>(
                 return Ok(None);
             };
             let before = sw.selection().clone();
-            let result = picker::apply_action(action, harness, sw);
+            // Front is the confirm prompt (not the faceplate): no view to
+            // preserve here — the run_modal_phase stash reopens the faceplate.
+            let result = picker::apply_action(action, None, harness, sw);
             let after = sw.selection().clone();
             match result {
                 ActionResult::Close(lines) => {
@@ -2284,7 +2411,7 @@ async fn dispatch_action<P: ChatProvider>(
                     tui.screen.open_modal(*modal);
                 }
             }
-            open_deferred_settings(tui, switch, steering);
+            open_deferred_settings(harness, tui, switch, steering);
         }
         ModalAction::ResumeSession(id) => {
             // Close the picker and hand the chosen session up to the loop, which
@@ -2355,26 +2482,12 @@ async fn dispatch_action<P: ChatProvider>(
                 .unwrap_or_else(|| vec!["no unreviewed Iris changes to roll back".to_string()]);
             apply_notices(tui, lines);
         }
-        ModalAction::ChooseLoginMethod(method) => match AuthStore::from_env() {
-            Ok(auth) => match login::provider_select(method, &auth) {
-                login::LoginStep::Open(modal) => tui.screen.open_modal(modal),
-                login::LoginStep::Lines(lines) => {
-                    apply_notices(tui, lines);
-                    tui.screen.close_modal();
-                }
-            },
-            Err(error) => {
-                apply_notices(tui, vec![format!("auth unavailable: {error:#}")]);
-                tui.screen.close_modal();
-            }
-        },
-        ModalAction::BackToLoginMethod => tui.screen.open_modal(login::open_login()),
-        // Settings -> Login / providers: open the existing `/login` method
-        // selector (the loop owns the auth store / login backend).
-        ModalAction::OpenLoginMethod => tui.screen.open_modal(login::open_login()),
+        // Providers hatch → OAuth/subscription login (a dialog-guard; the
+        // run_modal_phase stash reopens the faceplate expanded on return).
         ModalAction::BeginLogin(provider) => {
             run_login(provider, tui, input_rx, tick, login_backend).await?;
         }
+        // Providers hatch → API-key dialog (a dialog-guard).
         ModalAction::OpenApiKeyDialog(provider_id) => {
             tui.screen
                 .open_modal(login::open_api_key_dialog(&provider_id));
@@ -2389,15 +2502,31 @@ async fn dispatch_action<P: ChatProvider>(
                 Err(error) => vec![format!("auth unavailable: {error:#}")],
             };
             apply_notices(tui, lines);
+            // Resolving the API-key dialog leaves the modal region; the stash
+            // reopens the faceplate expanded on the providers hatch.
             tui.screen.close_modal();
         }
         ModalAction::Logout(id) => {
+            // The providers hatch's `x`: log out immediately and rebuild the
+            // faceplate in place so the row drops to `○ · —` and the catalog /
+            // scope rows refresh (a logout shrinks the model catalog).
+            let view = match &tui.screen.modal {
+                Some(Modal::Settings(panel)) => Some(panel.view()),
+                _ => None,
+            };
+            let flash = view.as_ref().map(|view| view.cursor());
             let lines = match AuthStore::from_env() {
                 Ok(auth) => login::apply_logout(&id, &auth),
                 Err(error) => vec![format!("auth unavailable: {error:#}")],
             };
             apply_notices(tui, lines);
-            tui.screen.close_modal();
+            match (view, switch.as_ref()) {
+                (Some(view), Some(sw)) => {
+                    tui.screen
+                        .open_modal(picker::refresh_settings_panel(view, flash, harness, sw));
+                }
+                _ => tui.screen.close_modal(),
+            }
         }
         ModalAction::InsertSkillMention { name, path } => {
             tui.screen.close_modal();
@@ -2406,14 +2535,20 @@ async fn dispatch_action<P: ChatProvider>(
                 .insert_str(format!("[${name}](skill://{path}) "));
             tui.screen.sync_palette();
         }
-        // Model / scoped / effort / settings actions.
+        // Model / scoped / effort / settings / policy actions.
         other => {
+            // Capture the faceplate's view before the action so a snapshot-
+            // refreshing action rebuilds it in place without losing position.
+            let view = match &tui.screen.modal {
+                Some(Modal::Settings(panel)) => Some(panel.view()),
+                _ => None,
+            };
             let Some(sw) = switch.as_mut() else {
                 tui.screen.close_modal();
                 return Ok(None);
             };
             let before = sw.selection().clone();
-            let result = picker::apply_action(other, harness, sw);
+            let result = picker::apply_action(other, view, harness, sw);
             tui.screen
                 .set_approval_policy(effective_approval_policy(harness));
             let after = sw.selection().clone();
@@ -2519,8 +2654,12 @@ async fn run_login(
         }
     };
     apply_notices(tui, lines);
+    // Close the login dialog but do NOT draw here: run_login is reached only from
+    // the providers hatch, so the `run_modal_phase` stash owns the return — it
+    // refreshes the snapshot (a login can grow the catalog) and reopens the
+    // faceplate expanded BEFORE the next draw. A draw here would paint one frame
+    // with no modal (the dock collapsed) between close and reopen (§7 criterion 7).
     tui.screen.close_modal();
-    tui.draw()?;
     Ok(())
 }
 
@@ -2793,6 +2932,13 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
         return IdleKey::Continue;
     }
 
+    // Any key completes the start page's power-on lamp test instantly — the
+    // panel is an instrument, never an obstacle. The key still performs its
+    // normal action below.
+    if let Some(page) = screen.start_page.as_mut() {
+        page.skip_boot();
+    }
+
     // Start-page launcher routing: the listed ctrl-chords activate directly,
     // and while the composer is empty ↑/↓/↵ drive the launcher selection. The
     // composer stays live throughout — typing a task and submitting it starts
@@ -2867,9 +3013,10 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
                 return IdleKey::Continue;
             }
             KeyCode::Char('o') | KeyCode::Char('O') if ctrl => {
-                if !screen.toggle_sticky_prompt() {
-                    screen.toggle_all_panels();
-                }
+                // ctrl+o has one meaning everywhere: toggle transcript folds. The
+                // pinned prompt band has its own toggle (click, or `o` in pager
+                // mode) so it never pre-empts a reader's collapsed blocks.
+                screen.toggle_all_panels();
                 return IdleKey::Continue;
             }
             KeyCode::Char('g') | KeyCode::Char('G') if ctrl => {
@@ -3125,6 +3272,18 @@ fn scrollback_focus_key(screen: &mut Screen, code: KeyCode, ctrl: bool, alt: boo
             screen.search_step(1);
             true
         }
+        // `o` toggles the pinned prompt band (the job card) -- legal here because
+        // the scrollback list, not the composer, holds focus (the list-state law).
+        // It consumes only when a band is actually pinned; otherwise it types like
+        // any other letter. ctrl+o is unrelated -- it toggles transcript folds.
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            if screen.toggle_sticky_prompt() {
+                true
+            } else {
+                screen.focus_prompt();
+                false
+            }
+        }
         // Typing always returns to the prompt; the key falls through and is
         // handled by the composer (it types). Esc keeps its cancel/clear
         // semantics untouched.
@@ -3288,9 +3447,9 @@ fn handle_running_event(
             let alt = key.modifiers.contains(KeyModifiers::ALT);
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             if ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
-                if !screen.toggle_sticky_prompt() {
-                    screen.toggle_all_panels();
-                }
+                // ctrl+o always toggles transcript folds; the pinned prompt band
+                // toggles via click or the `o` key, never by pre-empting ctrl+o.
+                screen.toggle_all_panels();
                 return true;
             }
             if ctrl
@@ -3482,6 +3641,7 @@ impl ApprovalGate for LoopBridge {
                     call,
                     allow_always,
                     allow_project,
+                    dirty_gate,
                     reply,
                 })
                 .is_err()
@@ -4168,7 +4328,7 @@ mod tests {
     #[test]
     fn start_page_launcher_navigates_wraps_and_activates() {
         let mut screen = Screen::new();
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
 
         // ↓ moves to Resume session; ↵ activates it (opens the resume picker).
         assert!(matches!(
@@ -4198,7 +4358,7 @@ mod tests {
     #[test]
     fn start_page_tasks_entry_opens_the_task_surface() {
         let mut screen = Screen::new();
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
         // New session → Resume session → Tasks, then ↵ opens the task surface —
         // the surface is a home entry now, not a picker forced open on launch.
         handle_idle_event(&mut screen, key(KeyCode::Down));
@@ -4220,7 +4380,7 @@ mod tests {
     #[test]
     fn start_page_ctrl_chords_activate_directly() {
         let mut screen = Screen::new();
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
         assert!(matches!(
             handle_idle_event(
                 &mut screen,
@@ -4264,7 +4424,7 @@ mod tests {
     #[test]
     fn start_page_ctrl_r_stays_redo_once_the_composer_has_text() {
         let mut screen = Screen::new();
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
         handle_idle_event(&mut screen, key(KeyCode::Char('x')));
         // A non-empty composer keeps ctrl-r as the editor's redo binding.
         assert!(matches!(
@@ -4280,7 +4440,7 @@ mod tests {
     #[test]
     fn start_page_composer_stays_live_and_submit_starts_the_session() {
         let mut screen = Screen::new();
-        screen.show_start_page(0);
+        screen.show_start_page(0, true);
         // Typing goes to the composer, not the launcher.
         for c in "fix the bug".chars() {
             handle_idle_event(&mut screen, key(KeyCode::Char(c)));
@@ -4367,6 +4527,103 @@ mod tests {
         ));
         // ctrl+o expanded it.
         assert!(!screen.latest_panel_collapsed());
+    }
+
+    #[test]
+    fn ctrl_o_toggles_folds_not_the_band_when_a_prompt_is_pinned() {
+        // The re-route regression (spec §5.3): with a governing prompt pinned as
+        // the sticky band AND a collapsed block below it, ctrl+o expands the
+        // block (its one meaning everywhere) and leaves the band alone. The old
+        // pre-emption that trapped a reader's folds behind the band is gone.
+        let mut screen = Screen::new();
+        screen.pager_active = true;
+        // A collapsed tool block.
+        screen.apply(UiEvent::ToolResult {
+            call: call(),
+            content: (0..20)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            exit_code: None,
+            duration: None,
+        });
+        assert!(screen.latest_panel_collapsed());
+        // A governing prompt scrolled above a small viewport.
+        screen.commit_user("the governing prompt");
+        for i in 0..40 {
+            screen.apply(UiEvent::Notice(format!("detail {i}")));
+        }
+        let total = screen.transcript_visible_total(80);
+        screen.scroll.sync(total, 5);
+        // Precondition: a band IS a viable toggle target (probe, then restore to
+        // collapsed) -- so the old code path really would have diverged here.
+        assert!(screen.toggle_sticky_prompt(), "a sticky prompt is pinned");
+        assert!(screen.toggle_sticky_prompt());
+        assert!(!screen.sticky_prompt_expanded);
+
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('o'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::Continue
+        ));
+        assert!(
+            !screen.latest_panel_collapsed(),
+            "ctrl+o expanded the collapsed block"
+        );
+        assert!(
+            !screen.sticky_prompt_expanded,
+            "ctrl+o did not touch the pinned band"
+        );
+    }
+
+    #[test]
+    fn o_key_toggles_the_pinned_band_only_under_scrollback_focus() {
+        // The band's keyboard toggle (spec §5.2/§5.4): `o` expands/collapses the
+        // pinned prompt, but only while the scrollback list holds focus (the
+        // list-state law). Without that focus it types like any other letter, so
+        // it never collides with composing a message that starts with `o`.
+        let mut screen = Screen::new();
+        screen.pager_active = true;
+        screen.commit_user("the governing prompt");
+        for i in 0..40 {
+            screen.apply(UiEvent::Notice(format!("detail {i}")));
+        }
+        let total = screen.transcript_visible_total(80);
+        screen.scroll.sync(total, 5);
+
+        // Composer focus: `o` is not consumed (types) and the band is untouched.
+        assert!(!scrollback_focus_key(
+            &mut screen,
+            KeyCode::Char('o'),
+            false,
+            false
+        ));
+        assert!(!screen.sticky_prompt_expanded);
+
+        // Focus the scrollback list, then `o` toggles the band both ways.
+        assert!(scrollback_focus_key(
+            &mut screen,
+            KeyCode::Tab,
+            false,
+            false
+        ));
+        assert!(screen.scrollback_focus);
+        assert!(scrollback_focus_key(
+            &mut screen,
+            KeyCode::Char('o'),
+            false,
+            false
+        ));
+        assert!(screen.sticky_prompt_expanded);
+        assert!(scrollback_focus_key(
+            &mut screen,
+            KeyCode::Char('o'),
+            false,
+            false
+        ));
+        assert!(!screen.sticky_prompt_expanded);
     }
 
     #[test]
@@ -5034,5 +5291,598 @@ mod tests {
             KeyModifiers::CONTROL
         )));
         assert!(!is_modal_cancel(&key(KeyCode::Enter)));
+    }
+
+    // --- faceplate stash / reopen-before-draw, dialog-guard round trips, and
+    // slash routing (spec §7 criteria 7, 12, 17–18, 21). The async loop needs a
+    // live TTY, so these drive the production functions the loop composes:
+    // `leaves_faceplate_for_guard` (the stash decision), `refresh_settings_panel`
+    // (the reopen), `apply_action` (the advisory), and the `open_settings_expanded`
+    // / `model_command` slash delegates. ---
+
+    use crate::mimir::selection::{ProviderId, ReasoningEffort};
+
+    fn null_selection() -> ModelSelection {
+        ModelSelection {
+            provider: ProviderId::OpenAiCodex,
+            model: "gpt-5.5".to_string(),
+            base_url: "https://example".to_string(),
+            reasoning: None,
+            cache_retention: crate::mimir::selection::PromptCacheRetention::Short,
+            codex_transport: crate::mimir::selection::CodexTransport::Auto,
+            context_management: crate::mimir::selection::ContextManagement::default(),
+            legacy_context_management: crate::mimir::selection::ContextManagement::default(),
+            tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
+            configured_tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
+            retry_policy: crate::mimir::retry::RetryPolicy::default(),
+            open_ai_compatible: crate::mimir::selection::OpenAiCompatibleConfig::default(),
+        }
+    }
+
+    /// An in-memory harness carrying `chars/4` estimated context tokens, so the
+    /// large-context switch advisory can be tripped deterministically.
+    fn harness_with_context(
+        chars: usize,
+        budget: Option<u64>,
+    ) -> (Harness<NullChat>, crate::tools::test_support::TestDir) {
+        use crate::nexus::{Agent, Message};
+        let dir = crate::tools::test_support::temp_dir();
+        let messages = vec![Message::user(&"x".repeat(chars))];
+        let agent = Agent::resumed(NullChat, crate::tools::built_in_tools(), messages);
+        let harness = crate::wayland::Harness::new(
+            agent,
+            dir.path.clone(),
+            crate::tools::ToolState::new(),
+            None,
+            budget,
+        );
+        (harness, dir)
+    }
+
+    fn model_choice(
+        provider: ProviderId,
+        model_id: &str,
+        is_current: bool,
+        is_default: bool,
+    ) -> settings_menu::ModelChoice {
+        let qualified = format!("{}/{}", provider.as_str(), model_id);
+        settings_menu::ModelChoice {
+            display: crate::mimir::model_catalog::display_name(&qualified),
+            provider_label: provider.display_name().to_string(),
+            levels: crate::mimir::model_capabilities::level_options(provider, model_id)
+                .iter()
+                .map(|option| (option.level, option.label))
+                .collect(),
+            provider,
+            model_id: model_id.to_string(),
+            is_current,
+            is_default,
+            qualified,
+        }
+    }
+
+    /// A hand-built faceplate snapshot with a real catalog + providers, so the
+    /// hatch-content assertions do not depend on the runner's auth store.
+    fn faceplate_snapshot() -> settings_menu::Snapshot {
+        settings_menu::Snapshot {
+            default_model: "openai-codex/gpt-5.5".to_string(),
+            reasoning_levels: vec![
+                (ReasoningEffort::Low, "low"),
+                (ReasoningEffort::Medium, "medium"),
+                (ReasoningEffort::High, "high"),
+            ],
+            reasoning: ReasoningEffort::Medium,
+            catalog: vec![
+                model_choice(ProviderId::OpenAiCodex, "gpt-5.5", true, true),
+                model_choice(ProviderId::Anthropic, "claude-sonnet-4-6", false, false),
+            ],
+            scope_candidates: vec![
+                settings_menu::ScopeChoice {
+                    qualified: "openai-codex/gpt-5.5".to_string(),
+                    provider_label: "OpenAI Codex".to_string(),
+                },
+                settings_menu::ScopeChoice {
+                    qualified: "anthropic/claude-sonnet-4-6".to_string(),
+                    provider_label: "Anthropic".to_string(),
+                },
+            ],
+            scope_enabled: None,
+            scope_persisted: None,
+            providers: vec![
+                settings_menu::ProviderStatus {
+                    id: "openai-codex".to_string(),
+                    name: "OpenAI Codex".to_string(),
+                    badge: "subscription".to_string(),
+                    oauth_capable: true,
+                    api_key_capable: false,
+                    credentialed: true,
+                },
+                settings_menu::ProviderStatus {
+                    id: "anthropic".to_string(),
+                    name: "Anthropic".to_string(),
+                    badge: "\u{2014}".to_string(),
+                    oauth_capable: true,
+                    api_key_capable: true,
+                    credentialed: false,
+                },
+            ],
+            policy: settings_menu::PolicySnapshot::default(),
+            default_approval: "auto".to_string(),
+            skip_permissions: false,
+            context_token_budget: 232_000,
+            compaction_summarizer: "subagent".to_string(),
+            microcompaction: true,
+            microcompaction_watermark: 32_000,
+            compaction_aggressiveness: "conservative".to_string(),
+            compaction_cache_timing: "cacheAware".to_string(),
+            semantic_retain_per_path: 1,
+            tool_clearing_keep_recent: 8,
+            prompt_cache_retention: "short".to_string(),
+            verify_command: None,
+            verify_max_attempts: 3,
+            theme: "terminal".to_string(),
+            alt_screen: "auto".to_string(),
+            scroll_speed: 3,
+            reduced_motion: false,
+            worktree_root: None,
+        }
+    }
+
+    fn flatten(lines: &[ratatui::text::Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // --- criterion 7: the stash is armed for exactly the guard handoffs ---
+    #[test]
+    fn guard_handoffs_arm_the_faceplate_stash_but_inline_refreshes_do_not() {
+        // The reopen-before-draw stash must be armed exactly for the three
+        // genuine dialog-guards' handoff actions. Inline refreshes (scope,
+        // effort, policy, settings, logout) never leave the faceplate, so they
+        // must not arm it — logout in particular refreshes in place (§2.5).
+        let guards = [
+            ModalAction::SelectModel {
+                id: "anthropic/claude-sonnet-4-6".to_string(),
+                effort: ReasoningEffort::Medium,
+                save_default: true,
+            },
+            ModalAction::ConfirmModelSwitch {
+                id: "anthropic/claude-sonnet-4-6".to_string(),
+                effort: ReasoningEffort::Medium,
+                save_default: true,
+                compact_first: false,
+            },
+            ModalAction::CycleModel { forward: true },
+            ModalAction::BeginLogin(ProviderId::Anthropic),
+            ModalAction::OpenApiKeyDialog("openai".to_string()),
+        ];
+        for action in &guards {
+            assert!(
+                leaves_faceplate_for_guard(action),
+                "{action:?} must stash the faceplate"
+            );
+        }
+        let inline = [
+            ModalAction::ApplyScoped(None),
+            ModalAction::SaveScoped(None),
+            ModalAction::AdjustEffort(ReasoningEffort::High),
+            ModalAction::EditPolicy(crate::wayland::trust::ProjectPolicyEdit::GrantTool(
+                "write".to_string(),
+            )),
+            ModalAction::Logout("anthropic".to_string()),
+            ModalAction::ToggleSkipPermissions,
+        ];
+        for action in &inline {
+            assert!(
+                !leaves_faceplate_for_guard(action),
+                "{action:?} refreshes in place, not via the stash"
+            );
+        }
+    }
+
+    // --- criterion 7: no frame is ever drawn with the dock collapsed ---
+    #[test]
+    fn a_dialog_guard_round_trip_reopens_the_faceplate_before_any_frame() {
+        // Models run_modal_phase's draw ordering (~L2170–2185) over a real Screen
+        // and the production `refresh_settings_panel` reopen: the guard's own
+        // handler closes the panel (no draw in that window), then the loop reopens
+        // the faceplate BEFORE the next draw. Covers all three guards — the OAuth
+        // login dialog (whose run_login no longer draws after closing), the
+        // API-key dialog, and the large-context switch prompt.
+        let (mut harness, _dir) = harness_with_context(80_000, Some(40_000));
+        let build = |_s: &ModelSelection, _p: &str| Ok(NullChat);
+        let mut switch = ModelSwitch::new(null_selection(), "P".to_string(), &build, None);
+
+        // Mint a real large-context switch prompt to use as one guard.
+        let switch_prompt = match picker::apply_action(
+            ModalAction::SelectModel {
+                id: "anthropic/claude-sonnet-4-6".to_string(),
+                effort: ReasoningEffort::Medium,
+                save_default: false,
+            },
+            None,
+            &mut harness,
+            &mut switch,
+        ) {
+            ActionResult::Replace(modal, _) => *modal,
+            _ => panic!("expected the large-context switch prompt"),
+        };
+
+        let cases: Vec<(settings_menu::HatchTarget, Modal)> = vec![
+            // The OAuth login dialog — the path whose trailing draw was removed so
+            // the stash owns the reopen.
+            (
+                settings_menu::HatchTarget::Login,
+                Modal::LoginDialog(LoginDialog::new("Anthropic", true)),
+            ),
+            (
+                settings_menu::HatchTarget::Login,
+                login::open_api_key_dialog("openai"),
+            ),
+            (settings_menu::HatchTarget::Model, switch_prompt),
+        ];
+
+        for (target, guard) in cases {
+            let mut screen = Screen::new();
+            // The faceplate is docked and drawn on the hatch (frame 0).
+            screen.open_modal(picker::open_settings_expanded(&harness, &switch, target));
+            let view = match &screen.modal {
+                Some(Modal::Settings(panel)) => panel.view(),
+                _ => panic!("faceplate front"),
+            };
+            let mut frames = vec![screen.modal.is_some()];
+            // A child-row verb hands off to the guard; the loop draws it.
+            screen.open_modal(guard);
+            frames.push(screen.modal.is_some());
+            // The guard resolves: its handler closes the modal (no draw here),
+            // then the loop reopens the faceplate before the next draw.
+            screen.close_modal();
+            screen.open_modal(picker::refresh_settings_panel(
+                view.clone(),
+                None,
+                &harness,
+                &switch,
+            ));
+            frames.push(screen.modal.is_some());
+            // Every drawn frame kept a modal — the dock never collapsed.
+            assert!(
+                frames.iter().all(|&present| present),
+                "{target:?}: a frame was drawn without the faceplate: {frames:?}"
+            );
+            // The faceplate came back, expanded, cursor held.
+            match &screen.modal {
+                Some(Modal::Settings(panel)) => {
+                    let back = panel.view();
+                    assert_eq!(
+                        back.expanded(),
+                        view.expanded(),
+                        "reopened expanded ({target:?})"
+                    );
+                    assert_eq!(back.cursor(), view.cursor(), "cursor held ({target:?})");
+                }
+                _ => panic!("faceplate reopened ({target:?})"),
+            }
+        }
+    }
+
+    // --- criterion 12: large-context select prompts, then re-homes the candidate ---
+    #[test]
+    fn a_large_context_switch_prompts_then_returns_to_the_same_candidate() {
+        let (mut harness, _dir) = harness_with_context(80_000, Some(40_000));
+        let build = |_s: &ModelSelection, _p: &str| Ok(NullChat);
+        let mut switch = ModelSwitch::new(null_selection(), "P".to_string(), &build, None);
+
+        // A real model change carrying a large context overlays the advisory.
+        match picker::apply_action(
+            ModalAction::SelectModel {
+                id: "anthropic/claude-sonnet-4-6".to_string(),
+                effort: ReasoningEffort::Medium,
+                save_default: false,
+            },
+            None,
+            &mut harness,
+            &mut switch,
+        ) {
+            ActionResult::Replace(modal, _) => {
+                assert!(
+                    matches!(*modal, Modal::SwitchContext(_)),
+                    "advisory overlays the prompt"
+                )
+            }
+            _ => panic!("large context must overlay the switch prompt"),
+        }
+
+        // Below the threshold the same switch resolves without the guard.
+        let (mut small, _small_dir) = harness_with_context(400, Some(40_000));
+        let mut small_switch = ModelSwitch::new(null_selection(), "P".to_string(), &build, None);
+        let resolved = picker::apply_action(
+            ModalAction::SelectModel {
+                id: "anthropic/claude-sonnet-4-6".to_string(),
+                effort: ReasoningEffort::Medium,
+                save_default: false,
+            },
+            None,
+            &mut small,
+            &mut small_switch,
+        );
+        assert!(
+            !matches!(resolved, ActionResult::Replace(modal, _) if matches!(*modal, Modal::SwitchContext(_))),
+            "no advisory below the threshold"
+        );
+
+        // The stashed view is the single source of truth for the return: neither
+        // a confirm nor a cancel touches it, so both re-home the same candidate.
+        let mut panel = settings_menu::SettingsPanel::with_expanded(
+            faceplate_snapshot(),
+            settings_menu::HatchTarget::Model,
+        );
+        panel.handle_key(ModalKey::Down); // off the active row, onto the next candidate
+        let candidate = panel.view().cursor();
+        assert!(
+            matches!(candidate, settings_menu::PanelRow::ModelChild(_)),
+            "cursor on a candidate row"
+        );
+        let view = panel.view();
+        for resolution in ["confirm", "cancel"] {
+            let mut back = settings_menu::SettingsPanel::new(faceplate_snapshot());
+            back.restore(view.clone());
+            assert_eq!(
+                back.view().expanded(),
+                Some(settings_menu::RowId::Model),
+                "{resolution}: returns expanded on the model hatch"
+            );
+            assert_eq!(
+                back.view().cursor(),
+                candidate,
+                "{resolution}: cursor held on the same candidate"
+            );
+        }
+    }
+
+    // --- decision #4 / coordinator override: the dangerous skip-approvals bypass
+    // PERSISTS as the default permission mode (#520) and survives a restart. It is
+    // NOT session-only — the faceplate row clicked once must still be dangerous on
+    // the next boot. ---
+    #[test]
+    fn skip_approvals_persists_the_dangerous_default_and_survives_a_restart() {
+        use crate::mimir::test_support::ConfigPathGuard;
+        use crate::nexus::{ApprovalMode, PermissionMode};
+
+        let dir = crate::tools::test_support::temp_dir();
+        let global = dir.path.join("settings.json");
+        let _guard = ConfigPathGuard::set(&global);
+
+        let (mut harness, _hdir) = harness_with_context(400, Some(40_000));
+        harness.set_approval_mode(ApprovalMode::Auto);
+        let build = |_s: &ModelSelection, _p: &str| Ok(NullChat);
+        let mut switch = ModelSwitch::new(null_selection(), "P".to_string(), &build, None);
+        assert!(!harness.skip_permissions(), "starts with the bypass off");
+
+        // Click the faceplate skip-approvals switch ON: applied live AND persisted
+        // through #520's permission-mode default.
+        let _ = picker::apply_action(
+            ModalAction::ToggleSkipPermissions,
+            None,
+            &mut harness,
+            &mut switch,
+        );
+        assert!(
+            harness.skip_permissions(),
+            "the bypass is live this session"
+        );
+
+        // Restart-shaped: a FRESH settings load reads the persisted global token,
+        // and startup resolution re-enables the bypass — proving it is not
+        // session-only but survives across restarts.
+        let reloaded = crate::config::Settings::load(&dir.path).unwrap();
+        assert_eq!(
+            reloaded.default_approval.as_deref(),
+            Some(crate::nexus::DANGEROUS_SKIP_PERMISSIONS_TOKEN),
+            "the dangerous default persisted to global settings"
+        );
+        assert!(
+            matches!(
+                PermissionMode::from_startup_setting(reloaded.default_approval.as_deref()),
+                PermissionMode::DangerousSkipPermissions
+            ),
+            "a fresh boot resolves the persisted token back to the bypass"
+        );
+
+        // Toggling it back OFF restores AND persists the parked approval preset,
+        // so a later restart is no longer dangerous (the persistence is symmetric).
+        let _ = picker::apply_action(
+            ModalAction::ToggleSkipPermissions,
+            None,
+            &mut harness,
+            &mut switch,
+        );
+        assert!(!harness.skip_permissions(), "the bypass is cleared live");
+        let reloaded = crate::config::Settings::load(&dir.path).unwrap();
+        assert_ne!(
+            reloaded.default_approval.as_deref(),
+            Some(crate::nexus::DANGEROUS_SKIP_PERMISSIONS_TOKEN),
+            "clearing the bypass persists a normal default, not the dangerous token"
+        );
+        assert!(
+            !matches!(
+                PermissionMode::from_startup_setting(reloaded.default_approval.as_deref()),
+                PermissionMode::DangerousSkipPermissions
+            ),
+            "a fresh boot no longer resolves to the bypass"
+        );
+    }
+
+    // --- criterion 17: a resolved login returns expanded, badge/count refreshed ---
+    #[test]
+    fn a_resolved_login_returns_to_the_provider_row_with_a_refreshed_badge() {
+        // The login/api-key dialog is a guard: on any resolution the loop reopens
+        // the providers hatch from a fresh snapshot with the cursor held. Modeled
+        // as the loop's refresh does it — a fresh panel from the post-login
+        // snapshot with the stashed view restored.
+        let panel = settings_menu::SettingsPanel::with_expanded(
+            faceplate_snapshot(),
+            settings_menu::HatchTarget::Login,
+        );
+        let view = panel.view();
+        let cursor = view.cursor();
+        assert_eq!(
+            cursor,
+            settings_menu::PanelRow::ProviderChild("anthropic".to_string()),
+            "login lands on the uncredentialed row"
+        );
+
+        // Cancel: the same snapshot, view restored — back on the row, expanded.
+        let mut cancelled = settings_menu::SettingsPanel::new(faceplate_snapshot());
+        cancelled.restore(view.clone());
+        assert_eq!(
+            cancelled.view().expanded(),
+            Some(settings_menu::RowId::Providers)
+        );
+        assert_eq!(cancelled.view().cursor(), cursor);
+
+        // Success: anthropic authenticates — badge → subscription, count 1 → 2 —
+        // and the cursor stays put across the refresh.
+        let mut snap = faceplate_snapshot();
+        snap.providers[1].credentialed = true;
+        snap.providers[1].badge = "subscription".to_string();
+        let mut back = settings_menu::SettingsPanel::new(snap);
+        back.restore(view);
+        assert_eq!(
+            back.view().cursor(),
+            cursor,
+            "cursor held across the refresh"
+        );
+        let rendered = flatten(&back.render_budgeted(100, 80));
+        assert!(
+            rendered.contains("2 connected"),
+            "header count refreshed:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("subscription"),
+            "badge refreshed:\n{rendered}"
+        );
+    }
+
+    // --- criterion 18: logout drops the row, decrements the count, refreshes catalog ---
+    #[test]
+    fn logout_drops_the_row_decrements_the_header_and_refreshes_the_catalog() {
+        // Logout is inline (not a guard, asserted above): the loop captures the
+        // view and rebuilds from the post-logout snapshot. The row drops to ○ · —,
+        // the header count decrements, and the ENGINE catalog shrinks (the logged
+        // out provider's models leave it). Cursor held.
+        let mut before = faceplate_snapshot();
+        before.providers[1].credentialed = true;
+        before.providers[1].badge = "subscription".to_string();
+        before.catalog.push(model_choice(
+            ProviderId::Anthropic,
+            "claude-opus-4-8",
+            false,
+            false,
+        ));
+        let panel =
+            settings_menu::SettingsPanel::with_expanded(before, settings_menu::HatchTarget::Logout);
+        let view = panel.view();
+        let cursor = view.cursor();
+        assert_eq!(
+            cursor,
+            settings_menu::PanelRow::ProviderChild("openai-codex".to_string()),
+            "logout lands on the first credentialed row"
+        );
+
+        // openai-codex logs out: uncredentialed, its model gone from the catalog.
+        let mut after = faceplate_snapshot();
+        after.providers[0].credentialed = false;
+        after.providers[0].badge = "\u{2014}".to_string();
+        after.providers[1].credentialed = true;
+        after.providers[1].badge = "subscription".to_string();
+        after.catalog = vec![model_choice(
+            ProviderId::Anthropic,
+            "claude-sonnet-4-6",
+            true,
+            true,
+        )];
+        let mut back = settings_menu::SettingsPanel::new(after.clone());
+        back.restore(view);
+        assert_eq!(
+            back.view().cursor(),
+            cursor,
+            "cursor held across the refresh"
+        );
+        let rendered = flatten(&back.render_budgeted(100, 80));
+        assert!(
+            rendered.contains("1 connected"),
+            "count decremented:\n{rendered}"
+        );
+        assert!(
+            rendered.contains('\u{2014}'),
+            "logged-out row dropped to —:\n{rendered}"
+        );
+
+        // The ENGINE catalog refreshed — gpt-5.5 left with its provider.
+        let catalog_view = flatten(
+            &settings_menu::SettingsPanel::with_expanded(after, settings_menu::HatchTarget::Model)
+                .render_budgeted(100, 80),
+        );
+        assert!(
+            !catalog_view.contains("GPT 5.5"),
+            "the logged-out provider's model left the catalog:\n{catalog_view}"
+        );
+    }
+
+    // --- criterion 21: slash entries open the faceplate on the named hatch ---
+    #[test]
+    fn slash_entries_open_the_faceplate_on_the_named_hatch() {
+        // route_command needs a live TuiUi, so it delegates the hatch mapping to
+        // `open_settings_expanded` (per HatchTarget) and `model_command` (bare
+        // /model / /reasoning). The expansion each target opens is auth-independent
+        // (the cursor placement and the typed fast path are pinned in the
+        // settings_menu / picker unit tests).
+        let (harness, _dir) = harness_with_context(400, None);
+        let build = |_s: &ModelSelection, _p: &str| Ok(NullChat);
+        let switch = ModelSwitch::new(null_selection(), "P".to_string(), &build, None);
+
+        for (target, want) in [
+            (
+                settings_menu::HatchTarget::Model,
+                settings_menu::RowId::Model,
+            ),
+            (
+                settings_menu::HatchTarget::Scope,
+                settings_menu::RowId::Scope,
+            ),
+            (
+                settings_menu::HatchTarget::Permissions,
+                settings_menu::RowId::Permissions,
+            ),
+            (
+                settings_menu::HatchTarget::Login,
+                settings_menu::RowId::Providers,
+            ),
+            (
+                settings_menu::HatchTarget::Logout,
+                settings_menu::RowId::Providers,
+            ),
+        ] {
+            match picker::open_settings_expanded(&harness, &switch, target) {
+                Modal::Settings(panel) => assert_eq!(
+                    panel.view().expanded(),
+                    Some(want),
+                    "{target:?} opens its hatch"
+                ),
+                _ => panic!("expected the faceplate for {target:?}"),
+            }
+        }
     }
 }

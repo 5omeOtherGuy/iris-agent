@@ -27,6 +27,19 @@ pub(super) enum FoldVis {
     WhenExpanded,
 }
 
+/// Wrap measure for a row's TEXT (reactive-density spec §3). `Prose` text wraps
+/// to `min(content_width, PROSE_MEASURE)` so an ultrawide pane does not stretch a
+/// paragraph past a readable line length; `Mechanical` text (code, tool bodies,
+/// diffs, tables, rules, chrome) keeps the full `content_width` because its
+/// alignment must not reflow. Only the wrap width changes — markers, rails, and
+/// indents render exactly as before, and the measure is a no-op at panes ≤ 96
+/// columns. The default is `Mechanical` (full width; the pre-measure behavior).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Measure {
+    Prose,
+    Mechanical,
+}
+
 /// One styled logical transcript row. Most rows are plain text + style; ANSI
 /// tool output stores a parsed ratatui line so the escape styling survives.
 #[derive(Clone)]
@@ -55,6 +68,11 @@ pub(super) struct TranscriptRow {
     /// match hidden UI and auto-expand panels for non-content. Defaults to
     /// `true`; only the fold-hint builders clear it.
     pub(super) searchable: bool,
+    /// Text wrap measure for this row (reactive-density spec §3). Prose wraps at
+    /// the reader's measure; mechanical content keeps the full width. Defaults
+    /// to `Mechanical` (via [`Self::new`]/[`Self::chrome_with_text`]); prose row
+    /// builders set `Measure::Prose` on the struct directly.
+    pub(super) measure: Measure,
 }
 
 impl TranscriptRow {
@@ -70,6 +88,7 @@ impl TranscriptRow {
             hrule: false,
             chrome: None,
             searchable: true,
+            measure: Measure::Mechanical,
         }
     }
 
@@ -95,6 +114,7 @@ impl TranscriptRow {
             hrule: false,
             chrome: Some(chrome),
             searchable: true,
+            measure: Measure::Mechanical,
         }
     }
 
@@ -158,9 +178,18 @@ impl TranscriptRow {
             width
         };
         let content_padding = row_text_padding(self);
-        let render_width = box_width
+        let content_width = box_width
             .saturating_sub(content_padding.saturating_mul(2))
             .max(1);
+        // Prose wraps to the reader's measure (spec §3): `min(content_width, 96)`.
+        // Mechanical rows keep the full content width. Only the wrap width moves;
+        // the content_padding indent (applied below) and any continuation prefix
+        // are untouched, so continuations still align under their content — the
+        // right side simply rags at the measure. A no-op at panes ≤ 96 columns.
+        let render_width = match self.measure {
+            Measure::Prose => content_width.min(super::PROSE_MEASURE),
+            Measure::Mechanical => content_width,
+        };
         let start = out.len();
         match &self.line {
             Some(line) if self.word_wrap => {
@@ -276,6 +305,9 @@ pub(super) enum ChromeRow {
         /// Whether the block folds (drives the `▾`/`▸` disclosure arrow; a
         /// short trace shown whole has no arrow and ignores ctrl+o).
         foldable: bool,
+        /// The live-receiving lamp: a static orange `●` after the label while
+        /// reasoning streams (§7.4). Drops when the block commits.
+        lamp: bool,
     },
     /// The end marker of a reasoning rail — the rail analogue of `Bottom`. Bounds
     /// the block for `panel_end_from`/the visibility reset and renders as a single
@@ -355,7 +387,8 @@ impl ChromeRow {
                 label,
                 right,
                 foldable,
-            } => rail_header_line(width, *expanded, *foldable, label, right),
+                lamp,
+            } => rail_header_line(width, *expanded, *foldable, label, right, *lamp),
             ChromeRow::RailEnd => Line::default(),
         }
     }
@@ -450,9 +483,12 @@ fn push_notice_rows(
     message: &str,
     out: &mut Vec<Line<'static>>,
 ) {
+    // A notice is prose (spec §3): its message wraps to the reader's measure,
+    // not the full pane. The rail prefix and text-column indent are untouched.
+    // `1 <= PROSE_MEASURE`, so the clamp never inverts.
     let render_width = width
         .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
-        .max(1);
+        .clamp(1, super::PROSE_MEASURE);
     let first = Line::from(vec![
         Span::styled(format!("{glyph} "), glyph_style),
         Span::styled(message.to_string(), dim_style()),

@@ -6,6 +6,7 @@
 //! inserts `@<relative-path> ` into the composer; `↵` on a dir toggles it.
 //! No box-drawing tree guides — indent + `▾`/`▸` carry the structure.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -16,7 +17,7 @@ use crate::ui::symbols;
 use crate::wayland::git_safety::git;
 
 use super::super::wrap::truncate_line;
-use super::super::{dim_style, prompt_style};
+use super::super::{dim_style, prompt_style, stdout_style};
 use super::{
     MenuAction, MenuKey, MenuOutcome, cap_block, dim_lines, footer_hints, fuzzy_match, home_rel,
     input_row, internal_rule, match_count, menu_row, readonly_footer, step_wrapped,
@@ -57,8 +58,10 @@ pub(crate) struct TreeMenu {
     cwd: PathBuf,
     /// Repo file list relative to `root` (`None` = non-repo readdir mode).
     files: Option<Vec<String>>,
-    /// Directory listing cache (key = dir rel path, `""` = root).
-    children: BTreeMap<String, Vec<Entry>>,
+    /// Directory listing cache (key = dir rel path, `""` = root). Behind a
+    /// `RefCell` so the read-only render path can fill it in place — the tree
+    /// is never cloned per frame to obtain `&mut` for the cache.
+    children: RefCell<BTreeMap<String, Vec<Entry>>>,
     expanded: BTreeSet<String>,
     selected: usize,
     mode: Mode,
@@ -72,7 +75,7 @@ impl TreeMenu {
             root: cwd.clone(),
             cwd,
             files: None,
-            children: BTreeMap::new(),
+            children: RefCell::new(BTreeMap::new()),
             expanded: BTreeSet::new(),
             selected: 0,
             mode: if filter {
@@ -95,7 +98,7 @@ impl TreeMenu {
 
     /// (Re)load the file list for the current root.
     fn reload(&mut self) {
-        self.children.clear();
+        self.children.get_mut().clear();
         self.expanded.clear();
         self.selected = 0;
         self.files = git::is_git_worktree(&self.root)
@@ -134,9 +137,10 @@ impl TreeMenu {
     }
 
     /// Immediate children of `dir` (rel path, `""` = root), dirs first then
-    /// files, both alphabetical. Cached.
-    fn children_of(&mut self, dir: &str) -> Vec<Entry> {
-        if let Some(cached) = self.children.get(dir) {
+    /// files, both alphabetical. Cached through the `RefCell` so rendering can
+    /// fill the cache without a `&mut` borrow of the tree.
+    fn children_of(&self, dir: &str) -> Vec<Entry> {
+        if let Some(cached) = self.children.borrow().get(dir) {
             return cached.clone();
         }
         let entries: Vec<Entry> = match &self.files {
@@ -223,7 +227,9 @@ impl TreeMenu {
                 dirs.into_iter().chain(plain).collect()
             }
         };
-        self.children.insert(dir.to_string(), entries.clone());
+        self.children
+            .borrow_mut()
+            .insert(dir.to_string(), entries.clone());
         entries
     }
 
@@ -234,14 +240,15 @@ impl TreeMenu {
         Some(files.iter().filter(|f| f.starts_with(&prefix)).count())
     }
 
-    /// Build the visible rows for the current expansion state (capped).
-    fn visible_rows(&mut self) -> (Vec<VisRow>, usize) {
+    /// Build the visible rows for the current expansion state (capped). Takes
+    /// `&self`: the listing cache lives behind a `RefCell`, so the render path
+    /// walks the tree without cloning it for a `&mut` borrow.
+    fn visible_rows(&self) -> (Vec<VisRow>, usize) {
         let mut rows = Vec::new();
         let mut overflow = 0usize;
-        let mut stack: Vec<(String, usize)> = vec![(String::new(), 0)];
         // Depth-first walk of expanded dirs.
         fn walk(
-            menu: &mut TreeMenu,
+            menu: &TreeMenu,
             dir: &str,
             depth: usize,
             rows: &mut Vec<VisRow>,
@@ -262,8 +269,7 @@ impl TreeMenu {
                 }
             }
         }
-        let (root, depth) = stack.pop().expect("root frame");
-        walk(self, &root, depth, &mut rows, &mut overflow);
+        walk(self, "", 0, &mut rows, &mut overflow);
         (rows, overflow)
     }
 
@@ -479,19 +485,37 @@ impl TreeMenu {
         line
     }
 
-    /// The attribution marker meta for a path, from the status partition.
+    /// Convert a row path (relative to the current `root`) back to a
+    /// cwd-relative path — the frame the status partition and composer
+    /// references live in — so attribution survives a breadcrumb re-root.
+    /// `None` = the row lives outside the cwd subtree (degrade that row only,
+    /// never all-or-nothing).
+    fn cwd_rel(&self, rel: &str) -> Option<String> {
+        self.root
+            .join(rel)
+            .strip_prefix(&self.cwd)
+            .ok()
+            .map(|relative| relative.display().to_string())
+    }
+
+    /// The attribution marker meta for a FILE, from the status partition:
+    /// `◉ open` (composer-referenced), `◇ iris` (unsettled ledger), `± yours`
+    /// (user-dirty). Collapsed directories carry the [`Self::dir_rollup`]
+    /// instead. Empty for a row outside the cwd subtree.
     fn attribution(
         &self,
         rel: &str,
-        dir: bool,
         git: Option<&GitStatus>,
         referenced: &[String],
     ) -> Vec<Span<'static>> {
-        // Markers only apply while the root is the session cwd (paths align).
-        if self.root != self.cwd {
+        // Markers describe the FILE, not the viewpoint: compare in the
+        // cwd-relative frame so attribution renders at any re-root. A row
+        // outside the cwd subtree has no cwd-relative form — no marker there.
+        let Some(rel) = self.cwd_rel(rel) else {
             return Vec::new();
-        }
-        if !dir && referenced.iter().any(|r| r == rel) {
+        };
+        let rel = rel.as_str();
+        if referenced.iter().any(|r| r == rel) {
             return vec![Span::styled(
                 format!("{} open", symbols::ACTIVE),
                 prompt_style(),
@@ -500,25 +524,77 @@ impl TreeMenu {
         let Some(status) = git else {
             return Vec::new();
         };
-        let prefix = format!("{rel}/");
-        let has = |paths: &[String]| {
-            if dir {
-                paths.iter().any(|p| p.starts_with(&prefix))
-            } else {
-                paths.iter().any(|p| p == rel)
-            }
-        };
-        if has(&status.iris_paths) {
+        if status.iris_paths.iter().any(|p| p == rel) {
             return vec![Span::styled(
                 format!("{} iris", symbols::PREVIEW),
                 dim_style(),
             )];
         }
-        if has(&status.user_paths) {
-            let style = if dir { dim_style() } else { prompt_style() };
-            return vec![Span::styled(format!("{} yours", symbols::DIRTY), style)];
+        if status.user_paths.iter().any(|p| p == rel) {
+            return vec![Span::styled(
+                format!("{} yours", symbols::DIRTY),
+                prompt_style(),
+            )];
         }
         Vec::new()
+    }
+
+    /// Collapsed-directory rollup: the §9.1 state cluster computed from the
+    /// already-fetched status path sets — `±N` (orange) user-dirty files
+    /// beneath, `◇M` (muted) iris-ledger files beneath, each half omitted at
+    /// zero — plus the muted file-count tail. Returned as `(state, count)` so
+    /// the row can drop the count first under width pressure: state outranks
+    /// inventory (§9.1.1). No new git calls — a prefix-match over the sets the
+    /// session bar already fetched.
+    fn dir_rollup(
+        &self,
+        rel: &str,
+        git: Option<&GitStatus>,
+    ) -> (Vec<Span<'static>>, Option<Span<'static>>) {
+        let mut state: Vec<Span<'static>> = Vec::new();
+        // An ancestor-of-cwd dir (`cwd_rel` = None: the cwd is inside it, not
+        // the other way round) degrades to count-only: the status sets are
+        // cwd-scoped, so a rollup there would report only the cwd's slice of a
+        // larger subtree — a partial `±N` presented as the dir's state would
+        // lie.
+        if let Some(status) = git
+            && let Some(cwd_rel) = self.cwd_rel(rel)
+        {
+            // Empty `cwd_rel` = this row IS the session cwd itself (seen from
+            // a root above it): every cwd-relative status path lies beneath
+            // it, so the prefix matches all.
+            let prefix = if cwd_rel.is_empty() {
+                String::new()
+            } else {
+                format!("{cwd_rel}/")
+            };
+            let under = |paths: &[String]| paths.iter().filter(|p| p.starts_with(&prefix)).count();
+            let user = under(&status.user_paths);
+            let iris = under(&status.iris_paths);
+            if user > 0 {
+                state.push(Span::styled(
+                    format!("{}{user}", symbols::DIRTY),
+                    prompt_style(),
+                ));
+            }
+            if iris > 0 {
+                if !state.is_empty() {
+                    state.push(Span::raw(" ".to_string()));
+                }
+                state.push(Span::styled(
+                    format!("{}{iris}", symbols::PREVIEW),
+                    dim_style(),
+                ));
+            }
+        }
+        let count = self.files_under(rel).map(|n| {
+            let noun = if n == 1 { "file" } else { "files" };
+            // The `·` joins state to inventory only when state is present
+            // (`±3 ◇1 · 41 files`); a clean dir reads `41 files` alone.
+            let joiner = if state.is_empty() { "" } else { " · " };
+            Span::styled(format!("{joiner}{n} {noun}"), dim_style())
+        });
+        (state, count)
     }
 
     pub(crate) fn render_lines(
@@ -529,21 +605,12 @@ impl TreeMenu {
         git: Option<&GitStatus>,
         referenced: &[String],
     ) -> Vec<Line<'static>> {
-        // `visible_rows` needs `&mut` for the listing cache; clone the state
-        // cheaply instead of threading interior mutability through render.
-        let mut walker = TreeMenu {
-            root: self.root.clone(),
-            cwd: self.cwd.clone(),
-            files: self.files.clone(),
-            children: self.children.clone(),
-            expanded: self.expanded.clone(),
-            selected: self.selected,
-            mode: self.mode.clone(),
-        };
+        // The listing cache is interior-mutable (`RefCell`), so rendering
+        // borrows the tree and fills the cache in place — no per-frame clone.
         let mut lines = vec![self.breadcrumb(width)];
         match &self.mode {
             Mode::Browse => {
-                let (rows, overflow) = walker.visible_rows();
+                let (rows, overflow) = self.visible_rows();
                 for (index, row) in rows.iter().enumerate() {
                     lines.push(self.tree_row(
                         row,
@@ -551,12 +618,13 @@ impl TreeMenu {
                         width,
                         git,
                         referenced,
-                        &walker,
                     ));
                 }
                 if overflow > 0 {
+                    // Mirror the git console's SWITCH overflow affordance: the
+                    // cap row names the way to reach the elided rows.
                     lines.push(Line::from(Span::styled(
-                        format!("   … {overflow} more"),
+                        format!("   … {overflow} more · / to filter"),
                         dim_style(),
                     )));
                 }
@@ -622,7 +690,10 @@ impl TreeMenu {
     }
 
     /// One tree row: 2-cells-per-level indent · disclosure (dirs only, dim) ·
-    /// name (dirs ink + `/`, files stdout grey) · right-aligned dim meta.
+    /// name (dirs ink + `/`, files stdout grey) · right-aligned dim meta. A
+    /// file's meta is its attribution marker; a COLLAPSED directory's is the
+    /// state rollup (`±N ◇M · N files`); an EXPANDED directory carries none
+    /// (its children speak for themselves).
     fn tree_row(
         &self,
         row: &VisRow,
@@ -630,12 +701,12 @@ impl TreeMenu {
         width: usize,
         git: Option<&GitStatus>,
         referenced: &[String],
-        walker: &TreeMenu,
     ) -> Line<'static> {
         let indent = " ".repeat(row.depth * 2 + 1);
         let mut label: Vec<Span<'static>> = vec![Span::raw(indent)];
+        let expanded = self.expanded.contains(&row.entry.rel);
         if row.entry.dir {
-            let glyph = if self.expanded.contains(&row.entry.rel) {
+            let glyph = if expanded {
                 symbols::EXPANDED
             } else {
                 symbols::COLLAPSED
@@ -643,23 +714,28 @@ impl TreeMenu {
             label.push(Span::styled(format!("{glyph} "), dim_style()));
             label.push(Span::raw(format!("{}/", row.entry.name)));
         } else {
-            label.push(Span::styled(
-                row.entry.name.clone(),
-                ratatui::style::Style::default().fg(ratatui::style::Color::Gray),
-            ));
+            label.push(Span::styled(row.entry.name.clone(), stdout_style()));
         }
-        let mut meta = self.attribution(&row.entry.rel, row.entry.dir, git, referenced);
-        if meta.is_empty()
-            && row.entry.dir
-            && !self.expanded.contains(&row.entry.rel)
-            && let Some(count) = walker.files_under(&row.entry.rel)
-        {
-            let noun = if count == 1 { "file" } else { "files" };
-            meta = vec![Span::styled(format!("{count} {noun}"), dim_style())];
-        }
+        // A collapsed dir rolls up its dirty state + inventory; the count is
+        // droppable, the state is not. Files carry a single attribution marker.
+        let (mut meta, count): (Vec<Span<'static>>, Option<Span<'static>>) = match &row.entry {
+            entry if entry.dir && !expanded => self.dir_rollup(&entry.rel, git),
+            entry if entry.dir => (Vec::new(), None),
+            entry => (self.attribution(&entry.rel, git, referenced), None),
+        };
         // Tree rows use plain gap alignment, not the dotted leader (the tree
         // is denser than a picker; leaders would draw a wall of dots).
         let label_w: usize = label.iter().map(|s| super::display_width(&s.content)).sum();
+        // The count tail joins only when the row still holds a 1-col gap after
+        // it; otherwise it drops and the state stands alone (§9.1.1).
+        if let Some(count) = count {
+            let state_w: usize = meta.iter().map(|s| super::display_width(&s.content)).sum();
+            let count_w = super::display_width(&count.content);
+            // `<` (not `<=`) reserves the 1-col gap between label and meta.
+            if label_w + state_w + count_w < width {
+                meta.push(count);
+            }
+        }
         let meta_w: usize = meta.iter().map(|s| super::display_width(&s.content)).sum();
         let gap = width.saturating_sub(label_w).saturating_sub(meta_w);
         let mut spans = label;
@@ -694,7 +770,7 @@ mod tests {
             root: PathBuf::from("/repo"),
             cwd: PathBuf::from("/repo"),
             files: Some(files.iter().map(|f| f.to_string()).collect()),
-            children: BTreeMap::new(),
+            children: RefCell::new(BTreeMap::new()),
             expanded: BTreeSet::new(),
             selected: 0,
             mode: Mode::Browse,
@@ -713,7 +789,7 @@ mod tests {
 
     #[test]
     fn root_listing_sorts_dirs_first_then_files() {
-        let mut t = tree(FILES);
+        let t = tree(FILES);
         let (rows, overflow) = t.visible_rows();
         assert_eq!(overflow, 0);
         let names: Vec<&str> = rows.iter().map(|r| r.entry.name.as_str()).collect();
@@ -794,6 +870,185 @@ mod tests {
     }
 
     #[test]
+    fn attribution_survives_reroot_above_cwd() {
+        // Re-rooted one level up: `root = /`, session cwd = `/repo`, files
+        // listed relative to the new root. Markers describe the file, so a
+        // dirty file and a referenced file keep their metas even though the
+        // viewpoint moved above the cwd.
+        let mut t = TreeMenu {
+            root: PathBuf::from("/"),
+            cwd: PathBuf::from("/repo"),
+            files: Some(vec![
+                "repo/src/main.rs".to_string(),
+                "repo/Cargo.toml".to_string(),
+                "other/README.md".to_string(),
+            ]),
+            children: RefCell::new(BTreeMap::new()),
+            expanded: BTreeSet::new(),
+            selected: 0,
+            mode: Mode::Browse,
+        };
+        t.expanded.insert("repo".to_string());
+        t.expanded.insert("repo/src".to_string());
+        // Status/reference paths stay cwd-relative (`src/main.rs`,
+        // `Cargo.toml`); the row paths are root-relative (`repo/...`).
+        let status = GitStatus {
+            user_paths: vec!["src/main.rs".to_string()],
+            ..GitStatus::default()
+        };
+        let text =
+            lines_text(&t.render_lines(60, 20, false, Some(&status), &["Cargo.toml".to_string()]));
+        assert!(
+            text.contains("± yours"),
+            "dirty file keeps its marker: {text}"
+        );
+        assert!(
+            text.contains("◉ open"),
+            "referenced file keeps its marker: {text}"
+        );
+        // A row outside the cwd subtree degrades to no marker, not a panic.
+        assert!(
+            text.contains("other/"),
+            "out-of-cwd row still renders: {text}"
+        );
+    }
+
+    #[test]
+    fn cwd_row_rolls_up_fully_when_rerooted_above() {
+        // Re-rooted above the cwd, the cwd's own COLLAPSED dir row has
+        // `cwd_rel == ""` — the rollup must match ALL cwd-relative status
+        // paths (every dirty file is by definition beneath the cwd), not a
+        // bogus `/`-prefix that matches none.
+        let t = TreeMenu {
+            root: PathBuf::from("/"),
+            cwd: PathBuf::from("/repo"),
+            files: Some(vec![
+                "repo/src/a.rs".to_string(),
+                "repo/src/b.rs".to_string(),
+                "repo/src/c.rs".to_string(),
+                "other/README.md".to_string(),
+            ]),
+            children: RefCell::new(BTreeMap::new()),
+            expanded: BTreeSet::new(),
+            selected: 0,
+            mode: Mode::Browse,
+        };
+        // `repo/` stays collapsed; status paths are cwd-relative.
+        let status = GitStatus {
+            user_paths: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            iris_paths: vec!["src/c.rs".to_string()],
+            ..GitStatus::default()
+        };
+        let lines = t.render_lines(60, 20, false, Some(&status), &[]);
+        let repo = row_text(&lines, "repo/");
+        assert!(repo.contains("±2 ◇1 · 3 files"), "{repo:?}");
+        // An out-of-cwd dir keeps the count-only degrade.
+        let other = row_text(&lines, "other/");
+        assert!(other.contains("1 file"), "{other:?}");
+        assert!(
+            !other.contains('±') && !other.contains('◇'),
+            "no state on out-of-cwd dir: {other:?}"
+        );
+    }
+
+    const ROLLUP_FILES: &[&str] = &[
+        "docs/guide.md",
+        "docs/spec.md",
+        "src/a.rs",
+        "src/b.rs",
+        "src/c.rs",
+    ];
+
+    fn rollup_status() -> GitStatus {
+        GitStatus {
+            user_paths: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            iris_paths: vec!["src/c.rs".to_string()],
+            ..GitStatus::default()
+        }
+    }
+
+    /// The rendered row (below the breadcrumb) whose label starts with `name`.
+    fn row_text(lines: &[Line<'static>], name: &str) -> String {
+        lines
+            .iter()
+            .map(super::super::line_text)
+            .find(|t| t.trim_start().contains(name))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn collapsed_dir_rolls_up_dirty_state_then_count() {
+        let t = tree(ROLLUP_FILES);
+        let status = rollup_status();
+        let lines = t.render_lines(60, 20, false, Some(&status), &[]);
+        // src/ collapsed: 2 user-dirty + 1 iris file beneath, then inventory.
+        let src = row_text(&lines, "src/");
+        assert!(src.contains("±2 ◇1 · 3 files"), "{src:?}");
+    }
+
+    #[test]
+    fn zero_state_dir_renders_count_only() {
+        let t = tree(ROLLUP_FILES);
+        let status = rollup_status();
+        let lines = t.render_lines(60, 20, false, Some(&status), &[]);
+        let docs = row_text(&lines, "docs/");
+        assert!(docs.contains("2 files"), "{docs:?}");
+        assert!(
+            !docs.contains('±') && !docs.contains('◇'),
+            "no state glyphs: {docs:?}"
+        );
+    }
+
+    #[test]
+    fn expanded_dir_renders_no_rollup() {
+        let mut t = tree(ROLLUP_FILES);
+        t.expanded.insert("src".to_string());
+        let status = rollup_status();
+        let lines = t.render_lines(60, 20, false, Some(&status), &[]);
+        let src = row_text(&lines, "src/");
+        // The expanded dir row carries neither state nor inventory; its
+        // children speak for themselves.
+        assert!(!src.contains("files"), "no count on expanded dir: {src:?}");
+        assert!(
+            !src.contains("±2"),
+            "no state rollup on expanded dir: {src:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_width_drops_count_before_state() {
+        let t = tree(ROLLUP_FILES);
+        let status = rollup_status();
+        // Wide: both state and inventory fit.
+        let wide = row_text(&t.render_lines(60, 20, false, Some(&status), &[]), "src/");
+        assert!(wide.contains("±2 ◇1"), "{wide:?}");
+        assert!(wide.contains("files"), "{wide:?}");
+        // Narrow: the inventory tail drops, the state cluster survives.
+        let narrow = row_text(&t.render_lines(20, 20, false, Some(&status), &[]), "src/");
+        assert!(narrow.contains("±2 ◇1"), "state kept: {narrow:?}");
+        assert!(!narrow.contains("files"), "count dropped: {narrow:?}");
+    }
+
+    #[test]
+    fn rollup_is_dim_under_readonly() {
+        let t = tree(ROLLUP_FILES);
+        let status = rollup_status();
+        let lines = t.render_lines(60, 20, true, Some(&status), &[]);
+        // The orange `±N` half is recolored to muted like every readout row.
+        let dirty = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| s.content.starts_with('±'));
+        let dirty = dirty.expect("rollup ± span present");
+        assert_eq!(
+            dirty.style.fg,
+            Some(crate::ui::palette::muted()),
+            "readonly dims the rollup: {:?}",
+            dirty.style
+        );
+    }
+
+    #[test]
     fn breadcrumb_marks_current_component_bold() {
         let t = tree(FILES);
         let lines = t.render_lines(60, 16, false, None, &[]);
@@ -815,12 +1070,28 @@ mod tests {
     fn visible_rows_cap_at_500_with_overflow_row() {
         let files: Vec<String> = (0..600).map(|i| format!("f{i:04}.txt")).collect();
         let refs: Vec<&str> = files.iter().map(String::as_str).collect();
-        let mut t = tree(&refs);
+        let t = tree(&refs);
         let (rows, overflow) = t.visible_rows();
         assert_eq!(rows.len(), 500);
         assert_eq!(overflow, 100);
         let text = lines_text(&t.render_lines(40, 1000, false, None, &[]));
         assert!(text.contains("… 100 more"), "{text}");
+        // The cap row carries the filter affordance (spec 1.5).
+        assert!(text.contains("… 100 more · / to filter"), "{text}");
+    }
+
+    #[test]
+    fn render_fills_the_shared_cache_without_cloning() {
+        // The render path is `&self`: it borrows the tree and fills the
+        // interior-mutable listing cache in place. A per-frame clone would
+        // discard the populated cache, leaving this tree's own cache empty.
+        let t = tree(FILES);
+        assert!(t.children.borrow().is_empty(), "cache starts empty");
+        let _ = t.render_lines(60, 16, false, None, &[]);
+        assert!(
+            t.children.borrow().contains_key(""),
+            "render populated the tree's own cache — no throwaway clone"
+        );
     }
 
     #[test]

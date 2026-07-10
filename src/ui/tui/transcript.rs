@@ -13,15 +13,15 @@ use crate::ui::{TurnErrorKind, UiEvent};
 use super::pane;
 use super::panel::{
     FooterField, PanelHeaderSpec, PanelState, ToolDiag, diff_counts, diff_table_rows,
-    edit_footer_extras, join_meta_fields, panel_state, review_footer_extras,
+    edit_footer_extras, join_meta_fields, panel_state,
 };
-use super::rows::{ChromeRow, FoldVis, TranscriptRow, is_separator_row};
-use super::streaming::StreamController;
+use super::rows::{ChromeRow, FoldVis, Measure, TranscriptRow, is_separator_row};
+use super::streaming::{Escapement, StreamController};
 use super::tool_render::{self, RenderCtx, ToolOutcome, ToolPanelKind};
 use super::wrap::line_text;
 use super::{
     MAX_EXEC_STREAM_BYTES, MAX_TRANSCRIPT_ROWS, TEXT_COLUMN_X_PADDING, dim_style, err_style,
-    format_elapsed_compact, tool_header_style, turn_divider_label,
+    format_elapsed_compact, prompt_style, tool_header_style, turn_divider_label,
 };
 
 /// Reasoning-rail label. Uppercase like the other structural labels; the rail
@@ -31,6 +31,11 @@ const THINKING_LABEL: &str = "THINKING";
 /// Placeholder for reasoning the provider withheld; the original text is never
 /// available and is never rendered.
 const REDACTED_THINKING_BODY: &str = "[reasoning withheld by provider]";
+/// The live thinking body is a bounded **tail window** while it streams: only
+/// the last N wrapped rows show, under an honest `┊ … +N rows` elision, so a
+/// thousand-row reasoning trace reads as a ticker and never floods the pane
+/// (§7.4). `ctrl+o` opens the full live stream (spec §2.3).
+const LIVE_TAIL_ROWS: usize = 4;
 
 /// The always-visible footer row of a frameless block: the state label as the
 /// row's actor (no `┊` between it and what follows — a 2-space layout gap
@@ -97,32 +102,82 @@ fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
         hrule: false,
         chrome: None,
         searchable: true,
+        // A thinking body is prose (spec §3): wraps at the reader's measure.
+        measure: Measure::Prose,
     }
 }
 
-/// Build the transient thinking-preview rows for live reasoning text: the
-/// `THINKING` rail header plus dim rail-body lines of the rendered markdown.
-/// Shown expanded (`▾ THINKING`) and whole while it streams — a live, growing
-/// trace shows everything, exactly as a running tool block stays open on its
-/// tail — then replaced by the committed block, which arrives collapsed, once
-/// the trace finalizes. The markdown is rendered at the same `content_width` the
-/// committed block uses, so finalizing never reflows the already-shown lines.
-fn live_reasoning_preview_rows(text: &str, content_width: usize) -> Vec<TranscriptRow> {
+/// Render the live reasoning body to physical (wrapped) rail lines, the orange
+/// `▋` live caret on the last row — the visible print head, which advances in
+/// even word-steps because the text feeding it is paced by the escapement
+/// (§7.4). Markdown is rendered at the same `content_width` the committed block
+/// uses (so finalizing never reflows), then each rail row is wrapped at the frame
+/// `width`. Shared by the tail-window builder and the ctrl+o foldability probe so
+/// the two always agree on the wrapped-row count.
+fn reasoning_preview_body_lines(
+    text: &str,
+    content_width: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
     let theme = MarkdownTheme::thinking()
         .with_code_highlighting()
         .with_hyperlinks();
-    let mut rows = Vec::new();
-    rows.push(TranscriptRow::chrome(ChromeRow::RailHeader {
+    let mut md = render_markdown_themed(text, &theme, content_width);
+    if let Some(last) = md.last_mut() {
+        last.spans
+            .push(Span::styled(crate::ui::symbols::CARET, prompt_style()));
+    }
+    let mut body = Vec::new();
+    for line in md {
+        rail_body_row(line).render_rows(width, &mut body);
+    }
+    body
+}
+
+/// Build the transient live-reasoning preview as physical lines: the `THINKING`
+/// rail header (the lit `●` lamp + live `elapsed`), a bounded **tail window** of
+/// the last [`LIVE_TAIL_ROWS`] wrapped body rows under an honest `┊ … +N rows`
+/// elision when rows are hidden, the `▋` caret at the stream edge, then a
+/// trailing blank (the `RailEnd`). `full` (ctrl+o during streaming, §2.3) renders
+/// the whole live stream instead of the window; the block is foldable — and the
+/// header shows the `▾` arrow — only when the body exceeds the tail (nothing
+/// hidden ⇒ no arrow, no elision, no no-op affordance).
+fn live_reasoning_preview_lines(
+    text: &str,
+    content_width: usize,
+    width: usize,
+    elapsed: &str,
+    full: bool,
+) -> Vec<Line<'static>> {
+    let body = reasoning_preview_body_lines(text, content_width, width);
+    let foldable = body.len() > LIVE_TAIL_ROWS;
+    let hidden = if full {
+        0
+    } else {
+        body.len().saturating_sub(LIVE_TAIL_ROWS)
+    };
+    let mut out = Vec::new();
+    TranscriptRow::chrome(ChromeRow::RailHeader {
         expanded: true,
         label: THINKING_LABEL.to_string(),
-        right: String::new(),
-        foldable: true,
-    }));
-    for line in render_markdown_themed(text, &theme, content_width) {
-        rows.push(rail_body_row(line));
+        right: elapsed.to_string(),
+        foldable,
+        lamp: true,
+    })
+    .render_rows(width, &mut out);
+    if hidden > 0 {
+        let noun = if hidden == 1 { "row" } else { "rows" };
+        rail_body_row(Line::from(Span::styled(
+            format!("\u{2026} +{hidden} {noun}"),
+            dim_style(),
+        )))
+        .render_rows(width, &mut out);
     }
-    rows.push(TranscriptRow::chrome(ChromeRow::RailEnd));
-    rows
+    out.extend(body.into_iter().skip(hidden));
+    // The RailEnd: one blank line of breathing room (no border), matching the
+    // committed block's rail terminator.
+    out.push(Line::default());
+    out
 }
 
 /// The currently-streaming exec block (issue #90 sub-item 1). `bash` is
@@ -157,12 +212,10 @@ struct ActiveTool {
     user_expanded: Option<bool>,
 }
 
-/// The offered choices for a pending in-block approval — mirrors the loop's
-/// `ApprovalRequest` so the `▲ REVIEW` footer only shows keys the loop honors.
+/// A pending in-block approval's footer context. The block only SIGNALS the
+/// pending decision (`▲ REVIEW` + a dim `awaiting decision` note); the offered
+/// keymap renders once, at the composer (§8.5) — never in two places at once.
 struct ReviewGate {
-    allow_always: bool,
-    allow_project: bool,
-    dirty_gate: bool,
     reason: Option<String>,
 }
 
@@ -244,6 +297,13 @@ struct StreamingRender {
     /// assistant-answer active tail). The two sources are mutually exclusive per
     /// frame; the flag keeps a source switch from reusing a stale memo.
     is_reasoning: bool,
+    /// Reasoning-only: the ctrl+o tail-window/full-stream state these lines were
+    /// built for, so a fold toggle re-renders (answer path: always `false`).
+    full: bool,
+    /// Reasoning-only: the live `elapsed` readout baked into the header, so the
+    /// header re-renders as the counter ticks even when the body did not grow
+    /// (answer path: empty).
+    elapsed: String,
 }
 
 #[derive(Debug)]
@@ -283,6 +343,22 @@ pub(super) struct Transcript {
     /// expanded thinking body; never used as the collapsed body while a summary
     /// is available.
     live_reasoning_raw: Option<String>,
+    /// Word-quantized drain buffer pacing the reasoning-summary stream: raw
+    /// deltas are held and released in even beats into `live_reasoning_summary`
+    /// on the loop's tick grid, so the `▋` reasoning caret steps evenly instead
+    /// of jumping on network bursts. Bypassed under reduced motion.
+    reasoning_escapement: Escapement,
+    /// The same pacing for the raw-reasoning channel (drains into
+    /// `live_reasoning_raw`); summary and raw are distinct provider channels.
+    raw_reasoning_escapement: Escapement,
+    /// ctrl+o intent for the LIVE reasoning preview (§2.3): `false` = the bounded
+    /// tail window (default), `true` = the full live stream. Remembered for the
+    /// live phase only — reset when the trace commits, so the settled block starts
+    /// from the standard fold state. Only meaningful while reasoning streams.
+    live_reasoning_full: bool,
+    /// Reduced-motion posture (mirrors `Screen::reduced_motion`): when set, the
+    /// stream escapements are bypassed so arrival renders immediately.
+    reduced_motion: bool,
     /// The open live exec cell, if a streaming tool is running.
     active_exec: Option<ActiveExec>,
     active_explorations: Vec<ActiveExploration>,
@@ -290,6 +366,10 @@ pub(super) struct Transcript {
     /// The open diff-bodied EDIT panel, if a mutation is pending/running.
     active_edit: Option<ActiveEdit>,
     pub(super) exploring_open: bool,
+    /// Explicit user fold on the OPEN explore group (mirrors the
+    /// `user_expanded` intent of exec/tool/edit actives): survives the
+    /// compact-by-default collapse when the group closes.
+    explore_user_expanded: Option<bool>,
     /// Wall-clock start of the current provider turn; drives the honest
     /// "time until reasoning arrived" telemetry on the thinking header.
     provider_turn_started: Option<Instant>,
@@ -304,6 +384,12 @@ pub(super) struct Transcript {
     /// shaping in the width-agnostic `apply` path (the tool-output flood cap)
     /// uses a realistic column count. Zero until the first render.
     last_width: usize,
+    /// Last terminal HEIGHT the transcript was rendered at, threaded from the
+    /// frame `Size` the same way `last_width` is, so the viewport-aware preview
+    /// budget ([`super::preview_row_budget`]) built during the width-agnostic
+    /// `apply` path reflects a realistic pane height. Zero until the first
+    /// frame, which yields the floor budget (today's fixed 8).
+    last_height: usize,
     wrapped_cache: WrappedTranscriptCache,
     /// Memoized wrapped lines for the current active-tail preview; see
     /// [`StreamingRender`].
@@ -319,8 +405,9 @@ pub(super) struct Transcript {
     /// ingests the tool results. Numbers are honest: fields exist only when the
     /// runtime measured them.
     tool_diags: std::collections::HashMap<String, ToolDiag>,
-    /// Per-call review affordance, set while a gated call is `▲ REVIEW` so its
-    /// footer can render `y approve ┊ n deny ┊ …`; dropped once it runs or is
+    /// Per-call review context, set while a gated call is `▲ REVIEW` so its
+    /// footer can render the danger reason + `awaiting decision` note (the
+    /// keymap renders at the composer, §8.5); dropped once it runs or is
     /// refused. Approval lives inside the tool block — there is no separate
     /// approval panel.
     review_gates: std::collections::HashMap<String, ReviewGate>,
@@ -359,6 +446,9 @@ impl Transcript {
     /// Append a blank separator row before a new top-level block, unless the
     /// transcript is empty or already ends in a real separator row.
     fn push_blank(&mut self) {
+        if self.exploring_open {
+            self.collapse_settled_explore();
+        }
         self.exploring_open = false;
         match self.rows.last() {
             None => {}
@@ -472,6 +562,8 @@ impl Transcript {
             label: THINKING_LABEL.to_string(),
             right: elapsed.unwrap_or_default(),
             foldable: has_distinct_expanded_body,
+            // Settled: the print head is gone, so the lamp is dark.
+            lamp: false,
         }));
         for (index, group) in collapsed_groups.into_iter().enumerate() {
             if index > 0 {
@@ -529,44 +621,73 @@ impl Transcript {
     }
 
     /// Append one live reasoning-summary delta to the transient thinking preview
-    /// and collapsed thinking body.
+    /// and collapsed thinking body. Held in the escapement and released in even
+    /// beats (so the caret steps evenly), unless reduced motion is in force.
     /// Display-only: never committed to `rows` until finalize, never stored.
     fn push_reasoning_delta(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
         }
-        self.live_reasoning_summary
-            .get_or_insert_with(String::new)
-            .push_str(delta);
-        // The preview is re-derived from live reasoning; drop the memo so the
-        // next frame re-renders with the appended text.
-        self.streaming_render = None;
+        if self.reduced_motion {
+            self.live_reasoning_summary
+                .get_or_insert_with(String::new)
+                .push_str(delta);
+            // The preview is re-derived from live reasoning; drop the memo so the
+            // next frame re-renders with the appended text.
+            self.streaming_render = None;
+        } else {
+            self.reasoning_escapement.push(delta);
+        }
     }
 
-    /// Append one live raw reasoning delta to the expanded thinking body.
+    /// Append one live raw reasoning delta to the expanded thinking body (paced
+    /// through the raw escapement, or immediate under reduced motion).
     fn push_raw_reasoning_delta(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
         }
-        self.live_reasoning_raw
-            .get_or_insert_with(String::new)
-            .push_str(delta);
-        self.streaming_render = None;
+        if self.reduced_motion {
+            self.live_reasoning_raw
+                .get_or_insert_with(String::new)
+                .push_str(delta);
+            self.streaming_render = None;
+        } else {
+            self.raw_reasoning_escapement.push(delta);
+        }
     }
 
-    /// Insert a blank line between two reasoning-summary parts. No-op before any
-    /// reasoning has streamed or when the buffer already ends with a break.
+    /// Insert a blank line between two reasoning-summary parts. Rides through the
+    /// summary escapement so it lands in order with the paced text; a no-op
+    /// before any reasoning has streamed or when the tail already ends with a
+    /// break. Under reduced motion it applies to the buffer directly.
     fn push_reasoning_section_break(&mut self) {
-        let append = self
-            .live_reasoning_summary
-            .as_deref()
-            .is_some_and(|buf| !buf.is_empty() && !buf.ends_with("\n\n"));
-        if append {
-            self.live_reasoning_summary
-                .as_mut()
-                .expect("checked non-empty above")
-                .push_str("\n\n");
-            self.streaming_render = None;
+        if self.reduced_motion {
+            let append = self
+                .live_reasoning_summary
+                .as_deref()
+                .is_some_and(|buf| !buf.is_empty() && !buf.ends_with("\n\n"));
+            if append {
+                self.live_reasoning_summary
+                    .as_mut()
+                    .expect("checked non-empty above")
+                    .push_str("\n\n");
+                self.streaming_render = None;
+            }
+            return;
+        }
+        // The reasoning tail is the committed buffer plus any escapement-held
+        // pending text; break only when there is content and it does not already
+        // end with a paragraph break.
+        let pending = self.reasoning_escapement.pending();
+        let committed = self.live_reasoning_summary.as_deref().unwrap_or_default();
+        let tail_empty = pending.is_empty() && committed.is_empty();
+        let ends_with_break = if pending.is_empty() {
+            committed.ends_with("\n\n")
+        } else {
+            pending.ends_with("\n\n")
+        };
+        if !tail_empty && !ends_with_break {
+            self.reasoning_escapement.push("\n\n");
         }
     }
 
@@ -576,8 +697,15 @@ impl Transcript {
     /// streamed. `stream_answer_start` is `None` here (reasoning precedes the
     /// answer), so `push_thinking_block` appends rather than splices.
     fn finish_live_reasoning_if_any(&mut self) {
+        // Flush any paced-but-unshown reasoning first (§2.2: reasoning end
+        // flushes) so the committed block is the complete trace, never a
+        // half-drained one.
+        self.flush_reasoning_escapements();
         let summary = self.live_reasoning_summary.take().unwrap_or_default();
         let raw = self.live_reasoning_raw.take().unwrap_or_default();
+        // The live phase is over: the committed block starts from the standard
+        // settled fold state, not the live ctrl+o intent (§2.3).
+        self.live_reasoning_full = false;
         if summary.is_empty() && raw.is_empty() {
             return;
         };
@@ -704,6 +832,8 @@ impl Transcript {
             hrule: true,
             chrome: None,
             searchable: true,
+            // A turn divider is a full-width rule (spec §3: mechanical).
+            measure: Measure::Mechanical,
         });
         self.push_blank();
     }
@@ -726,27 +856,136 @@ impl Transcript {
         self.stream_answer_start = None;
     }
 
-    /// Drive one paced commit tick: move any newly-stable streamed lines into
-    /// scrollback. Returns `true` when rows were committed (a redraw is due).
-    /// Called from the render loop's tick while a turn runs.
+    /// Drive one stream beat on the loop's tick: release a word-quantum of held
+    /// arrival into the assistant tail and the reasoning preview, and pace any
+    /// newly-stable answer lines into scrollback. Returns `true` when anything
+    /// the user can see advanced (committed rows, the tail, or the reasoning
+    /// caret), so a redraw is due. The ONE cadence for the whole stream area —
+    /// there is no second timer.
     pub(super) fn commit_stream_tick(&mut self, now: Instant) -> bool {
-        if !self.stream.is_active() {
-            return false;
-        }
         let width = self.markdown_content_width();
-        let rows = self.stream.commit_tick(now, width);
-        if rows.is_empty() {
-            return false;
+        let mut changed = false;
+        if self.stream.is_active() {
+            let before = self.stream.tail_signature();
+            let rows = self.stream.commit_tick(now, width);
+            if !rows.is_empty() {
+                self.mark_append_dirty();
+                self.rows.extend(rows);
+                changed = true;
+            } else if self.stream.tail_signature() != before {
+                // The escapement drained into the tail without committing a full
+                // line yet: the visible tail grew, so a redraw is still due (the
+                // tail memo re-derives on its changed signature).
+                changed = true;
+            }
         }
-        self.mark_append_dirty();
-        self.rows.extend(rows);
-        true
+        if self.beat_reasoning(now) {
+            changed = true;
+        }
+        changed
     }
 
-    /// Whether the stream has not-yet-committed content, so the loop should keep
-    /// driving commit ticks.
+    /// Beat both reasoning escapements: release a word-quantum of held reasoning
+    /// into the live buffers so the preview and its `▋` caret step evenly.
+    /// Returns whether either advanced.
+    fn beat_reasoning(&mut self, now: Instant) -> bool {
+        let mut advanced = false;
+        if let Some(quantum) = self.reasoning_escapement.beat(now) {
+            self.live_reasoning_summary
+                .get_or_insert_with(String::new)
+                .push_str(&quantum);
+            advanced = true;
+        }
+        if let Some(quantum) = self.raw_reasoning_escapement.beat(now) {
+            self.live_reasoning_raw
+                .get_or_insert_with(String::new)
+                .push_str(&quantum);
+            advanced = true;
+        }
+        if advanced {
+            // The preview is re-derived from the live buffers; drop the memo.
+            self.streaming_render = None;
+        }
+        advanced
+    }
+
+    /// Whether the stream has not-yet-shown content — escapement-held arrival
+    /// (answer or reasoning) or an un-committed answer backlog — so the loop
+    /// should keep driving commit ticks (and thus the beats).
     pub(super) fn has_stream_work(&self) -> bool {
         self.stream.has_work()
+            || !self.reasoning_escapement.is_empty()
+            || !self.raw_reasoning_escapement.is_empty()
+    }
+
+    /// The live reasoning trace shown in the transient preview: the streamed
+    /// summary if any, else the raw channel — the same source preference the
+    /// committed block uses. `None` when no reasoning is streaming.
+    fn live_reasoning_text(&self) -> Option<&str> {
+        self.live_reasoning_summary
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| {
+                self.live_reasoning_raw
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+            })
+    }
+
+    /// Whether the live reasoning preview has a genuinely hidden body (its wrapped
+    /// rows exceed the tail window at the current width), so it participates in
+    /// `ctrl+o` as a foldable block. A trace of ≤ [`LIVE_TAIL_ROWS`] rows shows
+    /// whole and offers no no-op toggle (§2.3, the house rule).
+    fn live_reasoning_foldable(&self) -> bool {
+        let Some(text) = self.live_reasoning_text() else {
+            return false;
+        };
+        let content_width = self.markdown_content_width();
+        // `markdown_content_width` returns the content width the memo renders at
+        // (`frame − 2·pad`); reconstruct the frame width the rail rows wrap at.
+        let width = content_width + TEXT_COLUMN_X_PADDING.saturating_mul(2);
+        reasoning_preview_body_lines(text, content_width, width).len() > LIVE_TAIL_ROWS
+    }
+
+    /// Apply the reduced-motion posture to the live stream: pacing is motion, so
+    /// reduced motion is pass-through (arrival renders immediately). On entering
+    /// it, any escapement-held text flushes at once (§2.2 flush trigger).
+    pub(super) fn set_reduced_motion(&mut self, reduced_motion: bool) {
+        self.reduced_motion = reduced_motion;
+        let width = self.markdown_content_width();
+        self.stream.set_reduced_motion(reduced_motion, width);
+        if reduced_motion {
+            self.flush_reasoning_escapements();
+        }
+    }
+
+    /// Release every escapement-held arrival into its visible surface now,
+    /// without finalizing — used when an approval gate opens so the user reviews
+    /// against complete context (§2.2), and by reduced motion.
+    pub(super) fn flush_live_escapements(&mut self) {
+        let width = self.markdown_content_width();
+        self.stream.flush_escapement(width);
+        self.flush_reasoning_escapements();
+    }
+
+    /// Drain both reasoning escapements into their live buffers immediately.
+    fn flush_reasoning_escapements(&mut self) {
+        let mut flushed = false;
+        if let Some(text) = self.reasoning_escapement.flush() {
+            self.live_reasoning_summary
+                .get_or_insert_with(String::new)
+                .push_str(&text);
+            flushed = true;
+        }
+        if let Some(text) = self.raw_reasoning_escapement.flush() {
+            self.live_reasoning_raw
+                .get_or_insert_with(String::new)
+                .push_str(&text);
+            flushed = true;
+        }
+        if flushed {
+            self.streaming_render = None;
+        }
     }
 
     /// Fallback (non-streamed) result render, used when no live exec cell was
@@ -806,11 +1045,28 @@ impl Transcript {
         );
     }
 
-    /// Wrap-width-aware [`RenderCtx`] for renderer body production.
+    /// Wrap-width-aware [`RenderCtx`] for renderer body production, carrying the
+    /// viewport-aware preview budget resolved from the last-known pane height.
     fn render_ctx(&self) -> RenderCtx {
         RenderCtx {
             width: self.wrap_width(),
+            preview_rows: self.preview_budget(),
         }
+    }
+
+    /// Tool-output preview budget (rows) for the current pane, `clamp(height/5,
+    /// 8, 24)`. Read at print time from the last-known frame height; before the
+    /// first frame (`last_height == 0`) it yields the floor (today's 8).
+    fn preview_budget(&self) -> usize {
+        super::preview_row_budget(self.last_height)
+    }
+
+    /// Record the frame's terminal height, threaded from the render `Size` the
+    /// same way width is, so the next block built in the `apply` path sizes its
+    /// preview to the pane it will be printed into. No global — the height flows
+    /// in from the frame just like width does.
+    pub(super) fn note_pane_height(&mut self, height: u16) {
+        self.last_height = usize::from(height);
     }
 
     /// Push a complete frameless tool block (header · hanging body · hairline
@@ -907,9 +1163,10 @@ impl Transcript {
         self.rows.push(TranscriptRow::chrome(ChromeRow::BlockEnd));
     }
 
-    /// Fold the approval decision into a tool block's own footer (approval lives
-    /// in the tool block, never a separate panel): the `y approve ┊ …` affordance
-    /// while the block is `▲ REVIEW`, or the muted `approved this time/session/
+    /// Fold the approval state into a tool block's own footer (approval lives
+    /// in the tool block, never a separate panel): a dim `awaiting decision`
+    /// note while the block is `▲ REVIEW` — the decision keymap renders once,
+    /// at the composer (§8.5) — or the muted `approved this time/session/
     /// project` note once the user has manually allowed it. Auto-approved calls
     /// carry neither — the tool block alone is the record.
     fn approval_footer_fields(&self, call_id: &str, state: PanelState) -> Vec<FooterField> {
@@ -919,16 +1176,12 @@ impl Transcript {
         if state == PanelState::Review
             && let Some(gate) = self.review_gates.get(call_id)
         {
-            // The safety caution (danger-toned) leads, then the affordance.
+            // The safety caution (danger-toned) leads, then the indicator.
             let mut fields = Vec::new();
             if let Some(reason) = &gate.reason {
                 fields.push(FooterField::styled(reason.clone(), err_style()));
             }
-            fields.extend(review_footer_extras(
-                gate.allow_always,
-                gate.allow_project,
-                gate.dirty_gate,
-            ));
+            fields.push(FooterField::styled("awaiting decision", dim_style()));
             return fields;
         }
         Vec::new()
@@ -1216,7 +1469,8 @@ impl Transcript {
     }
 
     /// Open a pending in-block review for a gated call: the tool block itself
-    /// renders `▲ REVIEW` with the affordance on its footer, so the whole
+    /// renders `▲ REVIEW` with a dim awaiting-decision note on its footer (the
+    /// keymap lives at the composer, §8.5), so the whole
     /// approval lifecycle lives inside the tool block (no separate panel). The
     /// block is adopted by `ToolStarted` (→ RUNNING) on approve, or flipped to
     /// `DENIED` in place on deny.
@@ -1900,6 +2154,28 @@ impl Transcript {
         })
     }
 
+    /// Compact by default (§8.1) for the grouped EXPLORE path: when the group
+    /// closes (the next top-level block begins), the settled explore collapses
+    /// to its header + footer record — unless the user explicitly expanded it
+    /// while it was open. The other families collapse at finalize in
+    /// `append_tool_panel`; EXPLORE's finalize moment IS the group close,
+    /// since ops keep appending until then.
+    fn collapse_settled_explore(&mut self) {
+        let user_expanded = self.explore_user_expanded.take();
+        if user_expanded == Some(true) {
+            return;
+        }
+        let Some(header) = self.current_explore_header_row() else {
+            return;
+        };
+        if let Some(ChromeRow::Header { expanded, .. }) = self.rows[header].chrome.as_mut()
+            && *expanded
+        {
+            *expanded = false;
+            self.mark_dirty_from(header);
+        }
+    }
+
     fn active_exploration_duration(&self, running: bool) -> Option<Duration> {
         if running {
             let started = self
@@ -2037,6 +2313,8 @@ impl Transcript {
             self.pop_trailing_explore_footer();
         } else {
             self.push_blank();
+            // A fresh group carries no stale fold intent from a prior one.
+            self.explore_user_expanded = None;
             self.rows.push(TranscriptRow::chrome(ChromeRow::BlockStart));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
                 expanded: true,
@@ -2080,6 +2358,8 @@ impl Transcript {
             self.pop_trailing_explore_footer();
         } else {
             self.push_blank();
+            // A fresh group carries no stale fold intent from a prior one.
+            self.explore_user_expanded = None;
             self.rows.push(TranscriptRow::chrome(ChromeRow::BlockStart));
             self.rows.push(TranscriptRow::chrome(ChromeRow::Header {
                 expanded: true,
@@ -2198,6 +2478,12 @@ impl Transcript {
                 self.current_turn_diag = None;
             }
             UiEvent::ProviderTurnCompleted { usage, .. } => {
+                // Completion is a terminal provider event like cancel/error
+                // (§2.2): flush the live tail before the telemetry patching.
+                // Nexus emits `AssistantTextEnd` first on every path today, so
+                // this is normally a no-op — it guards a turn that completes
+                // without that terminal text event.
+                self.finish_stream();
                 if let Some(usage) = usage {
                     self.set_thinking_telemetry(usage.reasoning_output_tokens);
                     // Forward attribution. This turn's INPUT side ingested the
@@ -2277,10 +2563,15 @@ impl Transcript {
                     ),
                 );
             }
-            UiEvent::ProviderTurnCancelled { .. }
-            | UiEvent::ProviderTurnError { .. }
-            | UiEvent::ToolLifecycle { .. }
-            | UiEvent::OutputHandleStored { .. } => {}
+            UiEvent::ProviderTurnCancelled { .. } | UiEvent::ProviderTurnError { .. } => {
+                // A terminal provider event flushes the live tail (§2.2): finalize
+                // any still-active answer stream so escapement-held text is
+                // committed once, never stranded. In the common path Nexus emits
+                // `AssistantTextEnd(partial)` first, so this is a no-op; it guards
+                // the case where a turn ends without that terminal text event.
+                self.finish_stream();
+            }
+            UiEvent::ToolLifecycle { .. } | UiEvent::OutputHandleStored { .. } => {}
             // Freeform tool-input deltas (ADR-0039) are display-only. The live
             // preview cell is deferred until a freeform tool (`apply_patch`, V4A)
             // exists to render; until then the event is inert here. The guard
@@ -2408,23 +2699,12 @@ impl Transcript {
                     self.relayout_active_running();
                 }
             }
-            UiEvent::ToolReview {
-                call,
-                allow_always,
-                allow_project,
-                dirty_gate,
-                reason,
-            } => {
+            UiEvent::ToolReview { call, reason, .. } => {
                 self.assign_turn_diag(&call.id);
-                self.begin_review(
-                    call,
-                    ReviewGate {
-                        allow_always,
-                        allow_project,
-                        dirty_gate,
-                        reason,
-                    },
-                );
+                // The offered keys (`allow_always`/`allow_project`/`dirty_gate`)
+                // are the loop's business: they surface once, in the composer
+                // echo via `show_approval`. The block records only the caution.
+                self.begin_review(call, ReviewGate { reason });
             }
             UiEvent::ToolAutoApproved(_call) => {
                 // Auto-approval is implicit in the policy; the tool block alone
@@ -2647,24 +2927,40 @@ impl Transcript {
     /// ANY is currently collapsed, else collapse them all. Returns whether any
     /// header changed; dirties from the first affected row via
     /// [`Self::set_panel_expanded_at`].
+    ///
+    /// The LIVE reasoning preview participates as one more foldable block (§2.3):
+    /// its tail window is the "collapsed" position and the full live stream the
+    /// "expanded" one, so the same all-or-nothing decision opens or closes it in
+    /// step. It only joins when it has a genuinely hidden body (> tail rows) —
+    /// a short live trace offers no no-op toggle.
     pub(super) fn toggle_all_panels(&mut self) -> bool {
         let headers: Vec<usize> = self
             .panel_header_rows()
             .into_iter()
             .filter(|&header| self.header_is_foldable(header))
             .collect();
-        if headers.is_empty() {
+        let live_foldable = self.live_reasoning_foldable();
+        if headers.is_empty() && !live_foldable {
             return false;
         }
-        // Expand all if any foldable block is currently collapsed.
+        // Expand all if any foldable block is currently collapsed — the live
+        // preview counts as collapsed while it shows the bounded tail window.
         let expand = headers
             .iter()
-            .any(|&header| self.panel_expanded_at(header) == Some(false));
+            .any(|&header| self.panel_expanded_at(header) == Some(false))
+            || (live_foldable && !self.live_reasoning_full);
         let mut changed = false;
         for header in headers {
             if self.set_panel_expanded_at(header, expand) {
                 changed = true;
             }
+        }
+        if live_foldable && self.live_reasoning_full != expand {
+            self.live_reasoning_full = expand;
+            // The transient preview re-derives from the live buffers; drop the
+            // memo so the next frame renders the new tail-window/full-stream shape.
+            self.streaming_render = None;
+            changed = true;
         }
         changed
     }
@@ -2732,6 +3028,9 @@ impl Transcript {
     /// in-place rebuild at finalize. A block's header row is `body_start + 1`
     /// (the row after its `BlockStart`); at most one exec/tool/edit is active.
     fn record_user_fold(&mut self, header: usize, expanded: bool) {
+        if self.exploring_open && self.current_explore_header_row() == Some(header) {
+            self.explore_user_expanded = Some(expanded);
+        }
         if let Some(active) = self.active_exec.as_mut()
             && active.body_start + 1 == header
         {
@@ -2992,44 +3291,47 @@ impl Transcript {
                     width,
                     lines,
                     is_reasoning: false,
+                    full: false,
+                    elapsed: String::new(),
                 });
             }
             return;
         }
-        let preview_text = self
-            .live_reasoning_summary
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-            .or_else(|| {
-                self.live_reasoning_raw
-                    .as_deref()
-                    .filter(|text| !text.trim().is_empty())
+        // The live reasoning header carries a live `elapsed` readout that ticks
+        // even when the body has not grown, and the tail window/full-stream state
+        // flips on ctrl+o — so both join the memo key alongside the buffer length.
+        let elapsed = self
+            .provider_turn_started
+            .map(|started| format_elapsed_compact(started.elapsed()))
+            .unwrap_or_default();
+        let full = self.live_reasoning_full;
+        // Key on both buffers: either stream can grow, so a longer buffer means
+        // new content to re-render.
+        let key = (
+            self.live_reasoning_summary.as_deref().map_or(0, str::len),
+            self.live_reasoning_raw.as_deref().map_or(0, str::len),
+        );
+        if let Some(text) = self.live_reasoning_text() {
+            let fresh = self.streaming_render.as_ref().is_some_and(|memo| {
+                memo.is_reasoning
+                    && memo.key == key
+                    && memo.width == width
+                    && memo.full == full
+                    && memo.elapsed == elapsed
             });
-        if let Some(text) = preview_text {
-            // Key on both buffers: either stream can grow, so a longer buffer
-            // means new content to re-render.
-            let key = (
-                self.live_reasoning_summary.as_deref().map_or(0, str::len),
-                self.live_reasoning_raw.as_deref().map_or(0, str::len),
-            );
-            let fresh = self
-                .streaming_render
-                .as_ref()
-                .is_some_and(|memo| memo.is_reasoning && memo.key == key && memo.width == width);
             if !fresh {
                 let content_width = width
                     .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
                     .max(1);
-                let rows = live_reasoning_preview_rows(text, content_width);
-                let mut lines = Vec::new();
-                for row in &rows {
-                    row.render_rows(width, &mut lines);
-                }
+                let lines =
+                    live_reasoning_preview_lines(text, content_width, width, &elapsed, full);
                 self.streaming_render = Some(StreamingRender {
                     key,
                     width,
                     lines,
                     is_reasoning: true,
+                    full,
+                    elapsed,
                 });
             }
             return;

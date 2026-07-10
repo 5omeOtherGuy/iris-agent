@@ -193,6 +193,18 @@ where density matters. Uppercase labels get `--tracking-label` (0.06em).
 overflow a border. Continuation lines align under the content column, not the
 marker (see §7, §8).
 
+**Measure.** Prose is read, not scanned — a line that runs the full width of an
+ultrawide pane loses the reader on the way back. So **prose wraps at
+`min(pane, 96)` columns**: assistant paragraphs / list items / headings,
+thinking bodies, notices, plan-step notes, and user message bodies rag at the
+measure while the marker, rail, and indent stay exactly where they are (nothing
+is centered; the right side simply rags). **Mechanical output uses the full
+pane** — fenced/indented code, tool bodies, diffs, tables, rules/dividers, and
+session chrome are column-aligned and must not reflow. The measure is a **print-
+time** decision: a printed block reflects the terminal it was printed into and
+is never retroactively reflowed (rows are immutable in scrollback). On any pane
+≤ 96 columns the measure is a no-op.
+
 ---
 
 ## 4 · Spacing & rhythm (exact)
@@ -263,6 +275,7 @@ GIT / TASK (session bar + git console)
 
 METER
   ●●●○○○○○○○  context meter — 10-dot LED strip (filled muted · edge orange · empty dim)
+  ▏▎▍▌▋▊▉█    flow-meter fill — left-anchored eighth-block ramp (bright accent)
 
 FRAME (box-drawing, square corners ONLY)
   ┌ ┐ └ ┘   corners        │  vertical        ─  horizontal        ├ ┤  tees
@@ -271,6 +284,13 @@ FRAME (box-drawing, square corners ONLY)
 **Punctuation law:** use the ellipsis `…` (never `...`); use the Unicode minus
 `−` for removals (never ASCII `-`); use `┊` as the soft separator (never ASCII
 `|`). A glyph is added only when it carries meaning — do not decorate.
+
+**Meter marks (exact):** `·` is the **shared unlit cell** — the LED chase's
+dark cells and the flow meter's unlit cells speak one vocabulary: a slot that
+could light, dark right now. The flow meter (§7.7) fills with the left-anchored
+eighth-block ramp ` ▏▎▍▌▋▊▉█`, and `▏` doubles as its **peak tick** (dim, in an
+unlit cell): the decaying high-water mark of the last burst — a sanctioned
+double duty, defined here so it stays the only one.
 
 **Git/task senses (exact, one job each):**
 
@@ -308,11 +328,55 @@ itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
   reserve rows above the composer and shift the editor down — not a floating
   layer over the pane. No cast shadow, no scrim, no blur, no glass; the pane is
   flat and fully opaque throughout. The composer's top edge is the only frame.
-- **Motion is almost nil.** Only two live motions exist: the **LED-chase
-  working indicator** (`●··· → ·●·· → ··●· → ···●`) and the **edge-dot pulse**
-  on the context meter / running symbol at high usage. No braille spinners, no
-  rainbow meters, no easing-heavy transitions. Both degrade to a **static
-  readout** under `prefers-reduced-motion: reduce`.
+- **Motion is physics, and it is quantized.** Every sanctioned motion is a
+  discrete step on the loop's tick grid — machines step, they do not ease. The
+  closed set:
+  1. the **LED-chase working indicator** (`●··· → ·●·· → ··●· → ···●`) and the
+     IrisMark's idle ping-pong sweep — the only *looping* motions, and they run
+     only while something is genuinely live;
+  2. the **edge-dot pulse** on the context meter / running symbol at high usage;
+  3. the **power-on lamp test** (§12.5) — the start page's one-shot boot: the
+     strip fills two LEDs per tick, holds all-lit for two ticks, releases. Runs
+     once, on the start page only, and any key completes it instantly;
+  4. the **detent flash** — when a bottom-statusline segment changes (model,
+     effort, approval policy), the context meter's lit-LED count moves, or a
+     settings-panel control clicks to a new position (§10.1), the changed
+     element alone acknowledges it for two ticks, then settles: a newly lit
+     LED renders **bright**; LEDs that go dark (compaction reclaiming
+     capacity) hold a dim `●` after-image — **the exhale** — before settling
+     to `○`; when growth and shrinkage land in the same tick the bright flash
+     wins. The mechanical acknowledgment that a switch clicked into a new
+     position. Never fires from startup initialization (it is armed only once
+     the first frame settles), so a flash is always news;
+  5. the **flow meter** — the working indicator's 6-cell display-stream inflow
+     bar (§7.7): instant attack, quantized release (4 quanta per tick), and a
+     peak tick that holds five ticks then decays one quantum per tick. Live
+     only while the stream is — it exists only on the running indicator's
+     line, resets with the turn, and vanishes with it;
+  6. the **escapement** — the live streaming tails (the assistant active tail
+     and the reasoning stream, §7.4) advance in **word-quantized steps** on the
+     same tick grid, never in raw network bursts: a tiny bounded buffer
+     releases a governed share of its backlog per beat (`pending/4` bytes,
+     clamped between about one word and about five, extended to the next word
+     boundary; CJK/no-boundary text falls back to the char-snapped share) — so
+     the cadence **tracks arrival like a hand at the keys**: it speeds up when
+     the stream runs hot, eases off as it thins, and never gulps a sentence.
+     Steady-state lag is ~4 beats (~400 ms); a pathological burst (> ~1 KB in
+     one delta) fast-forwards at half-the-buffer per beat rather than lag
+     unboundedly. It **flushes instantly** on
+     stream end, provider turn completion/cancel/error, an approval gate
+     opening, session reset, and entering reduced motion — the machine never
+     withholds against a decision. The committed-line pipeline (collector →
+     holdback → paced commit) is fed from the same drained output as the tail,
+     so pacing changes *when* a word shows, never *what* the finished message
+     says.
+  No braille spinners, no rainbow meters, no easing, no fades, no ambient
+  motion. The live-reasoning `●` lamp (§7.4) is a **state light, not a motion** —
+  a static glyph, either lit (receiving) or dark (settled) — so it adds no new
+  entry to this closed set. Everything above degrades to its **static settled
+  state** under `prefers-reduced-motion: reduce` / `IRIS_REDUCED_MOTION` — for the
+  escapement, reduced motion is a **pass-through**: streamed text renders on
+  arrival, the raw truth.
 - **Interaction states are quiet.** Hover/selected rows in overlays use the
   `surface` fill — never a colored left-border accent. Focus is the cyan
   interactive role. State changes are reported by the symbol vocabulary, not by
@@ -378,10 +442,22 @@ tool block's geometry** (§4, §8.1): the disclosure `▾`/`▸` sits in the gut
 grid, and the readout is never inset further than a tool's elapsed. Only the
 muted label tone and the `┊` body rail (at col 4, its text hanging at col 6) mark
 it as recessive. Folds by default (progressive disclosure); `ctrl+o` / header
-toggles `▾`⇄`▸`. Live reasoning pulses (`●` in the label, `▋` caret at the tail);
-finished reasoning may collapse to a line + token count. Short reasoning is shown
-whole and is not foldable (the arrow drops, but the gutter stays so the label
-holds its column).
+toggles `▾`⇄`▸`. While reasoning streams the header carries a **static orange
+`●` lamp** after the label (lit = receiving — a state light, not a motion; the
+moving text and caret carry the liveness) and a **live elapsed** readout on the
+right rail (the live counterpart of the settled `↓tokens elapsed`, and the only
+number honestly available live). Its live body is a bounded **tail window** — the
+last four wrapped rows on the `┊` rail, the bottom row ending in the `▋` caret at
+the stream edge — under a single honest `┊ … +N rows` elision counting the rows
+currently hidden (a readout, not a button). The live text feeds through the
+escapement (§6 motion 6), so the caret steps evenly in word-quanta on the tick
+grid instead of jumping on network bursts. `ctrl+o` opens the full live stream
+(window ⇄ full, remembered for the live phase only); a live trace of ≤ four rows
+shows whole and is not foldable. On commit the lamp drops and the block settles
+to the standard fold state (the caret exists only while printing). Finished
+reasoning may collapse to a line + token count. Short reasoning is shown whole and
+is not foldable (the arrow drops, but the gutter stays so the label holds its
+column).
 
 ### 7.5 Plan list
 The agent's task checklist. **Unboxed** (narration, not a tool event): a muted
@@ -425,11 +501,15 @@ An **inline** LED-chase readout shown while the agent runs. Never framed, never
 a braille spinner, one line:
 
 ```
-●···  1:27 ┊ ESC ┊ ↑177k ↓5.7k
+●··· 1:27 ┊ ESC ┊ Responding ┊ ↑177k ↓5.7k ██▊▏··
 ```
 
 The lit cell bounces across a 4-cell strip. One blank line above/below when
 adjacent to other blocks. Telemetry (`↑`/`↓`) and the `ESC` hint are optional.
+The trailing 6-cell **flow meter** (§6 motion 5) meters display-stream inflow
+on a fixed log scale — bright eighth-block fill, the chase's dim `·` for unlit
+cells, a dim `▏` peak tick — and sits last deliberately: end-of-line truncation
+drops it first, so the telemetry counters outrank it at narrow widths.
 
 ### 7.8 Turn divider
 A quiet unboxed rule rendered **after a tool-backed agent turn** (not after
@@ -487,7 +567,7 @@ transcript that is mostly successful calls does not shout a column of bold
 labels. The glyph is deliberately lossy — `Error` and `Denied` share `■` — and
 the **label carries the distinction the shape cannot**. After it, `┊`-joined
 family extras (EDIT counts + note, SHELL `EXIT <code>` + result meta, or an
-in-review block's danger-toned reason + decision affordance / approval note). Right-bound:
+in-review block's danger-toned reason + awaiting-decision note / approval note). Right-bound:
 the optional token diagnostics cluster, all muted, honest (rendered only when
 measured). The `┊` law: only BETWEEN sibling fields, one space each side,
 never leading/trailing, never after the state label — fields are joined
@@ -512,6 +592,17 @@ expand/collapse survives the block's in-place rebuilds.
 is searched even though it is unmounted from the view. Jumping to a match
 inside a collapsed block expands it; the newest match stays clear of the find
 indicator row.
+
+**Preview budget (breathes with height).** A running block's bounded live tail
+(and any streamed error/cancel tail) previews at most **`clamp(pane_height / 5,
+8, 24)`** physical rows — at height/5 the preview never claims more than a fifth
+of the viewport, so a tool block cannot dominate the pane. The **floor is the
+historical fixed 8**, so a pane ≤ 40 rows is byte-identical to before; a taller
+pane lets the tail breathe up to the ceiling of 24. This is a **print-time**
+decision measured against the last-known terminal height: a block printed before
+a resize keeps its printed preview size (rows are immutable in scrollback); only
+the next block built uses the new height. The elision affordance (`… N earlier
+lines hidden`) and the stored full output are unchanged — only the budget moves.
 
 ### 8.2 EXPLORE — read / grep / list / find
 The **single container** for every read-side op. Each op is **one row**:
@@ -564,9 +655,10 @@ duplicated in a second block.
   you authorize. The body is the block's own body: the `$ command` (SHELL) or
   the **diff** (EDIT). The footer carries, in order: an optional **danger-toned
   reason** (`destructive` · `N pre-existing changes` · `unsandboxed`) in the
-  danger role, then the `┊`-joined **decision affordance** — `y approve ┊ n
-  deny` plus `a always` / `p project` **only when the loop offers them**; deny
-  is always available.
+  danger role, then a dim **`awaiting decision`** note. The block only
+  *signals* — the decision keymap (`y approve ┊ n deny` plus `a always` /
+  `p project` **only when the loop offers them**) renders exactly once, at the
+  composer (§8.5): one affordance, one place, where the keys are pressed.
 - **Manual approval** folds a muted **note** into that same footer (`approved
   this time` / `approved this session` / `approved this project`) and drops the
   affordance in place; the block then flips to `RUNNING` when it starts, and the
@@ -576,6 +668,13 @@ duplicated in a second block.
   place** (the diff IS the review surface), then `RUNNING → DONE`, or `DENIED`.
 - **`DENIED`** (red, no elapsed) is terminal: the tool never ran, so the block
   is the honest record of what was proposed and declined.
+- While the decision is pending, the **bottom statusline** and the **composer
+  frame + placeholder** take the REVIEW posture (§9.2/§9.3): the same
+  `▲ REVIEW` symbol+label, and the placeholder carries the full offered keymap
+  (`y approve ┊ n deny ┊ …`) — the affordance's one home, at the eye's resting
+  place, so the decision is never lost off-screen and never printed twice.
+  Those cues carry no new state; they key on the same `awaiting_approval` flag
+  and revert with the block.
 
 ### 8.6 Diff rendering (`DiffBlock`) — shared by EDIT & the in-block review
 Columns: **line number** (right-aligned, muted, non-selectable) · **marker**
@@ -657,40 +756,53 @@ Height caps at 16 rows or ⅓ of the pane.
 - **Directory tree**: breadcrumb (parents dim, clickable re-root up), 2-cell
   indent per level, `▾`/`▸` disclosure on dirs — no box-drawing tree guides.
   Attribution metas from the task partition: `◇ iris` dim, `± yours` orange,
-  `◉ open` for the composer-referenced file. `↵` on a file inserts
-  `@<relative-path>` into the composer; `/` filters flat (parent path as dim
-  meta). Data: `git ls-files --cached --others --exclude-standard`, plain
-  readdir outside a repo; 500 visible rows, then a dim `… N more` row.
+  `◉ open` for the composer-referenced file. A **collapsed** directory carries
+  the §9.1 state cluster as a rollup (`±N ◇M`) over the files beneath it, with
+  the file count as the muted tail; the count drops before the state at width.
+  `↵` on a file inserts `@<relative-path>` into the composer; `/` filters flat
+  (parent path as dim meta). Data: `git ls-files --cached --others
+  --exclude-standard`, plain readdir outside a repo; 500 visible rows, then a
+  dim `… N more` row.
 - These are **disclosures, not sidebars**: invariant #1 stands — nothing
   persistent, nothing beside the transcript.
 
-#### 9.1.2 Pinned prompt band (the governing prompt)
+#### 9.1.2 The job card (the pinned governing prompt)
 
 When the newest user prompt has scrolled above the viewport, its text is pinned
-as a quiet **band** directly under the session bar, so the reader always knows
-which prompt the visible content answers (grok `sticky_headers`). It reads as an
-extension of the top chrome — **not** a card floating in the transcript.
+as a quiet **band** directly under the session bar — the machine's **job card**,
+the governing instruction for everything on screen below it, so the reader always
+knows which prompt the visible content answers (grok `sticky_headers`). Pager
+mode only; there is no inline-mode band. It reads as an extension of the top
+chrome — **not** a card floating in the transcript.
 
 ```
 ~/iris-agent ┊ git main                      CTX 94k/300k ●●●○○○○○○○
 ────────────────────────────────────────────────────────────────────  ← session bar hairline
 
-  › the prompt the visible answer belongs to, dimmed…
+  ▸ › Overhaul the settings menu. First, prune the settings and…   +4
 ────────────────────────────────────────────────────────────────────  ← band hairline (SAME rule)
 ```
 
 - **Same columns as the transcript.** The `›` marker sits on the user column
   (col 4) and the body hangs at col 6 — a prompt looks identical whether pinned
   or scrolled into view (§7.1). Continuation lines hang unmarked at col 6.
-- **Dim throughout.** The band is a pinned *reference*, not the live turn: the
-  whole prompt is `dim`, the differentiator from the ink transcript below. The
-  marker keeps its `›`+bold glyph; only the tone changes. Not orange, no fill.
+- **Ink text in muted chrome.** The prompt's text renders in body ink
+  (`panel_style`) — the one piece of legible content in the top chrome, readable
+  at a glance. The chrome around it stays muted: the `▸`/`▾` disclosure and the
+  `›` marker are muted **bold**, the closing rule is muted. Not orange, no fill;
+  the surrounding tones still read the band as chrome, not the live turn.
+- **Honest when collapsed.** Collapsed, the band is one row; when wrapped rows
+  are hidden it ends in a right-aligned dim `+N` (the house `+N more` idiom,
+  shortened — the band has no room for prose). No marker when nothing is hidden.
+- **Toggle.** A click on the band row, or the key `o` while the scrollback list
+  holds focus in pager mode (the list-state law, §9.1.1), expands it to the full
+  wrapped prompt and collapses it again. **ctrl+o never routes here** — that is
+  fold-toggling's one meaning everywhere (§8.1). Expansion resets to collapsed on
+  each new user message.
 - **Closed by the session bar's own hairline.** The band's bottom rule is the
   **same** inset dim `─` the session bar draws (col 2 → width−2), byte-for-byte —
   never the composer's full-width border weight. Two matching hairlines bracket
   the band as one top-chrome region.
-- **Capped.** A long prompt is truncated to three physical lines with a trailing
-  `…`; the full text is one scroll away. The band never grows to eat the view.
 - Yields the top row to an interactive overlay (a selection or search match
   revealed exactly at the viewport top keeps its highlight).
 
@@ -711,6 +823,12 @@ transcript) is the full `border-frame` hairline; the rule between the input
 and the statusline is a lighter internal hairline (the same soft weight panels
 use internally). There is no other chrome option.
 
+The frame is also the machine's **bezel lamp**: both weights render in their
+`border`/dim tones at rest and take the **orange accent** while a review waits
+(§8.5) — reinforcement for the `▲ REVIEW` readout, never the sole signal (the
+text carries state; the monochrome test still passes). The empty-buffer
+placeholder likewise becomes a dim decision echo for the duration (§8.5).
+
 ### 9.3 Bottom statusline (the composer's last row)
 `◉ MODE ─ MODEL EFFORT ─ <policy-symbol> <policy>`. The `◉` is orange; `MODE`
 bold uppercase; ` ─ ` dim separators; model name is an **underlined button**
@@ -723,9 +841,21 @@ state symbol + label, never color alone:
 | on-request | `▲` orange + dim label |
 | read-only | `■` red + dim label |
 | off (approvals disabled) | `○` dim + dim label |
+| **REVIEW posture** (`awaiting_approval`) | leading segment is `▲ REVIEW` (orange symbol, bold label); every other segment dims |
 
 **Narrow widths, drop in order:** policy → effort → minimum `◉ CODE ─ MODEL`.
 cwd/branch/context NEVER appear here — they live on the session bar.
+
+**The REVIEW posture (§8.5).** While a gated tool awaits the user's decision
+(`awaiting_approval`), the leading segment swaps `◉ MODE` for `▲ REVIEW`
+(`symbols::REVIEW`, orange, bold label — the same symbol+label the gated
+block's footer shows, echoed at the eye's resting place) and **every other
+segment dims**: the model button drops its underline (it is not clickable while
+the composer is frozen), and effort and the policy symbol lose their tone, so
+the line has one lit subject. `▲ REVIEW` inherits `◉ MODE`'s never-dropped
+slot, so the narrow-width minimum becomes `▲ REVIEW ─ MODEL`. The swap is a
+static state readout — ticks stay stopped during the wait (no flash) — and it
+reverts to the exact prior rendering on approve/deny/cancel.
 
 ### 9.4 Input row
 A single editable row directly beneath the top edge, growing **1 → 8 rows** as
@@ -741,6 +871,24 @@ Canonical commands: `/model` · `/diff` · `/undo` · `/compact` · `/clear` ·
 
 ### 9.6 File reference (`@`)
 `@` references a workspace file (a path completion). Same overlay idiom.
+
+### 9.7 The exit receipt
+
+When a session that ran at least one turn ends, Iris prints **one dim line**
+after terminal teardown — the instrument's printed slip, landing in normal
+terminal scrollback in both screen modes (in pager mode it is the only trace
+of the run; inline it closes the transcript):
+
+```
+iris 0.1.0 ┊ 12m ┊ 3 turns ┊ ↑412k ↓18.9k ┊ cache 88%
+```
+
+Fields, in order, `┊`-joined under the separator law: product + rev · wall
+time · turn count · tokens sent/received summed over **every provider turn**
+(the billing measure — unlike the per-task divider) · the cached share of
+sent tokens. **Numbers are honest** (§11): a field the runtime did not
+measure is omitted, never guessed; a session with no turns prints nothing —
+a receipt for nothing is noise.
 
 ---
 
@@ -761,10 +909,145 @@ The composer's top edge sits directly below, so the menu needs no frame of its
 own to read as a distinct region.
 
 - **SlashMenu** — command palette (§9.5). Title-less: just the rows.
-- **Picker** — model switcher, settings, scoped-models, **tasks**, resume, login
-  provider list. Rows: `[◉ if active] label … meta hint`.
+- **Picker** — **tasks** and resume. Rows: `[◉ if active] label … meta hint`.
+  The model switcher, scoped-models, providers, and project-permissions surfaces
+  are **no longer pickers** — they are hatches inside the faceplate (§10.1).
+  **Adjacent things share one picker** stands, now enforced *structurally*: the
+  model hatch's own `reasoning` row IS the effort track (§10.1), so there is no
+  second, duplicated track. `/model` and a bare `/reasoning` open the faceplate's
+  ENGINE hatch; the typed forms (`/model <id>`, `/reasoning <level>`) stay the
+  fast path. Never a second bespoke list for a sibling of an existing surface.
+- **Settings panel** — the faceplate (§10.1). Not a category tree. Its ports are
+  **hatches, not doors**: they expand in place, never swapping to another modal.
 - **HelpOverlay** — the `?` cheatsheet: grouped key→action rows (keys in ink,
   actions muted, quiet uppercase group headings). No color, no icons.
+
+### 10.1 The settings panel — the faceplate
+
+`/settings` is ONE flat control surface, like the printed back panel of a lab
+instrument: every setting is a row, grouped under dim uppercase **silkscreen
+section headers** (`ENGINE · SAFETY · MEMORY · CHECKS · PANEL · GIT` — what
+runs → what it may do → what it remembers → how it self-checks → the panel
+itself → where it works), and adjusted **in place**. No sub-menu is ever
+opened to change a value; drilling three levels to flip a switch is the
+anti-instrument.
+
+```
+SETTINGS                                                    iris 0.1.0
+
+ENGINE
+  model             ▸ gpt-5.5 ┊ openai-codex
+  reasoning         ○ off  ○ minimal  ○ low  ◉ medium  ○ high  ○ xhigh
+  model scope       ▸ all enabled
+  providers         ▸ 3 connected
+
+MEMORY
+  compact at        ●●●●●●○○○○  232k tokens
+  compaction        ○ off  ◉ on
+  aggressiveness    ◉ conservative  ○ balanced  ○ aggressive  ○ custom
+  trigger at        ●●●●●○○○○○  32k tokens
+
+↑↓ select · ←→ set · esc close
+```
+
+The `compaction` switch is the master for the tool-result compaction group
+(#518): its `aggressiveness`/`cache timing` switches and `trigger at` /
+`retain/path` / `keep recent` dials all persist through the structured
+`toolResultCompaction` policy and dim to inert hardware while `compaction` is
+off.
+
+Pressing `↵` on a `▸` port **expands it in place** — the marker flips to `▾`
+and the surface's rows print indented directly beneath, inside the same panel.
+The model hatch open, its `reasoning` row live-tracking the highlighted
+candidate:
+
+```
+ENGINE
+  model             ▾ gpt-5.5 ┊ openai-codex
+    ◉ gpt-5.5                          openai-codex   default
+    ○ claude-sonnet-5                  anthropic
+    ○ gemini-3-pro                     google
+  reasoning         ○ off  ○ minimal  ○ low  ◉ medium  ○ high  ○ xhigh
+  model scope       ▸ all enabled
+
+←→ reasoning · ↵ set default · s session · esc collapse
+```
+
+**Masthead.** Row one is the panel's silkscreen: bold `SETTINGS`, the crate
+rev right-bound on the panel measure (the same identity print as the start
+page and the exit receipt). It is pinned — a windowed panel scrolls its
+sections under it, never past it.
+
+**Four control archetypes** — a closed set, like the four tool families.
+Never invent a fifth:
+
+- **switch** — a fixed vocabulary printed as a labeled detent track
+  (`○ strict  ◉ auto  ○ never`). `←`/`→` click one detent and **clamp at the
+  stops** (a real switch never wraps; against the stop is a silent no-op).
+  Bools are two-position switches (`○ off  ◉ on`). The `◉` is the handle —
+  orange wherever it sits (selection color, not state color); the one guarded
+  switch (`skip approvals`) paints its handle **danger red in the on
+  position** and carries a permanent dim caution silkscreen
+  (`dangerous ┊ saved default`) — the bypass persists as the default
+  permission mode (#520), so it is honestly tagged `saved default`, not
+  `session only`. When the labeled track does not fit the
+  width, the row degrades to its **rotary form** — position dots + the
+  selected value (`○○◉○○  medium`) — width alone decides, per row.
+- **dial** — a numeric on a **10-detent ladder** rendered as the house 10-dot
+  meter (filled `●`, orange edge, dim `○`) plus the honest printed value
+  (`232k tokens` — the ONE house token format). `←`/`→` step to the
+  neighbouring detent; an off-ladder value (hand-edited json) snaps into the
+  ladder on its first click while the printed number stays true. `↵` opens an
+  inline register for a precise value, clamped to the field's hard bounds.
+- **register** — free text edited inline on the row: `↵` edits (buffer + the
+  `▋` caret), `↵` saves, `esc` cancels, an empty buffer clears the key when
+  the field allows it; a rejected buffer shows an inline danger token
+  (`■ whole numbers only`), never a modal.
+- **port** — a `▸` row that is a **hatch, not a door**: `↵` expands it in place
+  to `▾` + indented child rows inside the same panel (model picker, model scope,
+  providers, project permissions). **One hatch open at a time** (accordion —
+  expanding one folds any other in the same keypress); `↵` on the `▾` header or
+  `esc` anywhere folds it (cursor lands back on the header); `←`/`→` are never
+  collapse verbs. The panel never leaves — no surface replacement, no frame
+  without the faceplate. Child rows print at a four-cell indent and degrade like
+  their archetypes at narrow widths; the footer is contextual to the selected
+  child (its true verbs). The **model row is a rotary–port hybrid**: `←`/`→`
+  cycles the scoped models exactly like Ctrl+P (the row rebuilds on the new
+  engine and flashes), `↵` expands the hatch; its footer names both verbs
+  (`←→ cycle · ↵ open`). The collapsed value prints the **active session
+  engine** (not the persisted default); a session-only `s` pick that diverges
+  from the default carries a quiet `· session` tag so the row never lies about
+  what is running. Inside the model hatch the panel's own `reasoning` row
+  IS the effort track — arrowing over candidates re-renders it with that model's
+  levels, target clamped, and there is no duplicated second track.
+  **Dialog-guard exception:** three genuine interrupts (the large-context switch
+  advisory, the OAuth login dialog, the API-key dialog) still overlay the
+  faceplate; when one resolves — any path — the panel's snapshot is refreshed (a
+  login can grow the catalog) and it reopens expanded with the cursor intact,
+  *before the next draw*, so the dock never collapses for a frame.
+
+**Mechanics.** `↑`/`↓` move over controls (wrapping; headers and blanks are
+skipped — silkscreen is not selectable). Every adjustment **saves
+immediately** (position IS state, like a physical switch) and the changed
+element renders bright for two ticks — the §6 detent flash, on the same tick
+grid as the statusline detents, settled instantly under reduced motion. The
+theme row is a **live rotary**: each click re-skins the whole pane before
+your eyes. A **dependent control dims to inert hardware** while its master is
+off (the compaction group's `trigger at` / `aggressiveness` knobs under
+`compaction ○ off`) but stays operable. The
+footer prints only the selected row's true verbs (`←→ set` · `←→ adjust · ↵
+type` · `↵ edit` · `↵ open` — keymap honesty per archetype).
+
+**Height honesty.** On a tall pane the whole faceplate prints at once. On a
+short one the panel windows itself under the pinned session bar and above the
+protected composer, scrolling with the house `(n/N)` position row — never
+clipped, never painted under other chrome. The design floor is a 12-row
+terminal: panels window all the way down to it; below that floor the footer
+may clip.
+
+**Pruning.** The faceplate is curated; the service hatch is `settings.json`.
+Niche flags (bash tool mode, tool round-trip caps, retry tuning, custom
+endpoint blocks) stay json-only. Every panel row must earn its silkscreen.
 
 ---
 
@@ -778,8 +1061,10 @@ own to read as a distinct region.
 - **Numbers are honest.** Token telemetry (`↑177k ↓5.7k`), durations (`7.6s`,
   `1:27`), counts — shown compactly and only when real. Never assert savings the
   runtime hasn't measured.
-- **Brevity.** Hints are short and inline (`↵ to send • shift+↵ for new line • /
-  for commands`). Placeholders use exact product casing.
+- **Brevity.** Hints are short and inline (`↵ to send · shift+↵ for new line · /
+  for commands`), `·`-joined — `•` stays the markdown bullet's alone (§5). At a
+  narrow width a hint row drops whole trailing fields, never clipping one
+  mid-word: a printed control either fits or is omitted. Placeholders use exact product casing.
 - **Emoji: none, ever.** State is carried by the glyph vocabulary.
 - **Progressive disclosure.** Minimal at a glance; complete and structured on
   demand (`ctrl+o`). Nothing important is hidden; nothing trivial is shouted.
@@ -819,6 +1104,7 @@ tasks (ADR-0031) are surfaced **here** — a dim `· N to recover` badge on the
 ~/demo ┊ git main                                     CTX 0/300k ○○○○○○○○○○
 
                         ○ ○ ○ ● ○ ○ ○ ○ ○ ○ ○ ○        ← IrisMark (animated)
+                        I R I S                 0.1.0  ← silkscreen (printed)
 
                         ◉ New session ················ ctrl-n
                           Resume session ·············· ctrl-r
@@ -840,6 +1126,23 @@ behind the travel direction (trail-1 non-bold orange, trail-2 dimmest; head
 bright orange). All other dots are dim `○`. It reuses the working indicator's
 tick machinery: it stops when the terminal is unfocused, and under
 `IRIS_REDUCED_MOTION` it holds a single static lit dot at the center.
+
+**Silkscreen.** One row directly under the strip — printed faceplate text, so
+it is visible from the first frame and never animates: the letter-spaced
+wordmark `I R I S` anchored to the strip's **left** edge, the crate rev
+anchored to its **right** edge (dim). Wordmark in body ink, plain weight — the
+LEDs stay the only bright element. This is the interface's one version
+surface and its only wordmark; still no ASCII art, no figlet.
+
+**Power-on.** An interactive launch runs the **lamp test** (§6 motion 3):
+frame 0 shows the silkscreen printed, the strip dark, and the menu hidden
+(blank rows — the block's height never changes, so nothing reflows); the
+LEDs then fill left-to-right two per tick, hold all-lit for two ticks —
+every LED proves itself — and release into the idle ping-pong as the menu
+rows go live. Any key completes the boot instantly and still performs its
+normal action; the composer is live throughout; under reduced motion the
+page starts settled. The boot exists only here: launching with a task or a
+resume target powers straight into work, no ceremony.
 
 **Launcher.** A keyboard-navigable list (~44 columns, centered, one blank row
 below the mark) in the house picker idiom — NO hairline dividers between rows:
@@ -880,8 +1183,10 @@ starts the session with it.
 10. **Closed symbol set.** No glyph outside §5; `…`/`−`/`┊` (not `...`/`-`/`|`);
     no emoji.
 11. **Composer is unconditional.** No show/hide/reveal/collapse mechanic.
-12. **Motion** is only the LED chase (working indicator + IrisMark) + edge
-    pulse, all reduced-motion safe.
+12. **Motion** is only the closed quantized set of §6 — LED chase (working
+    indicator + IrisMark), edge pulse, the start page's one-shot lamp test,
+    and the two-tick detent flash — all stepped on the tick grid, all
+    reduced-motion safe, and none of them ambient.
 
 ---
 

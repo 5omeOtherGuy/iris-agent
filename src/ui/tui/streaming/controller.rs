@@ -20,6 +20,7 @@ use crate::ui::tui::rows::TranscriptRow;
 
 use super::chunking::{AdaptiveChunkingPolicy, DrainPlan, QueueSnapshot};
 use super::collector::MarkdownStreamCollector;
+use super::escapement::Escapement;
 use super::table_holdback::safe_commit_end;
 
 /// Cached rendered-line count for a stable source prefix, keyed by the prefix
@@ -42,6 +43,14 @@ struct RenderCache {
 /// Streaming controller for one assistant message.
 #[derive(Default)]
 pub(crate) struct StreamController {
+    /// Word-quantized drain buffer between raw delta arrival and the pipeline:
+    /// held arrivals are released one beat at a time on the loop's tick grid so
+    /// the visible tail advances by word-steps, never a raw burst. Bypassed in
+    /// reduced-motion (`passthrough`), where arrival ingests immediately.
+    escapement: Escapement,
+    /// Reduced-motion pass-through: deltas ingest straight into the collector on
+    /// arrival (arrival == display in the same frame), the escapement idle.
+    passthrough: bool,
     /// Newline-gated raw-source accumulator (owns the pending partial line).
     collector: MarkdownStreamCollector,
     /// Complete (newline-terminated) source committed out of the collector.
@@ -66,10 +75,15 @@ impl StreamController {
         self.active
     }
 
-    /// Whether there is any not-yet-committed content (paced backlog or a
-    /// mutable tail), i.e. the loop should keep driving commit ticks.
+    /// Whether there is any not-yet-committed content (escapement-held arrival,
+    /// paced backlog, or a mutable tail), i.e. the loop should keep driving
+    /// commit ticks. The escapement clause matters: held text must be beaten out
+    /// even when the collector is momentarily empty, or a stream would stall.
     pub(crate) fn has_work(&self) -> bool {
-        self.active && (self.emitted < self.stable_target || !self.collector.is_empty())
+        self.active
+            && (self.emitted < self.stable_target
+                || !self.collector.is_empty()
+                || !self.escapement.is_empty())
     }
 
     /// Identity of the current tail render `(buffered_len, emitted)`; changes
@@ -80,14 +94,51 @@ impl StreamController {
 
     /// Accept a streaming delta. `content_width` is the assistant content column
     /// used for markdown layout (see `Transcript::markdown_content_width`).
+    ///
+    /// The arrival is held in the [`Escapement`] and released in word-quantized
+    /// beats by [`commit_tick`](Self::commit_tick), so the visible tail advances
+    /// on the tick grid instead of on the network. Under reduced motion the
+    /// escapement is bypassed and the delta ingests immediately (arrival ==
+    /// display in the same frame), byte-identical to the pre-escapement path.
     pub(crate) fn push_delta(&mut self, delta: &str, content_width: usize) {
         self.active = true;
-        self.collector.push_delta(delta);
-        if delta.contains('\n')
+        if self.passthrough {
+            self.ingest(delta, content_width);
+        } else {
+            self.escapement.push(delta);
+        }
+    }
+
+    /// Feed drained text into the newline-gated collector, promoting completed
+    /// lines into the stable source. Both the visible tail and the collector are
+    /// fed from this ONE drained output, so committed lines and the tail share a
+    /// single, consistent, paced timeline.
+    fn ingest(&mut self, text: &str, content_width: usize) {
+        self.collector.push_delta(text);
+        if text.contains('\n')
             && let Some(chunk) = self.collector.commit_complete_source()
         {
             self.raw_source.push_str(&chunk);
             self.recompute_stable_target(content_width);
+        }
+    }
+
+    /// Apply the reduced-motion posture. On entering pass-through, any text still
+    /// held in the escapement flushes immediately (§2.2 flush trigger) so the
+    /// switch never strands a paced backlog.
+    pub(crate) fn set_reduced_motion(&mut self, reduced_motion: bool, content_width: usize) {
+        self.passthrough = reduced_motion;
+        if reduced_motion && let Some(text) = self.escapement.flush() {
+            self.ingest(&text, content_width);
+        }
+    }
+
+    /// Release everything the escapement is holding into the visible tail now
+    /// (approval gate: the user must review against complete context). Does not
+    /// finalize — the tail simply shows all arrived text at once.
+    pub(crate) fn flush_escapement(&mut self, content_width: usize) {
+        if let Some(text) = self.escapement.flush() {
+            self.ingest(&text, content_width);
         }
     }
 
@@ -161,6 +212,13 @@ impl StreamController {
     /// Advance the paced drain by one commit tick, returning the rendered lines
     /// that just entered scrollback (to be appended to the transcript).
     pub(crate) fn commit_tick(&mut self, now: Instant, content_width: usize) -> Vec<TranscriptRow> {
+        // The escapement beats on this same tick (never a second timer): release
+        // one word-quantum of held arrival into the pipeline so the visible tail
+        // advances by word-steps. The collector sees this drained output at the
+        // same moment the tail does — committed lines never lag the tail.
+        if let Some(quantum) = self.escapement.beat(now) {
+            self.ingest(&quantum, content_width);
+        }
         // Width may have changed since the last delta; keep the target current.
         self.recompute_stable_target(content_width);
         let queued = self.stable_target.saturating_sub(self.emitted);
@@ -198,6 +256,12 @@ impl StreamController {
     /// return every rendered line not yet emitted (committed exactly once). The
     /// controller is reset for the next stream.
     pub(crate) fn finalize(&mut self, content_width: usize) -> Vec<TranscriptRow> {
+        // Flush any escapement-held arrival into the collector first: finalize
+        // renders the WHOLE source, so pacing changes WHEN a line shows, never
+        // WHAT the finished message is (byte-identical to the unpaced path).
+        if let Some(text) = self.escapement.flush() {
+            self.collector.push_delta(&text);
+        }
         let remainder = self.collector.finalize_and_drain_source();
         self.raw_source.push_str(&remainder);
         let rows = if self.raw_source.is_empty() {
@@ -213,8 +277,11 @@ impl StreamController {
         out
     }
 
-    /// Clear all state (cancellation, session reset, or after finalize).
+    /// Clear all state (cancellation, session reset, or after finalize). The
+    /// reduced-motion posture is a screen preference, not stream state, so it
+    /// persists across streams.
     pub(crate) fn reset(&mut self) {
+        self.escapement.clear();
         self.collector.clear();
         self.raw_source.clear();
         self.stable_target = 0;
