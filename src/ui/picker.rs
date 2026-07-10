@@ -433,6 +433,34 @@ fn settings_snapshot<P: ChatProvider>(
             .tool_result_compaction()
             .unwrap()
     });
+    // The AUTO COMPACT group reads the validated full-context trigger; a
+    // malformed on-disk ladder falls back to the built-in default so the panel
+    // still opens. Percent dials carry the fractions as whole percents.
+    let trigger = settings.compaction_trigger().unwrap_or_else(|_| {
+        crate::config::Settings::default()
+            .compaction_trigger()
+            .unwrap()
+    });
+    let worker_input = settings
+        .compaction
+        .as_ref()
+        .and_then(|value| value.worker.as_ref())
+        .and_then(|value| value.input.clone())
+        .unwrap_or_else(|| "transcript".to_string());
+    // The dim resolved line reuses the live harness ladder (`/context`
+    // diagnostics) resolved against the active model window rather than
+    // recomputing the model-aware arithmetic on the panel.
+    let resolved_ladder = harness.context_diagnostics().map(|diag| {
+        let ladder = diag.ladder;
+        settings_menu::ResolvedLadder {
+            warn: ladder.warn,
+            start: ladder.start,
+            hard: ladder.hard,
+            effective_tail: ladder.keep_recent_tokens,
+            configured_tail: trigger.keep_recent_tokens,
+            effective_window: ladder.effective_window,
+        }
+    });
     settings_menu::Snapshot {
         default_model,
         reasoning_levels,
@@ -451,6 +479,14 @@ fn settings_snapshot<P: ChatProvider>(
         default_approval: cli::current_permission_token(harness).to_string(),
         skip_permissions: harness.skip_permissions(),
         context_token_budget: settings.context_token_budget(),
+        compaction_enabled: trigger.enabled,
+        compaction_warn_pct: (trigger.warn * 100.0).round() as u64,
+        compaction_start_pct: (trigger.start * 100.0).round() as u64,
+        compaction_hard_pct: (trigger.hard * 100.0).round() as u64,
+        compaction_keep_recent_tokens: trigger.keep_recent_tokens,
+        compaction_reactive: trigger.reactive,
+        compaction_worker_input: worker_input,
+        resolved_ladder,
         compaction_summarizer: settings
             .compaction_summarizer
             .clone()
@@ -569,6 +605,13 @@ fn provider_api_key_capable(provider: ProviderId) -> bool {
     )
 }
 
+/// Convert a whole-percent dial value (`"60"`) to the stored fraction (`0.60`).
+/// The ordering invariant is enforced by the config save, not here.
+fn percent_to_fraction(value: Option<&str>) -> anyhow::Result<f64> {
+    let percent: f64 = value.unwrap_or("0").trim().parse()?;
+    Ok(percent / 100.0)
+}
+
 /// Persist a single settings field to the user-global file. The menu widgets
 /// pre-validate/clamp the value, so the parse here is a safety net; the typed
 /// `config::save_*` also clamp defensively. `value` is `None` for the
@@ -584,8 +627,27 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
         Field::ContextTokenBudget => {
             config::save_context_token_budget(value.unwrap_or("0").parse()?)
         }
+        Field::CompactionEnabled => config::save_compaction_enabled(parse_bool(value)),
+        Field::CompactionReactive => config::save_compaction_reactive(parse_bool(value)),
+        Field::CompactionKeepRecentTokens => {
+            config::save_compaction_keep_recent_tokens(value.unwrap_or("0").parse()?)
+        }
+        // The percent dials persist as fractions; the config save rejects any
+        // combination that would leave the ladder unordered.
+        Field::CompactionWarn => {
+            config::save_compaction_threshold_warn(percent_to_fraction(value)?)
+        }
+        Field::CompactionStart => {
+            config::save_compaction_threshold_start(percent_to_fraction(value)?)
+        }
+        Field::CompactionHard => {
+            config::save_compaction_threshold_hard(percent_to_fraction(value)?)
+        }
+        Field::CompactionWorkerInput => {
+            config::save_compaction_worker_input(value.unwrap_or("transcript"))
+        }
         Field::CompactionSummarizer => {
-            config::save_compaction_summarizer(value.unwrap_or("provider"))
+            config::save_compaction_summarizer(value.unwrap_or("subagent"))
         }
         Field::Microcompaction => config::save_tool_result_compaction_enabled(parse_bool(value)),
         Field::MicrocompactionWatermark => {
@@ -615,6 +677,44 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
             config::save_theme(id)
         }
     }
+}
+
+/// Whether a saved field feeds the full-context auto-compaction trigger ladder
+/// (master switch, thresholds, tail, or the legacy context cap that clamps the
+/// window), so its live application re-resolves the ladder against the current
+/// model and installs it on the harness. Includes `context cap`
+/// (`contextTokenBudget`), which the menu previously failed to mirror live.
+fn is_auto_compaction_trigger_field(field: settings_menu::Field) -> bool {
+    use settings_menu::Field;
+    matches!(
+        field,
+        Field::CompactionEnabled
+            | Field::CompactionWarn
+            | Field::CompactionStart
+            | Field::CompactionHard
+            | Field::CompactionKeepRecentTokens
+            | Field::CompactionReactive
+            | Field::ContextTokenBudget
+    )
+}
+
+/// Reload settings, resolve the auto-compaction ladder against the active model,
+/// and install it on the live harness so a threshold/tail/reactive/enabled
+/// change takes effect at the next boundary. Disabling automatic compaction also
+/// cancels any in-flight background job. Reuses [`crate::resolved_compaction_trigger`]
+/// so the model-aware arithmetic is never duplicated.
+fn apply_compaction_trigger<P: ChatProvider>(
+    harness: &mut Harness<P>,
+    switch: &ModelSwitch<'_, P>,
+) -> anyhow::Result<()> {
+    let settings = config::Settings::load(harness.workspace())?;
+    let selection = switch.selection().clone();
+    let (window, trigger) = crate::resolved_compaction_trigger(&settings, &selection)?;
+    harness.set_compaction_trigger(window, trigger);
+    if !trigger.enabled {
+        harness.cancel_auto_compaction();
+    }
+    Ok(())
 }
 
 /// The permission mode a skip-approvals toggle flips to: enabling the dangerous
@@ -762,6 +862,33 @@ pub(crate) fn apply_action<P: ChatProvider>(
                     if field == settings_menu::Field::DefaultApproval {
                         if let Some(mode) = value.as_deref().and_then(PermissionMode::parse) {
                             cli::set_permission_mode(harness, mode);
+                        }
+                    } else if is_auto_compaction_trigger_field(field) {
+                        // Threshold/tail/reactive/enabled changes take effect at
+                        // the next boundary: reload, resolve the ladder against
+                        // the current model, and install it live. Disabling also
+                        // cancels an in-flight background job (the loop then
+                        // clears the chip from the live diagnostics).
+                        if let Err(error) = apply_compaction_trigger(harness, switch) {
+                            return refresh_settings(
+                                view,
+                                None,
+                                vec![format!("could not apply setting: {error:#}")],
+                                harness,
+                                switch,
+                            );
+                        }
+                    } else if field == settings_menu::Field::CompactionSummarizer {
+                        // Summarizer changes affect only the next worker job.
+                        if let Ok(settings) = config::Settings::load(harness.workspace()) {
+                            harness.set_summarizer(settings.compaction_summarizer());
+                        }
+                    } else if field == settings_menu::Field::CompactionWorkerInput {
+                        // Worker-input changes affect only the next worker job.
+                        if let Ok(settings) = config::Settings::load(harness.workspace())
+                            && let Ok(worker) = settings.compaction_worker_config()
+                        {
+                            harness.set_compaction_worker(worker);
                         }
                     } else if matches!(
                         field,
@@ -1051,6 +1178,37 @@ mod tests {
             model(ProviderId::OpenAiCodex, "gpt-5.5"),
             model(ProviderId::Anthropic, "claude-sonnet-4-6"),
         ]
+    }
+
+    #[test]
+    fn auto_compaction_trigger_fields_are_classified_apart_from_worker_knobs() {
+        use settings_menu::Field;
+        for field in [
+            Field::CompactionEnabled,
+            Field::CompactionWarn,
+            Field::CompactionStart,
+            Field::CompactionHard,
+            Field::CompactionKeepRecentTokens,
+            Field::CompactionReactive,
+        ] {
+            assert!(is_auto_compaction_trigger_field(field), "{field:?}");
+        }
+        // Summarizer/worker-input feed the next worker job, not the ladder.
+        assert!(!is_auto_compaction_trigger_field(
+            Field::CompactionSummarizer
+        ));
+        assert!(!is_auto_compaction_trigger_field(
+            Field::CompactionWorkerInput
+        ));
+        // The context cap clamps the window, so it re-resolves the ladder live.
+        assert!(is_auto_compaction_trigger_field(Field::ContextTokenBudget));
+    }
+
+    #[test]
+    fn percent_dial_value_converts_to_a_stored_fraction() {
+        assert_eq!(percent_to_fraction(Some("60")).unwrap(), 0.60);
+        assert_eq!(percent_to_fraction(Some(" 19 ")).unwrap(), 0.19);
+        assert!(percent_to_fraction(Some("not-a-number")).is_err());
     }
 
     #[test]

@@ -485,6 +485,17 @@ impl<P: ChatProvider> Harness<P> {
         self.compaction.worker = worker;
     }
 
+    /// Cancel any in-flight background auto-compaction job — used when the user
+    /// turns automatic compaction off in `/settings`. The worker's cancellation
+    /// token fires so the detached task unwinds, and the job slot is released
+    /// immediately so diagnostics stop reporting it running (and the caller can
+    /// clear the status chip). Returns whether a job was actually cancelled.
+    pub(crate) fn cancel_auto_compaction(&mut self) -> bool {
+        let had_job = self.compaction.background.is_some();
+        self.compaction.cancel_background();
+        had_job
+    }
+
     /// Enable or disable opt-in microcompaction (ADR-0048, #378). Installed once
     /// at startup by the Tier-3 app from the resolved `Settings::microcompaction`;
     /// the harness default is off. Takes effect at the next turn boundary (the

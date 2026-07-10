@@ -7373,6 +7373,14 @@ mod tests {
             default_approval: "auto".to_string(),
             skip_permissions: false,
             context_token_budget: 232_000,
+            compaction_enabled: true,
+            compaction_warn_pct: 60,
+            compaction_start_pct: 72,
+            compaction_hard_pct: 90,
+            compaction_keep_recent_tokens: 8_000,
+            compaction_reactive: true,
+            compaction_worker_input: "transcript".to_string(),
+            resolved_ladder: None,
             compaction_summarizer: "subagent".to_string(),
             microcompaction: true,
             microcompaction_watermark: 32_000,
@@ -7400,14 +7408,22 @@ mod tests {
         screen.open_modal(Modal::Settings(Box::new(SettingsPanel::new(
             faceplate_snapshot(),
         ))));
-        let rendered = rendered_text(&mut screen, 100, 50);
+        let rendered = rendered_text(&mut screen, 100, 60);
         // Masthead silkscreen + every section printed at once.
         assert!(rendered.contains("SETTINGS"), "{rendered}");
         assert!(
             rendered.contains(&format!("iris {}", env!("CARGO_PKG_VERSION"))),
             "{rendered}"
         );
-        for section in ["ENGINE", "SAFETY", "MEMORY", "CHECKS", "PANEL", "GIT"] {
+        for section in [
+            "ENGINE",
+            "SAFETY",
+            "AUTO COMPACT",
+            "MEMORY",
+            "CHECKS",
+            "PANEL",
+            "GIT",
+        ] {
             assert!(rendered.contains(section), "{section} visible:\n{rendered}");
         }
         // The control archetypes: a printed switch scale, a 10-LED dial with
@@ -7416,7 +7432,7 @@ mod tests {
         assert!(rendered.contains("●●●●●●○○○○  232k tokens"), "{rendered}");
         assert!(rendered.contains("▸ gpt-5.5 ┊ openai-codex"), "{rendered}");
         // Nothing windowed: no position row on a tall viewport.
-        assert!(!rendered.contains("(1/23)"), "{rendered}");
+        assert!(!rendered.contains("(1/30)"), "{rendered}");
         // The composer stays protected below the panel.
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }
@@ -7435,7 +7451,7 @@ mod tests {
         // session bar) and the window scrolls with the house position row.
         assert!(rendered.contains("SETTINGS"), "{rendered}");
         assert!(rendered.contains("ENGINE"), "{rendered}");
-        assert!(rendered.contains("(1/23)"), "{rendered}");
+        assert!(rendered.contains("(1/30)"), "{rendered}");
         assert!(!rendered.contains("worktree root"), "windowed:\n{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }

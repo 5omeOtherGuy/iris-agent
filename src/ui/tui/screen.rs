@@ -1455,6 +1455,14 @@ impl Screen {
         self.switch_status = Some(status);
     }
 
+    /// Reconcile the background-compaction status chip with the live harness,
+    /// used after a `/settings` change that may have cancelled the in-flight
+    /// job (turning automatic compaction off). Normal lifecycle events keep the
+    /// chip in sync during a turn; this covers the out-of-turn settings write.
+    pub(crate) fn set_compaction_running(&mut self, running: bool) {
+        self.compaction_running = running;
+    }
+
     // --- modal/picker ---
 
     /// Open a picker/dialog above the editor until it closes. A docked modal
