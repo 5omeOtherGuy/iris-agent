@@ -488,8 +488,8 @@ impl ToolRenderer for EditRenderer {
         generic_meta(call)
     }
 
-    fn body(&self, ctx: &RenderCtx, _call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
-        generic_body(ctx, _call, outcome)
+    fn body(&self, ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
+        generic_body(ctx, call, outcome)
     }
 }
 
@@ -506,8 +506,8 @@ impl ToolRenderer for GenericRenderer {
         generic_meta(call)
     }
 
-    fn body(&self, ctx: &RenderCtx, _call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
-        generic_body(ctx, _call, outcome)
+    fn body(&self, ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
+        generic_body(ctx, call, outcome)
     }
 }
 
@@ -554,40 +554,36 @@ pub(super) fn render_body(
 /// sits in the readable stdout grey rather than the darker `muted`.
 fn tool_output_line(prefix: &'static str, line: &str, base: Style) -> Line<'static> {
     let mut spans = vec![Span::styled(prefix, dim_style())];
-    // Linkify conservative workspace `file:line` references in tool output so
-    // they become clickable OSC 8 targets. Applied per parsed ANSI span (styling
-    // preserved); a reference split across ANSI style runs is left untouched.
-    // The workspace root is only resolved when a line actually holds a match.
-    let mut root: Option<std::path::PathBuf> = None;
-    for span in ansi_spans(line, base) {
-        let content = span.content.as_ref();
-        if crate::ui::hyperlink::find_file_refs(content).is_empty() {
-            spans.push(span);
-            continue;
-        }
-        let root = root.get_or_insert_with(|| std::env::current_dir().unwrap_or_default());
-        spans.extend(crate::ui::hyperlink::linkify_file_refs(
-            content, span.style, root,
-        ));
-    }
+    spans.extend(linkify_output_spans(ansi_spans(line, base)));
     Line::from(spans)
 }
 
-fn linkify_output_line(mut line: Line<'static>) -> Line<'static> {
-    let mut spans = Vec::with_capacity(line.spans.len());
+/// Linkify file references without disturbing the styling already carried by
+/// ANSI-parsed or syntax-highlighted spans. References split across style runs
+/// remain untouched.
+fn linkify_output_spans(spans: impl IntoIterator<Item = Span<'static>>) -> Vec<Span<'static>> {
+    // Linkify conservative workspace `file:line` references in tool output so
+    // they become clickable OSC 8 targets. Applied per styled span; a reference
+    // split across style runs is left untouched.
+    // The workspace root is only resolved when a line actually holds a match.
+    let mut linked = Vec::new();
     let mut root: Option<std::path::PathBuf> = None;
-    for span in line.spans.drain(..) {
+    for span in spans {
         let content = span.content.as_ref();
         if crate::ui::hyperlink::find_file_refs(content).is_empty() {
-            spans.push(span);
+            linked.push(span);
             continue;
         }
         let root = root.get_or_insert_with(|| std::env::current_dir().unwrap_or_default());
-        spans.extend(crate::ui::hyperlink::linkify_file_refs(
+        linked.extend(crate::ui::hyperlink::linkify_file_refs(
             content, span.style, root,
         ));
     }
-    Line::from(spans)
+    linked
+}
+
+fn linkify_output_line(mut line: Line<'static>) -> Line<'static> {
+    Line::from(linkify_output_spans(line.spans.drain(..)))
 }
 
 /// A short-lived builder for tool-panel body rows. Owns the flood-cap and
