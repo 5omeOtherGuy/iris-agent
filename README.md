@@ -207,8 +207,8 @@ the trigger ladder with:
 {
   "compaction": {
     "enabled": true,
-    "thresholds": { "warn": 0.55, "start": 0.65, "hard": 0.85 },
-    "keepRecentTokens": 20000,
+    "thresholds": { "warn": 0.60, "start": 0.72, "hard": 0.90 },
+    "keepRecentTokens": 8000,
     "hardWaitMs": 10000,
     "maxConsecutiveFailures": 3
   }

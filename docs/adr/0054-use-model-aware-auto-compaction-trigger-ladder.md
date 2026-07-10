@@ -21,9 +21,9 @@ Mimir resolves a numeric context window and maximum-output reserve for the activ
 selection. Wayland subtracts that reserve and an 8,192-token summary reserve,
 then evaluates a three-rung ladder over the effective window:
 
-- `warn`: 0.55;
-- `start`: 0.65;
-- `hard`: 0.85.
+- `warn`: 0.60;
+- `start`: 0.72;
+- `hard`: 0.90.
 
 Each threshold is `max(fraction * window, window - buffer)`. Buffers are six,
 four, and two summary reserves for `warn`, `start`, and `hard`. These multipliers
@@ -53,6 +53,17 @@ invalid; `compaction.enabled=false` is the off switch.
 
 The parent remains the only context mutation point. Automatic compaction errors
 emit a notice and never fail the user's turn.
+
+The default retained tail is 8,000 tokens. These values replace the provisional
+0.55/0.65/0.85 and 20,000-token defaults after the slice-9 production-seam
+benchmark. Over a four-generation deterministic scenario, the new policy used
+four rather than six generations, improved average total-context reduction from
+48.5% to 58.3%, and improved the shallowest reduction from 41.2% to 54.6% while
+preserving both the planted fact and recall-loop hit. A live Haiku probe reduced
+the shallowest apply from 7.6% total-context reclamation under the provisional
+policy to 49.1%, with two compactions and all protocol gates passing. The
+committed evidence and regeneration commands are in
+`docs/benchmarks/auto-compaction-v2-tuning.md`.
 
 ## Alternatives Considered
 

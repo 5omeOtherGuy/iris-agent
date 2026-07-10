@@ -57,6 +57,7 @@ const SUMMARY_INSTRUCTION_PREFIX: &str = "Summarize this coding session";
 struct CapturedUsage {
     is_summary: bool,
     tag: String,
+    started_at: Instant,
     usage: Option<ProviderUsage>,
 }
 
@@ -115,6 +116,7 @@ impl<P: ChatProvider> ChatProvider for RecordingProvider<P> {
             .last()
             .map(|m| m.content.chars().take(32).collect::<String>())
             .unwrap_or_default();
+        let started_at = Instant::now();
         let usages = self.usages.clone();
         let stream = self.inner.respond_stream(messages, tools, cancel)?;
         let mapped = stream.map(move |item| {
@@ -122,6 +124,7 @@ impl<P: ChatProvider> ChatProvider for RecordingProvider<P> {
                 usages.lock().expect("usages lock").push(CapturedUsage {
                     is_summary,
                     tag: tag.clone(),
+                    started_at,
                     usage: turn.usage.clone(),
                 });
             }
@@ -252,6 +255,13 @@ impl LiveLoopLane {
             )),
         }
     }
+
+    fn cache_metric(self) -> &'static str {
+        match self {
+            Self::AnthropicHaiku => "reported-write",
+            Self::CodexMini => "derived-fresh-input",
+        }
+    }
 }
 
 fn build_live_compaction_worker() -> Result<Box<dyn ChatProvider>> {
@@ -312,6 +322,57 @@ fn live_seed() -> Vec<Message> {
 // every summary worker is Opus 4.6 with medium thinking by operator requirement.
 const AUTO_LIVE_BUDGET: u64 = 32_768;
 const AUTO_LIVE_CARRY_HEADER: &str = "[files touched or read in the compacted range]";
+
+#[derive(Debug, Clone, Copy)]
+struct AutoLivePolicy {
+    warn: f64,
+    start: f64,
+    hard: f64,
+    keep_recent_tokens: u64,
+}
+
+fn auto_live_policy() -> AutoLivePolicy {
+    let float = |name: &str, default: f64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(default)
+    };
+    let integer = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    };
+    let policy = AutoLivePolicy {
+        warn: float(
+            "IRIS_AUTO_COMPACTION_WARN",
+            crate::config::DEFAULT_COMPACTION_WARN,
+        ),
+        start: float(
+            "IRIS_AUTO_COMPACTION_START",
+            crate::config::DEFAULT_COMPACTION_START,
+        ),
+        hard: float(
+            "IRIS_AUTO_COMPACTION_HARD",
+            crate::config::DEFAULT_COMPACTION_HARD,
+        ),
+        keep_recent_tokens: integer(
+            "IRIS_AUTO_COMPACTION_KEEP_TOKENS",
+            crate::config::DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
+        ),
+    };
+    assert!(
+        0.0 < policy.warn
+            && policy.warn < policy.start
+            && policy.start < policy.hard
+            && policy.hard < 1.0,
+        "live policy must satisfy 0 < warn < start < hard < 1"
+    );
+    policy
+}
 
 fn auto_live_seed(session: usize, workspace: &std::path::Path) -> Result<Vec<Message>> {
     let needle = format!("NEEDLE-{session:02x}7f3a9: the flag is --enable-zeta");
@@ -400,20 +461,25 @@ fn live_loop_enabled(test_name: &str) -> bool {
 /// continuing turn, excluding boundaries whose current pressure tier is hard.
 fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let policy = auto_live_policy();
     println!(
-        "\n== LIVE auto-compaction loop ==\nlane={} sessions={} budget={} tokens",
+        "\n== LIVE auto-compaction loop ==\nlane={} sessions={} budget={} tokens policy={:.2}/{:.2}/{:.2} keep={}",
         lane.label(),
         session_count,
-        AUTO_LIVE_BUDGET
+        AUTO_LIVE_BUDGET,
+        policy.warn,
+        policy.start,
+        policy.hard,
+        policy.keep_recent_tokens,
     );
     println!(
-        "lane | session | compactions | G1 blocked | G2 max-after/start/pass | G3 needle/marker/carry | G4 exact | G5 metadata | worker cache hit | real read | error"
+        "lane | session | compactions | G1 blocked | G2 max-after/start/pass | shallowest reclaim pre->post/reclaimed/covered%/total% | G3 needle/marker/carry | G4 exact | G5 metadata | worker cache hit | parent cache pre->post/ratio/kind/pairs | real read | error"
     );
 
     let mut exclusions = 0usize;
     let mut gate_failures = Vec::new();
     for session in 0..session_count {
-        let result = run_auto_compaction_live_session(lane, session, &workspace);
+        let result = run_auto_compaction_live_session(lane, session, &workspace, policy);
         match result {
             Ok(row) => {
                 let pass = row.compactions >= 2
@@ -441,7 +507,7 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
                     ));
                 }
                 println!(
-                    "{} | {session:02} | {} | {:.1}ms/{} | {}/{}/{} | {}/{}/{} | {} | {} | {} | {} | {}",
+                    "{} | {session:02} | {} | {:.1}ms/{} | {}/{}/{} | {}->{}/{}/{:.1}%/{:.1}% | {}/{}/{} | {} | {} | {} | {}->{}/{}/{}/{} | {} | {}",
                     lane.label(),
                     row.compactions,
                     row.g1_blocked_ms,
@@ -449,6 +515,11 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
                     row.max_context_after_apply,
                     row.start_threshold,
                     row.context_effective,
+                    row.shallowest_reclaim.before,
+                    row.shallowest_reclaim.after,
+                    row.shallowest_reclaim.reclaimed,
+                    row.shallowest_reclaim.covered_reduction_ratio * 100.0,
+                    row.shallowest_reclaim.total_reduction_ratio * 100.0,
                     row.needle_answered,
                     row.recall_marker,
                     row.carry_block,
@@ -457,6 +528,14 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
                     row.summary_cache_hit_rate
                         .map(|rate| format!("{rate:.3}"))
                         .unwrap_or_else(|| "unknown".to_string()),
+                    row.parent_cache.baseline_mass,
+                    row.parent_cache.post_mass,
+                    row.parent_cache
+                        .ratio
+                        .map(|rate| format!("{rate:.3}"))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    lane.cache_metric(),
+                    row.parent_cache.paired_applies,
                     row.real_read,
                     row.metadata_detail.as_deref().unwrap_or("-"),
                 );
@@ -464,7 +543,7 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
             Err(error) => {
                 exclusions += 1;
                 println!(
-                    "{} | {session:02} | excluded | -/- | -/- | -/-/- | - | - | - | - | {error:#}",
+                    "{} | {session:02} | excluded | -/- | -/- | -/-/-/-/- | -/-/- | - | - | - | -->-/-/-/0 | - | {error:#}",
                     lane.label()
                 );
             }
@@ -485,20 +564,103 @@ struct AutoLiveRow {
     max_context_after_apply: u64,
     start_threshold: u64,
     context_effective: bool,
+    shallowest_reclaim: ApplyReclamation,
     needle_answered: bool,
     recall_marker: bool,
     carry_block: bool,
     resume_exact: bool,
     measured_entries: bool,
     summary_cache_hit_rate: Option<f64>,
+    parent_cache: ParentCacheEconomics,
     real_read: bool,
     metadata_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct ParentCacheEconomics {
+    paired_applies: usize,
+    baseline_mass: u64,
+    post_mass: u64,
+    ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ApplyReclamation {
+    before: u64,
+    after: u64,
+    reclaimed: u64,
+    covered_reduction_ratio: f64,
+    total_reduction_ratio: f64,
+}
+
+fn apply_reclamation(original: u64, summary: u64, after: u64) -> ApplyReclamation {
+    let reclaimed = original.saturating_sub(summary);
+    let before = after.saturating_add(reclaimed);
+    ApplyReclamation {
+        before,
+        after,
+        reclaimed,
+        covered_reduction_ratio: if original == 0 {
+            0.0
+        } else {
+            reclaimed as f64 / original as f64
+        },
+        total_reduction_ratio: if before == 0 {
+            0.0
+        } else {
+            reclaimed as f64 / before as f64
+        },
+    }
+}
+
+fn cache_mass(lane: LiveLoopLane, usage: &ProviderUsage) -> u64 {
+    match lane {
+        LiveLoopLane::AnthropicHaiku => usage.cache_write_input_tokens,
+        LiveLoopLane::CodexMini => usage
+            .input_tokens
+            .saturating_sub(usage.cache_read_input_tokens),
+    }
+}
+
+fn parent_cache_economics(
+    lane: LiveLoopLane,
+    applies: &[(Instant, ApplyReclamation)],
+    captured: &[CapturedUsage],
+) -> ParentCacheEconomics {
+    let parent = captured
+        .iter()
+        .filter(|sample| !sample.is_summary && sample.usage.is_some())
+        .collect::<Vec<_>>();
+    let mut metric = ParentCacheEconomics::default();
+    for (applied_at, _) in applies {
+        let before = parent
+            .iter()
+            .rev()
+            .find(|sample| sample.started_at < *applied_at)
+            .and_then(|sample| sample.usage.as_ref());
+        let after = parent
+            .iter()
+            .find(|sample| sample.started_at >= *applied_at)
+            .and_then(|sample| sample.usage.as_ref());
+        let (Some(before), Some(after)) = (before, after) else {
+            continue;
+        };
+        metric.paired_applies += 1;
+        metric.baseline_mass = metric
+            .baseline_mass
+            .saturating_add(cache_mass(lane, before));
+        metric.post_mass = metric.post_mass.saturating_add(cache_mass(lane, after));
+    }
+    metric.ratio =
+        (metric.baseline_mass > 0).then_some(metric.post_mass as f64 / metric.baseline_mass as f64);
+    metric
 }
 
 fn run_auto_compaction_live_session(
     lane: LiveLoopLane,
     session: usize,
     workspace: &std::path::Path,
+    policy: AutoLivePolicy,
 ) -> Result<AutoLiveRow> {
     let root = TempDir::new(&format!("auto-loop-{session}"));
     let mut log = SessionLog::create_in(&root.path, workspace)?;
@@ -519,7 +681,11 @@ fn run_auto_compaction_live_session(
     let log = SessionLog::resume(&path)?;
 
     let parent_key = format!("iris-auto-loop-{}-{session}-parent", lane.label());
-    let provider = lane.build_provider(&parent_key)?;
+    let parent_usages = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: lane.build_provider(&parent_key)?,
+        usages: parent_usages.clone(),
+    };
     let agent = Agent::resumed(provider, built_in_tools().into_read_only(), stored.messages);
     let mut harness = Harness::resumed(
         agent,
@@ -533,10 +699,10 @@ fn run_auto_compaction_live_session(
         AUTO_LIVE_BUDGET,
         CompactionTriggerConfig {
             enabled: true,
-            warn: 0.55,
-            start: 0.65,
-            hard: 0.85,
-            keep_recent_tokens: 20_000,
+            warn: policy.warn,
+            start: policy.start,
+            hard: policy.hard,
+            keep_recent_tokens: policy.keep_recent_tokens,
             hard_wait_ms: 10_000,
             max_consecutive_failures: 3,
             reactive: true,
@@ -621,8 +787,17 @@ fn run_auto_compaction_live_session(
         .filter_map(|timed| match &timed.event {
             AgentEvent::CompactionApplied {
                 context_tokens_after_apply,
+                original_tokens_estimate,
+                summary_tokens_estimate,
                 ..
-            } => Some((timed.at, *context_tokens_after_apply)),
+            } => Some((
+                timed.at,
+                apply_reclamation(
+                    *original_tokens_estimate,
+                    *summary_tokens_estimate,
+                    *context_tokens_after_apply,
+                ),
+            )),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -631,13 +806,22 @@ fn run_auto_compaction_live_session(
             .iter()
             .any(|(started, ended)| started <= at && at <= ended)
     });
-    let max_context_after_apply = applies.iter().map(|(_, tokens)| *tokens).max().unwrap_or(0);
+    let max_context_after_apply = applies
+        .iter()
+        .map(|(_, reclaim)| reclaim.after)
+        .max()
+        .unwrap_or(0);
+    let shallowest_reclaim = applies
+        .iter()
+        .map(|(_, reclaim)| *reclaim)
+        .min_by(|a, b| a.total_reduction_ratio.total_cmp(&b.total_reduction_ratio))
+        .unwrap_or_else(|| apply_reclamation(0, 0, 0));
     let g1_blocked_ms = max_non_hard_compaction_block_ms(&events, &turn_timeline);
     let g1_non_blocking = g1_blocked_ms < 200.0;
     let context_effective = !applies.is_empty()
-        && applies
-            .iter()
-            .all(|(_, tokens)| *tokens <= AUTO_LIVE_BUDGET * 65 / 100);
+        && applies.iter().all(|(_, reclaim)| {
+            reclaim.after <= (AUTO_LIVE_BUDGET as f64 * policy.start).floor() as u64
+        });
     drop(events);
 
     let entries = compaction_json_entries(&path)?;
@@ -705,19 +889,26 @@ fn run_auto_compaction_live_session(
     });
     let summary_cache_hit_rate =
         (worker_input > 0).then_some(worker_cache_read as f64 / worker_input as f64);
+    let parent_cache = parent_cache_economics(
+        lane,
+        &applies,
+        &parent_usages.lock().expect("parent usages lock"),
+    );
     Ok(AutoLiveRow {
         compactions: applies.len(),
         g1_blocked_ms,
         g1_non_blocking,
         max_context_after_apply,
-        start_threshold: AUTO_LIVE_BUDGET * 65 / 100,
+        start_threshold: (AUTO_LIVE_BUDGET as f64 * policy.start).floor() as u64,
         context_effective,
+        shallowest_reclaim,
         needle_answered,
         recall_marker: context_text.matches("recall(handle=\"").count() >= applies.len(),
         carry_block: context_text.contains(AUTO_LIVE_CARRY_HEADER),
         resume_exact,
         measured_entries,
         summary_cache_hit_rate,
+        parent_cache,
         real_read,
         metadata_detail,
     })
@@ -857,6 +1048,60 @@ fn reactive_overflow_live(lane: LiveLoopLane) -> Result<()> {
     assert!(provider_starts >= 2, "overflow must trigger one resend");
     assert!(applied && resume_exact && measured && real_read);
     Ok(())
+}
+
+#[test]
+fn apply_reclamation_reconstructs_true_pre_apply_and_both_ratios() {
+    let metric = apply_reclamation(8_000, 1_000, 17_000);
+    assert_eq!(metric.before, 24_000);
+    assert_eq!(metric.after, 17_000);
+    assert_eq!(metric.reclaimed, 7_000);
+    assert!((metric.covered_reduction_ratio - 0.875).abs() < f64::EPSILON);
+    assert!((metric.total_reduction_ratio - 7.0 / 24.0).abs() < f64::EPSILON);
+
+    let malformed = apply_reclamation(10, 20, 30);
+    assert_eq!(malformed.reclaimed, 0);
+    assert_eq!(malformed.before, malformed.after);
+    assert_eq!(malformed.total_reduction_ratio, 0.0);
+}
+
+#[test]
+fn parent_cache_economics_pairs_requests_across_apply_without_fabricating_writes() {
+    let at = Instant::now();
+    let usage = |input, read, write| ProviderUsage {
+        provider: "test".to_string(),
+        model: "test".to_string(),
+        input_tokens: input,
+        output_tokens: 0,
+        cache_read_input_tokens: read,
+        cache_write_input_tokens: write,
+        reasoning_output_tokens: 0,
+        total_tokens: input,
+        cache_creation: None,
+    };
+    let captured = vec![
+        CapturedUsage {
+            is_summary: false,
+            tag: "before".to_string(),
+            started_at: at - std::time::Duration::from_millis(1),
+            usage: Some(usage(100, 70, 10)),
+        },
+        CapturedUsage {
+            is_summary: false,
+            tag: "after".to_string(),
+            started_at: at + std::time::Duration::from_millis(1),
+            usage: Some(usage(140, 60, 20)),
+        },
+    ];
+    let applies = vec![(at, apply_reclamation(80, 20, 100))];
+
+    let anthropic = parent_cache_economics(LiveLoopLane::AnthropicHaiku, &applies, &captured);
+    assert_eq!((anthropic.baseline_mass, anthropic.post_mass), (10, 20));
+    assert_eq!(anthropic.ratio, Some(2.0));
+
+    let codex = parent_cache_economics(LiveLoopLane::CodexMini, &applies, &captured);
+    assert_eq!((codex.baseline_mass, codex.post_mass), (30, 80));
+    assert_eq!(codex.ratio, Some(8.0 / 3.0));
 }
 
 #[test]

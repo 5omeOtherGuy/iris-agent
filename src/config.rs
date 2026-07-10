@@ -344,7 +344,10 @@ pub(crate) struct RetrySettings {
 /// Legacy fallback when neither an explicit budget nor a model window exists.
 const DEFAULT_CONTEXT_TOKEN_BUDGET: u64 = 128_000;
 pub(crate) const DEFAULT_SUMMARY_RESERVE: u64 = 8_192;
-const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 20_000;
+pub(crate) const DEFAULT_COMPACTION_WARN: f64 = 0.60;
+pub(crate) const DEFAULT_COMPACTION_START: f64 = 0.72;
+pub(crate) const DEFAULT_COMPACTION_HARD: f64 = 0.90;
+pub(crate) const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 8_000;
 const DEFAULT_COMPACTION_HARD_WAIT_MS: u64 = 10_000;
 const MAX_COMPACTION_HARD_WAIT_MS: u64 = 120_000;
 const DEFAULT_COMPACTION_MAX_FAILURES: u32 = 3;
@@ -536,9 +539,15 @@ impl Settings {
         }
         let compaction = self.compaction.as_ref();
         let thresholds = compaction.and_then(|value| value.thresholds.as_ref());
-        let warn = thresholds.and_then(|value| value.warn).unwrap_or(0.55);
-        let start = thresholds.and_then(|value| value.start).unwrap_or(0.65);
-        let hard = thresholds.and_then(|value| value.hard).unwrap_or(0.85);
+        let warn = thresholds
+            .and_then(|value| value.warn)
+            .unwrap_or(DEFAULT_COMPACTION_WARN);
+        let start = thresholds
+            .and_then(|value| value.start)
+            .unwrap_or(DEFAULT_COMPACTION_START);
+        let hard = thresholds
+            .and_then(|value| value.hard)
+            .unwrap_or(DEFAULT_COMPACTION_HARD);
         if !(warn.is_finite()
             && start.is_finite()
             && hard.is_finite()
@@ -1615,9 +1624,9 @@ mod tests {
         assert!(defaults.enabled);
         assert_eq!(
             (defaults.warn, defaults.start, defaults.hard),
-            (0.55, 0.65, 0.85)
+            (0.60, 0.72, 0.90)
         );
-        assert_eq!(defaults.keep_recent_tokens, 20_000);
+        assert_eq!(defaults.keep_recent_tokens, 8_000);
         assert_eq!(defaults.hard_wait_ms, 10_000);
         assert_eq!(defaults.max_consecutive_failures, 3);
         assert!(defaults.reactive);

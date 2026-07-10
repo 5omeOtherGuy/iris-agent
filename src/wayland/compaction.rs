@@ -197,7 +197,7 @@ impl CompactionEngine {
                 window,
                 TriggerThresholds::default(),
                 DEFAULT_SUMMARY_RESERVE,
-                20_000,
+                crate::config::DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
             )
         });
         Self {

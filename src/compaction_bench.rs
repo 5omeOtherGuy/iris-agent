@@ -27,19 +27,20 @@
 //! the sibling `compaction_live_bench` module (never run under the gate).
 
 use super::*;
+use crate::config::CompactionTriggerConfig;
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::ToolState;
 use crate::tools::bench_support::{
     assert_min_reduction, assert_min_reduction_tokens, assert_ratio_within,
     assert_survives_verbatim, est_ratio, est_tokens, report_header, report_row, report_row_tokens,
 };
-use crate::wayland::{Harness, SummarizerKind};
+use crate::wayland::{CompactionWorkerConfig, CompactionWorkerInput, Harness, SummarizerKind};
 use serde_json::json;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
 // --- Retention needles: facts that exist ONLY in the covered range (u1). ---
@@ -113,6 +114,8 @@ struct CompactionFakeProvider {
     /// recall reference, not the summary text -- so the fake echoes a generic
     /// short handoff and the production seam owns retention.
     echo_needles: Vec<&'static str>,
+    summary_delay: Duration,
+    summary_completed: Option<Arc<AtomicBool>>,
 }
 
 impl CompactionFakeProvider {
@@ -125,6 +128,24 @@ impl CompactionFakeProvider {
             summary_calls,
             requests,
             echo_needles,
+            summary_delay: Duration::ZERO,
+            summary_completed: None,
+        }
+    }
+
+    fn with_summary_delay_and_signal(
+        summary_calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        echo_needles: Vec<&'static str>,
+        summary_delay: Duration,
+        summary_completed: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            summary_calls,
+            requests,
+            echo_needles,
+            summary_delay,
+            summary_completed: Some(summary_completed),
         }
     }
 
@@ -176,9 +197,14 @@ impl ChatProvider for CompactionFakeProvider {
         _tools: &'a Tools,
         _cancel: &'a CancellationToken,
     ) -> Result<ProviderStream<'a>> {
-        let is_summary = messages
-            .last()
-            .is_some_and(|m| m.content.starts_with(SUMMARY_INSTRUCTION_PREFIX));
+        let investigator_summary = messages.last().is_some_and(|m| {
+            m.content
+                .starts_with("You are a read-only compaction summarizer")
+        });
+        let is_summary = investigator_summary
+            || messages
+                .last()
+                .is_some_and(|m| m.content.starts_with(SUMMARY_INSTRUCTION_PREFIX));
         // Record the exact request payload this boundary carries so the modeled
         // cache economics can char-diff it against the previous request.
         self.requests
@@ -189,11 +215,22 @@ impl ChatProvider for CompactionFakeProvider {
                 payload: serialize_request(messages),
             });
         let turn = if is_summary {
+            if !self.summary_delay.is_zero() {
+                std::thread::sleep(self.summary_delay);
+            }
             self.summary_calls.fetch_add(1, Ordering::Relaxed);
             // Covered range = every message before the final summary
             // instruction the seam appends.
-            let covered = &messages[..messages.len() - 1];
-            AssistantTurn::text(&self.derive_handoff(covered))
+            let covered = if investigator_summary {
+                messages
+            } else {
+                &messages[..messages.len() - 1]
+            };
+            let turn = AssistantTurn::text(&self.derive_handoff(covered));
+            if let Some(completed) = &self.summary_completed {
+                completed.store(true, Ordering::Release);
+            }
+            turn
         } else {
             AssistantTurn::text("ok")
         };
@@ -330,6 +367,7 @@ struct CompactionRecord {
     covered_messages: usize,
     original_tokens: u64,
     summary_tokens: u64,
+    context_tokens_after: u64,
     carried_paths: usize,
     covered_from: String,
 }
@@ -360,6 +398,7 @@ impl AgentObserver for CompactionCounter {
             covered_messages,
             original_tokens_estimate,
             summary_tokens_estimate,
+            context_tokens_after_apply,
             generation,
             carried_paths,
             ..
@@ -370,6 +409,7 @@ impl AgentObserver for CompactionCounter {
                 covered_messages,
                 original_tokens: original_tokens_estimate,
                 summary_tokens: summary_tokens_estimate,
+                context_tokens_after: context_tokens_after_apply,
                 carried_paths,
                 covered_from,
             });
@@ -1352,6 +1392,862 @@ fn modeled_cache_read_warms_across_generations() {
             prev.read_tokens,
             next.generation,
             next.read_tokens,
+        );
+    }
+}
+
+// --- Background worker arms and boundary dimensions (slice 9). ---
+
+const BACKGROUND_NEEDLE: &str = "BACKGROUND-V2-NEEDLE-41c9";
+
+struct OneToolParent {
+    calls: AtomicUsize,
+}
+
+impl ChatProvider for OneToolParent {
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        let turn = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            AssistantTurn {
+                tool_calls: vec![ToolCall {
+                    id: "bench-delay-1".to_string(),
+                    name: "bench_delay".to_string(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                }],
+                ..AssistantTurn::default()
+            }
+        } else {
+            AssistantTurn::text("done")
+        };
+        Ok(Box::pin(futures::stream::once(async move {
+            Ok(ProviderEvent::Completed(turn))
+        })))
+    }
+}
+
+struct DelayTool {
+    worker_completed: Arc<AtomicBool>,
+}
+
+impl Tool for DelayTool {
+    fn name(&self) -> &str {
+        "bench_delay"
+    }
+
+    fn description(&self) -> &str {
+        "Wait briefly so a deterministic background benchmark can overlap work."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: &'a serde_json::Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !self.worker_completed.load(Ordering::Acquire) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(ToolOutput::text("delay complete"))
+        })
+    }
+}
+
+#[derive(Default)]
+struct TimingObserver {
+    events: RefCell<Vec<(Instant, AgentEvent)>>,
+}
+
+impl AgentObserver for TimingObserver {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        self.events.borrow_mut().push((Instant::now(), event));
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct BackgroundArmResult {
+    blocked_ms: f64,
+    original_tokens: u64,
+    summary_tokens: u64,
+    boundary: &'static str,
+    trigger: Option<ContextPressureTier>,
+    origin: CompactionOrigin,
+    needle: bool,
+}
+
+fn background_seed() -> Vec<Message> {
+    vec![
+        Message::user(&format!(
+            "{BACKGROUND_NEEDLE}. {}",
+            "Large pair-closed transcript state with exact identifiers and decisions. "
+                .repeat(1_350)
+        )),
+        Message::assistant("The background benchmark state is recorded."),
+        Message::user(&format!(
+            "Recent hot-tail state. {}",
+            "Keep this current coding turn verbatim. ".repeat(60)
+        )),
+        Message::assistant("Retained."),
+    ]
+}
+
+fn build_v2_benchmark_harness(
+    input: CompactionWorkerInput,
+) -> (Harness<OneToolParent>, TempDir, TempDir) {
+    let root = TempDir::new();
+    let workspace = TempDir::new();
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).expect("create session");
+    for message in background_seed() {
+        log.append(&message).expect("append seed");
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .expect("list sessions")
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .expect("seed session listed");
+    let stored = store.open(&meta).expect("open seed");
+    let log = SessionLog::resume(&path).expect("resume seed");
+    let worker_completed = Arc::new(AtomicBool::new(false));
+    let agent = Agent::resumed(
+        OneToolParent {
+            calls: AtomicUsize::new(0),
+        },
+        Tools::new(vec![Box::new(DelayTool {
+            worker_completed: worker_completed.clone(),
+        })]),
+        stored.messages,
+    );
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        stored.entry_ids,
+        Some(32_768),
+    );
+    harness.set_compaction_trigger(
+        32_768,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: TUNED_POLICY.warn,
+            start: TUNED_POLICY.start,
+            hard: TUNED_POLICY.hard,
+            keep_recent_tokens: TUNED_POLICY.keep,
+            hard_wait_ms: 10_000,
+            max_consecutive_failures: 3,
+            reactive: true,
+        },
+    );
+    harness.set_summarizer(SummarizerKind::Subagent);
+    harness.set_compaction_worker(CompactionWorkerConfig {
+        input,
+        max_tool_roundtrips: 1,
+        timeout: Duration::from_secs(2),
+        instructions: String::new(),
+    });
+    harness.set_compaction_summarizer_factory(Arc::new(move || {
+        let worker_completed = worker_completed.clone();
+        Ok(Box::new(
+            CompactionFakeProvider::with_summary_delay_and_signal(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(Mutex::new(Vec::new())),
+                vec![BACKGROUND_NEEDLE],
+                Duration::from_millis(20),
+                worker_completed,
+            ),
+        ))
+    }));
+    (harness, root, workspace)
+}
+
+fn run_background_arm(input: CompactionWorkerInput) -> BackgroundArmResult {
+    let (mut harness, _root, _workspace) = build_v2_benchmark_harness(input);
+    let observer = TimingObserver::default();
+    block_on(harness.submit_turn(
+        "Continue through the delayed tool once, then finish.",
+        &observer,
+        &NoToolGate,
+        &CancellationToken::new(),
+    ))
+    .expect("background arm turn succeeds");
+    let events = observer.events.borrow();
+    let applied_index = events
+        .iter()
+        .position(|(_, event)| matches!(event, AgentEvent::CompactionApplied { .. }))
+        .expect("background arm applies");
+    let (applied_at, original_tokens, summary_tokens, origin) = match &events[applied_index] {
+        (
+            at,
+            AgentEvent::CompactionApplied {
+                original_tokens_estimate,
+                summary_tokens_estimate,
+                origin,
+                ..
+            },
+        ) => (
+            *at,
+            *original_tokens_estimate,
+            *summary_tokens_estimate,
+            *origin,
+        ),
+        _ => unreachable!(),
+    };
+    let next_request = events[applied_index + 1..]
+        .iter()
+        .find(|(_, event)| matches!(event, AgentEvent::ProviderTurnStarted { .. }))
+        .map(|(at, _)| *at)
+        .expect("mid-turn apply precedes another provider request");
+    let turn_complete = events
+        .iter()
+        .position(|(_, event)| matches!(event, AgentEvent::TurnComplete))
+        .expect("turn completes");
+    let provider_started_before_apply = events[..applied_index]
+        .iter()
+        .any(|(_, event)| matches!(event, AgentEvent::ProviderTurnStarted { .. }));
+    let trigger = events.iter().find_map(|(_, event)| match event {
+        AgentEvent::CompactionLifecycle {
+            state: CompactionLifecycleState::Running,
+            trigger_tier,
+            ..
+        } => *trigger_tier,
+        _ => None,
+    });
+    BackgroundArmResult {
+        blocked_ms: next_request.duration_since(applied_at).as_secs_f64() * 1_000.0,
+        original_tokens,
+        summary_tokens,
+        boundary: if provider_started_before_apply && applied_index < turn_complete {
+            "mid-turn"
+        } else {
+            "turn-edge"
+        },
+        trigger,
+        origin,
+        needle: harness
+            .messages()
+            .iter()
+            .any(|message| message.content.contains(BACKGROUND_NEEDLE)),
+    }
+}
+
+fn run_foreground_comparator() -> (f64, BackgroundArmResult) {
+    let (mut harness, _root, _workspace) =
+        build_v2_benchmark_harness(CompactionWorkerInput::Transcript);
+    let observer = TimingObserver::default();
+    let started = Instant::now();
+    block_on(harness.compact_now(&observer, &CancellationToken::new()))
+        .expect("foreground comparator compacts");
+    let blocked_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let events = observer.events.borrow();
+    let (original_tokens, summary_tokens, origin) = events
+        .iter()
+        .find_map(|(_, event)| match event {
+            AgentEvent::CompactionApplied {
+                original_tokens_estimate,
+                summary_tokens_estimate,
+                origin,
+                ..
+            } => Some((*original_tokens_estimate, *summary_tokens_estimate, *origin)),
+            _ => None,
+        })
+        .expect("foreground apply event");
+    (
+        blocked_ms,
+        BackgroundArmResult {
+            blocked_ms,
+            original_tokens,
+            summary_tokens,
+            boundary: "turn-edge/manual-await",
+            trigger: None,
+            origin,
+            needle: harness
+                .messages()
+                .iter()
+                .any(|message| message.content.contains(BACKGROUND_NEEDLE)),
+        },
+    )
+}
+
+#[test]
+fn background_worker_arms_preserve_needles_and_avoid_foreground_wait() {
+    let transcript = run_background_arm(CompactionWorkerInput::Transcript);
+    let investigator = run_background_arm(CompactionWorkerInput::Investigator);
+    let (foreground_ms, foreground) = run_foreground_comparator();
+    for (name, arm) in [
+        ("background-transcript", &transcript),
+        ("background-investigator", &investigator),
+        ("foreground", &foreground),
+    ] {
+        assert!(arm.needle, "{name}: retention needle missing");
+        assert_eq!(
+            arm.origin,
+            CompactionOrigin::Subagent,
+            "{name}: worker fallback invalidated the arm"
+        );
+        assert!(
+            arm.summary_tokens * 4 < arm.original_tokens,
+            "{name}: covered range reduction below 75%"
+        );
+    }
+    assert_eq!(transcript.boundary, "mid-turn");
+    assert_eq!(investigator.boundary, "mid-turn");
+    assert_eq!(transcript.trigger, Some(ContextPressureTier::Start));
+    assert_eq!(investigator.trigger, Some(ContextPressureTier::Start));
+    assert!(transcript.blocked_ms < 50.0, "{transcript:?}");
+    assert!(investigator.blocked_ms < 50.0, "{investigator:?}");
+    assert!(
+        foreground_ms >= 15.0,
+        "foreground comparator did not include the 20ms worker wait: {foreground_ms:.1}ms"
+    );
+}
+
+#[test]
+fn auto_compaction_v2_worker_arms_benchmark_report() {
+    let transcript = run_background_arm(CompactionWorkerInput::Transcript);
+    let investigator = run_background_arm(CompactionWorkerInput::Investigator);
+    let (_, foreground) = run_foreground_comparator();
+    println!(
+        "\n== Worker arms (production seam; deterministic 20ms worker) ==\n\
+         | arm | boundary | trigger | origin | main-loop blocked | covered reduction | needle |\n\
+         |---|---|---|---|---:|---:|---:|"
+    );
+    for (name, arm) in [
+        ("background-transcript", transcript),
+        ("background-investigator", investigator),
+        ("foreground/manual-await", foreground),
+    ] {
+        println!(
+            "| {name} | {} | {} | {} | {:.1} ms | {:.1}% | {} |",
+            arm.boundary,
+            arm.trigger.map_or("manual", ContextPressureTier::as_str),
+            arm.origin.as_str(),
+            arm.blocked_ms,
+            100.0 * (1.0 - arm.summary_tokens as f64 / arm.original_tokens as f64),
+            arm.needle,
+        );
+    }
+}
+
+fn run_hard_dimension() -> BackgroundArmResult {
+    let (mut harness, _root, _workspace) =
+        build_v2_benchmark_harness(CompactionWorkerInput::Transcript);
+    harness.set_compaction_trigger(
+        32_768,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.30,
+            start: 0.40,
+            hard: 0.50,
+            keep_recent_tokens: 8_000,
+            hard_wait_ms: 0,
+            max_consecutive_failures: 3,
+            reactive: true,
+        },
+    );
+    let observer = TimingObserver::default();
+    block_on(harness.submit_turn(
+        "Continue through the hard-pressure benchmark.",
+        &observer,
+        &NoToolGate,
+        &CancellationToken::new(),
+    ))
+    .expect("hard dimension turn succeeds");
+    let events = observer.events.borrow();
+    let (original_tokens, summary_tokens, origin) = events
+        .iter()
+        .find_map(|(_, event)| match event {
+            AgentEvent::CompactionApplied {
+                original_tokens_estimate,
+                summary_tokens_estimate,
+                origin,
+                ..
+            } => Some((*original_tokens_estimate, *summary_tokens_estimate, *origin)),
+            _ => None,
+        })
+        .expect("hard dimension applies");
+    BackgroundArmResult {
+        blocked_ms: 0.0,
+        original_tokens,
+        summary_tokens,
+        boundary: "turn-edge",
+        trigger: Some(ContextPressureTier::Hard),
+        origin,
+        needle: harness
+            .messages()
+            .iter()
+            .any(|message| message.content.contains(BACKGROUND_NEEDLE)),
+    }
+}
+
+struct OverflowOnceParent {
+    calls: AtomicUsize,
+}
+
+impl ChatProvider for OverflowOnceParent {
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        let turn = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            AssistantTurn {
+                completion_reason: Some(CompletionReason::ContextWindowExceeded),
+                ..AssistantTurn::default()
+            }
+        } else {
+            AssistantTurn::text("recovered")
+        };
+        Ok(Box::pin(futures::stream::once(async move {
+            Ok(ProviderEvent::Completed(turn))
+        })))
+    }
+}
+
+fn run_reactive_dimension() -> BackgroundArmResult {
+    let root = TempDir::new();
+    let workspace = TempDir::new();
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).expect("create reactive log");
+    for message in [
+        Message::user(&format!(
+            "{BACKGROUND_NEEDLE}. {}",
+            "Reactive seed context with exact state. ".repeat(850)
+        )),
+        Message::assistant("recorded"),
+        Message::user("small retained tail"),
+        Message::assistant("retained"),
+    ] {
+        log.append(&message).expect("append reactive seed");
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .expect("list reactive session")
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .expect("reactive session listed");
+    let stored = store.open(&meta).expect("open reactive seed");
+    let log = SessionLog::resume(&path).expect("resume reactive seed");
+    let agent = Agent::resumed(
+        OverflowOnceParent {
+            calls: AtomicUsize::new(0),
+        },
+        Tools::new(Vec::new()),
+        stored.messages,
+    );
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        stored.entry_ids,
+        Some(32_768),
+    );
+    harness.set_compaction_trigger(
+        32_768,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: TUNED_POLICY.warn,
+            start: TUNED_POLICY.start,
+            hard: TUNED_POLICY.hard,
+            keep_recent_tokens: TUNED_POLICY.keep,
+            hard_wait_ms: 10_000,
+            max_consecutive_failures: 3,
+            reactive: true,
+        },
+    );
+    harness.set_summarizer(SummarizerKind::Excerpts);
+    let observer = TimingObserver::default();
+    block_on(harness.submit_turn(
+        "Exercise one classified overflow and recover.",
+        &observer,
+        &NoToolGate,
+        &CancellationToken::new(),
+    ))
+    .expect("reactive dimension turn succeeds");
+    let events = observer.events.borrow();
+    let (original_tokens, summary_tokens, origin) = events
+        .iter()
+        .find_map(|(_, event)| match event {
+            AgentEvent::CompactionApplied {
+                original_tokens_estimate,
+                summary_tokens_estimate,
+                origin,
+                ..
+            } => Some((*original_tokens_estimate, *summary_tokens_estimate, *origin)),
+            _ => None,
+        })
+        .expect("reactive dimension applies");
+    BackgroundArmResult {
+        blocked_ms: 0.0,
+        original_tokens,
+        summary_tokens,
+        boundary: "reactive-resend",
+        trigger: None,
+        origin,
+        needle: harness
+            .messages()
+            .iter()
+            .any(|message| message.content.contains(BACKGROUND_NEEDLE)),
+    }
+}
+
+#[test]
+fn hard_and_reactive_dimensions_use_deterministic_parent_owned_apply() {
+    let hard = run_hard_dimension();
+    let reactive = run_reactive_dimension();
+    assert_eq!(hard.trigger, Some(ContextPressureTier::Hard));
+    assert_eq!(hard.boundary, "turn-edge");
+    assert_eq!(reactive.boundary, "reactive-resend");
+    for arm in [hard, reactive] {
+        assert_eq!(arm.origin, CompactionOrigin::Excerpts);
+        assert!(arm.needle);
+        assert!(arm.summary_tokens < arm.original_tokens);
+    }
+}
+
+#[test]
+fn auto_compaction_v2_trigger_boundary_benchmark_report() {
+    let start = run_background_arm(CompactionWorkerInput::Transcript);
+    let hard = run_hard_dimension();
+    let reactive = run_reactive_dimension();
+    println!(
+        "\n== Trigger and boundary dimensions ==\n\
+         | trigger | boundary | origin | covered reduction | needle |\n\
+         |---|---|---|---:|---:|"
+    );
+    for (trigger, arm) in [("start", start), ("hard", hard), ("reactive", reactive)] {
+        println!(
+            "| {trigger} | {} | {} | {:.1}% | {} |",
+            arm.boundary,
+            arm.origin.as_str(),
+            100.0 * (1.0 - arm.summary_tokens as f64 / arm.original_tokens as f64),
+            arm.needle,
+        );
+    }
+}
+
+// --- Focus-instruction retention needle (slice 9). ---
+
+const FOCUS_NEEDLE: &str = "FOCUS-NEEDLE-a91d: preserve allocator_epoch=73";
+
+struct FocusAwareProvider;
+
+impl ChatProvider for FocusAwareProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        let request = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let focused = messages
+            .last()
+            .is_some_and(|message| message.content.contains(FOCUS_NEEDLE));
+        let summary = if focused && request.contains(FOCUS_NEEDLE) {
+            format!("Goal: continue. Key facts: {FOCUS_NEEDLE}. Next: proceed.")
+        } else {
+            "Goal: continue. State: generic handoff. Next: proceed.".to_string()
+        };
+        Ok(Box::pin(futures::stream::once(async move {
+            Ok(ProviderEvent::Completed(AssistantTurn::text(&summary)))
+        })))
+    }
+}
+
+fn run_focus_trial(focused: bool) -> bool {
+    let root = TempDir::new();
+    let workspace = TempDir::new();
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).expect("create focus log");
+    for message in [
+        Message::user(&format!(
+            "{FOCUS_NEEDLE}. {}",
+            "Older coding state that must be summarized deliberately. ".repeat(100)
+        )),
+        Message::assistant("recorded"),
+        Message::user("recent hot tail"),
+        Message::assistant("retained"),
+    ] {
+        log.append(&message).expect("append focus seed");
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .expect("list focus session")
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .expect("focus session listed");
+    let stored = store.open(&meta).expect("open focus session");
+    let log = SessionLog::resume(&path).expect("resume focus session");
+    let agent = Agent::resumed(FocusAwareProvider, Tools::new(Vec::new()), stored.messages);
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        stored.entry_ids,
+        Some(32_768),
+    );
+    harness.set_summarizer(SummarizerKind::Subagent);
+    harness.set_compaction_worker(CompactionWorkerConfig {
+        input: CompactionWorkerInput::Transcript,
+        max_tool_roundtrips: 1,
+        timeout: Duration::from_secs(2),
+        instructions: if focused {
+            format!("Prioritize this exact fact: {FOCUS_NEEDLE}")
+        } else {
+            "Preserve the general task state.".to_string()
+        },
+    });
+    harness.set_compaction_summarizer_factory(Arc::new(|| Ok(Box::new(FocusAwareProvider))));
+    block_on(harness.compact_now(&CompactionCounter::new(), &CancellationToken::new()))
+        .expect("focus trial compacts");
+    harness
+        .messages()
+        .iter()
+        .any(|message| message.content.contains(FOCUS_NEEDLE))
+}
+
+fn focus_retention_rates() -> (usize, usize, usize) {
+    let trials = 5;
+    let control = (0..trials).filter(|_| run_focus_trial(false)).count();
+    let focused = (0..trials).filter(|_| run_focus_trial(true)).count();
+    (control, focused, trials)
+}
+
+#[test]
+fn focus_instruction_improves_needle_retention_rate() {
+    let (control, focused, trials) = focus_retention_rates();
+    assert_eq!(control, 0, "control unexpectedly retained focus-only fact");
+    assert_eq!(
+        focused, trials,
+        "focused arm must retain every planted fact"
+    );
+    assert!(focused > control);
+}
+
+#[test]
+fn auto_compaction_v2_focus_benchmark_report() {
+    let (control, focused, trials) = focus_retention_rates();
+    println!(
+        "\n== Focus instruction retention ==\n\
+         | arm | retained | trials | rate |\n\
+         |---|---:|---:|---:|\n\
+         | control | {control} | {trials} | {:.0}% |\n\
+         | focused | {focused} | {trials} | {:.0}% |",
+        100.0 * control as f64 / trials as f64,
+        100.0 * focused as f64 / trials as f64,
+    );
+}
+
+// --- Trigger-v2 default tuning (slice 9). ---
+
+const POLICY_NEEDLE: &str = "POLICY-NEEDLE-7f3a9 --enable-zeta";
+const RECALL_LOOP_HIT: &str = "RECALL-LOOP-HIT-22b7 allocator_epoch=73";
+
+#[derive(Clone, Copy)]
+struct PolicyCandidate {
+    name: &'static str,
+    warn: f64,
+    start: f64,
+    hard: f64,
+    keep: u64,
+}
+
+const CURRENT_POLICY: PolicyCandidate = PolicyCandidate {
+    name: "current-0.55/0.65/0.85-keep20k",
+    warn: 0.55,
+    start: 0.65,
+    hard: 0.85,
+    keep: 20_000,
+};
+
+const TUNED_POLICY: PolicyCandidate = PolicyCandidate {
+    name: "candidate-0.60/0.72/0.90-keep8k",
+    warn: 0.60,
+    start: 0.72,
+    hard: 0.90,
+    keep: 8_000,
+};
+
+fn policy_seed() -> Vec<Message> {
+    let mut seed = (0..30)
+        .flat_map(|turn| {
+            let prefix = if turn == 0 {
+                format!("{POLICY_NEEDLE}. ")
+            } else {
+                format!("Policy seed turn {turn}. ")
+            };
+            [
+                Message::user(&format!(
+                    "{prefix}{}",
+                    "Pair-closed coding context with exact decisions, paths, and current state. "
+                        .repeat(32)
+                )),
+                Message::assistant("recorded"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    seed.extend([
+        Message::assistant_tool_call(&ToolCall {
+            id: "policy-recall-1".to_string(),
+            name: "recall".to_string(),
+            arguments: json!({ "pattern": "allocator_epoch" }),
+            thought_signature: None,
+        }),
+        Message::tool_result(
+            "policy-recall-1",
+            "recall",
+            &format!(
+                "{RECALL_LOOP_HIT}. {}",
+                "Specific recalled detail re-inflated for one decision. ".repeat(80)
+            ),
+        ),
+        Message::assistant("The specific recalled hit is now understood."),
+    ]);
+    seed
+}
+
+fn run_policy_candidate(policy: PolicyCandidate) -> SeededArm {
+    let prompts = (0..60)
+        .map(|turn| {
+            format!(
+                "Policy growth turn {turn}. {}",
+                "Continue the coding task while preserving exact identifiers and decisions. "
+                    .repeat(48)
+            )
+        })
+        .collect::<Vec<_>>();
+    let prompt_refs = prompts.iter().map(String::as_str).collect::<Vec<_>>();
+    run_seeded_with(
+        &policy_seed(),
+        32_768,
+        false,
+        SummarizerKind::Excerpts,
+        Vec::new(),
+        &prompt_refs,
+        |harness| {
+            harness.set_compaction_trigger(
+                32_768,
+                CompactionTriggerConfig {
+                    enabled: true,
+                    warn: policy.warn,
+                    start: policy.start,
+                    hard: policy.hard,
+                    keep_recent_tokens: policy.keep,
+                    hard_wait_ms: 10_000,
+                    max_consecutive_failures: 3,
+                    reactive: true,
+                },
+            );
+        },
+        false,
+    )
+}
+
+fn record_total_reduction(record: &CompactionRecord) -> f64 {
+    let reclaimed = record.original_tokens.saturating_sub(record.summary_tokens);
+    let before = record.context_tokens_after.saturating_add(reclaimed);
+    if before == 0 {
+        0.0
+    } else {
+        reclaimed as f64 / before as f64
+    }
+}
+
+fn average_total_reduction(run: &SeededArm) -> f64 {
+    run.records.iter().map(record_total_reduction).sum::<f64>() / run.records.len().max(1) as f64
+}
+
+#[test]
+fn tuned_policy_reclaims_more_total_context_without_more_generations() {
+    let current = run_policy_candidate(CURRENT_POLICY);
+    let tuned = run_policy_candidate(TUNED_POLICY);
+    assert!(
+        tuned.records.len() >= 3,
+        "long-horizon candidate must exercise at least three generations"
+    );
+    assert!(
+        tuned.records.len() <= current.records.len(),
+        "candidate generations {} must not exceed current {}",
+        tuned.records.len(),
+        current.records.len()
+    );
+    assert!(
+        average_total_reduction(&tuned) > average_total_reduction(&current),
+        "candidate average total reduction {:.3} must beat current {:.3}",
+        average_total_reduction(&tuned),
+        average_total_reduction(&current)
+    );
+    for (name, run) in [(CURRENT_POLICY.name, &current), (TUNED_POLICY.name, &tuned)] {
+        assert!(run.rebuilt_context.contains(POLICY_NEEDLE), "{name}");
+        assert!(
+            run.rebuilt_context.contains(RECALL_LOOP_HIT),
+            "{name}: the specific recall-loop hit must survive repeated compaction"
+        );
+        assert!(
+            run.rebuilt_context.matches("recall(handle=\"").count() >= run.records.len(),
+            "{name}: every generation must retain a recall marker"
+        );
+    }
+}
+
+#[test]
+fn auto_compaction_v2_tuning_benchmark_report() {
+    println!(
+        "\n== Trigger-v2 tuning (production seam; estimated message tokens) ==\n\
+         | policy | generations | avg total reduction | shallowest total reduction | max post/start | needle | recall markers |\n\
+         |---|---:|---:|---:|---:|---:|---:|"
+    );
+    for policy in [CURRENT_POLICY, TUNED_POLICY] {
+        let run = run_policy_candidate(policy);
+        let shallowest = run
+            .records
+            .iter()
+            .map(record_total_reduction)
+            .fold(1.0f64, f64::min);
+        let max_post = run
+            .records
+            .iter()
+            .map(|record| record.context_tokens_after)
+            .max()
+            .unwrap_or(0);
+        let start = (32_768.0 * policy.start).floor() as u64;
+        println!(
+            "| {} | {} | {:.1}% | {:.1}% | {}/{} ({:.1}%) | {} | {}/{} |",
+            policy.name,
+            run.records.len(),
+            average_total_reduction(&run) * 100.0,
+            shallowest * 100.0,
+            max_post,
+            start,
+            max_post as f64 / start as f64 * 100.0,
+            run.rebuilt_context.contains(POLICY_NEEDLE),
+            run.rebuilt_context.matches("recall(handle=\"").count(),
+            run.records.len(),
         );
     }
 }
