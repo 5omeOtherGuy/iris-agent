@@ -11,7 +11,7 @@
 
 use std::io::BufReader;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Result, anyhow};
 use reqwest::blocking::Client;
@@ -34,6 +34,7 @@ use crate::mimir::selection::{
 };
 use crate::nexus::{
     AssistantTurn, CacheCreation, ChatProvider, CompletionReason, Message, ModelOrigin,
+    ProviderCompactionCapability, ProviderCompactionFuture, ProviderCompactionOutput,
     ProviderStream, ProviderUsage, ReasoningBlock, Role, ToolCall, Tools,
 };
 
@@ -53,6 +54,8 @@ const BASE_ANTHROPIC_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+const COMPACTION_BETA: &str = "compact-2026-01-12";
+const NATIVE_COMPACTION_MIN_INPUT_TOKENS: u64 = 50_000;
 /// Appended only when the payload carries a `fallbacks` array (Fable 5 refusal
 /// fallback). The header date is authoritative as written; adopted from
 /// minimalcc-pi `SERVER_SIDE_FALLBACK_BETA`.
@@ -62,6 +65,7 @@ const API_ID: &str = "anthropic-messages";
 /// Endpoint path surfaced in failure diagnostics (never the full base URL).
 const ENDPOINT_PATH: &str = "/v1/messages";
 static SERVER_SIDE_FALLBACK_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+static NATIVE_COMPACTION_UNSUPPORTED_MODELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 /// First system block required on the OAuth lane: omitting it gets the request
 /// rejected as not coming from the Claude Code client.
@@ -259,6 +263,28 @@ impl ChatProvider for AnthropicProvider {
             cancel,
         ))
     }
+
+    fn compaction_capability(&self, input_tokens: u64) -> ProviderCompactionCapability {
+        let unsupported = NATIVE_COMPACTION_UNSUPPORTED_MODELS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(&self.model);
+        if !unsupported && input_tokens >= NATIVE_COMPACTION_MIN_INPUT_TOKENS {
+            ProviderCompactionCapability::OpaqueBlocks
+        } else {
+            ProviderCompactionCapability::None
+        }
+    }
+
+    fn compact_context<'a>(
+        &'a self,
+        messages: &'a [Message],
+        instructions: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> ProviderCompactionFuture<'a> {
+        Box::pin(async move { self.compact_context_blocking(messages, instructions, cancel) })
+    }
 }
 
 impl AnthropicProvider {
@@ -417,6 +443,330 @@ impl AnthropicProvider {
             "provider token usage"
         );
     }
+
+    fn compact_context_blocking(
+        &self,
+        messages: &[Message],
+        instructions: &str,
+        cancel: &CancellationToken,
+    ) -> Result<ProviderCompactionOutput> {
+        let auth_kind = match &self.auth {
+            AnthropicAuthSource::OAuth(_) => AnthropicAuthKind::OAuth,
+            AnthropicAuthSource::ApiKey(_) => AnthropicAuthKind::ApiKey,
+        };
+        let request = build_native_compaction_request(
+            &self.model,
+            &self.system_prompt,
+            messages,
+            instructions,
+            auth_kind,
+        );
+        let mut last_token: Option<String> = None;
+        let mut force_refresh = false;
+        let mut reauth_used = false;
+        let mut transient_retries = 0u32;
+        loop {
+            if cancel.is_cancelled() {
+                anyhow::bail!("provider-native compaction cancelled");
+            }
+            let auth = match &self.auth {
+                AnthropicAuthSource::OAuth(tokens) => {
+                    let token = if force_refresh {
+                        tokens.force_refresh(&self.client, last_token.as_deref())
+                    } else {
+                        tokens.access_token(&self.client)
+                    }?;
+                    last_token = Some(token.clone());
+                    AnthropicAuth::OAuthBearer(token)
+                }
+                AnthropicAuthSource::ApiKey(key) => AnthropicAuth::ApiKey(key.clone()),
+            };
+            force_refresh = false;
+            match self.send_native_compaction_once(&auth, &request, cancel) {
+                NativeCompactionAttempt::Done(output) => {
+                    if let Some(usage) = &output.usage {
+                        self.record_usage(usage);
+                    }
+                    return Ok(output);
+                }
+                NativeCompactionAttempt::Unsupported(error) => {
+                    NATIVE_COMPACTION_UNSUPPORTED_MODELS
+                        .get_or_init(|| Mutex::new(HashSet::new()))
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .insert(self.model.clone());
+                    return Err(error);
+                }
+                NativeCompactionAttempt::Reauth(error) if !reauth_used => {
+                    reauth_used = true;
+                    force_refresh = true;
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "provider-native compaction auth rejected; refreshing once"
+                    );
+                }
+                NativeCompactionAttempt::Retry(error, retry_after)
+                    if transient_retries < self.retry_policy.max_retries =>
+                {
+                    transient_retries += 1;
+                    let delay = self
+                        .retry_policy
+                        .backoff_delay(transient_retries, retry_after);
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        attempt = transient_retries,
+                        delay_ms = delay.as_millis() as u64,
+                        "provider-native compaction transient error; retrying"
+                    );
+                    sleep_native_retry(delay, cancel);
+                }
+                NativeCompactionAttempt::Reauth(error)
+                | NativeCompactionAttempt::Retry(error, _)
+                | NativeCompactionAttempt::Fatal(error) => return Err(error),
+            }
+        }
+    }
+
+    fn send_native_compaction_once(
+        &self,
+        auth: &AnthropicAuth,
+        request: &Value,
+        cancel: &CancellationToken,
+    ) -> NativeCompactionAttempt {
+        let headers = match anthropic_headers_for_auth(auth, request) {
+            Ok(headers) => headers,
+            Err(error) => return NativeCompactionAttempt::Fatal(error),
+        };
+        let url = format!("{}{ENDPOINT_PATH}", self.base_url);
+        let response = match self.client.post(&url).headers(headers).json(request).send() {
+            Ok(response) => response,
+            Err(error) => {
+                return NativeCompactionAttempt::Retry(
+                    anyhow::Error::new(error)
+                        .context("failed to send Anthropic native compaction request"),
+                    None,
+                );
+            }
+        };
+        let status = response.status();
+        if status.is_success() {
+            return match parse_native_compaction_reader(
+                BufReader::new(response),
+                &self.model,
+                cancel,
+            ) {
+                Ok(output) => NativeCompactionAttempt::Done(output),
+                Err(error) => NativeCompactionAttempt::Retry(error, None),
+            };
+        }
+        let retry_after = retry_after_hint(response.headers());
+        let body = response.text().unwrap_or_default();
+        let error_type = extract_error_type(&body).unwrap_or_else(|| "unknown_error".to_string());
+        let error = anyhow!(
+            "Anthropic native compaction request failed (status={}, error_type={error_type})",
+            status.as_u16()
+        );
+        if status.as_u16() == 400 {
+            return NativeCompactionAttempt::Unsupported(error);
+        }
+        match classify_http_status_retryable(status.as_u16()) {
+            HttpClass::Reauth => NativeCompactionAttempt::Reauth(error),
+            HttpClass::Retry => NativeCompactionAttempt::Retry(error, retry_after),
+            HttpClass::Fatal => NativeCompactionAttempt::Fatal(error),
+        }
+    }
+}
+
+enum NativeCompactionAttempt {
+    Done(ProviderCompactionOutput),
+    Unsupported(anyhow::Error),
+    Reauth(anyhow::Error),
+    Retry(anyhow::Error, Option<std::time::Duration>),
+    Fatal(anyhow::Error),
+}
+
+fn sleep_native_retry(delay: std::time::Duration, cancel: &CancellationToken) {
+    let slice = std::time::Duration::from_millis(50);
+    let started = std::time::Instant::now();
+    while !cancel.is_cancelled() && started.elapsed() < delay {
+        std::thread::sleep(slice.min(delay.saturating_sub(started.elapsed())));
+    }
+}
+
+fn parse_native_compaction_reader(
+    reader: impl std::io::BufRead,
+    model: &str,
+    cancel: &CancellationToken,
+) -> Result<ProviderCompactionOutput> {
+    let mut open_index = None;
+    let mut summary = None;
+    let mut compaction_block = None;
+    let mut blocks = 0usize;
+    let mut message_stopped = false;
+    let mut stop_reason = None;
+    let mut usage_value = None;
+    for_each_sse_event(reader, cancel, |data| {
+        let value: Value = serde_json::from_str(data)
+            .map_err(|_| anyhow!("Anthropic native compaction SSE contained invalid JSON"))?;
+        match value.get("type").and_then(Value::as_str) {
+            Some("content_block_start")
+                if value
+                    .get("content_block")
+                    .and_then(|block| block.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("compaction") =>
+            {
+                blocks += 1;
+                open_index = value.get("index").and_then(Value::as_u64);
+                compaction_block = value.get("content_block").cloned();
+                summary = compaction_block
+                    .as_ref()
+                    .and_then(|block| block.get("content"))
+                    .and_then(Value::as_str)
+                    .map(String::from);
+            }
+            Some("content_block_delta")
+                if value
+                    .get("delta")
+                    .and_then(|delta| delta.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("compaction_delta") =>
+            {
+                let index = value.get("index").and_then(Value::as_u64);
+                if open_index != index {
+                    anyhow::bail!("Anthropic native compaction delta had no open block");
+                }
+                if let Some(content) = value
+                    .get("delta")
+                    .and_then(|delta| delta.get("content"))
+                    .and_then(Value::as_str)
+                {
+                    summary = Some(content.to_string());
+                    if let Some(block) = compaction_block.as_mut() {
+                        block["content"] = Value::String(content.to_string());
+                    }
+                }
+            }
+            Some("content_block_stop") => {
+                if open_index == value.get("index").and_then(Value::as_u64) {
+                    open_index = None;
+                }
+            }
+            Some("message_delta") => {
+                stop_reason = value
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                if let Some(usage) = value.get("usage") {
+                    usage_value = Some(usage.clone());
+                }
+            }
+            Some("message_stop") => message_stopped = true,
+            Some("error") => {
+                let error_type = value
+                    .get("error")
+                    .and_then(|error| error.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("error");
+                anyhow::bail!("Anthropic native compaction stream error (error_type={error_type})");
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    if !message_stopped || open_index.is_some() || blocks != 1 {
+        anyhow::bail!("Anthropic native compaction stream was incomplete");
+    }
+    if stop_reason.as_deref() != Some("compaction") {
+        anyhow::bail!("Anthropic native compaction did not pause after compaction");
+    }
+    let summary = summary
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("Anthropic native compaction returned an empty compaction block"))?;
+    let summary = summary.trim().to_string();
+    let mut block = compaction_block
+        .ok_or_else(|| anyhow!("Anthropic native compaction returned no compaction block"))?;
+    block["content"] = Value::String(summary.clone());
+    let provider_blocks = vec![json!({
+        "adapter": API_ID,
+        "model": model,
+        "block": block
+    })];
+    let usage = usage_value
+        .as_ref()
+        .map(|usage| native_compaction_usage(model, usage));
+    Ok(ProviderCompactionOutput {
+        summary,
+        provider_blocks,
+        usage,
+    })
+}
+
+fn native_compaction_usage(model: &str, usage: &Value) -> ProviderUsage {
+    let iterations = usage.get("iterations").and_then(Value::as_array);
+    let (input_tokens, output_tokens, cache_read_input_tokens, cache_write_input_tokens) =
+        if let Some(iterations) = iterations {
+            iterations.iter().fold((0, 0, 0, 0), |acc, item| {
+                (
+                    acc.0
+                        + item
+                            .get("input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    acc.1
+                        + item
+                            .get("output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    acc.2
+                        + item
+                            .get("cache_read_input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    acc.3
+                        + item
+                            .get("cache_creation_input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                )
+            })
+        } else {
+            (
+                usage
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                usage
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                usage
+                    .get("cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            )
+        };
+    ProviderUsage {
+        provider: PROVIDER_ID.to_string(),
+        model: model.to_string(),
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        cache_write_input_tokens,
+        reasoning_output_tokens: 0,
+        total_tokens: input_tokens.saturating_add(output_tokens),
+        cache_creation: None,
+    }
+}
+
+#[cfg(test)]
+fn parse_native_compaction_sse(body: &str, model: &str) -> Result<ProviderCompactionOutput> {
+    parse_native_compaction_reader(body.as_bytes(), model, &CancellationToken::new())
 }
 
 /// Safe, redacted diagnostics for an Anthropic request/stream failure. Every
@@ -714,7 +1064,9 @@ fn anthropic_beta_for_auth(request: &Value, auth_kind: AnthropicAuthKind) -> Opt
     if request_contains_one_hour_cache(request) {
         betas.push(EXTENDED_CACHE_TTL_BETA.to_string());
     }
-    if request_contains_context_management(request) {
+    if request_contains_native_compaction(request) {
+        betas.push(COMPACTION_BETA.to_string());
+    } else if request_contains_context_management(request) {
         betas.push(CONTEXT_MANAGEMENT_BETA.to_string());
     }
     (!betas.is_empty()).then(|| betas.join(","))
@@ -754,6 +1106,30 @@ fn request_contains_context_management(request: &Value) -> bool {
         .and_then(|context| context.get("edits"))
         .and_then(Value::as_array)
         .is_some_and(|edits| !edits.is_empty())
+}
+
+fn request_contains_native_compaction(request: &Value) -> bool {
+    request
+        .get("context_management")
+        .and_then(|context| context.get("edits"))
+        .and_then(Value::as_array)
+        .is_some_and(|edits| {
+            edits
+                .iter()
+                .any(|edit| edit.get("type").and_then(Value::as_str) == Some("compact_20260112"))
+        })
+        || contains_compaction_block(request)
+}
+
+fn contains_compaction_block(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.get("type").and_then(Value::as_str) == Some("compaction")
+                || map.values().any(contains_compaction_block)
+        }
+        Value::Array(items) => items.iter().any(contains_compaction_block),
+        _ => false,
+    }
 }
 
 fn request_contains_one_hour_cache(value: &Value) -> bool {
@@ -878,6 +1254,52 @@ fn build_anthropic_request_for_auth(
     apply_anthropic_cache_control(&mut body, config.cache_retention);
     apply_context_management(&mut body, config.context_management);
     body
+}
+
+fn build_native_compaction_request(
+    model: &str,
+    system_prompt: &str,
+    messages: &[Message],
+    instructions: &str,
+    auth_kind: AnthropicAuthKind,
+) -> Value {
+    let mut body = build_anthropic_request_for_auth(
+        model,
+        system_prompt,
+        messages,
+        &Tools::new(Vec::new()),
+        None,
+        AnthropicRequestConfig {
+            cache_retention: PromptCacheRetention::None,
+            context_management: &ContextManagement::default(),
+            auth_kind,
+        },
+    );
+    let instructions = native_compaction_instructions(instructions);
+    body["context_management"] = json!({
+        "edits": [{
+            "type": "compact_20260112",
+            "trigger": {
+                "type": "input_tokens",
+                "value": NATIVE_COMPACTION_MIN_INPUT_TOKENS,
+            },
+            "pause_after_compaction": true,
+            "instructions": instructions,
+        }]
+    });
+    body
+}
+
+fn native_compaction_instructions(instructions: &str) -> String {
+    let instructions = instructions.trim();
+    let guard = "Do not call tools while writing this summary; respond with text only.";
+    if instructions.is_empty() {
+        format!(
+            "Summarize the transcript inside <summary></summary> tags. Include all information needed to continue the task. {guard}"
+        )
+    } else {
+        format!("{instructions} {guard}")
+    }
 }
 
 /// Manual-budget thinking token budget for an iris reasoning level. Adopted
@@ -1048,6 +1470,18 @@ fn tool_declarations(tools: &Tools) -> Vec<Value> {
 fn build_messages(messages: &[Message], current_origin: &ModelOrigin) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for message in messages {
+        if let Some(block) = matching_compaction_block(message, current_origin) {
+            push_block(&mut out, "assistant", block);
+            // Keep the provider-neutral body after the opaque block. It carries
+            // deterministic recall/carry data the server-authored summary does
+            // not know about and is the exact text another adapter receives.
+            push_block(
+                &mut out,
+                "user",
+                json!({ "type": "text", "text": message.content }),
+            );
+            continue;
+        }
         let mapped = match message.role {
             // Anthropic has no interleaved developer-message role. Preserve the
             // lower-than-system contextual instruction as a user text block.
@@ -1084,6 +1518,18 @@ fn build_messages(messages: &[Message], current_origin: &ModelOrigin) -> Vec<Val
         }
     }
     out
+}
+
+fn matching_compaction_block(message: &Message, current_origin: &ModelOrigin) -> Option<Value> {
+    message.provider_blocks.iter().find_map(|envelope| {
+        let same_adapter = envelope.get("adapter").and_then(Value::as_str) == Some(API_ID);
+        let same_model =
+            envelope.get("model").and_then(Value::as_str) == Some(current_origin.model.as_str());
+        (same_adapter && same_model)
+            .then(|| envelope.get("block").cloned())
+            .flatten()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("compaction"))
+    })
 }
 
 fn anthropic_origin(model: &str) -> ModelOrigin {
@@ -1850,6 +2296,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
                 provider_turn_id: None,
                 redacted: false,
                 origin: None,
+                provider_blocks: Vec::new(),
             },
         ];
         let request = build_anthropic_request(
@@ -2009,6 +2456,95 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         let beta = anthropic_beta(&enabled);
         assert!(beta.contains(CONTEXT_MANAGEMENT_BETA), "{beta}");
         assert!(!beta.contains("compact-2026-01-12"), "{beta}");
+    }
+
+    #[test]
+    fn native_compaction_request_and_replay_use_the_beta_shape() {
+        let covered = [Message::user("old work"), Message::assistant("result")];
+        let request = build_native_compaction_request(
+            "claude-opus-4-6",
+            "IRIS PROMPT",
+            &covered,
+            "Preserve exact flags.",
+            AnthropicAuthKind::OAuth,
+        );
+        assert_eq!(
+            request["context_management"],
+            json!({
+                "edits": [{
+                    "type": "compact_20260112",
+                    "trigger": { "type": "input_tokens", "value": 50000 },
+                    "pause_after_compaction": true,
+                    "instructions": "Preserve exact flags. Do not call tools while writing this summary; respond with text only."
+                }]
+            })
+        );
+        assert!(request.get("tools").is_none());
+        let beta = anthropic_beta_for_auth(&request, AnthropicAuthKind::OAuth).unwrap();
+        assert!(beta.contains("compact-2026-01-12"), "{beta}");
+
+        let block = json!({
+            "adapter": "anthropic-messages",
+            "model": "claude-opus-4-6",
+            "block": { "type": "compaction", "content": "native summary" }
+        });
+        let messages = [Message::user("portable summary").with_provider_blocks(vec![block])];
+        let replay = build_anthropic_request(
+            "claude-opus-4-6",
+            "IRIS PROMPT",
+            &messages,
+            &Tools::new(Vec::new()),
+            None,
+            PromptCacheRetention::None,
+            &ContextManagement::default(),
+        );
+        assert_eq!(replay["messages"][0]["role"], "assistant");
+        assert_eq!(
+            replay["messages"][0]["content"][0],
+            json!({ "type": "compaction", "content": "native summary" })
+        );
+        assert_eq!(replay["messages"][1]["role"], "user");
+        assert_eq!(
+            replay["messages"][1]["content"][0]["text"],
+            "portable summary"
+        );
+
+        let cross_model = build_anthropic_request(
+            "claude-sonnet-4-6",
+            "IRIS PROMPT",
+            &messages,
+            &Tools::new(Vec::new()),
+            None,
+            PromptCacheRetention::None,
+            &ContextManagement::default(),
+        );
+        assert_eq!(cross_model["messages"][0]["role"], "user");
+        assert_eq!(
+            cross_model["messages"][0]["content"][0]["text"],
+            "portable summary"
+        );
+    }
+
+    #[test]
+    fn native_compaction_stream_captures_one_block_text_and_iteration_usage() {
+        let body = "\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_compact\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"compaction\",\"content\":null,\"future_field\":{\"version\":7}}}\n\n
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"compaction_delta\",\"content\":\"native summary\"}}\n\n
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"compaction\"},\"usage\":{\"input_tokens\":120,\"output_tokens\":0,\"iterations\":[{\"type\":\"compaction\",\"input_tokens\":50000,\"output_tokens\":800}]}}\n\n
+data: {\"type\":\"message_stop\"}\n\n";
+
+        let output = parse_native_compaction_sse(body, "claude-opus-4-6").unwrap();
+        assert_eq!(output.summary, "native summary");
+        assert_eq!(output.provider_blocks.len(), 1);
+        assert_eq!(
+            output.provider_blocks[0]["block"]["future_field"]["version"],
+            7
+        );
+        assert_eq!(output.usage.as_ref().unwrap().input_tokens, 50_000);
+        assert_eq!(output.usage.as_ref().unwrap().output_tokens, 800);
+        assert_eq!(output.usage.as_ref().unwrap().total_tokens, 50_800);
     }
 
     fn json_contains_key(value: &Value, key: &str) -> bool {
@@ -2595,6 +3131,7 @@ data: {\"type\":\"message_stop\"}
                 provider_turn_id: None,
                 redacted: false,
                 origin: None,
+                provider_blocks: Vec::new(),
             },
             Message::user("next prompt"),
         ];
@@ -2790,6 +3327,7 @@ data: {\"type\":\"message_stop\"}\n\n
                 provider_turn_id: None,
                 redacted: false,
                 origin: None,
+                provider_blocks: Vec::new(),
             },
             Message {
                 role: Role::AssistantToolCall,
@@ -2800,6 +3338,7 @@ data: {\"type\":\"message_stop\"}\n\n
                 provider_turn_id: None,
                 redacted: false,
                 origin: None,
+                provider_blocks: Vec::new(),
             },
             Message {
                 role: Role::Tool,
@@ -2810,6 +3349,7 @@ data: {\"type\":\"message_stop\"}\n\n
                 provider_turn_id: None,
                 redacted: false,
                 origin: None,
+                provider_blocks: Vec::new(),
             },
             Message {
                 role: Role::Tool,
@@ -2820,6 +3360,7 @@ data: {\"type\":\"message_stop\"}\n\n
                 provider_turn_id: None,
                 redacted: false,
                 origin: None,
+                provider_blocks: Vec::new(),
             },
         ];
         let msgs = build_messages(&messages, &anthropic_origin("m"));

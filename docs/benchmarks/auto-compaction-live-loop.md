@@ -380,3 +380,99 @@ unusually long provider path before the worker reported the 90-second stream
 idle error above. That latency is external to G1, which measures only
 compaction-event-to-next-request blocking. No evaluated session had a turn,
 tool, persistence, recall, metadata, or resume failure.
+
+## Slice 7 provider-native probe — 2026-07-10
+
+Base: `1e1ec0d` plus the slice 7 worktree. The portable fallback worker remains
+`anthropic/claude-opus-4-6` with medium thinking. The native probe uses an
+80,000-token effective window because Anthropic documents a 50,000-token
+minimum compact trigger. It plants a unique needle, performs a real `read`,
+exits, and compares live with resumed context.
+
+Regeneration command:
+
+```sh
+IRIS_BENCH_LIVE=1 cargo test --locked \
+  auto_compaction_native_live_anthropic -- \
+  --ignored --nocapture --test-threads=1
+```
+
+| lane | native applied | opaque blocks | usage | needle | live==resumed | result |
+|---|---:|---:|---:|---:|---:|---|
+| `anthropic/claude-haiku-4-5` | 0 | 0 | unknown | pass | pass | provider capability rejected |
+
+The first attempt exposed and then pinned a worker-runtime bug. Its panic was:
+
+```text
+Cannot drop a runtime in a context where blocking is not allowed. This happens when a runtime is dropped from within an asynchronous context.
+```
+
+After the runtime fix, the request reached the live provider and failed with:
+
+```text
+background compaction failed; using deterministic fallback: Anthropic native compaction request failed (status=400, error_type=invalid_request_error)
+```
+
+The session then applied one deterministic excerpts entry, retained
+`--enable-zeta`, and rebuilt byte-exactly. This is a failed native capability
+probe, not a passing native row and not an excluded ordinary-LVP session.
+`compaction.providerNative` therefore remains default-off. No success metric is
+inferred from the fallback.
+
+OpenAI v2 capability was probed separately because it cannot yet produce a
+portable Iris entry:
+
+```sh
+IRIS_BENCH_LIVE=1 IRIS_OPENAI_NATIVE_COMPACTION_PROBE=1 \
+  cargo test --locked auto_compaction_native_probe_codex -- \
+  --ignored --nocapture --test-threads=1
+```
+
+| lane | request shape | opaque blocks | portable text | backend capability | Iris route |
+|---|---|---:|---:|---:|---|
+| `openai-codex/gpt-5.4-mini` | v2 `compaction_trigger` | 1 | no | pass | rejected by portable-text invariant |
+
+The live output was:
+
+```text
+OPENAI NATIVE PROBE lane=openai-codex/gpt-5.4-mini adapter=openai-codex-responses model=gpt-5.4-mini blocks=1 portable_text=false
+```
+
+This proves backend support without claiming a durable provider-native entry.
+
+The first ordinary Codex LVP attempt was stopped after sessions 00 and 01 both
+returned:
+
+```text
+Codex request failed [status=429 endpoint=/codex/responses model=gpt-5.4-mini error_type=usage_limit_reached]
+```
+
+Two exclusions already exceeded the protocol allowance, so the remaining eight
+calls were cancelled. The aborted run contributes no gate metrics and will be
+regenerated when quota reopens.
+
+A later one-session availability retry returned the same error before any
+session could be evaluated. It also contributes no metrics.
+
+Portable-path Haiku LVP:
+
+| lane | sessions | compactions | worst G1 | worst post-apply/start | G2 | G3 | G4 | G5 | reads | cache-hit observations | exclusions |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| `anthropic/claude-haiku-4-5` | 10 | 22 | 16.2 ms | 17,103 / 21,299 (80.3%) | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 3 × 0.999; 7 × 0.000 | 0 |
+
+| session | compactions | G1 | maximum post-apply | G2–G5/read | worker cache hit | error |
+|---:|---:|---:|---:|---|---:|---|
+| 00 | 3 | 15.5 ms | 17,051 | pass | 0.999 | — |
+| 01 | 2 | 10.7 ms | 17,090 | pass | 0.999 | — |
+| 02 | 3 | 16.2 ms | 17,081 | pass | 0.999 | — |
+| 03 | 2 | 3.1 ms | 17,084 | pass | 0.000 | — |
+| 04 | 2 | 8.7 ms | 17,098 | pass | 0.000 | — |
+| 05 | 2 | 1.6 ms | 17,103 | pass | 0.000 | — |
+| 06 | 2 | 0.9 ms | 17,070 | pass | 0.000 | — |
+| 07 | 2 | 1.3 ms | 17,090 | pass | 0.000 | — |
+| 08 | 2 | 8.4 ms | 17,088 | pass | 0.000 | — |
+| 09 | 2 | 0.8 ms | 17,040 | pass | 0.000 | — |
+
+The run completed in 426.37 seconds. Every model-backed summary used
+`anthropic/claude-opus-4-6` with medium thinking. No provider, auth, tool,
+worker, persistence, recall, metadata, or resume error occurred.

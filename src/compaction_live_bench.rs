@@ -31,7 +31,7 @@ use crate::mimir::selection::{
 };
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::{ToolState, built_in_tools};
-use crate::wayland::{Harness, SummarizerKind};
+use crate::wayland::{CompactionWorkerConfig, Harness, SummarizerKind};
 use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -350,6 +350,20 @@ fn auto_live_seed(session: usize, workspace: &std::path::Path) -> Result<Vec<Mes
         ));
     }
     Ok(seed)
+}
+
+fn native_live_seed() -> Vec<Message> {
+    let needle = "NATIVE-NEEDLE-7f3a9: the flag is --enable-zeta";
+    vec![
+        Message::user(&format!(
+            "Remember this exact fact: {needle}. {}",
+            "Native compaction must preserve this coding-session state, exact identifiers, decisions, and next steps. "
+                .repeat(2_350)
+        )),
+        Message::assistant("The native-compaction needle is recorded."),
+        Message::user("Retain the latest exchange verbatim."),
+        Message::assistant("Retained."),
+    ]
 }
 
 fn context_bytes(messages: &[Message]) -> Vec<u8> {
@@ -932,6 +946,195 @@ fn auto_compaction_live_loop_codex() {
         return;
     }
     auto_compaction_live_loop(LiveLoopLane::CodexMini, auto_live_session_count());
+}
+
+#[test]
+#[ignore = "live Anthropic native-compaction probe; set IRIS_BENCH_LIVE=1 to run"]
+fn auto_compaction_native_live_anthropic() -> Result<()> {
+    if !live_loop_enabled("auto_compaction_native_live_anthropic") {
+        return Ok(());
+    }
+    if !claude_code_credentials_available() {
+        anyhow::bail!("no Claude Code credentials discovered");
+    }
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = TempDir::new("native-loop");
+    let mut log = SessionLog::create_in(&root.path, &workspace)?;
+    for message in native_live_seed() {
+        log.append(&message)?;
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()?
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .ok_or_else(|| anyhow::anyhow!("native seed session was not listed"))?;
+    let stored = store.open(&meta)?;
+    let entry_ids = stored.entry_ids.clone();
+    let log = SessionLog::resume(&path)?;
+    let provider = LiveLoopLane::AnthropicHaiku.build_provider("native-parent")?;
+    let agent = Agent::resumed(provider, built_in_tools().into_read_only(), stored.messages);
+    let window = 80_000;
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.clone(),
+        ToolState::new(),
+        Some(log),
+        entry_ids,
+        Some(window),
+    );
+    harness.set_compaction_trigger(
+        window,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.90,
+            keep_recent_tokens: 1_000,
+            hard_wait_ms: 10_000,
+            max_consecutive_failures: 3,
+            reactive: true,
+        },
+    );
+    harness.set_summarizer(SummarizerKind::Subagent);
+    harness.set_compaction_worker(CompactionWorkerConfig {
+        instructions:
+            "Preserve exact flags, identifiers, decisions, current state, and next steps."
+                .to_string(),
+        ..CompactionWorkerConfig::default()
+    });
+    harness.set_compaction_summarizer_factory(Arc::new(build_live_compaction_worker));
+    harness.set_provider_native(true);
+    harness.set_provider_compaction_factory(Arc::new(|| {
+        LiveLoopLane::AnthropicHaiku.build_provider("native-compaction")
+    }));
+    let observer = LiveLoopObserver::default();
+    let token = CancellationToken::new();
+    block_on(harness.submit_turn(
+        "Use the read tool on Cargo.toml, then reply briefly. You must use the tool.",
+        &observer,
+        &ReadOnlyGate,
+        &token,
+    ))?;
+    if harness
+        .context_diagnostics()
+        .is_some_and(|diagnostics| diagnostics.background_running)
+    {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+    block_on(harness.submit_turn(
+        "What was the exact flag for NATIVE-NEEDLE-7f3a9? Reply with the flag exactly.",
+        &observer,
+        &ReadOnlyGate,
+        &token,
+    ))?;
+
+    let entries = compaction_json_entries(&path)?;
+    let native = entries.iter().find(|entry| {
+        entry.get("origin").and_then(serde_json::Value::as_str) == Some("providerNative")
+    });
+    let resume_exact =
+        context_bytes(harness.messages()) == context_bytes(&store.open(&meta)?.messages);
+    let needle = harness
+        .messages()
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant)
+        .is_some_and(|message| message.content.contains("--enable-zeta"));
+    let lifecycle_failures = observer
+        .events
+        .lock()
+        .expect("native events lock")
+        .iter()
+        .filter_map(|timed| match &timed.event {
+            AgentEvent::CompactionLifecycle {
+                state: CompactionLifecycleState::Failed,
+                message: Some(message),
+                ..
+            } => Some(message.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "NATIVE LIVE lane={} native={} blocks={} usage={} needle={} resume_exact={} failures={} entries={}",
+        LiveLoopLane::AnthropicHaiku.label(),
+        native.is_some(),
+        native
+            .and_then(|entry| entry.get("providerBlocks"))
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        native
+            .and_then(|entry| entry.get("workerUsage"))
+            .is_some_and(|usage| !usage.is_null()),
+        needle,
+        resume_exact,
+        serde_json::to_string(&lifecycle_failures)
+            .unwrap_or_else(|_| "<unserializable>".to_string()),
+        serde_json::to_string(&entries).unwrap_or_else(|_| "<unserializable>".to_string()),
+    );
+    assert!(native.is_some(), "provider-native entry was not applied");
+    assert!(
+        native
+            .and_then(|entry| entry.get("providerBlocks"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|blocks| blocks.len() == 1)
+    );
+    assert!(
+        native
+            .and_then(|entry| entry.get("workerUsage"))
+            .is_some_and(|usage| !usage.is_null())
+    );
+    assert!(needle && resume_exact);
+    Ok(())
+}
+
+#[test]
+#[ignore = "live Codex native-compaction capability probe; set both live probe env flags"]
+fn auto_compaction_native_probe_codex() -> Result<()> {
+    if !live_loop_enabled("auto_compaction_native_probe_codex") {
+        return Ok(());
+    }
+    if std::env::var("IRIS_OPENAI_NATIVE_COMPACTION_PROBE")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!(
+            "auto_compaction_native_probe_codex: skipped (set IRIS_OPENAI_NATIVE_COMPACTION_PROBE=1 to authorize the probe)"
+        );
+        return Ok(());
+    }
+    let provider =
+        crate::mimir::providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
+            "gpt-5.4-mini",
+            "https://chatgpt.com/backend-api",
+            None,
+            LIVE_SYSTEM_PROMPT,
+            "auto-compaction-native-probe",
+            PromptCacheRetention::DEFAULT,
+            RetryPolicy::default(),
+            CodexTransport::Sse,
+        )?;
+    let block = provider.probe_v2_compaction(&native_live_seed(), &CancellationToken::new())?;
+    println!(
+        "OPENAI NATIVE PROBE lane={} adapter={} model={} blocks=1 portable_text=false",
+        LiveLoopLane::CodexMini.label(),
+        block
+            .get("adapter")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>"),
+        block
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>"),
+    );
+    assert_eq!(
+        block.get("adapter").and_then(serde_json::Value::as_str),
+        Some("openai-codex-responses")
+    );
+    Ok(())
 }
 
 #[test]

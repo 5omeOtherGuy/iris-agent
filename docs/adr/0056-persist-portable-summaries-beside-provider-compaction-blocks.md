@@ -1,0 +1,94 @@
+# ADR-0056: Persist portable summaries beside provider compaction blocks
+
+**Date**: 2026-07-10
+**Status**: accepted
+**Deciders**: Iris maintainers, Pi agent session
+
+## Context
+
+Provider-side compaction can return continuation state that only the producing
+adapter understands. Persisting that state alone would make resume depend on
+the original provider and model. Flattening it into text alone would discard
+the provider optimization. Iris also requires the live and resumed contexts to
+remain byte-identical before provider translation.
+
+## Decision
+
+Compaction entries may carry additive `providerBlocks`, but every entry still
+carries a self-sufficient text `summary`.
+
+- Nexus exposes only `ProviderCompactionCapability::{None, OpaqueBlocks}` and a
+  provider-neutral output containing text, opaque JSON values, and normalized
+  usage. Provider names and wire fields remain in Mimir.
+- `compaction.providerNative` is global-only, accepts `off|auto`, and defaults
+  to `off`. `auto` attempts a provider route only when the active adapter
+  reports capability for the planned range.
+- The parent-owned Wayland engine remains the only mutation point. Native and
+  portable workers share planning, revalidation, carry, recall, persistence,
+  apply, and lifecycle events.
+- Entries persist `origin: "providerNative"`, exactly one adapter envelope in
+  `providerBlocks`, normalized `workerUsage`, and portable text. Rebuild attaches
+  both to the synthetic summary message.
+- Mimir replays a block only for its recorded adapter and exact model. A model
+  or provider switch ignores it and sends the portable text. Any selection
+  change while a native job runs discards that job.
+- A native result with empty portable text or other than one opaque block is
+  rejected. Deterministic compaction remains available after any native error.
+
+Anthropic uses the `compact_20260112` context-management edit and
+`compact-2026-01-12` beta. The adapter requests a portable compaction body,
+persists the returned block, and replays it only on the same Anthropic model.
+The public API requires at least 50,000 trigger tokens, so smaller plans do not
+advertise capability.
+
+OpenAI Codex v2 probing is separately live-gated: a `compaction_trigger` input
+item maps to one encrypted compaction item. The subscription backend accepted
+the probe on `gpt-5.4-mini`, but Iris does not advertise that route because the
+observed contract supplies no portable text. Enabling it would violate
+cross-provider resume until a separate text summary is produced and measured.
+
+## Alternatives Considered
+
+### Persist only opaque blocks
+
+- **Why not**: Cross-provider and cross-model resume would lose usable context.
+
+### Persist only text
+
+- **Why not**: Same-provider continuation would discard the optimization this
+  slice exists to evaluate.
+
+### Let Mimir mutate live history
+
+- **Why not**: It would create a second mutation owner and break live/resume
+  equivalence, recall registration, and entry ordering.
+
+### Enable provider-native mode by default
+
+- **Why not**: Capability and economics are model- and backend-dependent. The
+  route remains an explicit optimization until live evidence clears it.
+
+## Consequences
+
+### Positive
+
+- Native continuity is additive; portable recovery remains authoritative.
+- Existing compaction invariants and session readers continue to work.
+- Provider capability failures degrade without failing the user turn.
+
+### Negative
+
+- Same-provider requests carry both the native block and portable carry/recall
+  text.
+- Session entries are larger and contain provider-specific opaque JSON.
+- A first `auto` attempt may pay for a rejected capability probe.
+
+### Risks
+
+- Provider beta shapes and supported models may change. Pin request/response
+  construction tests and keep live probes double-gated.
+- Opaque blocks may contain sensitive continuation state. They stay in the same
+  user-owned session log as the original transcript and are never interpreted
+  above Mimir.
+- A backend can reject a documented feature for a selected lane. Cache that
+  rejection for the process and keep `auto` default-off.

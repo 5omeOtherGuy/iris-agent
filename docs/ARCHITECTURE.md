@@ -208,13 +208,18 @@ command is destructive rides with the tool as `Tool`-trait methods (Tier 3), so
 core never matches on tool names.
 
 Provider-native optimization follows the same ownership rule. Nexus carries only
-provider-neutral messages, opaque continuity strings, provider usage metadata,
-and typed events. Mimir decides whether OpenAI receives prompt-cache keys or 24h
-retention, whether Anthropic receives `cache_control` or supported
-`context_management` edits, and whether Gemini tool calls need a
-`thoughtSignature` echoed back. User-controlled knobs for these behaviors are
-global settings because they can affect privacy, cost, or provider routing; repo
-settings cannot enable them.
+provider-neutral messages, opaque compaction values, continuity strings,
+provider usage metadata, a capability enum, and typed events. Mimir decides
+whether OpenAI receives prompt-cache keys or 24h retention, whether Anthropic
+receives `cache_control` or supported `context_management` edits, whether an
+opaque compaction block is replayable for the exact selection, and whether
+Gemini tool calls need a `thoughtSignature` echoed back. Wayland owns the single
+plan/revalidate/persist/apply path; a native provider is only another background
+summarizer and never mutates context directly. Every native entry also has a
+portable text summary, so model/provider switches and resume do not depend on an
+opaque block. User-controlled knobs for these behaviors are global settings
+because they can affect privacy, cost, or provider routing; repo settings cannot
+enable them.
 
 ## Packaging
 

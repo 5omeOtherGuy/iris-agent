@@ -1464,7 +1464,13 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    an honest second-overflow error, and a two-model-compaction per-turn cap.
    Slice 6 adds the durable `/compaction [generation]` viewer, a foldable TUI
    inspection panel, the muted running chip, `Ready`/`Applied` lifecycle states,
-   live job/frozen-fold `/context` detail, and the generation-5 warning.
+   live job/frozen-fold `/context` detail, and the generation-5 warning. Slice 7
+   (ADR-0056) adds the provider-neutral capability seam, additive opaque-block
+   persistence, portable cross-provider rebuild, discard-on-selection-change,
+   and the Anthropic compact beta adapter. The route remains default-off: the
+   required Haiku 4.5 live probe returned a provider `400 invalid_request_error`.
+   OpenAI v2's live Codex mini probe succeeds but remains probe-only because its
+   opaque item has no portable text.
 7. Prebuilt-binary distribution ([#199](https://github.com/5omeOtherGuy/iris-agent/issues/199),
    [#233](https://github.com/5omeOtherGuy/iris-agent/issues/233)) is wired and now
    validated locally ([#252](https://github.com/5omeOtherGuy/iris-agent/issues/252)):

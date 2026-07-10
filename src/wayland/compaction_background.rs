@@ -56,40 +56,75 @@ impl CompactionEngine {
         obs: &dyn AgentObserver,
         trigger_tier: Option<ContextPressureTier>,
     ) -> Result<()> {
-        let factory = self
-            .summarizer_factory
-            .as_ref()
-            .expect("caller checks factory")
-            .clone();
         let covered = messages[plan.start..plan.end].to_vec();
         let covered_messages = covered.len();
         let original_tokens = context_tokens(&covered);
+        let native_factory = if self.provider_native {
+            self.provider_compaction_factory
+                .as_ref()
+                .and_then(|factory| match factory() {
+                    Ok(provider)
+                        if provider.compaction_capability(original_tokens)
+                            == ProviderCompactionCapability::OpaqueBlocks =>
+                    {
+                        Some(factory.clone())
+                    }
+                    Ok(_) => None,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            "provider-native compaction probe failed; using the portable worker"
+                        );
+                        None
+                    }
+                })
+        } else {
+            None
+        };
         let job_id = format!("compaction_{:08x}", self.next_job_seq);
         self.next_job_seq = self.next_job_seq.saturating_add(1);
         let token = CancellationToken::new();
         let worker_token = token.clone();
-        let workspace_for_worker = workspace.to_path_buf();
-        let mode = self.summarizer;
         let worker = self.worker.clone();
-        let origin = match mode {
-            SummarizerKind::Subagent => CompactionOrigin::Subagent,
-            SummarizerKind::Provider => CompactionOrigin::Provider,
-            SummarizerKind::Excerpts => CompactionOrigin::Excerpts,
+        let origin = if native_factory.is_some() {
+            CompactionOrigin::ProviderNative
+        } else {
+            match self.summarizer {
+                SummarizerKind::Subagent => CompactionOrigin::Subagent,
+                SummarizerKind::Provider => CompactionOrigin::Provider,
+                SummarizerKind::Excerpts => CompactionOrigin::Excerpts,
+            }
         };
         let (tx, receiver) = mpsc::channel();
-        thread::Builder::new()
-            .name(format!("iris-{job_id}"))
-            .spawn(move || {
-                let result = run_compaction_worker(
-                    factory,
-                    workspace_for_worker,
-                    covered,
-                    worker,
-                    mode,
-                    worker_token,
-                );
-                let _ = tx.send(result);
-            })?;
+        if let Some(factory) = native_factory {
+            thread::Builder::new()
+                .name(format!("iris-{job_id}"))
+                .spawn(move || {
+                    let result = run_provider_native_worker(factory, covered, worker, worker_token);
+                    let _ = tx.send(result);
+                })?;
+        } else {
+            let factory = self
+                .summarizer_factory
+                .as_ref()
+                .expect("caller checks portable or native factory")
+                .clone();
+            let workspace_for_worker = workspace.to_path_buf();
+            let mode = self.summarizer;
+            thread::Builder::new()
+                .name(format!("iris-{job_id}"))
+                .spawn(move || {
+                    let result = run_compaction_worker(
+                        factory,
+                        workspace_for_worker,
+                        covered,
+                        worker,
+                        mode,
+                        worker_token,
+                    );
+                    let _ = tx.send(result);
+                })?;
+        }
         let job = BackgroundCompaction {
             job_id,
             session_id: self.session_id().map(str::to_string),
@@ -102,6 +137,7 @@ impl CompactionEngine {
             origin,
             trigger_tier,
             started_at: std::time::Instant::now(),
+            selection_generation: self.selection_generation,
         };
         self.emit_lifecycle(
             obs,
@@ -388,6 +424,11 @@ impl CompactionEngine {
         messages: &[Message],
     ) -> Option<CompactionPlan> {
         if self.session_id().map(str::to_string) != job.session_id {
+            return None;
+        }
+        if job.origin == CompactionOrigin::ProviderNative
+            && job.selection_generation != self.selection_generation
+        {
             return None;
         }
         let start = self

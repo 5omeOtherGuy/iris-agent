@@ -653,6 +653,7 @@ data: {\"error\":{\"message\":\"quota exceeded\"}}
                 provider_turn_id: None,
                 redacted: false,
                 origin: None,
+                provider_blocks: Vec::new(),
             },
         ];
         let inner = build_inner_request(
@@ -796,6 +797,7 @@ data: {\"error\":{\"message\":\"quota exceeded\"}}
                 provider_turn_id: None,
                 redacted: false,
                 origin: None,
+                provider_blocks: Vec::new(),
             },
         ];
         let contents = build_contents(&messages);

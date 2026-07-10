@@ -507,6 +507,9 @@ fn run_agent_inner(
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
     harness.set_compaction_worker(settings.compaction_worker_config()?);
+    harness.set_provider_native(
+        settings.compaction_provider_native()? == config::ProviderNativeMode::Auto,
+    );
     install_compaction_summarizer_factory(
         &mut harness,
         background_selection.clone(),
@@ -708,6 +711,9 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
     harness.set_compaction_worker(settings.compaction_worker_config()?);
+    harness.set_provider_native(
+        settings.compaction_provider_native()? == config::ProviderNativeMode::Auto,
+    );
     install_compaction_summarizer_factory(
         &mut harness,
         background_selection.clone(),
@@ -809,6 +815,20 @@ fn install_compaction_summarizer_factory(
     system_prompt: String,
     session_id: Arc<Mutex<String>>,
 ) {
+    let native_selection = selection.clone();
+    let native_system_prompt = system_prompt.clone();
+    let native_session_id = session_id.clone();
+    harness.set_provider_compaction_factory(Arc::new(move || {
+        let selection = native_selection
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let session_id = native_session_id
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        build_provider(&selection, &native_system_prompt, &session_id)
+    }));
     harness.set_compaction_summarizer_factory(Arc::new(move || {
         let selection = dedicated_selection.clone().unwrap_or_else(|| {
             selection
@@ -922,6 +942,9 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
     harness.set_compaction_worker(settings.compaction_worker_config()?);
+    harness.set_provider_native(
+        settings.compaction_provider_native()? == config::ProviderNativeMode::Auto,
+    );
     install_compaction_summarizer_factory(
         &mut harness,
         background_selection.clone(),

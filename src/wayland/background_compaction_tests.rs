@@ -17,8 +17,9 @@ use crate::config::CompactionTriggerConfig;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate,
     AssistantTurn, BoundaryContext, ChatProvider, CompactionLifecycleState, CompactionOrigin,
-    ContextDirective, ContextPressureTier, Message, ProviderEvent, ProviderStream, ProviderUsage,
-    ReviewContext, ToolCall, Tools,
+    ContextDirective, ContextPressureTier, Message, ProviderCompactionCapability,
+    ProviderCompactionFuture, ProviderCompactionOutput, ProviderEvent, ProviderStream,
+    ProviderUsage, ReviewContext, ToolCall, Tools,
 };
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::{ToolState, built_in_tools};
@@ -228,6 +229,62 @@ struct PendingSummaryProvider {
 struct ScriptedWorkerProvider {
     requests: Arc<Mutex<Vec<Vec<Message>>>>,
     turns: Arc<Mutex<VecDeque<AssistantTurn>>>,
+}
+
+#[derive(Clone)]
+struct NativeCompactionProvider {
+    requests: Arc<Mutex<Vec<Vec<Message>>>>,
+}
+
+impl ChatProvider for NativeCompactionProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    fn compaction_capability(&self, _input_tokens: u64) -> ProviderCompactionCapability {
+        ProviderCompactionCapability::OpaqueBlocks
+    }
+
+    fn compact_context<'a>(
+        &'a self,
+        messages: &'a [Message],
+        _instructions: &'a str,
+        _cancel: &'a CancellationToken,
+    ) -> ProviderCompactionFuture<'a> {
+        self.requests.lock().unwrap().push(messages.to_vec());
+        Box::pin(async {
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "provider-native compaction must not poll blocking adapters inside a Tokio runtime"
+            );
+            Ok(ProviderCompactionOutput {
+                summary: format!(
+                    "Goal: continue. State: native. Key facts: {SUMMARY_NEEDLE}. Next steps: proceed."
+                ),
+                provider_blocks: vec![serde_json::json!({
+                    "adapter": "fake-native",
+                    "model": "fake-model",
+                    "block": { "type": "compaction", "content": SUMMARY_NEEDLE }
+                })],
+                usage: Some(ProviderUsage {
+                    provider: "fake-native".to_string(),
+                    model: "fake-model".to_string(),
+                    input_tokens: 2_000,
+                    output_tokens: 100,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    reasoning_output_tokens: 0,
+                    total_tokens: 2_100,
+                    cache_creation: None,
+                }),
+            })
+        })
+    }
 }
 
 impl ChatProvider for ScriptedWorkerProvider {
@@ -979,6 +1036,137 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rebuilt.contains(SUMMARY_NEEDLE), "{rebuilt}");
+}
+
+#[test]
+fn provider_native_job_uses_the_same_parent_owned_apply_and_persists_blocks() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let seeded = seed_harness(&root.path, &workspace.path);
+    let SeededHarness {
+        mut harness,
+        path,
+        prompts,
+        ..
+    } = seeded;
+    let native_requests = Arc::new(Mutex::new(Vec::new()));
+    let requests = native_requests.clone();
+    harness.set_provider_native(true);
+    harness.set_provider_compaction_factory(Arc::new(move || {
+        Ok(Box::new(NativeCompactionProvider {
+            requests: requests.clone(),
+        }))
+    }));
+    let obs = Recorder::default();
+    let messages = harness.messages().to_vec();
+    let plan = harness
+        .compaction
+        .plan(&messages, 20)
+        .expect("coverable range");
+
+    harness
+        .compaction
+        .start_background(
+            &messages,
+            plan,
+            &workspace.path,
+            &obs,
+            Some(ContextPressureTier::Start),
+        )
+        .unwrap();
+
+    let replacement = (0..500)
+        .find_map(|_| {
+            let result = harness
+                .compaction
+                .drain_background_at_boundary(
+                    &messages,
+                    ApplyContext {
+                        workspace: &workspace.path,
+                        output_store: None,
+                        task_state: None,
+                        observer: &obs,
+                    },
+                )
+                .unwrap();
+            if result.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result
+        })
+        .expect("native result should apply");
+
+    assert_eq!(native_requests.lock().unwrap().len(), 1);
+    assert!(
+        prompts.lock().unwrap().is_empty(),
+        "local worker did not race"
+    );
+    let entry = compaction_entries(&path).pop().unwrap();
+    assert_eq!(entry["origin"], "providerNative");
+    assert_eq!(entry["providerBlocks"].as_array().unwrap().len(), 1);
+    assert_eq!(entry["workerUsage"]["totalTokens"], 2_100);
+    assert_eq!(replacement[0].provider_blocks.len(), 1);
+    assert_eq!(
+        obs.applied_metadata().unwrap().0,
+        CompactionOrigin::ProviderNative
+    );
+}
+
+#[test]
+fn provider_native_job_is_discarded_after_any_selection_change() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let seeded = seed_harness(&root.path, &workspace.path);
+    let SeededHarness {
+        mut harness, path, ..
+    } = seeded;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    harness.note_active_selection("before", "model", None);
+    harness.set_provider_native(true);
+    harness.set_provider_compaction_factory(Arc::new(move || {
+        Ok(Box::new(NativeCompactionProvider {
+            requests: captured.clone(),
+        }))
+    }));
+    let obs = Recorder::default();
+    let messages = harness.messages().to_vec();
+    let plan = harness.compaction.plan(&messages, 20).unwrap();
+    harness
+        .compaction
+        .start_background(
+            &messages,
+            plan,
+            &workspace.path,
+            &obs,
+            Some(ContextPressureTier::Start),
+        )
+        .unwrap();
+
+    harness.note_active_selection("after", "model", None);
+    for _ in 0..500 {
+        harness
+            .compaction
+            .drain_background_at_boundary(
+                &messages,
+                ApplyContext {
+                    workspace: &workspace.path,
+                    output_store: None,
+                    task_state: None,
+                    observer: &obs,
+                },
+            )
+            .unwrap();
+        if obs.lifecycle(CompactionLifecycleState::Discarded) == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(obs.applied(), 0);
+    assert_eq!(obs.lifecycle(CompactionLifecycleState::Discarded), 1);
+    assert!(compaction_entries(&path).is_empty());
 }
 
 #[test]
