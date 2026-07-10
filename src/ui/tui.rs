@@ -661,6 +661,21 @@ mod tests {
             .join("\n")
     }
 
+    /// Drive stream beats on the tick grid until the escapement has released all
+    /// held text into the visible tail and the paced backlog has settled. The
+    /// escapement (issue: the escapement spec) advances the tail by word-quanta
+    /// per tick, so a test inspecting the mid-stream tail must first let those
+    /// beats run — this reproduces the loop's cadence without a live loop.
+    fn settle_stream(screen: &mut Screen) {
+        let mut now = std::time::Instant::now();
+        for _ in 0..256 {
+            now += std::time::Duration::from_millis(100);
+            if !screen.commit_stream_tick(now) {
+                break;
+            }
+        }
+    }
+
     fn synthetic_render_perf_screen() -> Screen {
         let mut screen = Screen::new();
         screen.set_footer(
@@ -975,7 +990,11 @@ mod tests {
         screen.apply(UiEvent::AssistantTextDelta("Hel".to_string()));
         screen.apply(UiEvent::AssistantTextDelta("lo".to_string()));
         assert_eq!(screen.transcript.rows.len(), 0);
+        // The tail advances on the tick beat, not on the delta: let the
+        // escapement release "Hello" into the tail, then it renders as one line.
+        settle_stream(&mut screen);
         assert_eq!(screen.wrapped_lines(80).len(), 1);
+        assert_eq!(screen.transcript.rows.len(), 0, "tail still uncommitted");
         screen.apply(UiEvent::AssistantTextEnd("Hello".to_string()));
         let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert_eq!(texts, vec!["Hello".to_string(), String::new()]);
@@ -1046,8 +1065,19 @@ mod tests {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantTextDelta(markdown.to_string()));
 
+        // Let the escapement release the whole delta and pace the closed blocks;
+        // the still-open list item stays in the mutable tail (never committed
+        // early), and the whole thing renders live like the finalized version.
+        settle_stream(&mut screen);
         let live = screen.wrapped_lines(80);
-        assert!(screen.transcript.rows.is_empty());
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .all(|r| !row_text(r).contains("- one")),
+            "the open list item is held in the tail, not committed early"
+        );
         let live_document = render_document(&mut screen, Size::new(80, 12))
             .iter()
             .map(line_text)
@@ -1078,6 +1108,8 @@ mod tests {
         for markdown in ["```rust\nlet x = **", "half **bold"] {
             let mut screen = Screen::new();
             screen.apply(UiEvent::AssistantTextDelta(markdown.to_string()));
+            // Release the held delta into the tail; the open block never commits.
+            settle_stream(&mut screen);
             let lines = screen.wrapped_lines(80);
             assert!(!lines.is_empty(), "partial markdown vanished: {markdown:?}");
             assert!(screen.transcript.rows.is_empty());
@@ -1092,11 +1124,13 @@ mod tests {
         // is dropped on every stream start/end transition).
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantTextDelta("alpha".to_string()));
+        settle_stream(&mut screen);
         let live_a = screen.wrapped_lines(80);
         assert!(live_a.iter().any(|l| line_text(l).contains("alpha")));
         screen.apply(UiEvent::AssistantTextEnd(String::new()));
 
         screen.apply(UiEvent::AssistantTextDelta("gamma".to_string()));
+        settle_stream(&mut screen);
         let live_b = screen.wrapped_lines(80);
         assert!(
             live_b.iter().any(|l| line_text(l).contains("gamma")),
@@ -1113,14 +1147,16 @@ mod tests {
     fn streaming_render_memo_tracks_growth_and_width() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantTextDelta("one two three".to_string()));
+        settle_stream(&mut screen);
         // Unchanged stream renders identically across repeated frames (the
         // memo-hit path must be byte-stable with the fresh render).
         let first = screen.wrapped_lines(80);
         let second = screen.wrapped_lines(80);
         assert_eq!(line_signature(&first), line_signature(&second));
 
-        // A delta grows the buffer: the next frame must show the new tail.
+        // A delta grows the buffer: once its beat releases, the tail shows it.
         screen.apply(UiEvent::AssistantTextDelta(" four".to_string()));
+        settle_stream(&mut screen);
         let grown = screen.wrapped_lines(80);
         assert!(grown.iter().any(|l| line_text(l).contains("four")));
 
@@ -1166,6 +1202,8 @@ mod tests {
         screen.apply(UiEvent::AssistantTextDelta(
             "Second in progress".to_string(),
         ));
+        // Let the escapement release the second block into the tail.
+        settle_stream(&mut screen);
         let committed2: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert!(
             !committed2.iter().any(|t| t.contains("Second in progress")),
@@ -1454,17 +1492,19 @@ mod tests {
         // that is entirely in-flight is still reachable/visible.
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
-        // Three complete blocks, held in the tail (no commit tick).
+        // Three complete blocks. Before any beat they are held in the escapement
+        // (nothing anywhere yet); the beat then releases them.
         screen.apply(UiEvent::AssistantTextDelta(
             "Tail A.\n\nTail B.\n\nTail C.\n\n".to_string(),
         ));
         assert!(
             screen.transcript.rows.is_empty(),
-            "the tail is not committed without a tick"
+            "nothing is committed or shown before the first beat"
         );
+        settle_stream(&mut screen);
         // The pager sizes its scrollable range from `transcript_visible_total`
-        // (committed rows + streaming preview), not `render().total_lines`.
-        // With nothing committed, the whole visible total is the active tail, so
+        // (committed rows + streaming preview), not `render().total_lines`. The
+        // paced tail (committed prefix + un-emitted tail) must all be counted, so
         // a regression that dropped the tail from the pager total would read 0.
         let visible_total = screen.transcript_visible_total(80);
         assert!(
@@ -1600,6 +1640,367 @@ mod tests {
         );
     }
 
+    // --- The escapement: even beats for the live stream ---
+
+    /// Count occurrences of `needle` in the rendered document (committed rows +
+    /// the transient stream/reasoning tail).
+    fn rendered_needle_count(screen: &mut Screen, needle: &str) -> usize {
+        rendered_text(screen, 90, 60).matches(needle).count()
+    }
+
+    #[test]
+    fn streamed_tail_advances_by_the_beat_quantum_not_the_whole_burst() {
+        // Criterion 2: feed a large burst in one delta — the visible tail grows
+        // only by the beat quantum per tick, never the whole burst at once.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(90);
+        let burst = "word ".repeat(100); // 500 bytes, one open paragraph
+        screen.apply(UiEvent::AssistantTextDelta(burst.clone()));
+        // Nothing is shown before the first beat (held in the escapement).
+        assert_eq!(
+            rendered_needle_count(&mut screen, "word"),
+            0,
+            "no tail before the first beat"
+        );
+        // One beat releases a bounded quantum — some words, but not all 100.
+        let base = std::time::Instant::now();
+        screen.commit_stream_tick(base);
+        let after_one = rendered_needle_count(&mut screen, "word");
+        assert!(
+            after_one > 0 && after_one < 100,
+            "the tail grew by a quantum, not the whole burst: {after_one}"
+        );
+        // Each further beat advances it monotonically until fully drained.
+        screen.commit_stream_tick(base + std::time::Duration::from_millis(100));
+        let after_two = rendered_needle_count(&mut screen, "word");
+        assert!(
+            after_two > after_one,
+            "the tail keeps advancing per beat: {after_one} -> {after_two}"
+        );
+        settle_stream(&mut screen);
+        assert_eq!(
+            rendered_needle_count(&mut screen, "word"),
+            100,
+            "the whole burst drains across beats"
+        );
+        // The committed pipeline is untouched: an open paragraph never commits.
+        assert!(
+            screen.transcript.rows.is_empty(),
+            "the open tail is never committed by the escapement"
+        );
+    }
+
+    #[test]
+    fn pacing_changes_when_a_line_shows_never_what_the_message_is() {
+        // Criterion 3: the finalized message is byte-identical with the
+        // escapement pacing on vs bypassed (reduced motion) — pacing changes
+        // WHEN a line shows, never WHAT the finished message says.
+        let deltas = [
+            "# Heading\n\n",
+            "A paragraph with `code` and **bold**.\n\n",
+            "- item one\n- item two\n\n",
+            "| a | b |\n| --- | --- |\n| 1 | 2 |\n\n",
+            "Final tail line.\n",
+        ];
+        // Paced: escapement on, streamed with per-delta ticks, then finalize.
+        let mut paced = Screen::new();
+        let _ = paced.wrapped_lines(80);
+        let base = std::time::Instant::now();
+        for (i, d) in deltas.iter().enumerate() {
+            paced.apply(UiEvent::AssistantTextDelta((*d).to_string()));
+            paced.commit_stream_tick(base + std::time::Duration::from_millis(i as u64 * 100));
+        }
+        paced.apply(UiEvent::AssistantTextEnd(String::new()));
+
+        // Bypassed: reduced motion, same deltas, no ticks.
+        let mut bypass = Screen::new();
+        bypass.set_reduced_motion(true);
+        let _ = bypass.wrapped_lines(80);
+        for d in deltas {
+            bypass.apply(UiEvent::AssistantTextDelta(d.to_string()));
+        }
+        bypass.apply(UiEvent::AssistantTextEnd(String::new()));
+
+        let paced_rows: Vec<String> = paced.transcript.rows.iter().map(row_text).collect();
+        let bypass_rows: Vec<String> = bypass.transcript.rows.iter().map(row_text).collect();
+        assert_eq!(
+            paced_rows, bypass_rows,
+            "the finished message is byte-identical regardless of pacing"
+        );
+        assert_eq!(
+            line_signature(&paced.wrapped_lines(80)),
+            line_signature(&bypass.wrapped_lines(80)),
+            "rendered finished message differs between paced and bypassed"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_shows_arrival_in_the_same_frame() {
+        // Criterion 6: reduced motion is pass-through — arrival == display in the
+        // same frame, with no beat needed.
+        let mut screen = Screen::new();
+        screen.set_reduced_motion(true);
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "instant answer tail".to_string(),
+        ));
+        assert!(
+            rendered_text(&mut screen, 80, 12).contains("instant answer tail"),
+            "reduced-motion answer renders on arrival, no beat"
+        );
+
+        let mut screen2 = Screen::new();
+        screen2.set_reduced_motion(true);
+        let _ = screen2.wrapped_lines(80);
+        screen2.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen2.apply(UiEvent::AssistantReasoningDelta(
+            "instant reasoning trace".to_string(),
+        ));
+        assert!(
+            rendered_text(&mut screen2, 80, 12).contains("instant reasoning trace"),
+            "reduced-motion reasoning renders on arrival, no beat"
+        );
+    }
+
+    #[test]
+    fn entering_reduced_motion_flushes_held_stream_text() {
+        // Criterion 4 (§2.2): entering reduced motion flushes any escapement-held
+        // text immediately.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "held mid-stream text".to_string(),
+        ));
+        assert!(
+            !rendered_text(&mut screen, 80, 12).contains("held mid-stream text"),
+            "held before entering reduced motion"
+        );
+        screen.set_reduced_motion(true);
+        assert!(
+            rendered_text(&mut screen, 80, 12).contains("held mid-stream text"),
+            "entering reduced motion flushed the held tail"
+        );
+    }
+
+    #[test]
+    fn only_the_commit_tick_beats_the_escapement_no_second_timer() {
+        // Criterion 7: the drain is driven by the existing tick/commit cadence
+        // ONLY. The animation tick (`screen.tick`) must not advance the tail —
+        // there is no second timer.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "held until the commit tick".to_string(),
+        ));
+        for _ in 0..5 {
+            let _ = screen.tick();
+        }
+        assert!(
+            !rendered_text(&mut screen, 80, 12).contains("held until"),
+            "screen.tick (animation) must not beat the escapement"
+        );
+        // Only commit_stream_tick — the same cadence that paces scrollback —
+        // advances the tail.
+        assert!(screen.commit_stream_tick(std::time::Instant::now()));
+        assert!(
+            rendered_text(&mut screen, 80, 12).contains("held until"),
+            "commit_stream_tick is the single beat driver"
+        );
+    }
+
+    #[test]
+    fn approval_gate_flushes_pending_text_before_the_review_block() {
+        // Criterion 4 (§2.2): an approval gate opening flushes — the user must
+        // review against complete context, so the pending assistant text is
+        // visible above the REVIEW block.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(100);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "Rationale for the proposed change.\n\n".to_string(),
+        ));
+        // The gated tool opens its REVIEW block; the block's own begin_block
+        // finalizes (flushes) the stream so the text lands above it.
+        let call = call_args("bash", json!({ "command": "rm -rf build" }));
+        screen.apply(UiEvent::ToolReview {
+            call,
+            allow_always: true,
+            allow_project: false,
+            dirty_gate: false,
+            reason: None,
+        });
+        let out = rendered_text(&mut screen, 100, 30);
+        let text_at = out
+            .find("Rationale for the proposed change.")
+            .expect("pending text visible before review");
+        let review_at = out.find("REVIEW").expect("review block rendered");
+        assert!(
+            text_at < review_at,
+            "pending assistant text renders above the REVIEW block: {out}"
+        );
+    }
+
+    #[test]
+    fn show_approval_flushes_the_pending_tail() {
+        // Criterion 4 (§2.2): the show_approval entry point itself flushes the
+        // escapement into the tail, independent of the block-rendering path.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "pending answer tail".to_string(),
+        ));
+        assert!(
+            !rendered_text(&mut screen, 80, 12).contains("pending answer tail"),
+            "held before the gate opens"
+        );
+        screen.show_approval(true, false, false);
+        assert!(
+            rendered_text(&mut screen, 80, 12).contains("pending answer tail"),
+            "the approval gate released the held tail"
+        );
+    }
+
+    #[test]
+    fn session_reset_flushes_the_pending_stream() {
+        // Criterion 4 (§2.2): a session reset (`/new`) flushes — the stream is
+        // finalized, its text committed, and no escapement backlog is stranded.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "answer before the reset.\n\n".to_string(),
+        ));
+        screen.apply(UiEvent::SessionStarted);
+        assert!(
+            !screen.transcript.stream.is_active() && !screen.has_stream_work(),
+            "the session reset flushed and finalized the stream"
+        );
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|r| row_text(r).contains("answer before the reset.")),
+            "the held text was flushed, not stranded"
+        );
+    }
+
+    #[test]
+    fn cancel_flushes_the_held_answer_tail_without_an_end() {
+        // Criterion 4 (§2.2): a terminal provider event (cancel) flushes the
+        // answer stream even when no AssistantTextEnd precedes it.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "partial answer held in the escapement.\n\n".to_string(),
+        ));
+        screen.apply(UiEvent::ProviderTurnCancelled {
+            turn_id: "t1".to_string(),
+        });
+        assert!(
+            !screen.transcript.stream.is_active() && !screen.has_stream_work(),
+            "cancel finalized the stream"
+        );
+        let committed = screen
+            .transcript
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            committed
+                .matches("partial answer held in the escapement.")
+                .count(),
+            1,
+            "the held tail is committed exactly once on cancel: {committed}"
+        );
+    }
+
+    #[test]
+    fn reasoning_burst_paces_across_beats_and_flushes_on_end() {
+        // Criterion 5: a reasoning delta burst renders across beats (not all at
+        // once), and reasoning end flushes the trace.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(90);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        let burst = "reasoning ".repeat(30); // 300 bytes
+        screen.apply(UiEvent::AssistantReasoningDelta(burst));
+        // Held until the beat: nothing shown yet.
+        assert_eq!(
+            rendered_needle_count(&mut screen, "reasoning"),
+            0,
+            "reasoning is held until the beat"
+        );
+        // One beat releases a bounded quantum of the trace, not all of it.
+        screen.commit_stream_tick(std::time::Instant::now());
+        let after_one = rendered_needle_count(&mut screen, "reasoning");
+        assert!(
+            after_one > 0 && after_one < 30,
+            "reasoning renders across beats, not all at once: {after_one}"
+        );
+        settle_stream(&mut screen);
+        assert_eq!(
+            rendered_needle_count(&mut screen, "reasoning"),
+            30,
+            "the whole reasoning burst drains across beats"
+        );
+        // Still transient — not committed to scrollback until the trace ends.
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .all(|r| !row_text(r).contains("reasoning")),
+            "reasoning preview stays transient before its end"
+        );
+        // Reasoning end (a non-reasoning event) flushes + commits the trace.
+        screen.apply(UiEvent::TurnComplete);
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|r| row_text(r).contains("reasoning")),
+            "reasoning flushed and committed on end"
+        );
+    }
+
+    #[test]
+    fn reasoning_flushes_and_commits_on_provider_error() {
+        // Criterion 4 (§2.2): a provider error flushes the reasoning trace.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(
+            "partial thought held".to_string(),
+        ));
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .all(|r| !row_text(r).contains("partial thought held")),
+            "held before the error"
+        );
+        screen.apply(UiEvent::ProviderTurnError {
+            turn_id: "t1".to_string(),
+            message: "boom".to_string(),
+        });
+        assert!(
+            screen
+                .transcript
+                .rows
+                .iter()
+                .any(|r| row_text(r).contains("partial thought held")),
+            "reasoning flushed and committed on error"
+        );
+    }
+
     // --- Slice 3: provider-neutral live reasoning deltas ---
 
     #[test]
@@ -1613,6 +2014,9 @@ mod tests {
         // the frame but NOT yet committed to scrollback.
         screen.apply(UiEvent::AssistantReasoningDelta("Weighing ".to_string()));
         screen.apply(UiEvent::AssistantReasoningDelta("the options.".to_string()));
+        // The reasoning caret steps on the tick beat: let the escapement release
+        // the held reasoning into the preview.
+        settle_stream(&mut screen);
         let preview = rendered_text(&mut screen, 80, 16);
         assert!(
             preview.contains("THINKING"),
@@ -1639,6 +2043,8 @@ mod tests {
                 .any(|r| row_text(r).contains("Weighing the options.")),
             "reasoning committed on first answer delta"
         );
+        // Release the held answer into the tail so it renders below the trace.
+        settle_stream(&mut screen);
         let out = rendered_text(&mut screen, 80, 16);
         let thinking_at = out.find("THINKING").expect("thinking");
         let answer_at = out.find("Here is the answer.").expect("answer");
@@ -1832,7 +2238,8 @@ mod tests {
         screen.apply(UiEvent::AssistantReasoningSectionBreak);
         screen.apply(UiEvent::AssistantReasoningDelta("Second part.".to_string()));
         // A leading section break (before any text) is a no-op; the two parts
-        // both render in the live preview.
+        // both render in the live preview once their beats release.
+        settle_stream(&mut screen);
         let preview = rendered_text(&mut screen, 80, 16);
         assert!(preview.contains("First part."), "{preview}");
         assert!(preview.contains("Second part."), "{preview}");
@@ -1936,12 +2343,15 @@ mod tests {
         screen.commit_user("a user prompt that wraps across the narrow test width");
         check(&mut screen, &mut incremental);
 
-        // Streaming frames: transient rows after committed history.
+        // Streaming frames: transient rows after committed history. Beat the
+        // escapement so the paced tail is actually present to diff.
         screen.apply(UiEvent::AssistantTextDelta(
             "streaming **tail** ".to_string(),
         ));
+        settle_stream(&mut screen);
         check(&mut screen, &mut incremental);
         screen.apply(UiEvent::AssistantTextDelta("grows".to_string()));
+        settle_stream(&mut screen);
         check(&mut screen, &mut incremental);
         screen.apply(UiEvent::AssistantTextEnd(String::new()));
         check(&mut screen, &mut incremental);
@@ -5469,10 +5879,11 @@ mod tests {
                     line_text(&line)
                 );
             }
-            // Streaming path.
+            // Streaming path: beat the escapement so the table is in the tail.
             let mut screen = Screen::new();
             let _ = screen.wrapped_lines(width);
             screen.apply(UiEvent::AssistantTextDelta(md.to_string()));
+            settle_stream(&mut screen);
             for line in rendered_lines(&mut screen, width, 24) {
                 let w = super::wrap::display_width(&line_text(&line));
                 assert!(

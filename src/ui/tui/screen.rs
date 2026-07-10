@@ -1103,8 +1103,13 @@ pub(crate) struct SearchState {
 
 impl Screen {
     pub(crate) fn new() -> Self {
+        let mut transcript = Transcript::default();
+        // The stream escapement honors the env flag from construction, exactly
+        // like the spinner and flow meter (the persisted preference is applied
+        // post-construction via `set_reduced_motion`, same as theirs).
+        transcript.set_reduced_motion(reduced_motion());
         Self {
-            transcript: Transcript::default(),
+            transcript,
             editor: fresh_editor(),
             palette: Palette::default(),
             spinner: Spinner {
@@ -1327,6 +1332,8 @@ impl Screen {
         self.reduced_motion = reduced_motion;
         self.spinner.reduced_motion = reduced_motion;
         self.flow_meter.reduced_motion = reduced_motion;
+        // The stream escapement is motion too: reduced motion is pass-through.
+        self.transcript.set_reduced_motion(reduced_motion);
     }
 
     /// Dismiss the start page: entering a session replaces the launcher with
@@ -2057,6 +2064,11 @@ impl Screen {
         allow_project: bool,
         dirty_gate: bool,
     ) {
+        // The user must review against complete context: release any escapement-
+        // held stream text into the tail before the REVIEW gate takes over
+        // (§2.2 flush trigger). The gated block itself commits via its own
+        // begin_block/finish_stream; this covers any residue.
+        self.transcript.flush_live_escapements();
         // The review takes the input surface: close any dropdown.
         self.session_menu = None;
         self.phase = WorkPhase::AwaitingApproval;
