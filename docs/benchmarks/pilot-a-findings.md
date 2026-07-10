@@ -50,7 +50,7 @@ Tests (in-gate, no provider):
 while other rows only trailed by the just-generated output tokens.
 
 **Root cause -- harness sampling artifact, NOT a runtime undercount.** The
-column was mis-sampled on two counts:
+column was sampled wrongly on two counts:
 1. It was not the estimator at all. It was `context_diagnostics().measured`
    (`measure_context`, provider-anchored), so it could never serve its
    documented purpose (catching estimator drift).
