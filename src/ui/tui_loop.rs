@@ -2567,8 +2567,12 @@ async fn run_login(
         }
     };
     apply_notices(tui, lines);
+    // Close the login dialog but do NOT draw here: run_login is reached only from
+    // the providers hatch, so the `run_modal_phase` stash owns the return — it
+    // refreshes the snapshot (a login can grow the catalog) and reopens the
+    // faceplate expanded BEFORE the next draw. A draw here would paint one frame
+    // with no modal (the dock collapsed) between close and reopen (§7 criterion 7).
     tui.screen.close_modal();
-    tui.draw()?;
     Ok(())
 }
 
@@ -5270,8 +5274,9 @@ mod tests {
         // Models run_modal_phase's draw ordering (~L2170–2185) over a real Screen
         // and the production `refresh_settings_panel` reopen: the guard's own
         // handler closes the panel (no draw in that window), then the loop reopens
-        // the faceplate BEFORE the next draw. Covers the API-key dialog and the
-        // large-context switch prompt; the login dialog is added with its draw fix.
+        // the faceplate BEFORE the next draw. Covers all three guards — the OAuth
+        // login dialog (whose run_login no longer draws after closing), the
+        // API-key dialog, and the large-context switch prompt.
         let (mut harness, _dir) = harness_with_context(80_000, Some(40_000));
         let build = |_s: &ModelSelection, _p: &str| Ok(NullChat);
         let mut switch = ModelSwitch::new(null_selection(), "P".to_string(), &build, None);
@@ -5292,6 +5297,12 @@ mod tests {
         };
 
         let cases: Vec<(settings_menu::HatchTarget, Modal)> = vec![
+            // The OAuth login dialog — the path whose trailing draw was removed so
+            // the stash owns the reopen.
+            (
+                settings_menu::HatchTarget::Login,
+                Modal::LoginDialog(LoginDialog::new("Anthropic", true)),
+            ),
             (
                 settings_menu::HatchTarget::Login,
                 login::open_api_key_dialog("openai"),
