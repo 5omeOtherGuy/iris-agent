@@ -1908,7 +1908,11 @@ mod tests {
     #[test]
     fn text_path_compact_on_in_memory_session_reports_why() -> Result<()> {
         let (mut harness, _dir) = fake_harness();
-        let mut ui = TextUi::new("/compact\n/quit\n".as_bytes(), Vec::new(), Vec::new());
+        let mut ui = TextUi::new(
+            "/compact preserve exact flags\n/quit\n".as_bytes(),
+            Vec::new(),
+            Vec::new(),
+        );
         let mut switch = None;
         run_session(&mut harness, &mut ui, &mut switch)?;
         let (_, out, _) = ui.into_parts();
