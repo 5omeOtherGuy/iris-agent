@@ -1277,28 +1277,52 @@ fn execute_menu_action<P: ChatProvider>(
 /// free headroom, plus per-batch fold lines tagged with their trigger class.
 /// Everything is an estimate from data that already exists (the harness
 /// message estimates, the budget, the runtime fold/compaction events and the
-/// pending set); nothing is fabricated, and the system+tools row is labeled
-/// as outside the budget estimate (the budget covers conversation messages).
+/// pending set); nothing is fabricated. System+tools are labeled as included
+/// when provider usage anchors the total and display-only for local estimates.
 fn context_breakdown_lines<P: ChatProvider>(
     harness: &crate::wayland::Harness<P>,
     switch: Option<&ModelSwitch<'_, P>>,
     accounting: &super::tui::ContextAccounting,
 ) -> Vec<String> {
     use crate::session::estimate_tokens;
-    let total = harness.context_token_estimate();
+    let local_total = harness.context_token_estimate();
     let mut lines = Vec::new();
-    match harness.context_budget() {
-        Some(budget) => {
+    match harness.context_diagnostics() {
+        Some(diagnostics) => {
+            let total = diagnostics.measured;
+            let budget = diagnostics.ladder.effective_window;
             let pct = (total.saturating_mul(100)).checked_div(budget).unwrap_or(0);
+            let source = match diagnostics.source {
+                crate::nexus::ContextMeasurementSource::ProviderReportedPlusLocal => {
+                    "provider-reported + local"
+                }
+                crate::nexus::ContextMeasurementSource::Estimated => "estimated",
+            };
             lines.push(format!(
-                "context: ~{total} of {budget} tokens ({pct}% of the compaction budget)"
+                "context: ~{total} of {budget} tokens ({pct}% of effective window; {source})"
             ));
             lines.push(format!(
                 "  free headroom      ~{} tokens",
                 budget.saturating_sub(total)
             ));
+            let state = if diagnostics.automatic_enabled {
+                "on"
+            } else {
+                "off"
+            };
+            let job = if diagnostics.background_running {
+                "running"
+            } else {
+                "idle"
+            };
+            lines.push(format!(
+                "  compaction         {state}; warn {} / start {} / hard {}; job {job}",
+                diagnostics.ladder.warn, diagnostics.ladder.start, diagnostics.ladder.hard
+            ));
         }
-        None => lines.push(format!("context: ~{total} tokens (no compaction budget)")),
+        None => lines.push(format!(
+            "context: ~{local_total} tokens (no compaction window)"
+        )),
     }
     // System prompt + tool declarations: sent with every request but not part
     // of the conversation estimate the budget covers.
@@ -1314,8 +1338,19 @@ fn context_breakdown_lines<P: ChatProvider>(
                     .saturating_add(estimate_tokens(&tool.parameters().to_string()))
             })
             .fold(0, u64::saturating_add);
+        let inclusion = harness.context_diagnostics().map_or(
+            "display-only; no window configured",
+            |diagnostics| match diagnostics.source {
+                crate::nexus::ContextMeasurementSource::ProviderReportedPlusLocal => {
+                    "included in provider-reported total"
+                }
+                crate::nexus::ContextMeasurementSource::Estimated => {
+                    "not included in conversation-only estimate"
+                }
+            },
+        );
         lines.push(format!(
-            "  system + tools     ~{} tokens (per request, outside the budget estimate)",
+            "  system + tools     ~{} tokens ({inclusion})",
             system.saturating_add(tools)
         ));
     }
@@ -1335,7 +1370,7 @@ fn context_breakdown_lines<P: ChatProvider>(
         .count();
     lines.push(format!(
         "  raw conversation   ~{} tokens",
-        total.saturating_sub(summarized)
+        local_total.saturating_sub(summarized)
     ));
     let (original_total, summary_total) = accounting
         .compactions

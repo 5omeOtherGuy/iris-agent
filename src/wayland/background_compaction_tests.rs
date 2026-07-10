@@ -3,12 +3,13 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
 use super::{Harness, SummarizerKind};
+use crate::config::CompactionTriggerConfig;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate,
     AssistantTurn, ChatProvider, CompactionLifecycleState, CompactionOrigin, Message,
@@ -681,4 +682,117 @@ fn stale_background_result_is_discarded_after_parent_revalidation() {
         1,
         "stale worker result must not append a second compaction"
     );
+}
+
+#[test]
+fn hard_tier_bounds_wait_then_cancels_and_applies_deterministic_fallback() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut seeded = seed_harness(&root.path, &workspace.path);
+    let worker_prompts = Arc::new(Mutex::new(Vec::new()));
+    seeded
+        .harness
+        .set_compaction_summarizer_factory(BlockingSummaryProvider::factory(
+            worker_prompts.clone(),
+        ));
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    // Start through the legacy test seam, then engage v2 with an immediate
+    // hard-wait deadline. The production host installs v2 at startup.
+    block_on(seeded.harness.maybe_auto_compact(&obs, &token, true)).unwrap();
+    assert_eq!(obs.lifecycle(CompactionLifecycleState::Running), 1);
+    for _ in 0..50 {
+        if !worker_prompts.lock().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    seeded.harness.set_compaction_trigger(
+        300,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.85,
+            keep_recent_tokens: 20_000,
+            hard_wait_ms: 0,
+            max_consecutive_failures: 3,
+        },
+    );
+
+    let started = Instant::now();
+    block_on(seeded.harness.maybe_auto_compact(&obs, &token, false)).unwrap();
+    assert!(started.elapsed() < Duration::from_millis(100));
+    assert_eq!(obs.lifecycle(CompactionLifecycleState::Cancelled), 1);
+    assert_eq!(obs.applied(), 1);
+}
+
+#[test]
+fn v2_off_switch_leaves_automatic_rewrites_disabled() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut seeded = seed_harness(&root.path, &workspace.path);
+    seeded.harness.set_compaction_trigger(
+        300,
+        CompactionTriggerConfig {
+            enabled: false,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.85,
+            keep_recent_tokens: 20_000,
+            hard_wait_ms: 0,
+            max_consecutive_failures: 3,
+        },
+    );
+    let obs = Recorder::default();
+    block_on(
+        seeded
+            .harness
+            .maybe_auto_compact(&obs, &CancellationToken::new(), false),
+    )
+    .unwrap();
+    assert_eq!(obs.applied(), 0);
+    assert_eq!(obs.lifecycle(CompactionLifecycleState::Running), 0);
+}
+
+#[test]
+fn breaker_disables_model_jobs_but_keeps_deterministic_compaction() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut seeded = seed_harness(&root.path, &workspace.path);
+    seeded.harness.set_compaction_trigger(
+        300,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.1,
+            start: 0.2,
+            hard: 0.9,
+            keep_recent_tokens: 20_000,
+            hard_wait_ms: 0,
+            max_consecutive_failures: 3,
+        },
+    );
+    let ladder = seeded.harness.compaction.ladder.as_mut().unwrap();
+    ladder.warn = 1;
+    ladder.start = 2;
+    ladder.hard = u64::MAX;
+    ladder.deterministic_only = false;
+    for _ in 0..3 {
+        seeded.harness.record_compaction_failure();
+    }
+    let obs = Recorder::default();
+    block_on(
+        seeded
+            .harness
+            .maybe_auto_compact(&obs, &CancellationToken::new(), true),
+    )
+    .unwrap();
+
+    assert_eq!(obs.lifecycle(CompactionLifecycleState::Running), 0);
+    assert_eq!(obs.applied(), 1);
+    assert!(obs.events.borrow().iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(message) if message.contains("disabled after 3 consecutive failures")
+    )));
 }

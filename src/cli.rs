@@ -37,6 +37,7 @@ pub(crate) struct ModelSwitch<'a, P> {
     /// factory. Text/TUI model switches update it at the same boundary as the
     /// foreground provider swap; tests and generic harnesses leave it unset.
     background_selection: Option<Arc<Mutex<ModelSelection>>>,
+    compaction_settings: Option<config::Settings>,
     /// Ordered `provider/model` ids that scope Ctrl+P cycling, or `None` to cycle
     /// every authenticated model. Seeded from `settings.enabled_models` and edited
     /// by `/scoped-models`; only the picker's Ctrl+S persists it back to settings.
@@ -55,12 +56,17 @@ impl<'a, P> ModelSwitch<'a, P> {
             system_prompt,
             build,
             background_selection: None,
+            compaction_settings: None,
             scoped,
         }
     }
 
     pub(crate) fn set_background_selection_cell(&mut self, cell: Arc<Mutex<ModelSelection>>) {
         self.background_selection = Some(cell);
+    }
+
+    pub(crate) fn set_compaction_settings(&mut self, settings: config::Settings) {
+        self.compaction_settings = Some(settings);
     }
 
     /// The active resolved selection (provider/model/base-url/reasoning).
@@ -690,6 +696,11 @@ pub(crate) fn apply_selection<P: ChatProvider>(
     };
     let scope = switch_scope(&switch.selection, &candidate);
     harness.replace_provider(provider);
+    if let Some(settings) = switch.compaction_settings.as_ref()
+        && let Ok((window, trigger)) = crate::resolved_compaction_trigger(settings, &candidate)
+    {
+        harness.set_compaction_trigger(window, trigger);
+    }
     // Install the new lane's cache profile for the fold scheduler (issue
     // #400) before recording the switch, so the A2/A3 break is scheduled
     // against the profile of the lane the next request actually uses.

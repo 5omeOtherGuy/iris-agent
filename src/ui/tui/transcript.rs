@@ -2181,6 +2181,7 @@ impl Transcript {
             self.finish_live_reasoning_if_any();
         }
         match event {
+            UiEvent::ContextPressure { .. } => {}
             UiEvent::AssistantReasoningDelta(delta) => {
                 self.push_reasoning_delta(&delta);
             }

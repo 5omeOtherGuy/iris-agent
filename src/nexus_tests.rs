@@ -6089,6 +6089,7 @@ fn replace_provider_replans_the_tool_surface() {
         agent.tools.iter().any(|tool| tool.name() == "edit"),
         "edit is visible under default capabilities"
     );
+    agent.last_provider_usage = Some((42_000, 7));
 
     agent.replace_provider(SurfaceProbe::new(
         ProviderCapabilities { native_edit: true },
@@ -6105,6 +6106,11 @@ fn replace_provider_replans_the_tool_surface() {
     assert!(
         agent.tools.by_name("edit").is_some(),
         "hidden edit is still executable"
+    );
+    assert_eq!(
+        agent.last_provider_usage_anchor(),
+        None,
+        "usage from the prior provider must not seed the new lane"
     );
 }
 

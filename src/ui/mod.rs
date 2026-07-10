@@ -143,6 +143,12 @@ pub(crate) trait Ui {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UiEvent {
     SessionStarted,
+    ContextPressure {
+        tier: crate::nexus::ContextPressureTier,
+        measured: u64,
+        effective_window: u64,
+        source: crate::nexus::ContextMeasurementSource,
+    },
     ProviderTurnStarted {
         turn_id: String,
     },
@@ -303,6 +309,17 @@ impl UiEvent {
     /// both the blocking text bridge and the async loop bridge agree.
     pub(crate) fn from_agent_event(event: AgentEvent) -> Self {
         match event {
+            AgentEvent::ContextPressure {
+                tier,
+                measured,
+                effective_window,
+                source,
+            } => UiEvent::ContextPressure {
+                tier,
+                measured,
+                effective_window,
+                source,
+            },
             AgentEvent::ProviderTurnStarted { turn_id } => UiEvent::ProviderTurnStarted { turn_id },
             AgentEvent::ProviderTurnCompleted {
                 turn_id,

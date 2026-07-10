@@ -20,11 +20,11 @@ use crate::mimir::auth::storage::{AuthStore, CredentialKind};
 use crate::mimir::selection::{ModelSelection, OpenAiCompatibleConfig, ProviderId};
 
 /// The hand-maintained set of (provider, model id, display name, context-window
-/// label) tuples Iris supports. New models are added here in one place; the list
-/// intentionally stays small.
+/// label) tuples Iris supports. The label also resolves to the numeric trigger
+/// window below. New models are added here in one place; the list stays small.
 ///
-// ponytail: the context-window labels are hand-maintained display strings for
-// the `/model` picker badge, not enforced limits. Verify against provider docs
+// ponytail: context-window labels are hand-maintained catalog facts used by the
+// `/model` picker and the compaction trigger. Verify them with output reserves
 // when adding models; the upgrade path is a generated registry (declined for
 // now, see model_catalog module docs).
 // Anthropic rows are the Claude Code subscription matrix; their wire facts
@@ -264,6 +264,81 @@ pub(crate) fn context_window_label(tokens: u64) -> String {
     }
 }
 
+/// Where the numeric context window came from. Kept in Mimir so Wayland never
+/// branches on provider or model ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextWindowSource {
+    Catalog,
+    OpenAiCompatible,
+}
+
+/// Provider-neutral window handed inward to the compaction trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EffectiveContextWindow {
+    pub(crate) raw: u64,
+    pub(crate) max_output_reserve: u64,
+    pub(crate) summary_reserve: u64,
+    pub(crate) effective: u64,
+    pub(crate) source: ContextWindowSource,
+}
+
+/// Resolve the active selection's enforced context capacity. Display labels
+/// remain generated from the same catalog facts; custom compatible endpoints
+/// use their configured numeric window and make no claim about an output cap.
+pub(crate) fn effective_context_window(
+    selection: &ModelSelection,
+    summary_reserve: u64,
+) -> Option<EffectiveContextWindow> {
+    let (raw, max_output_reserve, source) = if selection.provider == ProviderId::OpenAiCompatible {
+        (
+            selection.open_ai_compatible.context_window?,
+            0,
+            ContextWindowSource::OpenAiCompatible,
+        )
+    } else {
+        let qualified = format!("{}/{}", selection.provider.as_str(), selection.model);
+        let raw = catalog_context_window(&qualified)?;
+        let max_output = catalog_max_output_tokens(selection.provider, &selection.model);
+        (raw, max_output, ContextWindowSource::Catalog)
+    };
+    Some(EffectiveContextWindow {
+        raw,
+        max_output_reserve,
+        summary_reserve,
+        effective: raw
+            .saturating_sub(max_output_reserve)
+            .saturating_sub(summary_reserve),
+        source,
+    })
+}
+
+fn catalog_context_window(qualified: &str) -> Option<u64> {
+    ctx_label(qualified).and_then(|label| match label {
+        "128k" => Some(128_000),
+        "200k" => Some(200_000),
+        "300k" => Some(300_000),
+        "1M" => Some(1_000_000),
+        _ => None,
+    })
+}
+
+fn catalog_max_output_tokens(provider: ProviderId, model: &str) -> u64 {
+    if provider == ProviderId::Anthropic {
+        return crate::mimir::anthropic_models::find(model)
+            .map(|model| u64::from(model.output_cap))
+            .unwrap_or(64_000);
+    }
+    match provider {
+        // These are selection/catalog reserves, not request limits. Provider
+        // adapters may choose a smaller response for an individual request.
+        ProviderId::OpenAiCodex => 128_000,
+        ProviderId::OpenAi if model.starts_with("gpt-4.1") => 32_768,
+        ProviderId::OpenAi => 16_384,
+        ProviderId::Antigravity => 65_536,
+        ProviderId::OpenAiCompatible | ProviderId::Anthropic => 0,
+    }
+}
+
 /// Result of resolving a `/model <search>` argument against a candidate set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExactMatch {
@@ -349,6 +424,7 @@ mod tests {
             tui: None,
             default_approval: None,
             worktree_root: None,
+            compaction: None,
         }
     }
 
@@ -358,6 +434,56 @@ mod tests {
             model(ProviderId::Anthropic, "claude-sonnet-4-6").qualified(),
             "anthropic/claude-sonnet-4-6"
         );
+    }
+
+    #[test]
+    fn effective_window_reserves_model_output_and_summary_capacity() {
+        let haiku = settings(Some("anthropic"), Some("claude-haiku-4-5"), None);
+        let haiku = ModelSelection::resolve(&haiku).unwrap();
+        assert_eq!(
+            effective_context_window(&haiku, 8_192),
+            Some(EffectiveContextWindow {
+                raw: 200_000,
+                max_output_reserve: 64_000,
+                summary_reserve: 8_192,
+                effective: 127_808,
+                source: ContextWindowSource::Catalog,
+            })
+        );
+
+        let codex = settings(Some("openai-codex"), Some("gpt-5.4-mini"), None);
+        let codex = ModelSelection::resolve(&codex).unwrap();
+        assert_eq!(
+            effective_context_window(&codex, 8_192),
+            Some(EffectiveContextWindow {
+                raw: 300_000,
+                max_output_reserve: 128_000,
+                summary_reserve: 8_192,
+                effective: 163_808,
+                source: ContextWindowSource::Catalog,
+            })
+        );
+    }
+
+    #[test]
+    fn openai_compatible_window_is_numeric_and_unknown_models_degrade() {
+        let custom = settings(Some("openai-compatible"), Some("llama3.1"), None);
+        let custom = ModelSelection::resolve(&custom).unwrap();
+        assert_eq!(
+            effective_context_window(&custom, 8_192),
+            Some(EffectiveContextWindow {
+                raw: 131_072,
+                max_output_reserve: 0,
+                summary_reserve: 8_192,
+                effective: 122_880,
+                source: ContextWindowSource::OpenAiCompatible,
+            })
+        );
+
+        let mut unknown_settings = settings(Some("openai"), Some("gpt-unknown"), None);
+        unknown_settings.open_ai_compatible = None;
+        let unknown = ModelSelection::resolve(&unknown_settings).unwrap();
+        assert_eq!(effective_context_window(&unknown, 8_192), None);
     }
 
     #[test]

@@ -98,7 +98,7 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 | Tool execution state (observed files, bash sessions) | `tools/observe.rs`, `tools/bash/session.rs` (`ToolState`) |
 | Host capabilities, if a plugin system is ever added (`host_read`, `host_ls`, later `host_*_plan`) | _exploratory (issue #18)_ |
 | Oversized tool-output handle storage | `handles.rs`, `wayland/mod.rs` |
-| Context compaction | `wayland/mod.rs`, `session.rs` |
+| Context compaction engine, hybrid measurement, and trigger ladder | `wayland/compaction.rs`, `wayland/trigger.rs`, `wayland/mod.rs`, `session.rs` |
 | System-prompt / project-instruction assembly (fragments + generated tool blocks + project docs + runtime context) | `wayland/system_prompt/` |
 | Skills: bounded repo/user/system/admin discovery, Codex metadata/config compatibility, metadata budgeting, contextual injection, confined resource reads, refresh-at-turn-boundary | `wayland/skills/`, `wayland/mod.rs`, `tools/read.rs` |
 
