@@ -57,6 +57,7 @@
 //! files into the prompt.
 
 mod defaults;
+pub(crate) mod onboarding;
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -291,22 +292,37 @@ fn default_fragments() -> Vec<Fragment> {
 
 /// Discover project docs walking `cwd` -> filesystem root, deduping by path, and
 /// returning them root-to-leaf (pi order). Each directory contributes its first
-/// existing, non-empty, regular-file candidate.
+/// existing, non-empty, regular-file candidate. Additionally, `~/.iris/AGENTS.md`
+/// is prepended as the outermost user-level doc (before the root-to-leaf walk
+/// results) when it exists and is non-empty, so user-level instructions from
+/// onboarding or manual placement always appear first.
 fn discover_project_docs(cwd: &Path) -> Vec<(String, String)> {
+    let mut docs = Vec::new();
+
+    // Prepend ~/.iris/AGENTS.md as the outermost user-level doc.
+    if let Some(iris_path) = onboarding::iris_agents_path()
+        && let Some(content) = read_regular_bounded(&iris_path, MAX_DOC_BYTES)
+        && !content.trim().is_empty()
+    {
+        let path_str = iris_path.display().to_string();
+        docs.push((path_str, content));
+    }
+
     // Each iteration shortens `current` via `parent()`, so every visited dir --
     // and therefore every candidate path -- is unique; no dedup set is needed.
-    let mut docs = Vec::new();
+    let mut walk_docs = Vec::new();
     let mut current = cwd.to_path_buf();
     loop {
         if let Some(doc) = read_doc_in_dir(&current) {
-            docs.push(doc);
+            walk_docs.push(doc);
         }
         match current.parent() {
             Some(parent) => current = parent.to_path_buf(),
             None => break,
         }
     }
-    docs.reverse(); // leaf-first collection -> root-to-leaf emission
+    walk_docs.reverse(); // leaf-first collection -> root-to-leaf emission
+    docs.extend(walk_docs);
     docs
 }
 
