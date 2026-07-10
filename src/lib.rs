@@ -455,6 +455,10 @@ fn run_agent_inner(
     let permission_defaults =
         startup_permission_defaults(settings.default_approval.as_deref(), cli_skip_permissions);
     persist_cli_skip_permissions(cli_skip_permissions);
+    // First-run onboarding: if no ~/.iris/AGENTS.md exists, discover peer-tool
+    // instruction files and offer the user a choice. Must run before assemble()
+    // so the newly written file is picked up by the project-doc discovery walk.
+    wayland::system_prompt::onboarding::maybe_onboard();
     // Harness-owned assembly: the fragment/slot baukasten composes the prompt
     // from the in-binary shipped fragments plus dynamic context (project docs,
     // date, cwd) and the live tool registry (ADR-0026). Fresh and resume call
@@ -903,6 +907,8 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
 
     // Resume assembles instructions through the same harness-owned baukasten as
     // a fresh session, so a resumed turn gets identical fragment/context output.
+    // Onboarding must run first so a newly written ~/.iris/AGENTS.md is picked up.
+    wayland::system_prompt::onboarding::maybe_onboard();
     let tools =
         tools::built_in_tools_for(settings.bash_tool_mode(), settings.compaction_model_tool());
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);

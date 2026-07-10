@@ -607,3 +607,68 @@ fn civil_from_days_matches_known_dates() {
     // 2021-01-01 is 18628 days after the epoch.
     assert_eq!(civil_from_days(18_628), (2021, 1, 1));
 }
+
+// ---- user-level ~/.iris/AGENTS.md integration ------------------------------
+
+#[test]
+fn discover_prepends_iris_agents_when_present() {
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    let iris_dir = home.path.join(".iris");
+    fs::create_dir_all(&iris_dir).unwrap();
+    fs::write(iris_dir.join("AGENTS.md"), "USER LEVEL RULES").unwrap();
+
+    let ws = temp_dir();
+    fs::write(ws.path.join("AGENTS.md"), "PROJECT RULES").unwrap();
+
+    let docs = discover_project_docs(&ws.path);
+    // User-level doc appears first (outermost), project doc appears after.
+    let user_pos = docs
+        .iter()
+        .position(|(_, c)| c.contains("USER LEVEL RULES"))
+        .expect("user-level doc present");
+    let project_pos = docs
+        .iter()
+        .position(|(_, c)| c.contains("PROJECT RULES"))
+        .expect("project doc present");
+    assert!(
+        user_pos < project_pos,
+        "user-level ~/.iris/AGENTS.md must be outermost (first)"
+    );
+    // Verify the path recorded is the ~/.iris/AGENTS.md path.
+    assert!(docs[user_pos].0.contains(".iris/AGENTS.md"));
+}
+
+#[test]
+fn discover_skips_empty_iris_agents_sentinel() {
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    let iris_dir = home.path.join(".iris");
+    fs::create_dir_all(&iris_dir).unwrap();
+    // Zero-byte sentinel from a skipped onboarding.
+    fs::write(iris_dir.join("AGENTS.md"), "").unwrap();
+
+    let ws = temp_dir();
+    let docs = discover_project_docs(&ws.path);
+    assert!(
+        docs.iter().all(|(p, _)| !p.contains(".iris/AGENTS.md")),
+        "empty sentinel must not appear in project docs"
+    );
+}
+
+#[test]
+fn discover_works_without_iris_agents() {
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    // No ~/.iris/AGENTS.md at all.
+
+    let ws = temp_dir();
+    fs::write(ws.path.join("AGENTS.md"), "PROJECT ONLY").unwrap();
+
+    let docs = discover_project_docs(&ws.path);
+    assert!(docs.iter().any(|(_, c)| c.contains("PROJECT ONLY")));
+    assert!(
+        docs.iter().all(|(p, _)| !p.contains(".iris/AGENTS.md")),
+        "no iris agents path when file is absent"
+    );
+}
