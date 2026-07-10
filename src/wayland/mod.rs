@@ -2733,6 +2733,10 @@ mod background_compaction_tests;
 mod incremental_persistence_tests;
 
 #[cfg(test)]
+#[path = "compaction_property_tests.rs"]
+mod compaction_property_tests;
+
+#[cfg(test)]
 mod carry_tests {
     use super::{MAX_CARRY_PATHS, combined_shrinks, derive_carry_paths};
     use crate::nexus::Message;
