@@ -53,6 +53,9 @@
 | [0050](0050-stream-reasoning-summary-deltas.md) | Stream reasoning summary deltas as a display event | accepted | 2026-07-05 |
 | [0051](0051-cache-aware-fold-flush-scheduling.md) | Cache-aware fold flush scheduling | accepted | 2026-07-05 |
 | [0052](0052-task-workflow-v2-opt-in-guard-and-integrated-settlement.md) | Task workflow v2 - opt-in workflow, always-on guard, and integrated settlement | accepted | 2026-07-07 |
+| [0053](0053-load-codex-skills-as-contextual-messages.md) | Load Codex skills as contextual messages | accepted | 2026-07-09 |
+| [0054](0054-use-model-aware-auto-compaction-trigger-ladder.md) | Use a model-aware auto-compaction trigger ladder | accepted | 2026-07-10 |
+| [0055](0055-govern-context-between-provider-round-trips.md) | Govern context between provider round trips | accepted | 2026-07-10 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
 ADR-0019 to preserve existing file names and cross-references.

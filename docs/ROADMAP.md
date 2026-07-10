@@ -1,6 +1,6 @@
 # Iris — Roadmap
 
-> Status (2026-06-26): Milestone 1, the async-hard runtime completion, and the
+> Status (2026-07-09): Milestone 1, the async-hard runtime completion, and the
 > Milestone 2 foundations are done. Iris has a terminal-surface TUI with
 > Iris-owned transcript replay plus a text fallback, selectable Mimir providers (`openai-codex`,
 > `anthropic`, and `antigravity`), runtime model/reasoning switching, streamed
@@ -10,7 +10,8 @@
 > reasoning/context/cache settings, linear session resume, JSONL session
 > persistence, handle-backed large tool outputs, token estimates, turn-boundary
 > auto-compaction, default-short provider-native prompt-cache controls, and
-> default-off context-management controls.
+> default-off context-management controls, and Codex-compatible native skills
+> with progressive disclosure and explicit/implicit invocation.
 > Nexus runs a tokio async loop with turn-level cancellation: the provider is an
 > async stream raced against cancellation, tools are async with child tokens,
 > concurrency-safe tools run in parallel while everything else stays exclusive,
@@ -130,9 +131,10 @@ Implemented today:
   Wayland `system_prompt::assemble` builds in-binary shipped fragments +
   generated live-tool blocks + dynamic project docs (`AGENTS.md`/`CLAUDE.md`) +
   runtime context in one place; fresh and resumed sessions feed the same
-  assembled string through the provider request path. Skills/templates remain
-  deferred (issue #57); named slots and selector-driven assembly remain open
-  (#76/#73). ADR-0026 made fragments fully internal (superseding the #202
+  assembled string through the provider request path. Native filesystem skills
+  are implemented (issue #57); templates remain deferred, and named slots plus
+  selector-driven assembly remain open (#76/#73). ADR-0026 made fragments fully
+  internal (superseding the #202
   user/repo `.md` loading and its per-project trust gate: no
   `~/.iris/fragments` materialization, no repo `.iris/fragments` loading, no
   fragment-trust prompt); project docs keep loading. ADR-0027 repurposed the
@@ -620,9 +622,10 @@ Potential scope:
 - Session transcript persistence. [Shipped, now a read/write store foundation:
   `src/session.rs` writes a JSONL transcript -- a `session` header line plus one
   `message` line per entry -- to `<root>/<cwd-slug>/<unix-ms>_<id>.jsonl`, where
-  `<root>` is `IRIS_SESSION_DIR` or `~/.iris/sessions`. The harness appends new
-  messages after each turn (best-effort: a write failure warns, never crashes
-  the session; flushed per line so a crash leaves a valid prefix). Mirrors
+  `<root>` is `IRIS_SESSION_DIR` or `~/.iris/sessions`. The harness appends each
+  complete provider round trip before the next request and keeps its after-turn
+  diff as a final/error backstop (best-effort: a write failure warns, never
+  crashes the session; flushed per line so a crash leaves a valid prefix). Mirrors
   pi-mono's session store at the smallest useful level. Session Store
   Foundation ([#42](https://github.com/5omeOtherGuy/iris-agent/issues/42),
   shipped 2026-06-17) added the tree-ready/read pieces on top of the original
@@ -855,8 +858,12 @@ Potential scope:
   observer event, and the `/context` breakdown. Per-trigger marginal write <= 0
   is CI-asserted; the Class-B live pair realized a -355-token write delta
   (Anthropic, real 390s idle) and a 317-token input saving (Codex, read-side).
-  `clearToolUses` + microcompaction are now mutually exclusive (ADR-0022
-  addendum), discharging the provider-native context-management interplay gap.
+  Configurable tool-result compaction now extends that durable fold path with
+  retain-N semantic read dedupe, local age/count clearing, four cache-timing
+  modes, and `recall(tool_call_id=...)`. The legacy `microcompaction` alias stays
+  conservative/default-off. Optional Anthropic-native clearing maps public
+  `exclude_tools`/`clear_tool_inputs`; native and local reducers compose only
+  over disjoint tool sets (ADR-0022 addendum, 2026-07-09).
   Phase 3 calibration (persisted per-turn usage, watermark retuning) is
   [#395](https://github.com/5omeOtherGuy/iris-agent/issues/395). Deferred
   (still open, outside #372): the over-budget-no-coverable-range floor and
@@ -1430,11 +1437,25 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    Next: prove the token-efficiency thesis with benchmark evidence, then add the
    missing consumer slices: selective handle dereferencing and a richer
    micro-summary schema. Done (2026-07-02, ADR-0041): provider-quality
-   compaction summaries (default `compactionSummarizer: provider`, deterministic
-   excerpts as the fallback/floor), a manual `/compact` command in both
-   front-ends, switch-time context-cost advisories on `/model`/picker/cycle
+   compaction summaries (default `compactionSummarizer: subagent`, direct
+   provider request then deterministic excerpts as fallbacks), a manual
+   `/compact` command in both front-ends, switch-time context-cost advisories on
+   `/model`/picker/cycle
    switches, and dropping foreign-origin reasoning from every provider request
-   after a model change.
+   after a model change. Auto-compaction redesign slice 0 (2026-07-10) extracts
+   the Tier-2 engine state and worker pipeline, persists summary origin and
+   reported worker usage, and adds the double-gated two-lane live-loop baseline
+   in `docs/benchmarks/auto-compaction-live-loop.md`. Slice 1 (2026-07-10,
+   ADR-0054) replaces the absolute trigger with Mimir-resolved effective windows,
+   hybrid provider/local measurement, a warn/start/hard ladder, bounded hard
+   wait, deterministic fallback, and a model-backed failure breaker. `/context`
+   reports the measurement source, ladder, off state, and worker state. Slice 2
+   persists completed provider round trips before the next request and proves a
+   crash-mid-turn resume is byte-identical. Slice 3 (ADR-0055) adds the
+   `ContextGovernor` seam: ready summaries and hard-tier deterministic relief
+   can apply inside long tool loops, steering injects after the swap, governor
+   failures never fail the user turn, and active job ranges freeze overlapping
+   folds.
 7. Prebuilt-binary distribution ([#199](https://github.com/5omeOtherGuy/iris-agent/issues/199),
    [#233](https://github.com/5omeOtherGuy/iris-agent/issues/233)) is wired and now
    validated locally ([#252](https://github.com/5omeOtherGuy/iris-agent/issues/252)):

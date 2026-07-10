@@ -276,6 +276,23 @@ pub(crate) fn parse_level(
     .into())
 }
 
+/// Parse a persisted settings/session reasoning value. Iris writes normalized
+/// [`ReasoningEffort::as_str`] tokens, while interactive input uses provider-
+/// native labels. Some providers (notably Anthropic adaptive thinking) have
+/// labels that overlap normalized tokens but mean a different internal level, so
+/// persisted values must prefer the normalized interpretation and only fall back
+/// to provider-native parsing for hand-edited values like `max` or `4,096`.
+pub(crate) fn parse_persisted_level(
+    provider: ProviderId,
+    model: &str,
+    value: &str,
+) -> Result<ReasoningEffort> {
+    if let Ok(level) = ReasoningEffort::parse(value) {
+        return Ok(level);
+    }
+    parse_level(provider, model, value)
+}
+
 fn normalize_label(value: &str) -> String {
     let mut normalized = value.trim().to_ascii_lowercase().replace(',', "");
     normalized = normalized.replace('_', "-");
@@ -464,7 +481,7 @@ pub(crate) fn join_display_levels(provider: ProviderId, model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mimir::selection::{ContextManagement, PromptCacheRetention};
+    use crate::mimir::selection::{CodexTransport, ContextManagement, PromptCacheRetention};
 
     fn selection(provider: ProviderId, reasoning: Option<ReasoningEffort>) -> ModelSelection {
         ModelSelection {
@@ -473,7 +490,15 @@ mod tests {
             base_url: "https://example".to_string(),
             reasoning,
             cache_retention: PromptCacheRetention::Short,
+            codex_transport: CodexTransport::Auto,
             context_management: ContextManagement::default(),
+            legacy_context_management: ContextManagement::default(),
+            tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
+            configured_tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
             retry_policy: crate::mimir::retry::RetryPolicy::default(),
             open_ai_compatible: crate::mimir::selection::OpenAiCompatibleConfig::default(),
         }
@@ -637,7 +662,15 @@ mod tests {
                 base_url: "https://example".to_string(),
                 reasoning: Some(ReasoningEffort::XHigh),
                 cache_retention: PromptCacheRetention::Short,
+                codex_transport: CodexTransport::Auto,
                 context_management: ContextManagement::default(),
+                legacy_context_management: ContextManagement::default(),
+                tool_result_compaction: crate::config::Settings::default()
+                    .tool_result_compaction()
+                    .unwrap(),
+                configured_tool_result_compaction: crate::config::Settings::default()
+                    .tool_result_compaction()
+                    .unwrap(),
                 retry_policy: crate::mimir::retry::RetryPolicy::default(),
                 open_ai_compatible: crate::mimir::selection::OpenAiCompatibleConfig::default(),
             };

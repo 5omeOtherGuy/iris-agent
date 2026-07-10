@@ -214,6 +214,267 @@ fn resolves_codex_responses_url() -> Result<()> {
 }
 
 #[test]
+fn resolves_codex_websocket_url_from_backend_url() -> Result<()> {
+    assert_eq!(
+        resolve_codex_ws_url("https://chatgpt.com/backend-api")?.as_str(),
+        "wss://chatgpt.com/backend-api/codex/responses"
+    );
+    assert_eq!(
+        resolve_codex_ws_url("http://localhost:8080/backend-api/codex")?.as_str(),
+        "ws://localhost:8080/backend-api/codex/responses"
+    );
+    assert_eq!(
+        resolve_codex_ws_url("https://chatgpt.com/backend-api/codex/responses")?.as_str(),
+        "wss://chatgpt.com/backend-api/codex/responses"
+    );
+    Ok(())
+}
+
+#[test]
+fn codex_ws_headers_use_oauth_metadata_without_content_type() -> Result<()> {
+    let token = AccessToken {
+        bearer: "secret-token".to_string(),
+        account_id: "acct_123".to_string(),
+    };
+    let headers = ws_headers_for_test(&token, "session-1")?;
+    assert_eq!(
+        headers.get(AUTHORIZATION.as_str()).unwrap(),
+        "Bearer secret-token"
+    );
+    assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct_123");
+    assert_eq!(headers.get("originator").unwrap(), "iris");
+    assert_eq!(headers.get(USER_AGENT.as_str()).unwrap(), "iris-agent");
+    assert_eq!(
+        headers.get("OpenAI-Beta").unwrap(),
+        "responses_websockets=2026-02-06"
+    );
+    assert_eq!(headers.get("session-id").unwrap(), "session-1");
+    assert_eq!(
+        headers.get("x-client-request-id").unwrap(),
+        "iris-session-1"
+    );
+    assert!(headers.get(CONTENT_TYPE.as_str()).is_none());
+    Ok(())
+}
+
+#[test]
+fn websocket_setup_timeout_falls_back_before_visible_output() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+
+    let (policy, error) = runtime
+        .block_on(await_ws_setup(
+            "connect",
+            std::time::Duration::from_millis(1),
+            &cancel,
+            false,
+            std::future::pending::<Result<()>>(),
+        ))
+        .unwrap_err();
+
+    assert_eq!(policy, WsFallback::FallbackSse);
+    assert!(error.to_string().contains("timed out"), "{error}");
+}
+
+#[test]
+fn websocket_setup_timeout_after_visible_output_is_fatal() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+
+    let (policy, error) = runtime
+        .block_on(await_ws_setup(
+            "pong",
+            std::time::Duration::from_millis(1),
+            &cancel,
+            true,
+            std::future::pending::<Result<()>>(),
+        ))
+        .unwrap_err();
+
+    assert_eq!(policy, WsFallback::Fatal);
+    assert!(error.to_string().contains("timed out"), "{error}");
+}
+
+#[test]
+fn websocket_setup_cancel_stops_before_connect_or_send_complete() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let (policy, error) = runtime
+        .block_on(await_ws_setup(
+            "send",
+            std::time::Duration::from_secs(30),
+            &cancel,
+            false,
+            std::future::pending::<Result<()>>(),
+        ))
+        .unwrap_err();
+
+    assert_eq!(policy, WsFallback::Fatal);
+    assert!(error.to_string().contains("cancelled"), "{error}");
+}
+
+#[test]
+fn websocket_create_frame_omits_stream_and_keeps_store_false() {
+    let full = json!({
+        "model": "gpt-test",
+        "store": false,
+        "stream": true,
+        "background": false,
+        "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+        "tools": [],
+        "reasoning": {"effort":"low"},
+        "prompt_cache_key": "session-1"
+    });
+
+    let frame = build_ws_create_frame(&full, None, false);
+
+    assert_eq!(frame["type"], "response.create");
+    assert_eq!(frame["store"], false);
+    assert_eq!(frame["model"], "gpt-test");
+    assert!(frame.get("stream").is_none());
+    assert!(frame.get("background").is_none());
+    assert_eq!(frame["reasoning"]["effort"], "low");
+    assert_eq!(frame["prompt_cache_key"], "session-1");
+}
+
+#[test]
+fn websocket_continuation_sends_only_suffix_when_prefix_matches() {
+    let prior = json!({
+        "model": "gpt-test",
+        "store": false,
+        "input": [
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"one"}]}
+        ],
+        "tools": []
+    });
+    let assistant = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"two"}]});
+    let next_user =
+        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"three"}]});
+    let current = json!({
+        "model": "gpt-test",
+        "store": false,
+        "stream": true,
+        "input": [prior["input"][0].clone(), assistant.clone(), next_user.clone()],
+        "tools": []
+    });
+    let continuation = CodexContinuation {
+        last_full_body: prior,
+        last_response_id: "resp_1".to_string(),
+        last_response_items: vec![assistant],
+    };
+
+    let frame = build_ws_create_frame(&current, Some(&continuation), false);
+
+    assert_eq!(frame["previous_response_id"], "resp_1");
+    assert_eq!(frame["input"], Value::Array(vec![next_user]));
+}
+
+#[test]
+fn websocket_continuation_normalizes_server_output_items_for_prefix_match() {
+    let prior_user =
+        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"one"}]});
+    let prior = json!({
+        "model": "gpt-test",
+        "store": false,
+        "input": [prior_user.clone()],
+        "tools": []
+    });
+    let response = json!({
+        "id": "resp_1",
+        "output": [
+            {
+                "id": "rs_1",
+                "type": "reasoning",
+                "status": "completed",
+                "encrypted_content": " encrypted-reasoning ",
+                "summary": [{"type":"summary_text","text":"thinking"}]
+            },
+            {
+                "id": "msg_1",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type":"output_text","text":"two","annotations":[]}]
+            },
+            {
+                "id": "fc_1",
+                "type": "function_call",
+                "status": "completed",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": "{ \"path\" : \"src/main.rs\" }"
+            }
+        ]
+    });
+    let normalized = normalize_response_items_for_continuation(&response).unwrap();
+    let reasoning = json!({
+        "type": "reasoning",
+        "encrypted_content": "encrypted-reasoning",
+        "summary": []
+    });
+    let assistant = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"two"}]});
+    let tool_call = json!({
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "read",
+        "arguments": json!({"path":"src/main.rs"}).to_string()
+    });
+    let tool_result = json!({
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": "ok"
+    });
+    let current = json!({
+        "model": "gpt-test",
+        "store": false,
+        "stream": true,
+        "input": [prior_user, reasoning, assistant, tool_call, tool_result.clone()],
+        "tools": []
+    });
+    let continuation = CodexContinuation {
+        last_full_body: prior,
+        last_response_id: "resp_1".to_string(),
+        last_response_items: normalized,
+    };
+
+    let frame = build_ws_create_frame(&current, Some(&continuation), false);
+
+    assert_eq!(frame["previous_response_id"], "resp_1");
+    assert_eq!(frame["input"], Value::Array(vec![tool_result]));
+}
+
+#[test]
+fn websocket_continuation_falls_back_to_full_on_shape_mismatch() {
+    let prior = json!({"model":"gpt-test","store":false,"input":[],"tools":[]});
+    let current_input = vec![
+        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"new"}]}),
+    ];
+    let current =
+        json!({"model":"other","store":false,"stream":true,"input":current_input,"tools":[]});
+    let continuation = CodexContinuation {
+        last_full_body: prior,
+        last_response_id: "resp_1".to_string(),
+        last_response_items: vec![],
+    };
+
+    let frame = build_ws_create_frame(&current, Some(&continuation), false);
+
+    assert!(frame.get("previous_response_id").is_none());
+    assert_eq!(frame["input"], current["input"]);
+}
+
+#[test]
 fn rejects_invalid_codex_base_url() {
     assert!(resolve_codex_url("not a url").is_err());
 }
@@ -987,4 +1248,15 @@ fn reasoning_display_text_is_summary_only_never_raw_content() {
         "content": [{ "type": "reasoning_text", "text": "raw cot" }]
     }));
     assert_eq!(text, "summary");
+}
+
+#[test]
+fn developer_context_keeps_its_native_responses_role() {
+    let origin = ModelOrigin::new(PROVIDER_ID, API_ID, "gpt-test");
+    let item = codex_input_item(&Message::developer("skill catalog"), &origin).unwrap();
+
+    assert_eq!(item["type"], json!("message"));
+    assert_eq!(item["role"], json!("developer"));
+    assert_eq!(item["content"][0]["type"], json!("input_text"));
+    assert_eq!(item["content"][0]["text"], json!("skill catalog"));
 }

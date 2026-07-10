@@ -107,6 +107,7 @@ fn test_harness<P: ChatProvider>(provider: P, workspace: &Path, tools: Tools) ->
 /// -- the checks the old in-`request_approval` asserts used to make.
 struct RecordingFrontend {
     events: RefCell<Vec<AgentEvent>>,
+    committed: RefCell<Vec<Vec<Message>>>,
     decision: Cell<ApprovalDecision>,
     events_at_review: RefCell<Option<Vec<AgentEvent>>>,
     /// The structured review facts the last `review` call received, so a test
@@ -118,6 +119,7 @@ impl RecordingFrontend {
     fn new(decision: ApprovalDecision) -> Self {
         Self {
             events: RefCell::new(Vec::new()),
+            committed: RefCell::new(Vec::new()),
             decision: Cell::new(decision),
             events_at_review: RefCell::new(None),
             last_ctx: RefCell::new(None),
@@ -129,6 +131,10 @@ impl AgentObserver for RecordingFrontend {
     fn on_event(&self, event: AgentEvent) -> Result<()> {
         self.events.borrow_mut().push(event);
         Ok(())
+    }
+
+    fn on_messages_committed(&self, messages: &[Message]) {
+        self.committed.borrow_mut().push(messages.to_vec());
     }
 }
 
@@ -874,6 +880,297 @@ fn tool_loop_reads_workspace_file_and_returns_result_to_model() -> Result<()> {
     // #15 contract: structured metadata rides alongside the text on the wire.
     assert!(tool_result.content.contains("\"metadata\""));
     assert!(tool_result.content.contains("\"total_lines\":1"));
+    Ok(())
+}
+
+#[test]
+fn round_trip_commit_callback_sees_paired_tool_result_before_follow_up() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "persist me")?;
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn {
+            tool_calls: vec![ToolCall {
+                id: "call_commit".to_string(),
+                thought_signature: None,
+                name: "read".to_string(),
+                arguments: json!({ "path": "note.txt" }),
+            }],
+            ..AssistantTurn::default()
+        }),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(harness.submit_turn(
+        "read the note",
+        &frontend,
+        &frontend,
+        &CancellationToken::new(),
+    ))?;
+
+    let commits = frontend.committed.borrow();
+    assert_eq!(
+        commits.len(),
+        1,
+        "only the continuing round trip commits early"
+    );
+    let snapshot = &commits[0];
+    assert_eq!(snapshot.len(), 3, "user + assistant call + tool result");
+    assert_eq!(snapshot[1].role, Role::AssistantToolCall);
+    assert_eq!(snapshot[1].tool_call_id.as_deref(), Some("call_commit"));
+    assert_eq!(snapshot[2].role, Role::Tool);
+    assert_eq!(snapshot[2].tool_call_id.as_deref(), Some("call_commit"));
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GovernedBoundary {
+    roles: Vec<Role>,
+    usage_total: Option<u64>,
+    usage_message_count: Option<usize>,
+    round_trip: usize,
+    turn_continues: bool,
+}
+
+struct ReplacingGovernor {
+    calls: RefCell<Vec<GovernedBoundary>>,
+}
+
+impl ContextGovernor for ReplacingGovernor {
+    fn at_boundary<'a>(&'a self, cx: BoundaryContext<'a>) -> ContextGovernorFuture<'a> {
+        self.calls.borrow_mut().push(GovernedBoundary {
+            roles: cx.messages.iter().map(|message| message.role).collect(),
+            usage_total: cx.last_usage.map(|anchor| anchor.usage.total_tokens),
+            usage_message_count: cx.last_usage.map(|anchor| anchor.message_count),
+            round_trip: cx.round_trip,
+            turn_continues: cx.turn_continues,
+        });
+        Box::pin(async {
+            Ok(ContextDirective::Replace {
+                messages: vec![
+                    Message::user("[summary installed at boundary]"),
+                    Message::assistant("compacted"),
+                ],
+            })
+        })
+    }
+}
+
+#[test]
+fn governor_runs_after_tool_results_and_replaces_before_follow_up_request() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "govern me")?;
+    let first_usage = ProviderUsage {
+        provider: "test".to_string(),
+        model: "test-model".to_string(),
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_read_input_tokens: 0,
+        cache_write_input_tokens: 0,
+        reasoning_output_tokens: 0,
+        total_tokens: 120,
+        cache_creation: None,
+    };
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn {
+            tool_calls: vec![ToolCall {
+                id: "call_govern".to_string(),
+                thought_signature: None,
+                name: "read".to_string(),
+                arguments: json!({ "path": "note.txt" }),
+            }],
+            usage: Some(first_usage),
+            ..AssistantTurn::default()
+        }),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    let state = RefCell::new(ToolState::new());
+    let env = ToolEnv {
+        workspace: &workspace.path,
+        state: &state,
+        output_store: None,
+        session_span: None,
+        output_sink: None,
+        mutation_guard: None,
+    };
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let governor = ReplacingGovernor {
+        calls: RefCell::new(Vec::new()),
+    };
+
+    block_on(agent.submit_turn_with_governor(
+        "read the note",
+        TurnContextHooks {
+            observer: &frontend,
+            governor: Some(&governor),
+        },
+        &frontend,
+        &env,
+        &CancellationToken::new(),
+        None,
+    ))?;
+
+    let calls = governor.calls.borrow();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the final tool-less response is not governed"
+    );
+    assert_eq!(
+        calls[0],
+        GovernedBoundary {
+            roles: vec![Role::User, Role::AssistantToolCall, Role::Tool],
+            usage_total: Some(120),
+            usage_message_count: Some(2),
+            round_trip: 1,
+            turn_continues: true,
+        }
+    );
+    let seen = agent.provider.seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        seen[1],
+        [
+            Message::user("[summary installed at boundary]"),
+            Message::assistant("compacted")
+        ],
+        "the next provider request must use the governor replacement"
+    );
+    Ok(())
+}
+
+struct PendingGovernor;
+
+impl ContextGovernor for PendingGovernor {
+    fn at_boundary<'a>(&'a self, _cx: BoundaryContext<'a>) -> ContextGovernorFuture<'a> {
+        Box::pin(futures::future::pending())
+    }
+}
+
+#[test]
+fn cancellation_wins_a_pending_governor_boundary() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "cancel boundary")?;
+    let provider = FakeProvider::new(vec![Ok(AssistantTurn {
+        tool_calls: vec![ToolCall {
+            id: "call_cancel_governor".to_string(),
+            thought_signature: None,
+            name: "read".to_string(),
+            arguments: json!({ "path": "note.txt" }),
+        }],
+        ..AssistantTurn::default()
+    })]);
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    let state = RefCell::new(ToolState::new());
+    let env = ToolEnv {
+        workspace: &workspace.path,
+        state: &state,
+        output_store: None,
+        session_span: None,
+        output_sink: None,
+        mutation_guard: None,
+    };
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let token = CancellationToken::new();
+
+    block_on(async {
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            token.cancel();
+        };
+        let turn = agent.submit_turn_with_governor(
+            "read the note",
+            TurnContextHooks {
+                observer: &frontend,
+                governor: Some(&PendingGovernor),
+            },
+            &frontend,
+            &env,
+            &token,
+            None,
+        );
+        let (_, result) = tokio::join!(cancel, turn);
+        result
+    })?;
+
+    assert_eq!(agent.provider.seen.borrow().len(), 1);
+    assert!(
+        frontend.events.borrow().iter().any(
+            |event| matches!(event, AgentEvent::Notice(message) if message == INTERRUPT_NOTICE)
+        )
+    );
+    assert!(
+        frontend
+            .events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnComplete))
+    );
+    let messages = agent.messages();
+    assert_eq!(messages[1].role, Role::AssistantToolCall);
+    assert_eq!(messages[2].role, Role::Tool);
+    Ok(())
+}
+
+struct FailingGovernor;
+
+impl ContextGovernor for FailingGovernor {
+    fn at_boundary<'a>(&'a self, _cx: BoundaryContext<'a>) -> ContextGovernorFuture<'a> {
+        Box::pin(async { Err(anyhow!("injected governor failure")) })
+    }
+}
+
+#[test]
+fn governor_failure_never_fails_the_user_turn() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "failure fallback")?;
+    let provider = FakeProvider::new(vec![
+        Ok(AssistantTurn {
+            tool_calls: vec![ToolCall {
+                id: "call_fail_governor".to_string(),
+                thought_signature: None,
+                name: "read".to_string(),
+                arguments: json!({ "path": "note.txt" }),
+            }],
+            ..AssistantTurn::default()
+        }),
+        Ok(AssistantTurn::text("turn still completed")),
+    ]);
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    let state = RefCell::new(ToolState::new());
+    let env = ToolEnv {
+        workspace: &workspace.path,
+        state: &state,
+        output_store: None,
+        session_span: None,
+        output_sink: None,
+        mutation_guard: None,
+    };
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+
+    block_on(agent.submit_turn_with_governor(
+        "read the note",
+        TurnContextHooks {
+            observer: &frontend,
+            governor: Some(&FailingGovernor),
+        },
+        &frontend,
+        &env,
+        &CancellationToken::new(),
+        None,
+    ))?;
+
+    assert_eq!(agent.provider.seen.borrow().len(), 2);
+    assert_eq!(
+        agent.messages().last().unwrap().content,
+        "turn still completed"
+    );
+    assert!(frontend.events.borrow().iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(message) if message.contains("injected governor failure")
+    )));
     Ok(())
 }
 
@@ -2619,7 +2916,8 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
-    trust_path: Option<OsString>,
+    trust_path: Option<Option<OsString>>,
+    config_path: Option<Option<OsString>>,
 }
 
 impl EnvGuard {
@@ -2627,11 +2925,25 @@ impl EnvGuard {
         let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let guard = Self {
             _lock: lock,
-            trust_path: std::env::var_os("IRIS_TRUST_PATH"),
+            trust_path: Some(std::env::var_os("IRIS_TRUST_PATH")),
+            config_path: None,
         };
         // SAFETY: nexus env-sensitive tests run under ENV_LOCK and restore the
         // process-global var before releasing it.
         unsafe { std::env::set_var("IRIS_TRUST_PATH", path) };
+        guard
+    }
+
+    fn with_config_path(path: &Path) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let guard = Self {
+            _lock: lock,
+            trust_path: None,
+            config_path: Some(std::env::var_os("IRIS_CONFIG_PATH")),
+        };
+        // SAFETY: nexus env-sensitive tests run under ENV_LOCK and restore the
+        // process-global var before releasing it.
+        unsafe { std::env::set_var("IRIS_CONFIG_PATH", path) };
         guard
     }
 }
@@ -2640,9 +2952,17 @@ impl Drop for EnvGuard {
     fn drop(&mut self) {
         // SAFETY: serialized under ENV_LOCK by EnvGuard and restored on drop.
         unsafe {
-            match &self.trust_path {
-                Some(value) => std::env::set_var("IRIS_TRUST_PATH", value),
-                None => std::env::remove_var("IRIS_TRUST_PATH"),
+            if let Some(previous) = &self.trust_path {
+                match previous {
+                    Some(value) => std::env::set_var("IRIS_TRUST_PATH", value),
+                    None => std::env::remove_var("IRIS_TRUST_PATH"),
+                }
+            }
+            if let Some(previous) = &self.config_path {
+                match previous {
+                    Some(value) => std::env::set_var("IRIS_CONFIG_PATH", value),
+                    None => std::env::remove_var("IRIS_CONFIG_PATH"),
+                }
             }
         }
     }
@@ -5166,9 +5486,12 @@ fn auto_compaction_emits_typed_event_with_ids_and_token_estimates() -> Result<()
                 covered_messages,
                 original_tokens_estimate,
                 summary_tokens_estimate,
+                context_tokens_after_apply: _,
                 budget,
                 generation,
                 carried_paths: _,
+                origin: _,
+                worker_usage: _,
             } => Some((
                 compaction_id,
                 covered_from,
@@ -6063,6 +6386,20 @@ fn replace_provider_replans_the_tool_surface() {
         agent.tools.iter().any(|tool| tool.name() == "edit"),
         "edit is visible under default capabilities"
     );
+    agent.last_provider_usage = Some((
+        ProviderUsage {
+            provider: "old".to_string(),
+            model: "old-model".to_string(),
+            input_tokens: 40_000,
+            output_tokens: 2_000,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 42_000,
+            cache_creation: None,
+        },
+        7,
+    ));
 
     agent.replace_provider(SurfaceProbe::new(
         ProviderCapabilities { native_edit: true },
@@ -6079,6 +6416,11 @@ fn replace_provider_replans_the_tool_surface() {
     assert!(
         agent.tools.by_name("edit").is_some(),
         "hidden edit is still executable"
+    );
+    assert_eq!(
+        agent.last_provider_usage_anchor(),
+        None,
+        "usage from the prior provider must not seed the new lane"
     );
 }
 
@@ -6436,6 +6778,19 @@ fn follow_up_injected_when_agent_would_stop() -> Result<()> {
             .any(|m| m.role == Role::User && m.content == "now write tests"),
         "follow-up must reach the continued turn: {:?}",
         seen[1]
+    );
+    let commits = frontend.committed.borrow();
+    assert_eq!(commits.len(), 1, "the continuing response commits early");
+    assert_eq!(commits[0].len(), 2);
+    assert_eq!(commits[0][0].role, Role::User);
+    assert_eq!(commits[0][0].content, "hi");
+    assert_eq!(commits[0][1].role, Role::Assistant);
+    assert_eq!(commits[0][1].content, "working");
+    assert!(
+        commits[0]
+            .iter()
+            .all(|message| message.content != "now write tests"),
+        "the commit boundary precedes follow-up injection"
     );
     Ok(())
 }
@@ -7869,25 +8224,42 @@ fn approval_mode_parses_and_round_trips_tokens() {
 }
 
 #[test]
-fn approval_mode_from_startup_setting_resolves_or_defaults() {
-    // Absent -> today's default (posture unchanged).
+fn permission_mode_parses_dangerous_as_exclusive_mode() {
     assert_eq!(
-        ApprovalMode::from_startup_setting(None),
-        ApprovalMode::Strict
-    );
-    // A valid token is applied.
-    assert_eq!(
-        ApprovalMode::from_startup_setting(Some("auto")),
-        ApprovalMode::Auto
+        PermissionMode::parse("dangerously-skip-permissions"),
+        Some(PermissionMode::DangerousSkipPermissions)
     );
     assert_eq!(
-        ApprovalMode::from_startup_setting(Some("never")),
-        ApprovalMode::NeverAsk
+        PermissionMode::parse("--dangerously-skip-permissions"),
+        Some(PermissionMode::DangerousSkipPermissions)
     );
-    // An invalid token falls back to the default rather than changing posture.
     assert_eq!(
-        ApprovalMode::from_startup_setting(Some("bogus")),
-        ApprovalMode::Strict
+        PermissionMode::parse("auto"),
+        Some(PermissionMode::Approval(ApprovalMode::Auto))
+    );
+    assert_eq!(
+        PermissionMode::from_startup_setting(Some("dangerously-skip-permissions")),
+        PermissionMode::DangerousSkipPermissions
+    );
+}
+
+#[test]
+fn permission_mode_from_startup_setting_resolves_or_defaults() {
+    assert_eq!(
+        PermissionMode::from_startup_setting(None),
+        PermissionMode::Approval(ApprovalMode::Strict)
+    );
+    assert_eq!(
+        PermissionMode::from_startup_setting(Some("auto")),
+        PermissionMode::Approval(ApprovalMode::Auto)
+    );
+    assert_eq!(
+        PermissionMode::from_startup_setting(Some("never")),
+        PermissionMode::Approval(ApprovalMode::NeverAsk)
+    );
+    assert_eq!(
+        PermissionMode::from_startup_setting(Some("bogus")),
+        PermissionMode::Approval(ApprovalMode::Strict)
     );
 }
 
@@ -7897,6 +8269,7 @@ fn approval_command_switches_session_mode_in_text_path() -> Result<()> {
     // session preset at the inter-turn boundary, so the following clean
     // in-workspace write auto-runs without an approval prompt on stdin.
     let workspace = test_workspace()?;
+    let _env = EnvGuard::with_config_path(&workspace.path.join("settings.json"));
     let provider = FakeProvider::new(vec![
         Ok(single_call_turn(
             "write",
@@ -7926,6 +8299,11 @@ fn approval_command_switches_session_mode_in_text_path() -> Result<()> {
         fs::read_to_string(workspace.path.join("out.txt"))?,
         "auto\n",
         "the auto-approved write ran without a prompt"
+    );
+    assert!(
+        fs::read_to_string(workspace.path.join("settings.json"))?
+            .contains("\"defaultApproval\": \"auto\""),
+        "the permission mode is persisted as the default"
     );
     Ok(())
 }

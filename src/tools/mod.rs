@@ -76,6 +76,11 @@ pub(crate) fn content_hash(bytes: &[u8]) -> String {
 /// is needed (relocated to the harness tier in Step C).
 pub(crate) struct ToolState {
     pub(crate) observed: ObservedFiles,
+    /// Canonical, read-only roots belonging to currently loaded skills. The
+    /// `read` tool may access these when workspace confinement is enabled so a
+    /// global skill can progressively disclose its own references and scripts;
+    /// mutating tools remain workspace-only.
+    pub(crate) skill_read_roots: Vec<std::path::PathBuf>,
     /// The bash tool's persistent-session/background-job registry. Held behind
     /// an `Arc<Mutex<_>>` (not just the env's `RefCell`) so a `bash` run can be
     /// moved onto `tokio::task::spawn_blocking` while keeping the executor free
@@ -98,6 +103,7 @@ impl ToolState {
     pub(crate) fn new() -> Self {
         Self {
             observed: ObservedFiles::new(),
+            skill_read_roots: Vec::new(),
             bash: std::sync::Arc::new(std::sync::Mutex::new(bash::BashState::new())),
             // Production is always the shipped behavior: reductions on. The
             // benchmark baseline arm is selected only via the test-only

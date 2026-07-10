@@ -7284,6 +7284,10 @@ mod tests {
             compaction_summarizer: "subagent".to_string(),
             microcompaction: true,
             microcompaction_watermark: 32_000,
+            compaction_aggressiveness: "conservative".to_string(),
+            compaction_cache_timing: "cacheAware".to_string(),
+            semantic_retain_per_path: 1,
+            tool_clearing_keep_recent: 8,
             prompt_cache_retention: "short".to_string(),
             verify_command: None,
             verify_max_attempts: 3,
@@ -7304,7 +7308,7 @@ mod tests {
         screen.open_modal(Modal::Settings(Box::new(SettingsPanel::new(
             faceplate_snapshot(),
         ))));
-        let rendered = rendered_text(&mut screen, 100, 44);
+        let rendered = rendered_text(&mut screen, 100, 50);
         // Masthead silkscreen + every section printed at once.
         assert!(rendered.contains("SETTINGS"), "{rendered}");
         assert!(
@@ -7320,7 +7324,7 @@ mod tests {
         assert!(rendered.contains("●●●●●●○○○○  232k tokens"), "{rendered}");
         assert!(rendered.contains("▸ gpt-5.5 ┊ openai-codex"), "{rendered}");
         // Nothing windowed: no position row on a tall viewport.
-        assert!(!rendered.contains("(1/19)"), "{rendered}");
+        assert!(!rendered.contains("(1/23)"), "{rendered}");
         // The composer stays protected below the panel.
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }
@@ -7339,7 +7343,7 @@ mod tests {
         // session bar) and the window scrolls with the house position row.
         assert!(rendered.contains("SETTINGS"), "{rendered}");
         assert!(rendered.contains("ENGINE"), "{rendered}");
-        assert!(rendered.contains("(1/19)"), "{rendered}");
+        assert!(rendered.contains("(1/23)"), "{rendered}");
         assert!(!rendered.contains("worktree root"), "windowed:\n{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }

@@ -13,7 +13,7 @@ use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_capabilities;
 use crate::mimir::model_catalog::{self, AuthStatus, CatalogModel, ExactMatch};
 use crate::mimir::selection::{ProviderId, ReasoningEffort};
-use crate::nexus::ChatProvider;
+use crate::nexus::{ApprovalMode, ChatProvider, PermissionMode};
 use crate::session::{self, ResumableSession, SessionStore};
 use crate::ui::modal::{
     Modal, ModalAction, SessionPicker, SessionRow, SwitchContextPrompt, TaskPicker,
@@ -424,6 +424,15 @@ fn settings_snapshot<P: ChatProvider>(
         bash_prefix: record.allow_bash_prefix.iter().cloned().collect(),
         sandbox: record.sandbox.clone(),
     };
+    // The MEMORY compaction group reads the RESOLVED tool-result-compaction
+    // policy (structured block, or the legacy microcompaction alias); a
+    // malformed on-disk policy falls back to the built-in default so the panel
+    // still opens.
+    let compaction = settings.tool_result_compaction().unwrap_or_else(|_| {
+        crate::config::Settings::default()
+            .tool_result_compaction()
+            .unwrap()
+    });
     settings_menu::Snapshot {
         default_model,
         reasoning_levels,
@@ -439,18 +448,19 @@ fn settings_snapshot<P: ChatProvider>(
             .unwrap_or_else(|| "auto".to_string()),
         scroll_speed: tui.and_then(|t| t.scroll_speed).unwrap_or(3),
         reduced_motion: tui.and_then(|t| t.reduced_motion).unwrap_or(false),
-        default_approval: settings
-            .default_approval
-            .clone()
-            .unwrap_or_else(|| "strict".to_string()),
+        default_approval: cli::current_permission_token(harness).to_string(),
         skip_permissions: harness.skip_permissions(),
         context_token_budget: settings.context_token_budget(),
         compaction_summarizer: settings
             .compaction_summarizer
             .clone()
             .unwrap_or_else(|| "subagent".to_string()),
-        microcompaction: settings.microcompaction(),
-        microcompaction_watermark: settings.microcompaction_watermark(),
+        microcompaction: compaction.enabled,
+        microcompaction_watermark: compaction.trigger_tokens,
+        compaction_aggressiveness: compaction.aggressiveness.as_str().to_string(),
+        compaction_cache_timing: compaction.cache_timing.as_str().to_string(),
+        semantic_retain_per_path: compaction.semantic_dedupe.retain_per_path,
+        tool_clearing_keep_recent: compaction.tool_clearing.keep_recent_tool_uses,
         prompt_cache_retention: settings
             .prompt_cache_retention
             .clone()
@@ -577,9 +587,21 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
         Field::CompactionSummarizer => {
             config::save_compaction_summarizer(value.unwrap_or("provider"))
         }
-        Field::Microcompaction => config::save_microcompaction(parse_bool(value)),
+        Field::Microcompaction => config::save_tool_result_compaction_enabled(parse_bool(value)),
         Field::MicrocompactionWatermark => {
-            config::save_microcompaction_watermark(value.unwrap_or("0").parse()?)
+            config::save_tool_result_compaction_trigger_tokens(value.unwrap_or("0").parse()?)
+        }
+        Field::CompactionAggressiveness => {
+            config::save_tool_result_compaction_aggressiveness(value.unwrap_or("conservative"))
+        }
+        Field::CompactionCacheTiming => {
+            config::save_tool_result_compaction_cache_timing(value.unwrap_or("cacheAware"))
+        }
+        Field::SemanticRetainPerPath => {
+            config::save_tool_result_compaction_retain_per_path(value.unwrap_or("1").parse()?)
+        }
+        Field::ToolClearingKeepRecent => {
+            config::save_tool_result_compaction_keep_recent_tool_uses(value.unwrap_or("1").parse()?)
         }
         Field::PromptCacheRetention => {
             config::save_prompt_cache_retention(value.unwrap_or("short"))
@@ -592,6 +614,20 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
             crate::ui::theme::set_active(id);
             config::save_theme(id)
         }
+    }
+}
+
+/// The permission mode a skip-approvals toggle flips to: enabling the dangerous
+/// bypass, or restoring the parked approval mode (#520). Shared by the faceplate
+/// skip-approvals row and its tests.
+fn toggle_skip_permissions_mode(
+    skip_permissions: bool,
+    approval_mode: ApprovalMode,
+) -> PermissionMode {
+    if skip_permissions {
+        PermissionMode::Approval(approval_mode)
+    } else {
+        PermissionMode::DangerousSkipPermissions
     }
 }
 
@@ -657,15 +693,17 @@ pub(crate) fn apply_action<P: ChatProvider>(
             ActionResult::Keep(lines)
         }
         ModalAction::ToggleSkipPermissions => {
-            // The panel's guarded switch already clicked its own display; the
-            // harness is the live state, so flip it and keep the panel open.
-            let enabled = !harness.skip_permissions();
-            harness.set_skip_permissions(enabled);
-            ActionResult::Keep(vec![if enabled {
-                "Dangerously skip permissions enabled for this session".to_string()
-            } else {
-                "Dangerously skip permissions disabled for this session".to_string()
-            }])
+            // The panel's guarded switch already clicked its own display. Persist
+            // through #520's permission-mode default: `apply_permission_mode`
+            // flips the live harness AND saves `defaultApproval` (the dangerous
+            // bypass becomes the persisted default, the parked preset is restored
+            // and persisted when toggled back). Rebuild the faceplate in place so
+            // the skip and approvals rows settle onto the new persisted posture.
+            let mode =
+                toggle_skip_permissions_mode(harness.skip_permissions(), harness.approval_mode());
+            let flash = view.as_ref().map(|view| view.cursor());
+            let lines = cli::apply_permission_mode(harness, mode);
+            refresh_settings(view, flash, lines, harness, switch)
         }
         ModalAction::EditPolicy(edit) => {
             // Wayland owns the policy store edit and live Nexus refresh; rebuild
@@ -721,13 +759,34 @@ pub(crate) fn apply_action<P: ChatProvider>(
                     // harness so the toggle takes effect at the next turn
                     // boundary in this session (DoD, ADR-0048/#378), the same
                     // way `EditPolicy` refreshes live Nexus state on save.
-                    if field == settings_menu::Field::Microcompaction {
-                        harness.set_microcompaction(value.as_deref() == Some("true"));
-                    } else if field == settings_menu::Field::MicrocompactionWatermark
-                        && let Some(value) = value.as_deref()
-                        && let Ok(value) = value.parse()
+                    if field == settings_menu::Field::DefaultApproval {
+                        if let Some(mode) = value.as_deref().and_then(PermissionMode::parse) {
+                            cli::set_permission_mode(harness, mode);
+                        }
+                    } else if matches!(
+                        field,
+                        settings_menu::Field::Microcompaction
+                            | settings_menu::Field::MicrocompactionWatermark
+                            | settings_menu::Field::CompactionAggressiveness
+                            | settings_menu::Field::CompactionCacheTiming
+                            | settings_menu::Field::SemanticRetainPerPath
+                            | settings_menu::Field::ToolClearingKeepRecent
+                    ) && let Ok(settings) = config::Settings::load(harness.workspace())
+                        && let Ok(policy) = settings.tool_result_compaction()
+                        && let Err(error) =
+                            cli::apply_tool_result_compaction(policy, harness, switch)
                     {
-                        harness.set_microcompaction_watermark(value);
+                        // The live re-provider failed (e.g. the new policy is
+                        // incompatible with the model): rebuild the faceplate from
+                        // disk with the error surfaced — the panel is the only
+                        // settings UI, so there is no submenu to fall back to.
+                        return refresh_settings(
+                            view,
+                            None,
+                            vec![format!("could not apply setting: {error:#}")],
+                            harness,
+                            switch,
+                        );
                     }
                     // The panel is the display truth while open: it already
                     // clicked the detent, so keep it (no rebuild jank).
@@ -1100,6 +1159,22 @@ mod tests {
         // forward picks the first, backward the last - never skipping index 0.
         assert_eq!(next_cycle_index(2, None, true), 0);
         assert_eq!(next_cycle_index(2, None, false), 1);
+    }
+
+    #[test]
+    fn skip_permissions_toggle_restores_parked_approval_mode() {
+        assert_eq!(
+            toggle_skip_permissions_mode(false, ApprovalMode::Auto),
+            PermissionMode::DangerousSkipPermissions
+        );
+        assert_eq!(
+            toggle_skip_permissions_mode(true, ApprovalMode::Auto),
+            PermissionMode::Approval(ApprovalMode::Auto)
+        );
+        assert_eq!(
+            toggle_skip_permissions_mode(true, ApprovalMode::NeverAsk),
+            PermissionMode::Approval(ApprovalMode::NeverAsk)
+        );
     }
 
     #[test]

@@ -9,18 +9,21 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::Harness;
+use super::{BackgroundCompaction, Harness};
+use crate::config::{CompactionCacheTiming, Settings};
 use crate::nexus::{
-    Agent, AgentEvent, AgentObserver, ChatProvider, FoldTrigger, Message, ProviderStream, Tools,
+    Agent, AgentEvent, AgentObserver, ChatProvider, CompactionOrigin, FoldTrigger, Message,
+    ProviderStream, SessionSpanReader, ToolCall, Tools,
 };
 use crate::session::{SessionLog, SessionStore};
-use crate::tools::{ToolState, built_in_tools};
+use crate::tools::{ToolState, built_in_tools, recall};
 
 /// Swallows every agent event: most tests inspect the rebuilt context and the
 /// transcript directly, not the event stream.
@@ -43,6 +46,7 @@ impl AgentObserver for FoldRecorder {
             folds,
             reclaimed_tokens_estimate,
             trigger,
+            ..
         } = event
         {
             self.folds
@@ -102,6 +106,15 @@ fn ok_read(call: &str, target: &str, body: &str) -> Message {
     )
 }
 
+fn read_call(call: &str, target: &str) -> Message {
+    Message::assistant_tool_call(&ToolCall {
+        id: call.to_string(),
+        name: "read".to_string(),
+        arguments: json!({"path": target}),
+        thought_signature: None,
+    })
+}
+
 /// Seed a session where an early large read of `a.rs` (needle-bearing) is
 /// superseded by a later read of the same path, followed by a recent tail. The
 /// superseded read sits before the protected fold tail, so it is foldable once
@@ -117,9 +130,11 @@ fn seed_session() -> (TempDir, TempDir, PathBuf) {
     let big2 = "current contents. ".repeat(800);
     for message in [
         Message::user("read a.rs"),
+        read_call("c1", "a.rs"),
         ok_read("c1", "a.rs", &big),
         Message::assistant("ok"),
         Message::user("read a.rs again"),
+        read_call("c2", "a.rs"),
         ok_read("c2", "a.rs", &big2),
         Message::assistant("done"),
     ] {
@@ -180,6 +195,173 @@ fn fold_entries(path: &Path) -> Vec<Value> {
         .collect()
 }
 
+fn set_timing(
+    harness: &mut Harness<SilentProvider>,
+    timing: CompactionCacheTiming,
+    trigger_tokens: u64,
+) {
+    let mut policy = Settings {
+        microcompaction: Some(true),
+        ..Settings::default()
+    }
+    .tool_result_compaction()
+    .unwrap();
+    policy.cache_timing = timing;
+    policy.trigger_tokens = trigger_tokens;
+    harness.set_tool_result_compaction(policy);
+}
+
+#[test]
+fn active_background_range_freezes_inside_folds_but_outside_folds_flush() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).unwrap();
+    let mut ids = Vec::new();
+    for (index, body) in ["old one", "old two", "current three"]
+        .into_iter()
+        .enumerate()
+    {
+        let call = format!("c{}", index + 1);
+        for message in [
+            Message::user("read a.rs"),
+            read_call(&call, "a.rs"),
+            ok_read(&call, "a.rs", body),
+            Message::assistant("ok"),
+        ] {
+            ids.push(log.append(&message).unwrap());
+        }
+    }
+    let path = log.path().to_path_buf();
+    let session_id = log.id().to_string();
+    drop(log);
+
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .unwrap();
+    let stored = store.open(&meta).unwrap();
+    let session = SessionLog::resume(&path).unwrap();
+    let agent = Agent::resumed(SilentProvider, built_in_tools(), stored.messages);
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(session),
+        stored.entry_ids,
+        None,
+    );
+    let mut policy = Settings {
+        microcompaction: Some(true),
+        ..Settings::default()
+    }
+    .tool_result_compaction()
+    .unwrap();
+    policy.cache_timing = CompactionCacheTiming::Immediate;
+    policy.semantic_dedupe.protect_recent_tokens = 0;
+    policy.semantic_dedupe.protect_recent_tool_results = 0;
+    policy.semantic_dedupe.retain_per_path = 1;
+    harness.set_tool_result_compaction(policy);
+
+    let (_sender, receiver) = mpsc::channel();
+    harness.compaction.background = Some(BackgroundCompaction {
+        job_id: "compaction_freeze".to_string(),
+        session_id: Some(session_id),
+        from_id: ids[0].clone(),
+        to_id: ids[3].clone(),
+        covered_messages: 4,
+        original_tokens: 10,
+        receiver,
+        token: CancellationToken::new(),
+        origin: CompactionOrigin::Subagent,
+    });
+
+    let pending = harness.pending_folds();
+    assert_eq!(pending.len(), 1, "the c1 result is frozen under the job");
+    assert_eq!(pending[0].tool_call_id, "c2", "outside fold stays eligible");
+    assert_eq!(harness.maybe_microcompact(&NullObserver).unwrap(), 1);
+    assert_eq!(fold_count(&path), 1, "only the outside fold is durable");
+
+    harness.compaction.cancel_background();
+    let released = harness.pending_folds();
+    assert_eq!(released.len(), 1, "the frozen fold releases with the slot");
+    assert_eq!(released[0].tool_call_id, "c1");
+    assert_eq!(harness.maybe_microcompact(&NullObserver).unwrap(), 1);
+    assert_eq!(fold_count(&path), 2);
+}
+
+#[test]
+fn cache_timing_break_only_uses_breaks_but_not_pressure() {
+    let (root, workspace, path) = seed_session();
+    let mut harness = resume(&root.path, &workspace.path, &path, None, true);
+    set_timing(&mut harness, CompactionCacheTiming::BreakOnly, 1);
+    assert_eq!(harness.maybe_microcompact(&NullObserver).unwrap(), 0);
+    harness
+        .record_selection_event("provider-b", "model-b", None)
+        .unwrap();
+    let recorder = FoldRecorder::default();
+    assert_eq!(harness.maybe_microcompact(&recorder).unwrap(), 1);
+    assert_eq!(recorder.folds.borrow()[0].2, FoldTrigger::SelectionSwitch);
+    assert_eq!(fold_entries(&path)[0]["trigger"], "A2");
+}
+
+#[test]
+fn cache_timing_pressure_only_ignores_breaks_until_watermark() {
+    let (root, workspace, path) = seed_session();
+    let mut harness = resume(&root.path, &workspace.path, &path, None, true);
+    let total = harness.context_token_estimate();
+    set_timing(&mut harness, CompactionCacheTiming::PressureOnly, total + 1);
+    harness
+        .record_selection_event("provider-b", "model-b", None)
+        .unwrap();
+    assert_eq!(harness.maybe_microcompact(&NullObserver).unwrap(), 0);
+    set_timing(&mut harness, CompactionCacheTiming::PressureOnly, total);
+    let recorder = FoldRecorder::default();
+    assert_eq!(harness.maybe_microcompact(&recorder).unwrap(), 1);
+    assert_eq!(recorder.folds.borrow()[0].2, FoldTrigger::Watermark);
+    assert_eq!(fold_entries(&path)[0]["trigger"], "C");
+}
+
+#[test]
+fn cache_timing_immediate_flushes_with_honest_trigger() {
+    let (root, workspace, path) = seed_session();
+    let mut harness = resume(&root.path, &workspace.path, &path, None, true);
+    set_timing(&mut harness, CompactionCacheTiming::Immediate, u64::MAX);
+    let recorder = FoldRecorder::default();
+    assert_eq!(harness.maybe_microcompact(&recorder).unwrap(), 1);
+    assert_eq!(recorder.folds.borrow()[0].2, FoldTrigger::Immediate);
+    assert_eq!(fold_entries(&path)[0]["trigger"], "I");
+}
+
+#[test]
+fn folded_result_is_recoverable_by_tool_call_id_from_the_original_transcript() {
+    let (root, workspace, path) = seed_session();
+    let mut harness = resume(&root.path, &workspace.path, &path, None, true);
+    set_timing(&mut harness, CompactionCacheTiming::Immediate, u64::MAX);
+    assert_eq!(harness.maybe_microcompact(&NullObserver).unwrap(), 1);
+    assert!(
+        !harness
+            .messages()
+            .iter()
+            .any(|message| message.content.contains(NEEDLE))
+    );
+
+    let reader = super::SessionSpanSource {
+        transcript: Some(path),
+    };
+    let output = recall::execute_for_test(
+        None,
+        Some(&reader as &dyn SessionSpanReader),
+        &json!({"tool_call_id":"c1"}),
+    )
+    .unwrap();
+    assert!(output.content.contains(NEEDLE));
+    assert!(output.content.contains("tool=read"));
+    assert!(output.content.contains("a.rs"));
+}
+
 #[test]
 fn no_fold_below_the_micro_watermark_and_a_fold_at_or_above_it() {
     let (root, workspace, path) = seed_session();
@@ -218,6 +400,7 @@ fn no_fold_below_the_micro_watermark_and_a_fold_at_or_above_it() {
         1,
         "exactly one durable fold entry is written"
     );
+    assert_eq!(fold_entries(&path)[0]["reasons"], json!(["semanticDedupe"]));
     // The fold rewrote the in-memory result content: the needle is gone and the
     // stub names the recoverable path.
     let joined = above
@@ -706,6 +889,8 @@ fn fold_event_reaches_the_ui_layer_with_its_tag() {
     // (issue #400 M1 DoD): wayland -> nexus event -> UiEvent.
     let event = AgentEvent::FoldApplied {
         folds: 2,
+        semantic_dedupe_folds: 2,
+        tool_clearing_folds: 0,
         reclaimed_tokens_estimate: 1200,
         trigger: FoldTrigger::Watermark,
     };
@@ -714,6 +899,7 @@ fn fold_event_reaches_the_ui_layer_with_its_tag() {
             folds,
             reclaimed_tokens_estimate,
             trigger,
+            ..
         } => {
             assert_eq!(folds, 2);
             assert_eq!(reclaimed_tokens_estimate, 1200);

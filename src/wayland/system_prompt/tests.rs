@@ -305,6 +305,7 @@ fn recall_fragment_renders_only_when_the_recall_tool_is_registered() {
         "recall fragment must render when the tool is registered"
     );
     assert!(with_recall.contains("recall(handle="));
+    assert!(with_recall.contains("recall(tool_call_id="));
     // Not registered: the fragment must be absent, so no build advertises an
     // affordance the model cannot invoke (ADR-0046 / ADR-0014).
     let without_recall = assemble_defaults(workspace, &Tools::new(Vec::new()));

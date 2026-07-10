@@ -186,16 +186,19 @@ impl SessionLog {
         carry_paths: &[String],
         token_estimate: Option<u64>,
     ) -> Result<String> {
-        self.append_compaction_with_task_state(
+        self.append_compaction_with_metadata(
             covered_from,
             covered_to,
             summary,
             carry_paths,
             None,
             token_estimate,
+            crate::nexus::CompactionOrigin::Excerpts,
+            None,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn append_compaction_with_task_state(
         &mut self,
         covered_from: &str,
@@ -204,6 +207,30 @@ impl SessionLog {
         carry_paths: &[String],
         task_state: Option<&CompactionTaskState>,
         token_estimate: Option<u64>,
+    ) -> Result<String> {
+        self.append_compaction_with_metadata(
+            covered_from,
+            covered_to,
+            summary,
+            carry_paths,
+            task_state,
+            token_estimate,
+            crate::nexus::CompactionOrigin::Excerpts,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_compaction_with_metadata(
+        &mut self,
+        covered_from: &str,
+        covered_to: &str,
+        summary: &str,
+        carry_paths: &[String],
+        task_state: Option<&CompactionTaskState>,
+        token_estimate: Option<u64>,
+        origin: crate::nexus::CompactionOrigin,
+        worker_usage: Option<&crate::nexus::ProviderUsage>,
     ) -> Result<String> {
         let id = self.next_id();
         // Generation ordinal (ADR-0047): 1-based count of compactions in this
@@ -229,6 +256,8 @@ impl SessionLog {
             // it is recomputable from compaction-entry order, so its absence
             // never changes how a pre-ADR-0047 session rebuilds.
             "generation": generation,
+            "origin": origin.as_str(),
+            "workerUsage": worker_usage,
         });
         // Additive optional carry (ADR-0044): only written when non-empty, so an
         // empty carry leaves the serialized entry byte-identical to a pre-carry
@@ -273,6 +302,7 @@ impl SessionLog {
     /// class code (issue #400, e.g. `"C"` for the watermark backstop):
     /// additive-optional audit metadata -- rebuild ignores it, and entries
     /// written before it existed simply lack the field.
+    #[cfg(test)]
     pub(crate) fn append_fold(
         &mut self,
         target_id: &str,
@@ -280,8 +310,19 @@ impl SessionLog {
         token_estimate: Option<u64>,
         trigger: &str,
     ) -> Result<String> {
+        self.append_fold_with_reasons(target_id, stub, token_estimate, trigger, &[])
+    }
+
+    pub(crate) fn append_fold_with_reasons(
+        &mut self,
+        target_id: &str,
+        stub: &str,
+        token_estimate: Option<u64>,
+        trigger: &str,
+        reasons: &[&str],
+    ) -> Result<String> {
         let id = self.next_id();
-        let entry = json!({
+        let mut entry = json!({
             "type": "fold",
             "id": id,
             "parentId": self.last_id.as_deref(),
@@ -292,6 +333,9 @@ impl SessionLog {
             "tokenEstimate": token_estimate,
             "trigger": trigger,
         });
+        if !reasons.is_empty() {
+            entry["reasons"] = json!(reasons);
+        }
         write_line(&mut self.file, &entry)
             .with_context(|| format!("failed to append fold to session {}", self.path.display()))?;
         self.last_id = Some(id.clone());
@@ -881,9 +925,11 @@ pub(crate) struct StoredSession {
     /// so reopening a session reports the same total every time. The foundation
     /// the next slice (auto-compaction budgeting) reads instead of recomputing.
     pub(crate) context_tokens: u64,
-    /// Last persisted dangerous skip-permissions state for this session. This is
+    /// Last persisted dangerous skip-permissions state for this session. `None`
+    /// means the transcript has no marker and should inherit the global default;
+    /// `Some(false)` is an explicit clear after a prior dangerous marker. This is
     /// chrome/runtime state, not provider-visible context.
-    pub(crate) dangerous_skip_permissions: bool,
+    pub(crate) dangerous_skip_permissions: Option<bool>,
 }
 
 /// Serialize one message into its session entry value, with a stable id and a
@@ -1199,10 +1245,11 @@ fn read_messages(path: &Path) -> Result<RebuiltContext> {
 
 /// Read the last persisted dangerous skip-permissions state from the transcript.
 /// Legacy markers without `enabled` mean enabled=true; malformed lines are skipped
-/// like the rest of the session reader.
-fn read_dangerous_skip_permissions(path: &Path) -> Result<bool> {
+/// like the rest of the session reader. `None` means this transcript never chose
+/// the dangerous mode, so callers may fall back to the global default.
+fn read_dangerous_skip_permissions(path: &Path) -> Result<Option<bool>> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut enabled = false;
+    let mut enabled = None;
     for line in bytes
         .split(|&b| b == b'\n')
         .map(|line| std::str::from_utf8(line).map(str::trim))
@@ -1218,10 +1265,12 @@ fn read_dangerous_skip_permissions(path: &Path) -> Result<bool> {
         if value.get("type").and_then(Value::as_str) == Some("dangerousMode")
             && value.get("mode").and_then(Value::as_str) == Some("dangerously-skip-permissions")
         {
-            enabled = value
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
+            enabled = Some(
+                value
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+            );
         }
     }
     Ok(enabled)
@@ -1247,6 +1296,25 @@ pub(crate) fn read_span(path: &Path, from: u64, to: u64) -> Result<Vec<(Option<S
                 .as_deref()
                 .and_then(|id| u64::from_str_radix(id, 16).ok())
                 .is_some_and(|n| n >= from && n <= to)
+        })
+        .map(|entry| (entry.id, entry.message))
+        .collect())
+}
+
+/// Read the ORIGINAL assistant tool-call and tool-result rows for one provider
+/// tool-call id. Fold and compaction entries are ignored: raw message entries
+/// remain the recovery source even after their provider-visible rendering was
+/// replaced.
+pub(crate) fn read_tool_call(
+    path: &Path,
+    tool_call_id: &str,
+) -> Result<Vec<(Option<String>, Message)>> {
+    let (entries, _compactions, _folds) = read_entries(path)?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| {
+            entry.message.tool_call_id.as_deref() == Some(tool_call_id)
+                && matches!(entry.message.role, Role::AssistantToolCall | Role::Tool)
         })
         .map(|entry| (entry.id, entry.message))
         .collect())
@@ -1822,7 +1890,7 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nexus::{Message, ModelOrigin, ToolCall};
+    use crate::nexus::{CompactionOrigin, Message, ModelOrigin, ProviderUsage, ToolCall};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct TempDir {
@@ -1921,7 +1989,19 @@ mod tests {
             id
         };
         let stored = open_by_id(&store, &id);
-        assert!(!stored.dangerous_skip_permissions);
+        assert_eq!(stored.dangerous_skip_permissions, Some(false));
+    }
+
+    #[test]
+    fn dangerous_mode_state_absent_inherits_global_default() {
+        let dir = temp_dir();
+        let store = SessionStore::with_root(dir.path.clone());
+        let id = {
+            let log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+            log.id().to_string()
+        };
+        let stored = open_by_id(&store, &id);
+        assert_eq!(stored.dangerous_skip_permissions, None);
     }
 
     #[test]
@@ -2175,6 +2255,37 @@ mod tests {
         let span = read_span(&path, target_num, target_num).unwrap();
         assert_eq!(span.len(), 1);
         assert!(span[0].1.content.contains("fn load_bearing_NEEDLE() {}"));
+    }
+
+    #[test]
+    fn tool_call_id_reader_returns_original_call_and_result_after_fold() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let call = crate::nexus::ToolCall {
+            id: "call-recover".to_string(),
+            name: "read".to_string(),
+            arguments: json!({"path":"src/lib.rs"}),
+            thought_signature: None,
+        };
+        log.append(&Message::assistant_tool_call(&call)).unwrap();
+        let result_id = log
+            .append(&read_result(
+                "call-recover",
+                "src/lib.rs",
+                "ORIGINAL-CALL-ID-NEEDLE",
+            ))
+            .unwrap();
+        log.append_fold(&result_id, "[folded] replacement", None, "C")
+            .unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        let recovered = read_tool_call(&path, "call-recover").unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].1.role, Role::AssistantToolCall);
+        assert_eq!(recovered[1].1.role, Role::Tool);
+        assert!(recovered[1].1.content.contains("ORIGINAL-CALL-ID-NEEDLE"));
+        assert!(read_tool_call(&path, "missing").unwrap().is_empty());
     }
 
     #[test]
@@ -2977,6 +3088,50 @@ mod tests {
         assert!(entry["tokenEstimate"].is_null());
         // The first compaction in the session persists generation 1 (ADR-0047).
         assert_eq!(entry["generation"], 1);
+        assert_eq!(entry["origin"], "excerpts");
+        assert!(entry["workerUsage"].is_null());
+    }
+
+    #[test]
+    fn append_compaction_persists_worker_usage_and_origin() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        let usage = ProviderUsage {
+            provider: "anthropic".to_string(),
+            model: "claude-haiku-4-5".to_string(),
+            input_tokens: 120,
+            output_tokens: 30,
+            cache_read_input_tokens: 80,
+            cache_write_input_tokens: 20,
+            reasoning_output_tokens: 0,
+            total_tokens: 150,
+            cache_creation: None,
+        };
+
+        log.append_compaction_with_metadata(
+            &from,
+            &to,
+            "summary text",
+            &[],
+            None,
+            None,
+            CompactionOrigin::Subagent,
+            Some(&usage),
+        )
+        .unwrap();
+
+        let entries = lines(log.path());
+        let entry = entries.last().unwrap();
+        assert_eq!(entry["origin"], "subagent");
+        assert_eq!(entry["workerUsage"]["provider"], "anthropic");
+        assert_eq!(entry["workerUsage"]["model"], "claude-haiku-4-5");
+        assert_eq!(entry["workerUsage"]["inputTokens"], 120);
+        assert_eq!(entry["workerUsage"]["outputTokens"], 30);
+        assert_eq!(entry["workerUsage"]["cacheReadInputTokens"], 80);
+        assert_eq!(entry["workerUsage"]["cacheWriteInputTokens"], 20);
+        assert_eq!(entry["workerUsage"]["totalTokens"], 150);
     }
 
     #[test]

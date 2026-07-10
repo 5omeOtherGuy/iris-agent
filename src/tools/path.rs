@@ -49,11 +49,23 @@ pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
 
 /// Resolve a path that must already exist, confined to the workspace.
 pub(crate) fn resolve_existing(root: &Path, requested: &str) -> Result<PathBuf> {
+    resolve_existing_in_roots(root, requested, &[])
+}
+
+/// Resolve an existing path for a read-only consumer. When confinement is on,
+/// the target must be in the workspace or one of the trusted extra roots.
+/// Callers must derive extras from host-discovered resources, never model input.
+pub(crate) fn resolve_existing_in_roots(
+    root: &Path,
+    requested: &str,
+    extra_roots: &[PathBuf],
+) -> Result<PathBuf> {
     let candidate = lexical_normalize(&join_request(root, requested));
     let resolved = candidate
         .canonicalize()
         .with_context(|| format!("failed to resolve path {requested}"))?;
-    if restrictions_enabled() && !resolved.starts_with(root) {
+    let in_extra_root = extra_roots.iter().any(|extra| resolved.starts_with(extra));
+    if restrictions_enabled() && !resolved.starts_with(root) && !in_extra_root {
         bail!("path escapes workspace: {requested}");
     }
     Ok(resolved)

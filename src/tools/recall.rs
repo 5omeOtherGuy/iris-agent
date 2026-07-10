@@ -43,13 +43,15 @@ const MAX_SEARCH_HITS: usize = 30;
 /// full turns; a windowed read then retrieves the hit verbatim).
 const SEARCH_PREVIEW_CHARS: usize = 200;
 
-pub(super) const DESCRIPTION: &str = "Retrieve the ORIGINAL turns of a compacted range that a summary replaced (ADR-0046). Address them EITHER by `handle` OR by a standalone entry-id span. After compaction the context shows a summary plus a recall reference naming a `handle`; pass that `handle` to page the original turns back, windowed with `offset` (1-indexed turn-group) and `limit`, narrowed to a `from`..`to` span, or searched with `pattern` (returns matching turns with their entry ids). Or omit `handle` and pass a `from`/`to` entry-id span to recall those original turns of THIS session directly. Provide exactly one of `handle` or a standalone span. Tool-call/tool-result pairs are returned intact. Read-only over this session's own transcript: no file path, no shell, no approval.";
+pub(super) const DESCRIPTION: &str = "Retrieve ORIGINAL turns from this session. Address them by exactly one mode: a compaction `handle`, a standalone `from`/`to` entry-id span, or a `tool_call_id` shown in a folded tool-result stub. Handle reads may be narrowed by a span. Results can be windowed with `offset`/`limit` or searched with `pattern`; tool-call/tool-result pairs stay intact. Read-only over this session's own transcript: no file path, shell, or approval.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
             "handle": { "type": "string", "description": "The recall handle id from a compaction reference (the `recall(handle=...)` marker in the summary). Omit it to address original turns by a standalone `from`/`to` entry-id span instead." },
+            "tool_call_id": { "type": "string", "description": "A tool_call_id from a folded-result stub. Returns the original assistant tool call and result from this session. Exclusive with handle/from/to." },
+            "toolCallId": { "type": "string", "description": "Camel-case alias for tool_call_id. Do not provide both aliases." },
             "from": { "type": "string", "description": "Inclusive start entry id. With a `handle`, narrows the returned turns to the [from, to] span within the compacted range; without a `handle`, defines a standalone span read directly from this session." },
             "to": { "type": "string", "description": "Inclusive end entry id for the span (used with `from`)." },
             "pattern": { "type": "string", "description": "Optional search: return only turns whose content contains this substring, with their entry ids (bounded count)." },
@@ -135,6 +137,8 @@ pub(crate) fn recall_marker(handle: &str, from: &str, to: &str) -> String {
 struct RecallInput {
     #[serde(default)]
     handle: Option<String>,
+    #[serde(default, alias = "toolCallId")]
+    tool_call_id: Option<String>,
     #[serde(default)]
     from: Option<String>,
     #[serde(default)]
@@ -170,13 +174,61 @@ pub(super) fn execute(
     // malformed input and rejected rather than silently ignored.
     let span = parse_span(input.from.as_deref(), input.to.as_deref())?;
 
-    // Exactly one addressing MODE: a `handle` (a compaction reference; a span
-    // then narrows within its blob) OR a standalone entry-id span read directly
-    // from this session. A non-empty handle selects the handle path.
-    match input.handle.as_deref().filter(|h| !h.trim().is_empty()) {
+    // Exactly one addressing mode. A handle may use a span as a narrowing
+    // modifier; tool-call-id mode is exclusive with every other address.
+    let handle = input
+        .handle
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let tool_call_id = input
+        .tool_call_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    if let Some(tool_call_id) = tool_call_id {
+        if handle.is_some() || span.is_some() {
+            return Err(anyhow!(
+                "recall `tool_call_id` is exclusive with `handle`, `from`, and `to`"
+            ));
+        }
+        return execute_tool_call(session_span, tool_call_id, &input);
+    }
+    match handle {
         Some(handle) => execute_handle(store, handle, span, &input),
         None => execute_span(session_span, span, &input),
     }
+}
+
+fn execute_tool_call(
+    session_span: Option<&dyn SessionSpanReader>,
+    tool_call_id: &str,
+    input: &RecallInput,
+) -> Result<super::ToolOutput> {
+    let reader = session_span
+        .ok_or_else(|| anyhow!("no session transcript is available; there is nothing to recall"))?;
+    let turns: Vec<RecalledTurn> = reader
+        .recall_tool_call(tool_call_id)?
+        .iter()
+        .map(|(id, message)| recalled_turn(id.clone(), message))
+        .collect();
+    if turns.is_empty() {
+        return Err(anyhow!(
+            "no tool call with tool_call_id {tool_call_id:?} exists in this session"
+        ));
+    }
+    let blob = RecallBlob {
+        covered_from: span_bound_id(&turns, false),
+        covered_to: span_bound_id(&turns, true),
+        turns,
+    };
+    let selected: Vec<&RecalledTurn> = blob.turns.iter().collect();
+    if let Some(pattern) = input
+        .pattern
+        .as_deref()
+        .filter(|pattern| !pattern.is_empty())
+    {
+        return Ok(search(&selected, pattern, &blob));
+    }
+    Ok(window(&selected, input.offset, input.limit, &blob))
 }
 
 /// Handle path: resolve the covered range from the ADR-0011 store, optionally
@@ -487,6 +539,67 @@ mod tests {
                 .cloned()
                 .collect())
         }
+
+        fn recall_tool_call(&self, tool_call_id: &str) -> Result<Vec<(Option<String>, Message)>> {
+            Ok(self
+                .0
+                .iter()
+                .filter(|(_, message)| message.tool_call_id.as_deref() == Some(tool_call_id))
+                .cloned()
+                .collect())
+        }
+    }
+
+    #[test]
+    fn tool_call_id_mode_returns_the_original_pair_and_accepts_camel_alias() {
+        let turns = vec![
+            (
+                Some("01".to_string()),
+                tool_call_msg("call_1", "read", "a.rs"),
+            ),
+            (
+                Some("02".to_string()),
+                Message::tool_result("call_1", "read", "ORIGINAL-RESULT"),
+            ),
+            (
+                Some("03".to_string()),
+                tool_call_msg("call_2", "read", "b.rs"),
+            ),
+            (
+                Some("04".to_string()),
+                Message::tool_result("call_2", "read", "OTHER-RESULT"),
+            ),
+        ];
+        let reader = FakeSpan(turns);
+        for args in [
+            json!({"tool_call_id":"call_1"}),
+            json!({"toolCallId":"call_1"}),
+        ] {
+            let out = execute(None, Some(&reader), &args).unwrap();
+            assert!(out.content.contains("ORIGINAL-RESULT"));
+            assert!(!out.content.contains("OTHER-RESULT"));
+            assert!(out.content.contains("tool=read"));
+            assert!(out.content.contains("id=01"));
+            assert!(out.content.contains("id=02"));
+        }
+    }
+
+    #[test]
+    fn tool_call_id_mode_is_exclusive_and_unknown_ids_error() {
+        let reader = FakeSpan(Vec::new());
+        let error = execute(
+            None,
+            Some(&reader),
+            &json!({"tool_call_id":"call_1","from":"01"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exclusive"), "{error}");
+
+        let error = execute(None, Some(&reader), &json!({"tool_call_id":"missing"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no tool call"), "{error}");
     }
 
     #[test]
@@ -773,7 +886,16 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            vec!["from", "handle", "limit", "offset", "pattern", "to"]
+            vec![
+                "from",
+                "handle",
+                "limit",
+                "offset",
+                "pattern",
+                "to",
+                "toolCallId",
+                "tool_call_id",
+            ]
         );
     }
 }

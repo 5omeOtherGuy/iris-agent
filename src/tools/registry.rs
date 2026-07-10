@@ -165,7 +165,8 @@ impl Tool for ReadTool {
         Box::pin(async move {
             let root = root(env)?;
             let mut state = state_mut(env)?;
-            read::execute(&root, args, &mut state.observed)
+            let state = &mut *state;
+            read::execute(&root, args, &mut state.observed, &state.skill_read_roots)
         })
     }
     // `read` mutates `state.observed` (read-before-write tracking) behind the

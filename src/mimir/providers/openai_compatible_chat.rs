@@ -587,6 +587,7 @@ fn build_chat_messages(system_prompt: &str, messages: &[Message]) -> Vec<Value> 
     }
     for message in messages {
         match message.role {
+            Role::Developer => out.push(json!({ "role": "developer", "content": message.content })),
             Role::User => out.push(json!({ "role": "user", "content": message.content })),
             Role::Assistant => push_assistant_content(&mut out, &message.content),
             // Chat Completions has no reasoning replay channel; re-sending
@@ -1078,5 +1079,14 @@ mod tests {
         let turn = turn.expect("empty completion with stop reason is legitimate");
         assert!(turn.text.is_none());
         assert!(turn.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn developer_context_keeps_its_chat_role() {
+        let messages = build_chat_messages("system", &[Message::developer("skill catalog")]);
+
+        assert_eq!(messages[0]["role"], json!("system"));
+        assert_eq!(messages[1]["role"], json!("developer"));
+        assert_eq!(messages[1]["content"], json!("skill catalog"));
     }
 }
