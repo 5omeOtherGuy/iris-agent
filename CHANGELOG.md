@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.1.0...iris-agent-v0.2.0) - 2026-07-10
+
+### Highlights
+
+- **The TUI instrument identity**
+  ([#522](https://github.com/5omeOtherGuy/iris-agent/pull/522)) — a power-on
+  lamp test and `I R I S` silkscreen at boot; detent flashes when a setting
+  clicks into place; an exit receipt; the `/settings` faceplate — switches,
+  dials, registers, and ports on one silkscreened panel where position is
+  state and every click saves; escapement-governed streaming that tracks the
+  model's cadence like a hand at the keys; and a living thought rail with a
+  working lamp, live elapsed time, and honest `+N rows` elision.
+- **Updates you can trust**
+  ([#529](https://github.com/5omeOtherGuy/iris-agent/pull/529),
+  [#531](https://github.com/5omeOtherGuy/iris-agent/pull/531),
+  [#532](https://github.com/5omeOtherGuy/iris-agent/pull/532)) — `iris update`
+  installs tagged stable releases only (never `main`, never a prerelease,
+  never a downgrade), verifies SHA-256 before replacing anything, and — like
+  `install.sh` — reports in the instrument voice; `iris --version` names the
+  exact artifact you are running.
+- **Governed context**
+  ([#518](https://github.com/5omeOtherGuy/iris-agent/pull/518),
+  [#523](https://github.com/5omeOtherGuy/iris-agent/pull/523)–[#527](https://github.com/5omeOtherGuy/iris-agent/pull/527),
+  [#530](https://github.com/5omeOtherGuy/iris-agent/pull/530)) — transcript
+  compaction workers, a model-aware trigger, configurable tool-result
+  compaction, context governed between provider round trips, and reactive
+  overflow recovery.
+
+### Added
+
+- iris --version names the exact artifact ([#532](https://github.com/5omeOtherGuy/iris-agent/pull/532))
+- first-class install and update experience ([#531](https://github.com/5omeOtherGuy/iris-agent/pull/531))
+- recover reactively from context overflow ([#530](https://github.com/5omeOtherGuy/iris-agent/pull/530))
+- iris update installs tagged releases only, never downgrades ([#529](https://github.com/5omeOtherGuy/iris-agent/pull/529))
+- the TUI instrument identity — boot, detents, receipt, faceplate, escapement, living thought ([#522](https://github.com/5omeOtherGuy/iris-agent/pull/522))
+- add transcript compaction workers ([#527](https://github.com/5omeOtherGuy/iris-agent/pull/527))
+- govern context between provider round trips ([#526](https://github.com/5omeOtherGuy/iris-agent/pull/526))
+- persist completed provider round trips ([#525](https://github.com/5omeOtherGuy/iris-agent/pull/525))
+- add model-aware compaction trigger ([#524](https://github.com/5omeOtherGuy/iris-agent/pull/524))
+- add auto-compaction engine telemetry baseline ([#523](https://github.com/5omeOtherGuy/iris-agent/pull/523))
+- add Codex-compatible native skills ([#521](https://github.com/5omeOtherGuy/iris-agent/pull/521))
+- use Codex WebSocket transport by default ([#509](https://github.com/5omeOtherGuy/iris-agent/pull/509))
+- add configurable tool result compaction ([#518](https://github.com/5omeOtherGuy/iris-agent/pull/518))
+- reveal raw thinking from collapsed summaries
+- stream raw Codex reasoning deltas ([#508](https://github.com/5omeOtherGuy/iris-agent/pull/508))
+
+### Fixed
+
+- persist permission mode defaults ([#520](https://github.com/5omeOtherGuy/iris-agent/pull/520))
+- preserve persisted reasoning effort ([#519](https://github.com/5omeOtherGuy/iris-agent/pull/519))
+- address licenser-reported tui settings ([#516](https://github.com/5omeOtherGuy/iris-agent/pull/516))
+- avoid no-op thinking disclosure
+- apply subagent summarizer to all compaction ([#507](https://github.com/5omeOtherGuy/iris-agent/pull/507))
+- prefer completed Codex reasoning summaries ([#506](https://github.com/5omeOtherGuy/iris-agent/pull/506))
+
 ## [0.1.0](https://github.com/5omeOtherGuy/iris-agent/releases/tag/v0.1.0) - 2026-07-09
 
 _0.1.0 was version-cut on 2026-06-17; the v0.1.0 tag, prebuilt binaries, and
