@@ -1228,7 +1228,8 @@ without `TestBackend` frame assertions.
 
 **Status: shipped (2026-07-04, PRs [#334](https://github.com/5omeOtherGuy/iris-agent/pull/334) and [#347](https://github.com/5omeOtherGuy/iris-agent/pull/347)).**
 Both slices landed through the gate with pre-merge review: syntect
-highlighting via the `HighlightFn` seam, and spans-first OSC 8 hyperlinks
+highlighting via the `HighlightFn` seam (later extended to inferred file and
+heredoc languages in tool panels), and spans-first OSC 8 hyperlinks
 (inline serialization + pager hit-testing, URI sanitization choke point,
 marker-forgery defense). `--plain` byte-identical in both.
 
