@@ -58,11 +58,6 @@ impl SelectorItem {
         self.trailing = Some(trailing.into());
         self
     }
-
-    pub(crate) fn enabled(mut self, enabled: bool) -> Self {
-        self.enabled = Some(enabled);
-        self
-    }
 }
 
 /// A list-with-search picker. `searchable` toggles the search row; `wrap`
@@ -110,15 +105,6 @@ impl Selector {
         selector
     }
 
-    /// Replace the item list (e.g. after a scoped-models toggle/reorder),
-    /// preserving the search string and keeping the highlight on the same id
-    /// when it still exists.
-    pub(crate) fn replace_items(&mut self, items: Vec<SelectorItem>) {
-        let keep = self.selected().map(|item| item.id.clone());
-        self.items = items;
-        self.refilter(keep.as_deref());
-    }
-
     /// Recompute the filtered view. When `keep_id` is set and still visible after
     /// filtering, the cursor is moved onto it; otherwise the cursor clamps into
     /// range (0 for a fresh filter).
@@ -146,17 +132,6 @@ impl Selector {
             self.cursor = 0;
         } else if self.cursor >= self.filtered.len() {
             self.cursor = self.filtered.len() - 1;
-        }
-    }
-
-    /// Move the highlight to the row with `id` if it is currently visible.
-    pub(crate) fn select_id(&mut self, id: &str) {
-        if let Some(position) = self
-            .filtered
-            .iter()
-            .position(|&index| self.items[index].id == id)
-        {
-            self.cursor = position;
         }
     }
 
@@ -281,14 +256,6 @@ impl Selector {
             })
             .collect()
     }
-
-    /// All currently filtered items (used by Ctrl+A/Ctrl+X "all matching" ops).
-    pub(crate) fn filtered_ids(&self) -> Vec<String> {
-        self.filtered
-            .iter()
-            .map(|&index| self.items[index].id.clone())
-            .collect()
-    }
 }
 
 /// Case-insensitive subsequence match: every char of `needle` appears in
@@ -393,18 +360,6 @@ mod tests {
         clamping.down();
         clamping.down();
         assert_eq!(clamping.cursor(), 2, "clamp at bottom");
-    }
-
-    #[test]
-    fn replace_items_keeps_cursor_on_same_id() {
-        let mut selector = Selector::new(items(), true, true, 10);
-        selector.down(); // anthropic
-        assert_eq!(selector.selected_id(), Some("anthropic/claude-sonnet-4-6"));
-        // Reorder: move anthropic to the front; cursor should follow it.
-        let mut reordered = items();
-        reordered.swap(0, 1);
-        selector.replace_items(reordered);
-        assert_eq!(selector.selected_id(), Some("anthropic/claude-sonnet-4-6"));
     }
 
     #[test]

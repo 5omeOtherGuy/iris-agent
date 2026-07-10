@@ -11,15 +11,17 @@ use crate::config;
 use crate::git::status::GitStatus;
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_capabilities;
-use crate::mimir::model_catalog::{self, CatalogModel, ExactMatch};
+use crate::mimir::model_catalog::{self, AuthStatus, CatalogModel, ExactMatch};
 use crate::mimir::selection::{ProviderId, ReasoningEffort};
 use crate::nexus::ChatProvider;
 use crate::session::{self, ResumableSession, SessionStore};
 use crate::ui::modal::{
-    Modal, ModalAction, ModelPicker, ScopedModels, SessionPicker, SessionRow, SwitchContextPrompt,
-    TaskPicker, TrustMenu,
+    Modal, ModalAction, SessionPicker, SessionRow, SwitchContextPrompt, TaskPicker,
 };
-use crate::ui::settings_menu::{self, SettingsPanel};
+use crate::ui::settings_menu::{
+    self, HatchTarget, ModelChoice, PanelView, PolicySnapshot, ProviderStatus, ScopeChoice,
+    SettingsPanel,
+};
 use crate::ui::task_view::TaskCard;
 use crate::wayland::Harness;
 use crate::wayland::git_safety::{ActiveTaskDisplay, AdoptedTask, GitSafety, RecoverableTask};
@@ -168,28 +170,11 @@ pub(crate) fn model_command<P: ChatProvider>(
         ModelDecision::Status(lines) => ModelCommand::Lines(lines),
         ModelDecision::Switch(model) => model_command_for_candidate(model, true, harness, switch),
         ModelDecision::Open(_search) => {
-            // The redesigned picker is not searchable, so an unresolved `/model
-            // <arg>` opens the full list rather than a hidden filtered view.
-            let default = config::default_model_qualified().unwrap_or_else(|| current.clone());
-            let effort = switch
-                .selection()
-                .reasoning
-                .unwrap_or(ReasoningEffort::DEFAULT);
-            ModelCommand::Open(Modal::Model(ModelPicker::new(
-                available, &current, &default, effort,
-            )))
+            // Bare / unresolved `/model` opens the faceplate's ENGINE model
+            // hatch (§4.1) — the picker is now an in-place hatch, not a door.
+            ModelCommand::Open(open_settings_expanded(harness, switch, HatchTarget::Model))
         }
     }
-}
-
-/// Build the `/scoped-models` modal, or report no available models.
-pub(crate) fn open_scoped<P>(switch: &ModelSwitch<'_, P>) -> ModelCommand {
-    let available = available_now();
-    if available.is_empty() {
-        return ModelCommand::Lines(vec!["No models available".to_string()]);
-    }
-    let enabled = switch.scoped().map(<[String]>::to_vec);
-    ModelCommand::Open(Modal::Scoped(ScopedModels::new(available, enabled)))
 }
 
 /// Build the `/resume` picker for the given workspace, or `None` when no prior
@@ -343,18 +328,6 @@ pub(crate) fn linked_task_offer(task: &RecoverableTask) -> Modal {
     ))
 }
 
-/// Build the `/trust` project-permissions modal from the harness-owned policy
-/// snapshot (ADR-0027). The modal is a snapshot; every applied edit rebuilds it.
-pub(crate) fn open_trust<P: ChatProvider>(harness: &Harness<P>) -> Modal {
-    let record = harness.project_policy_record();
-    Modal::Trust(TrustMenu::new(
-        &record.allow_tools.iter().cloned().collect::<Vec<_>>(),
-        &record.allow_bash.iter().cloned().collect::<Vec<_>>(),
-        &record.allow_bash_prefix.iter().cloned().collect::<Vec<_>>(),
-        record.sandbox.clone(),
-    ))
-}
-
 /// Build the `/settings` modal: the flat settings panel (the faceplate),
 /// populated with a fresh snapshot of the persisted + live values.
 pub(crate) fn open_settings<P: ChatProvider>(
@@ -366,24 +339,43 @@ pub(crate) fn open_settings<P: ChatProvider>(
     ))))
 }
 
-/// Re-open the panel with the cursor on `row` — the port-return path (leaving
-/// the model picker / trust / scoped / login surfaces lands back on the port
-/// that opened them, with the snapshot refreshed to show what changed).
-pub(crate) fn open_settings_at<P: ChatProvider>(
+/// Open the faceplate with a hatch pre-expanded — the slash-command entry path
+/// (§4.1). `/model` opens ENGINE › model, `/scoped-models` opens the scope
+/// hatch, `/trust` the permissions hatch, `/login`/`/logout` the providers
+/// hatch (cursor per [`HatchTarget`]).
+pub(crate) fn open_settings_expanded<P: ChatProvider>(
     harness: &Harness<P>,
     switch: &ModelSwitch<'_, P>,
-    row: settings_menu::RowId,
+    target: HatchTarget,
 ) -> Modal {
-    Modal::Settings(Box::new(SettingsPanel::with_selected(
+    Modal::Settings(Box::new(SettingsPanel::with_expanded(
         settings_snapshot(harness, switch),
-        row,
+        target,
     )))
 }
 
+/// Rebuild the faceplate from a fresh snapshot while preserving the operator's
+/// view (open hatch, identity-keyed cursor, live filter) and re-arming the
+/// acted-on row's detent flash (§2.5, §5). This is the seamless refresh after
+/// a model select, a policy edit, a logout, or a dialog-guard round trip.
+pub(crate) fn refresh_settings_panel<P: ChatProvider>(
+    view: PanelView,
+    flash: Option<crate::ui::settings_menu::PanelRow>,
+    harness: &Harness<P>,
+    switch: &ModelSwitch<'_, P>,
+) -> Modal {
+    let mut panel = SettingsPanel::new(settings_snapshot(harness, switch));
+    panel.restore(view);
+    if let Some(row) = flash {
+        panel.flash_row(row);
+    }
+    Modal::Settings(Box::new(panel))
+}
+
 /// Snapshot the current persisted settings (plus the live session state the
-/// panel controls) so the panel shows each control's real position. Reads the
-/// merged global+project config for `cwd`; a read failure degrades to built-in
-/// defaults rather than failing the panel.
+/// panel controls, and the hatch payloads) so the panel shows each control's
+/// real position. Reads the merged global+project config for `cwd`; a read
+/// failure degrades to built-in defaults rather than failing the panel.
 fn settings_snapshot<P: ChatProvider>(
     harness: &Harness<P>,
     switch: &ModelSwitch<'_, P>,
@@ -413,28 +405,35 @@ fn settings_snapshot<P: ChatProvider>(
         selection.reasoning.unwrap_or(ReasoningEffort::DEFAULT),
     );
     let available = available_now();
-    let providers_connected = available
+    let current = current_qualified(switch);
+    let default_model = config::default_model_qualified().unwrap_or_else(|| current.clone());
+    let catalog = build_catalog(&available, &current, &default_model);
+    let scope_candidates: Vec<ScopeChoice> = available
         .iter()
-        .map(|model| model.provider.as_str())
-        .collect::<BTreeSet<_>>()
-        .len();
-    let scope_summary = match switch.scoped() {
-        Some(ids) if !ids.is_empty() => {
-            format!(
-                "{} of {} enabled",
-                ids.len(),
-                available.len().max(ids.len())
-            )
-        }
-        _ => "all models".to_string(),
+        .map(|model| ScopeChoice {
+            qualified: model.qualified(),
+            provider_label: model.provider.display_name().to_string(),
+        })
+        .collect();
+    let scope_enabled = switch.scoped().map(<[String]>::to_vec);
+    let providers = build_providers();
+    let record = harness.project_policy_record();
+    let policy = PolicySnapshot {
+        granted_tools: record.allow_tools.iter().cloned().collect(),
+        bash_exact: record.allow_bash.iter().cloned().collect(),
+        bash_prefix: record.allow_bash_prefix.iter().cloned().collect(),
+        sandbox: record.sandbox.clone(),
     };
     settings_menu::Snapshot {
-        default_model: config::default_model_qualified()
-            .unwrap_or_else(|| current_qualified(switch)),
+        default_model,
         reasoning_levels,
         reasoning,
-        scope_summary,
-        providers_connected,
+        catalog,
+        scope_candidates,
+        scope_enabled,
+        scope_persisted: settings.enabled_models.clone(),
+        providers,
+        policy,
         alt_screen: tui
             .and_then(|t| t.alt_screen.clone())
             .unwrap_or_else(|| "auto".to_string()),
@@ -468,6 +467,96 @@ fn settings_snapshot<P: ChatProvider>(
             .and_then(|t| t.theme.clone())
             .unwrap_or_else(|| crate::ui::theme::default().id().to_string()),
     }
+}
+
+/// Build the ENGINE › model hatch catalog: default-first (then by provider),
+/// each row carrying the reasoning levels its inline effort track clicks. This
+/// is the `ModelPicker` ordering + level data, moved onto the hatch (§4.2).
+fn build_catalog(available: &[CatalogModel], current: &str, default: &str) -> Vec<ModelChoice> {
+    order_by_default(available.to_vec(), default)
+        .into_iter()
+        .map(|model| {
+            let qualified = model.qualified();
+            let levels = model_capabilities::level_options(model.provider, &model.id)
+                .iter()
+                .map(|option| (option.level, option.label))
+                .collect();
+            ModelChoice {
+                display: model_catalog::display_name(&qualified),
+                provider_label: model.provider.display_name().to_string(),
+                is_current: qualified == current,
+                is_default: qualified == default,
+                provider: model.provider,
+                model_id: model.id.clone(),
+                levels,
+                qualified,
+            }
+        })
+        .collect()
+}
+
+/// Order the catalog: the persisted default first, then the rest by provider
+/// name, preserving registry order within a provider (the `ModelPicker` rule).
+fn order_by_default(models: Vec<CatalogModel>, default: &str) -> Vec<CatalogModel> {
+    let mut ordered: Vec<CatalogModel> = Vec::with_capacity(models.len());
+    if let Some(found) = models.iter().find(|model| model.qualified() == default) {
+        ordered.push(found.clone());
+    }
+    let mut rest: Vec<CatalogModel> = models
+        .into_iter()
+        .filter(|model| model.qualified() != default)
+        .collect();
+    rest.sort_by(|a, b| a.provider.as_str().cmp(b.provider.as_str()));
+    ordered.extend(rest);
+    ordered
+}
+
+/// Build the ENGINE › providers hatch rows for every known provider (registry
+/// order): the no-secret credential badge plus the login methods that exist.
+fn build_providers() -> Vec<ProviderStatus> {
+    let auth = AuthStore::from_env().ok();
+    ProviderId::ALL
+        .iter()
+        .map(|&provider| {
+            let status = auth
+                .as_ref()
+                .map(|auth| model_catalog::provider_status(auth, provider))
+                .unwrap_or(AuthStatus::Unconfigured);
+            let credentialed = status.is_configured();
+            let badge = match status {
+                AuthStatus::StoredOAuth | AuthStatus::ClaudeCode => "subscription",
+                AuthStatus::StoredApiKey | AuthStatus::EnvApiKey => "api key",
+                AuthStatus::Unconfigured => "\u{2014}",
+            }
+            .to_string();
+            ProviderStatus {
+                id: provider.as_str().to_string(),
+                name: provider.display_name().to_string(),
+                badge,
+                oauth_capable: provider_oauth_capable(provider),
+                api_key_capable: provider_api_key_capable(provider),
+                credentialed,
+            }
+        })
+        .collect()
+}
+
+/// Whether a provider supports the OAuth/subscription login flow (the `↵`
+/// primary method for these). Mirrors `login::subscription_providers`.
+fn provider_oauth_capable(provider: ProviderId) -> bool {
+    matches!(
+        provider,
+        ProviderId::OpenAiCodex | ProviderId::Anthropic | ProviderId::Antigravity
+    )
+}
+
+/// Whether a provider accepts a stored API key (the `a` path / the `↵` primary
+/// for non-OAuth providers). Mirrors `login::api_key_providers`.
+fn provider_api_key_capable(provider: ProviderId) -> bool {
+    matches!(
+        provider,
+        ProviderId::Anthropic | ProviderId::OpenAi | ProviderId::OpenAiCompatible
+    )
 }
 
 /// Persist a single settings field to the user-global file. The menu widgets
@@ -506,10 +595,15 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
     }
 }
 
-/// Apply a model/scoped/effort/settings [`ModalAction`]. Login actions are
-/// handled by the loop via [`crate::ui::login`], not here.
+/// Apply a model/scoped/effort/settings/policy [`ModalAction`] emitted by the
+/// faceplate. `view` is the panel's restorable view (open hatch + identity
+/// cursor + filter), captured before the action so a snapshot-refreshing action
+/// (model select, policy edit) can rebuild the panel in place without losing
+/// the operator's position (§5). Login/logout side effects are handled by the
+/// loop via [`crate::ui::login`], not here.
 pub(crate) fn apply_action<P: ChatProvider>(
     action: ModalAction,
+    view: Option<PanelView>,
     harness: &mut Harness<P>,
     switch: &mut ModelSwitch<'_, P>,
 ) -> ActionResult {
@@ -522,9 +616,21 @@ pub(crate) fn apply_action<P: ChatProvider>(
             if let Some(modal) =
                 switch_context_prompt(id.clone(), effort, save_default, harness, switch)
             {
+                // Advisory: the confirm prompt overlays as a dialog-guard; the
+                // loop's stash reopens the faceplate expanded whichever way it
+                // resolves (§2.5).
                 ActionResult::Replace(Box::new(modal), Vec::new())
             } else {
-                apply_confirmed_model_switch(id, effort, save_default, harness, switch)
+                let lines = switch_model_lines(id, effort, save_default, harness, switch);
+                // The row now shows the new engine; only a failed persist is
+                // worth a transcript line. The hatch stays open, header flashes.
+                refresh_settings(
+                    view,
+                    Some(model_header_flash()),
+                    failures(lines),
+                    harness,
+                    switch,
+                )
             }
         }
         ModalAction::ConfirmModelSwitch {
@@ -562,20 +668,22 @@ pub(crate) fn apply_action<P: ChatProvider>(
             }])
         }
         ModalAction::EditPolicy(edit) => {
-            // Wayland owns the policy store edit and live Nexus refresh; re-open
-            // the modal on the refreshed policy so row states reflect it.
+            // Wayland owns the policy store edit and live Nexus refresh; rebuild
+            // the panel on the refreshed policy so the hatch rows reflect it. The
+            // switch flip / row removal is the feedback — only a failed write is
+            // worth a line.
+            let flash = view.as_ref().map(|view| view.cursor());
             let lines = match harness.apply_project_policy_edit(&edit) {
-                Ok(notice) => vec![notice],
+                Ok(_notice) => Vec::new(),
                 Err(error) => vec![format!("could not save project policy: {error:#}")],
             };
-            ActionResult::Replace(Box::new(open_trust(harness)), lines)
+            refresh_settings(view, flash, lines, harness, switch)
         }
         ModalAction::CycleModel { forward } => {
-            // The panel's model row clicked ←/→: cycle the scoped models
-            // exactly like Ctrl+P. A large-context advisory replaces the
-            // panel with the confirm prompt (the loop returns home after);
-            // a completed click rebuilds the panel on the fresh snapshot so
-            // the row shows the new engine, and flashes it.
+            // The model row clicked ←/→: cycle the scoped models exactly like
+            // Ctrl+P. A large-context advisory overlays the confirm prompt (the
+            // loop's stash returns home); a completed click rebuilds the panel on
+            // the fresh snapshot so the row shows the new engine, and flashes it.
             let before = current_qualified(switch);
             match cycle_model(forward, harness, switch) {
                 ModelCommand::Open(modal) => ActionResult::Replace(Box::new(modal), Vec::new()),
@@ -585,19 +693,12 @@ pub(crate) fn apply_action<P: ChatProvider>(
                         // scope): the status line is the honest feedback.
                         ActionResult::Keep(lines)
                     } else {
-                        let mut panel = SettingsPanel::with_selected(
-                            settings_snapshot(harness, switch),
-                            settings_menu::RowId::Model,
-                        );
-                        panel.flash_selected();
-                        // The row itself reports the switch; only a failed
-                        // persist is worth a transcript line.
-                        ActionResult::Replace(
-                            Box::new(Modal::Settings(Box::new(panel))),
-                            lines
-                                .into_iter()
-                                .filter(|line| line.contains("not saved"))
-                                .collect(),
+                        refresh_settings(
+                            view,
+                            Some(model_header_flash()),
+                            failures(lines),
+                            harness,
+                            switch,
                         )
                     }
                 }
@@ -605,17 +706,12 @@ pub(crate) fn apply_action<P: ChatProvider>(
         }
         ModalAction::AdjustEffort(level) => {
             // The panel's reasoning switch: apply to the live session and
-            // persist as the default, exactly like the model picker's inline
+            // persist as the default, exactly like the model hatch's inline
             // effort. The panel stays open and already shows the new detent,
             // so the switch chatter is suppressed — only a failed persist is
             // surfaced (numbers/notices stay honest).
             let lines = apply_effort(level, harness, switch);
-            ActionResult::Keep(
-                lines
-                    .into_iter()
-                    .filter(|line| line.contains("not saved"))
-                    .collect(),
-            )
+            ActionResult::Keep(failures(lines))
         }
         ModalAction::SaveSetting { field, value } => {
             match save_setting_field(field, value.as_deref()) {
@@ -640,47 +736,63 @@ pub(crate) fn apply_action<P: ChatProvider>(
                 Err(error) => {
                     // The write failed: rebuild the panel from disk so the
                     // control settles back onto the persisted position.
-                    ActionResult::Replace(
-                        Box::new(open_settings_at(
-                            harness,
-                            switch,
-                            settings_menu::RowId::Field(field),
-                        )),
+                    refresh_settings(
+                        view,
+                        None,
                         vec![format!("could not save setting: {error:#}")],
+                        harness,
+                        switch,
                     )
                 }
             }
         }
-        ModalAction::OpenModelPicker => {
-            let available = available_now();
-            if available.is_empty() {
-                return ActionResult::Close(vec![
-                    "No models available. Use /login to add providers.".to_string(),
-                ]);
-            }
-            let current = current_qualified(switch);
-            let default = config::default_model_qualified().unwrap_or_else(|| current.clone());
-            let effort = switch
-                .selection()
-                .reasoning
-                .unwrap_or(ReasoningEffort::DEFAULT);
-            ActionResult::Replace(
-                Box::new(Modal::Model(ModelPicker::new(
-                    available, &current, &default, effort,
-                ))),
-                Vec::new(),
-            )
-        }
-        ModalAction::OpenTrustMenu => {
-            ActionResult::Replace(Box::new(open_trust(harness)), Vec::new())
-        }
-        ModalAction::OpenScopedModels => match open_scoped(switch) {
-            ModelCommand::Open(modal) => ActionResult::Replace(Box::new(modal), Vec::new()),
-            ModelCommand::Lines(lines) => ActionResult::Close(lines),
-        },
-        // Login navigation/side effects (incl. OpenLoginMethod) are handled by
-        // the loop, which owns the auth store / login backend.
+        // Login navigation/side effects (BeginLogin/OpenApiKeyDialog/Logout) are
+        // handled by the loop, which owns the auth store / login backend.
         other => ActionResult::Close(vec![format!("unhandled action: {other:?}")]),
+    }
+}
+
+/// The model header row — the flash target after a model select/cycle (§3.1).
+fn model_header_flash() -> crate::ui::settings_menu::PanelRow {
+    crate::ui::settings_menu::PanelRow::Top(crate::ui::settings_menu::RowId::Model)
+}
+
+/// Keep only the failure lines from a model/effort switch (a failed persist);
+/// the row itself is the success feedback, so the confirmation chatter is muted.
+fn failures(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .filter(|line| line.contains("not saved"))
+        .collect()
+}
+
+/// Rebuild the faceplate in place from a fresh snapshot, preserving the view and
+/// re-arming `flash`; fall back to a fresh (unexpanded) panel if no view was
+/// captured (should not happen — the panel is always front for these actions).
+fn refresh_settings<P: ChatProvider>(
+    view: Option<PanelView>,
+    flash: Option<crate::ui::settings_menu::PanelRow>,
+    lines: Vec<String>,
+    harness: &Harness<P>,
+    switch: &ModelSwitch<'_, P>,
+) -> ActionResult {
+    let modal = match view {
+        Some(view) => refresh_settings_panel(view, flash, harness, switch),
+        None => open_settings(harness, switch),
+    };
+    ActionResult::Replace(Box::new(modal), lines)
+}
+
+fn switch_model_lines<P: ChatProvider>(
+    id: String,
+    effort: ReasoningEffort,
+    save_default: bool,
+    harness: &mut Harness<P>,
+    switch: &mut ModelSwitch<'_, P>,
+) -> Vec<String> {
+    match parse_qualified(&id) {
+        Some(model) => apply_model_effort(model, effort, save_default, harness, switch),
+        None => vec![format!("unknown model: {id}")],
     }
 }
 
@@ -691,16 +803,13 @@ fn apply_confirmed_model_switch<P: ChatProvider>(
     harness: &mut Harness<P>,
     switch: &mut ModelSwitch<'_, P>,
 ) -> ActionResult {
-    match parse_qualified(&id) {
-        Some(model) => ActionResult::Close(apply_model_effort(
-            model,
-            effort,
-            save_default,
-            harness,
-            switch,
-        )),
-        None => ActionResult::Close(vec![format!("unknown model: {id}")]),
-    }
+    ActionResult::Close(switch_model_lines(
+        id,
+        effort,
+        save_default,
+        harness,
+        switch,
+    ))
 }
 
 /// Fold an explicit enabled list back to `None` when it covers every available

@@ -119,17 +119,6 @@ impl AuthStatus {
     pub(crate) fn is_configured(self) -> bool {
         !matches!(self, AuthStatus::Unconfigured)
     }
-
-    /// Short status badge for the `/login` provider selector. Never a secret.
-    pub(crate) fn badge(self) -> &'static str {
-        match self {
-            AuthStatus::StoredOAuth => "✓ configured",
-            AuthStatus::StoredApiKey => "✓ API key",
-            AuthStatus::EnvApiKey => "✓ env API key",
-            AuthStatus::ClaudeCode => "✓ Claude Code login",
-            AuthStatus::Unconfigured => "unconfigured",
-        }
-    }
 }
 
 /// The full catalog, in registry order.
@@ -414,8 +403,6 @@ mod tests {
             provider_status(&auth, ProviderId::Anthropic),
             AuthStatus::EnvApiKey
         );
-        assert_eq!(AuthStatus::StoredApiKey.badge(), "✓ API key");
-        assert_eq!(AuthStatus::EnvApiKey.badge(), "✓ env API key");
 
         let models = available_models(&auth, &settings(None, None, None));
         assert!(models.iter().any(|m| m.qualified() == "openai/gpt-4.1"));
@@ -520,14 +507,10 @@ mod tests {
     }
 
     #[test]
-    fn unconfigured_status_is_not_configured_and_has_no_secret_badge() {
+    fn unconfigured_status_is_not_configured() {
         assert!(!AuthStatus::Unconfigured.is_configured());
         assert!(AuthStatus::StoredOAuth.is_configured());
         assert!(AuthStatus::StoredApiKey.is_configured());
         assert!(AuthStatus::EnvApiKey.is_configured());
-        assert_eq!(AuthStatus::Unconfigured.badge(), "unconfigured");
-        assert_eq!(AuthStatus::StoredOAuth.badge(), "✓ configured");
-        assert_eq!(AuthStatus::StoredApiKey.badge(), "✓ API key");
-        assert_eq!(AuthStatus::EnvApiKey.badge(), "✓ env API key");
     }
 }

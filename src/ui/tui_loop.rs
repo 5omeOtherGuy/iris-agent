@@ -46,6 +46,7 @@ use crate::ui::UiEvent;
 use crate::ui::login::{self, LoginBackend, LoginOutcome, LoginUpdate, OAuthLoginBackend};
 use crate::ui::modal::{LoginDialog, Modal, ModalAction, ModalKey, ModalOutcome};
 use crate::ui::picker::{self, ActionResult, ModelCommand};
+use crate::ui::settings_menu;
 use crate::ui::slash::{self, SlashAction, SlashCommand};
 use crate::ui::steering::SteeringQueue;
 use crate::ui::tui::{
@@ -1427,10 +1428,11 @@ fn route_command<P: ChatProvider>(
                 return Ok(RouteOutcome::Fall);
             };
             tui.screen.commit_user(prompt);
-            match picker::open_scoped(sw) {
-                ModelCommand::Open(modal) => tui.screen.open_modal(modal),
-                ModelCommand::Lines(lines) => apply_notices(tui, lines),
-            }
+            tui.screen.open_modal(picker::open_settings_expanded(
+                harness,
+                sw,
+                settings_menu::HatchTarget::Scope,
+            ));
             Ok(RouteOutcome::Consumed)
         }
         "/settings" => {
@@ -1471,11 +1473,15 @@ fn route_command<P: ChatProvider>(
         "/trust" | "/permissions" if rest.is_empty() => {
             // Modal actions dispatch through picker::apply_action, which takes
             // the switch; keep the same guard as the other pickers.
-            if switch.as_ref().is_none() {
+            let Some(sw) = switch.as_mut() else {
                 return Ok(RouteOutcome::Fall);
-            }
+            };
             tui.screen.commit_user(prompt);
-            tui.screen.open_modal(picker::open_trust(harness));
+            tui.screen.open_modal(picker::open_settings_expanded(
+                harness,
+                sw,
+                settings_menu::HatchTarget::Permissions,
+            ));
             Ok(RouteOutcome::Consumed)
         }
         "/resume" if rest.is_empty() => {
@@ -1578,19 +1584,27 @@ fn route_command<P: ChatProvider>(
             Ok(RouteOutcome::Consumed)
         }
         "/login" if rest.is_empty() => {
+            let Some(sw) = switch.as_mut() else {
+                return Ok(RouteOutcome::Fall);
+            };
             tui.screen.commit_user(prompt);
-            tui.screen.open_modal(login::open_login());
+            tui.screen.open_modal(picker::open_settings_expanded(
+                harness,
+                sw,
+                settings_menu::HatchTarget::Login,
+            ));
             Ok(RouteOutcome::Consumed)
         }
         "/logout" if rest.is_empty() => {
+            let Some(sw) = switch.as_mut() else {
+                return Ok(RouteOutcome::Fall);
+            };
             tui.screen.commit_user(prompt);
-            match AuthStore::from_env() {
-                Ok(auth) => match login::open_logout(&auth) {
-                    login::LoginStep::Open(modal) => tui.screen.open_modal(modal),
-                    login::LoginStep::Lines(lines) => apply_notices(tui, lines),
-                },
-                Err(error) => apply_notices(tui, vec![format!("auth unavailable: {error:#}")]),
-            }
+            tui.screen.open_modal(picker::open_settings_expanded(
+                harness,
+                sw,
+                settings_menu::HatchTarget::Logout,
+            ));
             Ok(RouteOutcome::Consumed)
         }
         "/reasoning" if rest.is_empty() => {
@@ -2086,10 +2100,14 @@ async fn run_modal_phase<P: ChatProvider>(
     git_cache: &GitStatusCache,
     git_generation: &mut u64,
 ) -> Result<Option<SessionSource>> {
-    // The settings panel is home: leaving a surface one of its ports opened
-    // (model picker, scoped models, trust, login) re-opens the panel on that
-    // port row instead of dropping back to the editor.
-    let mut settings_return: Option<crate::ui::settings_menu::RowId> = None;
+    // The faceplate is home. Its ports are hatches, not doors — but three
+    // genuine dialog-guards (the large-context advisory, the OAuth login
+    // dialog, the API-key dialog) still overlay it. When one does, stash the
+    // panel's view; when the guard resolves — any path — refresh the snapshot
+    // (a login can grow the catalog) and reopen the faceplate expanded, cursor
+    // intact, BEFORE the next draw so the dock never collapses for a frame
+    // (§2.5, the invariant that killed the jank in fa93453).
+    let mut settings_return: Option<crate::ui::settings_menu::PanelView> = None;
     while tui.screen.focus() == FocusTarget::Modal {
         tokio::select! {
             maybe = input_rx.recv() => {
@@ -2109,7 +2127,12 @@ async fn run_modal_phase<P: ChatProvider>(
                     }
                     _ => {}
                 }
-                let from_settings = matches!(tui.screen.modal, Some(Modal::Settings(_)));
+                // Capture the faceplate's view before the key is handled, in
+                // case the action about to fire hands off to a dialog-guard.
+                let from_settings_view = match &tui.screen.modal {
+                    Some(Modal::Settings(panel)) => Some(panel.view()),
+                    _ => None,
+                };
                 let outcome = if let Event::Paste(text) = &event {
                     match tui.screen.modal.as_mut() {
                         Some(modal) => modal.paste_text(text),
@@ -2124,8 +2147,10 @@ async fn run_modal_phase<P: ChatProvider>(
                         None => ModalOutcome::Ignore,
                     }
                 };
-                if from_settings && let ModalOutcome::Emit(action) = &outcome {
-                    settings_return = settings_return_row(action);
+                if let (Some(view), ModalOutcome::Emit(action)) = (&from_settings_view, &outcome)
+                    && leaves_faceplate_for_guard(action)
+                {
+                    settings_return = Some(view.clone());
                 }
                 let requested = apply_modal_outcome(
                     outcome,
@@ -2144,15 +2169,16 @@ async fn run_modal_phase<P: ChatProvider>(
                 if requested.is_some() {
                     return Ok(requested);
                 }
-                // Settings is home: when a surface a panel port opened has
-                // closed, re-open the panel on that port row BEFORE drawing,
-                // so the dock never collapses for a frame on the way back.
+                // The faceplate is home: when a dialog-guard it handed off to has
+                // resolved (focus left the modal region), refresh the snapshot
+                // and reopen the panel expanded BEFORE drawing, so the dock never
+                // collapses for a frame on the way back.
                 if tui.screen.focus() != FocusTarget::Modal
-                    && let Some(row) = settings_return.take()
+                    && let Some(view) = settings_return.take()
                     && let Some(sw) = switch.as_mut()
                 {
                     tui.screen
-                        .open_modal(picker::open_settings_at(harness, sw, row));
+                        .open_modal(picker::refresh_settings_panel(view, None, harness, sw));
                 }
                 // Once the panel itself is in front again, nothing is pending.
                 if matches!(tui.screen.modal, Some(Modal::Settings(_))) {
@@ -2176,21 +2202,21 @@ async fn run_modal_phase<P: ChatProvider>(
     Ok(None)
 }
 
-/// The panel row a port action departs from, so the modal phase lands back on
-/// it when the opened surface closes (settings is home; §10.1).
-fn settings_return_row(action: &ModalAction) -> Option<crate::ui::settings_menu::RowId> {
-    use crate::ui::settings_menu::RowId;
-    match action {
-        ModalAction::OpenModelPicker => Some(RowId::Model),
-        // A model cycle usually lands straight back on a rebuilt panel (the
-        // pending return clears once it is in front); arming it here covers
-        // the large-context advisory that replaces the panel mid-cycle.
-        ModalAction::CycleModel { .. } => Some(RowId::Model),
-        ModalAction::OpenScopedModels => Some(RowId::Scope),
-        ModalAction::OpenLoginMethod => Some(RowId::Providers),
-        ModalAction::OpenTrustMenu => Some(RowId::Permissions),
-        _ => None,
-    }
+/// Whether a faceplate action hands off to a dialog-guard that overlays the
+/// panel, so the modal phase should stash the view and reopen the faceplate when
+/// the guard resolves (§2.5). Model select/cycle only leave when they trip the
+/// large-context advisory; otherwise they refresh the panel in place (a Keep or
+/// a Replace that is still the faceplate), and the "panel in front" check clears
+/// the stash harmlessly.
+fn leaves_faceplate_for_guard(action: &ModalAction) -> bool {
+    matches!(
+        action,
+        ModalAction::SelectModel { .. }
+            | ModalAction::ConfirmModelSwitch { .. }
+            | ModalAction::CycleModel { .. }
+            | ModalAction::BeginLogin(_)
+            | ModalAction::OpenApiKeyDialog(_)
+    )
 }
 
 /// Interpret one [`ModalOutcome`]. Returns a requested session swap (from the
@@ -2288,7 +2314,9 @@ async fn dispatch_action<P: ChatProvider>(
                 return Ok(None);
             };
             let before = sw.selection().clone();
-            let result = picker::apply_action(action, harness, sw);
+            // Front is the confirm prompt (not the faceplate): no view to
+            // preserve here — the run_modal_phase stash reopens the faceplate.
+            let result = picker::apply_action(action, None, harness, sw);
             let after = sw.selection().clone();
             match result {
                 ActionResult::Close(lines) => {
@@ -2374,26 +2402,12 @@ async fn dispatch_action<P: ChatProvider>(
                 .unwrap_or_else(|| vec!["no unreviewed Iris changes to roll back".to_string()]);
             apply_notices(tui, lines);
         }
-        ModalAction::ChooseLoginMethod(method) => match AuthStore::from_env() {
-            Ok(auth) => match login::provider_select(method, &auth) {
-                login::LoginStep::Open(modal) => tui.screen.open_modal(modal),
-                login::LoginStep::Lines(lines) => {
-                    apply_notices(tui, lines);
-                    tui.screen.close_modal();
-                }
-            },
-            Err(error) => {
-                apply_notices(tui, vec![format!("auth unavailable: {error:#}")]);
-                tui.screen.close_modal();
-            }
-        },
-        ModalAction::BackToLoginMethod => tui.screen.open_modal(login::open_login()),
-        // Settings -> Login / providers: open the existing `/login` method
-        // selector (the loop owns the auth store / login backend).
-        ModalAction::OpenLoginMethod => tui.screen.open_modal(login::open_login()),
+        // Providers hatch → OAuth/subscription login (a dialog-guard; the
+        // run_modal_phase stash reopens the faceplate expanded on return).
         ModalAction::BeginLogin(provider) => {
             run_login(provider, tui, input_rx, tick, login_backend).await?;
         }
+        // Providers hatch → API-key dialog (a dialog-guard).
         ModalAction::OpenApiKeyDialog(provider_id) => {
             tui.screen
                 .open_modal(login::open_api_key_dialog(&provider_id));
@@ -2408,24 +2422,46 @@ async fn dispatch_action<P: ChatProvider>(
                 Err(error) => vec![format!("auth unavailable: {error:#}")],
             };
             apply_notices(tui, lines);
+            // Resolving the API-key dialog leaves the modal region; the stash
+            // reopens the faceplate expanded on the providers hatch.
             tui.screen.close_modal();
         }
         ModalAction::Logout(id) => {
+            // The providers hatch's `x`: log out immediately and rebuild the
+            // faceplate in place so the row drops to `○ · —` and the catalog /
+            // scope rows refresh (a logout shrinks the model catalog).
+            let view = match &tui.screen.modal {
+                Some(Modal::Settings(panel)) => Some(panel.view()),
+                _ => None,
+            };
+            let flash = view.as_ref().map(|view| view.cursor());
             let lines = match AuthStore::from_env() {
                 Ok(auth) => login::apply_logout(&id, &auth),
                 Err(error) => vec![format!("auth unavailable: {error:#}")],
             };
             apply_notices(tui, lines);
-            tui.screen.close_modal();
+            match (view, switch.as_ref()) {
+                (Some(view), Some(sw)) => {
+                    tui.screen
+                        .open_modal(picker::refresh_settings_panel(view, flash, harness, sw));
+                }
+                _ => tui.screen.close_modal(),
+            }
         }
-        // Model / scoped / effort / settings actions.
+        // Model / scoped / effort / settings / policy actions.
         other => {
+            // Capture the faceplate's view before the action so a snapshot-
+            // refreshing action rebuilds it in place without losing position.
+            let view = match &tui.screen.modal {
+                Some(Modal::Settings(panel)) => Some(panel.view()),
+                _ => None,
+            };
             let Some(sw) = switch.as_mut() else {
                 tui.screen.close_modal();
                 return Ok(None);
             };
             let before = sw.selection().clone();
-            let result = picker::apply_action(other, harness, sw);
+            let result = picker::apply_action(other, view, harness, sw);
             tui.screen
                 .set_approval_policy(effective_approval_policy(harness));
             let after = sw.selection().clone();

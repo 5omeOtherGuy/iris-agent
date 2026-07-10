@@ -6178,30 +6178,16 @@ mod tests {
 
     #[test]
     fn shrinking_palette_and_modal_content_clears_old_rows() -> std::io::Result<()> {
-        use crate::mimir::model_catalog::CatalogModel;
-        use crate::mimir::selection::ProviderId;
-        use crate::ui::modal::{Modal, ModelPicker};
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::{HatchTarget, SettingsPanel};
 
         let mut surface = TerminalSurface::new(Vec::new());
         let mut screen = Screen::new();
-        screen.open_modal(Modal::Model(ModelPicker::new(
-            vec![
-                CatalogModel {
-                    provider: ProviderId::OpenAiCodex,
-                    id: "gpt-5.5".to_string(),
-                    ctx_label: None,
-                },
-                CatalogModel {
-                    provider: ProviderId::Anthropic,
-                    id: "claude-sonnet-4-6".to_string(),
-                    ctx_label: None,
-                },
-            ],
-            "openai-codex/gpt-5.5",
-            "openai-codex/gpt-5.5",
-            crate::mimir::selection::ReasoningEffort::Medium,
-        )));
-        surface.render(Size::new(60, 14), &rendered_lines(&mut screen, 60, 14))?;
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::with_expanded(
+            faceplate_snapshot(),
+            HatchTarget::Model,
+        ))));
+        surface.render(Size::new(60, 22), &rendered_lines(&mut screen, 60, 22))?;
         assert!(
             surface
                 .state()
@@ -6211,7 +6197,7 @@ mod tests {
         );
 
         screen.close_modal();
-        let stats = surface.render(Size::new(60, 14), &rendered_lines(&mut screen, 60, 14))?;
+        let stats = surface.render(Size::new(60, 22), &rendered_lines(&mut screen, 60, 22))?;
         let replay = strip_ansi(&surface.state().previous_lines.join("\n"));
         assert_ne!(stats.kind, RenderKind::Unchanged);
         assert!(!replay.contains("GPT 5.5"), "{replay:?}");
@@ -6256,88 +6242,142 @@ mod tests {
 
     #[test]
     fn modal_render_survives_a_tiny_terminal() {
-        use crate::mimir::model_catalog::CatalogModel;
-        use crate::mimir::selection::ProviderId;
-        use crate::ui::modal::{Modal, ModelPicker};
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::{HatchTarget, SettingsPanel};
 
-        for width in [10u16, 16, 24, 40] {
-            for height in [2u16, 3, 4] {
-                let mut screen = Screen::new();
-                screen.open_modal(Modal::Model(ModelPicker::new(
-                    vec![CatalogModel {
-                        provider: ProviderId::OpenAiCodex,
-                        id: "gpt-5.5".to_string(),
-                        ctx_label: None,
-                    }],
-                    "openai-codex/gpt-5.5",
-                    "openai-codex/gpt-5.5",
-                    crate::mimir::selection::ReasoningEffort::Medium,
-                )));
-                let _ = rendered_lines(&mut screen, width, height);
+        // Every hatch, at every degenerate width/height: rendering must never
+        // panic (the adversarial narrow-and-short pass, §6).
+        for target in [
+            HatchTarget::Model,
+            HatchTarget::Scope,
+            HatchTarget::Permissions,
+            HatchTarget::Login,
+        ] {
+            for width in [10u16, 16, 24, 40] {
+                for height in [2u16, 3, 4, 20] {
+                    let mut screen = Screen::new();
+                    screen.open_modal(Modal::Settings(Box::new(SettingsPanel::with_expanded(
+                        faceplate_snapshot(),
+                        target,
+                    ))));
+                    let _ = rendered_lines(&mut screen, width, height);
+                }
             }
         }
     }
 
     #[test]
-    fn open_modal_renders_plain_picker_above_composer() {
-        use crate::mimir::model_catalog::CatalogModel;
-        use crate::mimir::selection::ProviderId;
-        use crate::ui::modal::{Modal, ModelPicker};
+    fn model_hatch_renders_above_the_composer_on_a_tall_pane() {
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::{HatchTarget, SettingsPanel};
 
         let mut screen = Screen::new();
         screen.apply(UiEvent::AssistantText("prior reply".to_string()));
-        let models = vec![
-            CatalogModel {
-                provider: ProviderId::OpenAiCodex,
-                id: "gpt-5.5".to_string(),
-                ctx_label: None,
-            },
-            CatalogModel {
-                provider: ProviderId::Anthropic,
-                id: "claude-sonnet-4-6".to_string(),
-                ctx_label: None,
-            },
-        ];
-        screen.open_modal(Modal::Model(ModelPicker::new(
-            models,
-            "openai-codex/gpt-5.5",
-            "openai-codex/gpt-5.5",
-            crate::mimir::selection::ReasoningEffort::Medium,
-        )));
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::with_expanded(
+            faceplate_snapshot(),
+            HatchTarget::Model,
+        ))));
 
-        let rendered = rendered_text(&mut screen, 60, 14);
+        // Golden (a): the model hatch open on a tall pane — the ▾ marker, the
+        // candidate rows, and the reasoning track, all above the composer.
+        let rendered = rendered_text(&mut screen, 80, 30);
         assert!(rendered.contains("prior reply"), "{rendered}");
+        assert!(rendered.contains("SETTINGS"), "masthead:\n{rendered}");
+        assert!(
+            rendered.contains(crate::ui::symbols::EXPANDED),
+            "▾:\n{rendered}"
+        );
         assert!(rendered.contains("GPT 5.5"), "{rendered}");
         assert!(rendered.contains("Sonnet 4.6"), "{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
         let model_idx = rendered.find("GPT 5.5").expect("model row");
         let editor_idx = rendered.find("Give Iris a task").expect("composer row");
         assert!(model_idx < editor_idx, "{rendered}");
+        // The old modal titles are gone.
+        assert!(!rendered.contains("MODEL & REASONING"), "{rendered}");
         assert!(!rendered.contains("Model & reasoning"), "{rendered}");
     }
 
     #[test]
-    fn open_modal_has_room_for_model_picker_footer() {
-        use crate::mimir::model_catalog;
-        use crate::ui::modal::{Modal, ModelPicker};
+    fn scope_hatch_windows_on_a_short_pane() {
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::{HatchTarget, SettingsPanel};
 
+        // Golden (b): the scope hatch windowed on a short pane — the masthead is
+        // pinned, the house (n/N) position row prints, the composer survives.
         let mut screen = Screen::new();
-        screen.open_modal(Modal::Model(ModelPicker::new(
-            model_catalog::all(),
-            "anthropic/claude-opus-4-8",
-            "anthropic/claude-opus-4-8",
-            crate::mimir::selection::ReasoningEffort::XHigh,
-        )));
-
-        let rendered = rendered_text(&mut screen, 80, 17);
-        assert!(rendered.contains("Sonnet 5"), "{rendered}");
-        assert!(rendered.contains("◉ max"), "{rendered}");
-        assert!(rendered.contains("MODEL & REASONING"), "{rendered}");
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::with_expanded(
+            faceplate_snapshot(),
+            HatchTarget::Scope,
+        ))));
+        let rendered = rendered_text(&mut screen, 80, 18);
+        assert!(
+            rendered.contains("SETTINGS"),
+            "masthead pinned:\n{rendered}"
+        );
+        assert!(rendered.contains("ENGINE"), "{rendered}");
+        assert!(
+            rendered.contains(crate::ui::symbols::EXPANDED),
+            "▾:\n{rendered}"
+        );
+        assert!(rendered.contains('('), "position row:\n{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }
 
+    #[test]
+    fn permissions_hatch_renders_a_bash_grant() {
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::{HatchTarget, SettingsPanel};
+
+        // Golden (c): the permissions hatch with a bash grant — the per-tool
+        // switches, the revoke-only bash row, and the read-only sandbox line.
+        let mut snap = faceplate_snapshot();
+        snap.policy.bash_exact = vec!["cargo test".to_string()];
+        snap.policy.sandbox = Some("workspace-write".to_string());
+        let mut screen = Screen::new();
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::with_expanded(
+            snap,
+            HatchTarget::Permissions,
+        ))));
+        let rendered = rendered_text(&mut screen, 90, 30);
+        assert!(
+            rendered.contains(crate::ui::symbols::EXPANDED),
+            "▾:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("ask") && rendered.contains("always"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("bash: cargo test"), "{rendered}");
+        assert!(rendered.contains("revoke"), "{rendered}");
+        assert!(rendered.contains("workspace-write"), "sandbox:\n{rendered}");
+        assert!(rendered.contains("Give Iris a task"), "{rendered}");
+    }
+
+    fn faceplate_model_choice(
+        provider: crate::mimir::selection::ProviderId,
+        model_id: &str,
+        is_current: bool,
+        is_default: bool,
+    ) -> crate::ui::settings_menu::ModelChoice {
+        let qualified = format!("{}/{}", provider.as_str(), model_id);
+        crate::ui::settings_menu::ModelChoice {
+            display: crate::mimir::model_catalog::display_name(&qualified),
+            provider_label: provider.display_name().to_string(),
+            levels: crate::mimir::model_capabilities::level_options(provider, model_id)
+                .iter()
+                .map(|option| (option.level, option.label))
+                .collect(),
+            provider,
+            model_id: model_id.to_string(),
+            is_current,
+            is_default,
+            qualified,
+        }
+    }
+
     fn faceplate_snapshot() -> crate::ui::settings_menu::Snapshot {
-        use crate::mimir::selection::ReasoningEffort;
+        use crate::mimir::selection::{ProviderId, ReasoningEffort};
         crate::ui::settings_menu::Snapshot {
             default_model: "openai-codex/gpt-5.5".to_string(),
             reasoning_levels: vec![
@@ -6346,8 +6386,41 @@ mod tests {
                 (ReasoningEffort::High, "high"),
             ],
             reasoning: ReasoningEffort::Medium,
-            scope_summary: "all models".to_string(),
-            providers_connected: 2,
+            catalog: vec![
+                faceplate_model_choice(ProviderId::OpenAiCodex, "gpt-5.5", true, true),
+                faceplate_model_choice(ProviderId::Anthropic, "claude-sonnet-4-6", false, false),
+            ],
+            scope_candidates: vec![
+                crate::ui::settings_menu::ScopeChoice {
+                    qualified: "openai-codex/gpt-5.5".to_string(),
+                    provider_label: "OpenAI Codex".to_string(),
+                },
+                crate::ui::settings_menu::ScopeChoice {
+                    qualified: "anthropic/claude-sonnet-4-6".to_string(),
+                    provider_label: "Anthropic".to_string(),
+                },
+            ],
+            scope_enabled: None,
+            scope_persisted: None,
+            providers: vec![
+                crate::ui::settings_menu::ProviderStatus {
+                    id: "openai-codex".to_string(),
+                    name: "OpenAI Codex".to_string(),
+                    badge: "subscription".to_string(),
+                    oauth_capable: true,
+                    api_key_capable: false,
+                    credentialed: true,
+                },
+                crate::ui::settings_menu::ProviderStatus {
+                    id: "anthropic".to_string(),
+                    name: "Anthropic".to_string(),
+                    badge: "\u{2014}".to_string(),
+                    oauth_capable: true,
+                    api_key_capable: true,
+                    credentialed: false,
+                },
+            ],
+            policy: crate::ui::settings_menu::PolicySnapshot::default(),
             default_approval: "auto".to_string(),
             skip_permissions: false,
             context_token_budget: 232_000,
@@ -6436,16 +6509,14 @@ mod tests {
 
     #[test]
     fn open_modal_reclaims_composer_bottom_padding() {
-        use crate::mimir::model_catalog;
-        use crate::ui::modal::{Modal, ModelPicker};
+        use crate::ui::modal::Modal;
+        use crate::ui::settings_menu::{HatchTarget, SettingsPanel};
 
         let mut screen = Screen::new();
-        screen.open_modal(Modal::Model(ModelPicker::new(
-            model_catalog::all(),
-            "anthropic/claude-opus-4-8",
-            "anthropic/claude-opus-4-8",
-            crate::mimir::selection::ReasoningEffort::XHigh,
-        )));
+        screen.open_modal(Modal::Settings(Box::new(SettingsPanel::with_expanded(
+            faceplate_snapshot(),
+            HatchTarget::Model,
+        ))));
 
         let lines = rendered_lines(&mut screen, 80, 17)
             .into_iter()
@@ -6923,10 +6994,11 @@ mod tests {
             "no cyan selection accent: {exit:?}"
         );
         let model = line_matching(&lines, |line| line_text(line).contains("/model"));
-        // Descriptions align in one column across rows.
+        // Descriptions align in one column across rows (match on the leading
+        // words, which survive any right-edge truncation).
         assert_eq!(
             line_text(exit).find("End the session"),
-            line_text(model).find("Pick model & reasoning (or /model <id>)")
+            line_text(model).find("Model & reasoning")
         );
         assert!(
             model

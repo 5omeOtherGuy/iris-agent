@@ -48,12 +48,12 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/model",
-        description: "Pick model & reasoning (or /model <id>)",
+        description: "Model & reasoning (opens settings › engine, or /model <id>)",
         action: SlashAction::Submit,
     },
     SlashCommand {
         name: "/reasoning",
-        description: "Pick model & reasoning (or /reasoning <level>)",
+        description: "Model & reasoning (opens settings › engine, or /reasoning <level>)",
         action: SlashAction::Submit,
     },
     SlashCommand {
@@ -108,7 +108,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/scoped-models",
-        description: "Enable/disable models for Ctrl+P cycling",
+        description: "Enable/disable models for Ctrl+P cycling (opens settings › model scope)",
         action: SlashAction::Submit,
     },
     SlashCommand {
@@ -123,22 +123,22 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/trust",
-        description: "View or edit this project's permission policy",
+        description: "Project permissions (opens settings › permissions)",
         action: SlashAction::Submit,
     },
     SlashCommand {
         name: "/permissions",
-        description: "Alias for /trust project permissions",
+        description: "Project permissions (opens settings › permissions)",
         action: SlashAction::Submit,
     },
     SlashCommand {
         name: "/login",
-        description: "Configure provider authentication",
+        description: "Connect a provider (opens settings › providers)",
         action: SlashAction::Submit,
     },
     SlashCommand {
         name: "/logout",
-        description: "Remove provider authentication",
+        description: "Disconnect a provider (opens settings › providers)",
         action: SlashAction::Submit,
     },
     SlashCommand {

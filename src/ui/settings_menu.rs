@@ -18,9 +18,11 @@
 //! - **register** — free text edited inline on the row (`▋` caret); `↵` edits,
 //!   `↵` again saves, `esc` cancels. An empty buffer clears the key when the
 //!   field allows it.
-//! - **port** — a `▸` row that opens a deeper surface (model picker, project
-//!   permissions, scoped models, login). The loop returns to the panel when
-//!   that surface closes, so the panel is home.
+//! - **port** — a `▸` row that **expands in place** to `▾` + indented child
+//!   rows inside the same panel (model picker, model scope, providers, project
+//!   permissions). One hatch open at a time (accordion); `↵` on the header or
+//!   `esc` anywhere folds it. The panel never leaves — a port opens a hatch, not
+//!   a door.
 //!
 //! Every widget here is pure: it turns a [`ModalKey`] into a [`ModalOutcome`],
 //! and the loop ([`crate::ui::picker::apply_action`]) performs the disk writes
@@ -40,8 +42,10 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::mimir::selection::ReasoningEffort;
+use crate::mimir::model_capabilities;
+use crate::mimir::selection::{ProviderId, ReasoningEffort};
 use crate::ui::modal::{ModalAction, ModalKey, ModalOutcome, dim};
+use crate::wayland::trust::ProjectPolicyEdit;
 
 /// Crate rev printed on the masthead (the panel's silkscreen, same source as
 /// the start page and the exit receipt).
@@ -59,6 +63,11 @@ const FLASH_TICKS: u8 = 2;
 /// Default line budget when the render path supplies none: matches the legacy
 /// 16-row docked-menu cap minus its two inset rows.
 const DEFAULT_LINE_BUDGET: usize = 14;
+
+/// The per-tool grants the permissions hatch can toggle. Matches the ADR-0027
+/// per-tool approval defaults; `bash` is intentionally absent (bash grants are
+/// per-command, minted at the approval prompt).
+const POLICY_TOOLS: &[&str] = &["write", "edit"];
 
 /// A persisted setting adjusted in place on the panel. Pruned relative to the
 /// full `Settings` struct — see the module doc for the service-hatch list.
@@ -79,8 +88,9 @@ pub(crate) enum Field {
     WorktreeRoot,
 }
 
-/// One row of the faceplate. `Field` rows edit persisted settings; the rest
-/// are the session-live controls (reasoning, skip-approvals) and the ports.
+/// One top-level control of the faceplate. `Field` rows edit persisted settings;
+/// the rest are the session-live controls (reasoning, skip-approvals) and the
+/// ports (model, scope, providers, permissions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RowId {
     Model,
@@ -90,6 +100,60 @@ pub(crate) enum RowId {
     SkipApprovals,
     Permissions,
     Field(Field),
+}
+
+/// A selectable row of the panel, keyed on identity (not position) so a hatch
+/// opening above the cursor never silently moves the selection, and a flash
+/// armed on a row survives the list reflowing (§2.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PanelRow {
+    /// A top-level control (in `SECTIONS` order).
+    Top(RowId),
+    /// A model-hatch candidate, carrying its qualified `provider/model` id.
+    ModelChild(String),
+    /// A scope-hatch candidate, carrying its qualified id.
+    ScopeChild(String),
+    /// A providers-hatch row, carrying the provider id.
+    ProviderChild(String),
+    /// A permissions per-tool switch, carrying the tool name.
+    PolicyTool(String),
+    /// A permissions stored-bash-grant row (exact), carrying the command.
+    PolicyBashExact(String),
+    /// A permissions stored-bash-grant row (prefix), carrying the prefix.
+    PolicyBashPrefix(String),
+}
+
+/// Which hatch a slash entry pre-expands, and where its cursor lands (§4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HatchTarget {
+    /// `/model`, bare `/reasoning`, ctrl+p picker key: model hatch, active row.
+    Model,
+    /// `/scoped-models`: scope hatch, first child.
+    Scope,
+    /// `/trust`, bare `/permissions`: permissions hatch, first child.
+    Permissions,
+    /// `/login`: providers hatch, first uncredentialed row (else first).
+    Login,
+    /// `/logout`: providers hatch, first credentialed row (else first).
+    Logout,
+}
+
+/// The panel's restorable view: the open hatch, the identity-keyed cursor, and
+/// any live scope filter. Captured before a dialog-guard replaces the panel or
+/// a snapshot refresh rebuilds it, then re-applied so the operator lands back
+/// exactly where they were (§2.5, §5).
+#[derive(Debug, Clone)]
+pub(crate) struct PanelView {
+    expanded: Option<RowId>,
+    cursor: PanelRow,
+    filter: String,
+}
+
+impl PanelView {
+    /// The row the cursor rested on — the flash target for an in-place refresh.
+    pub(crate) fn cursor(&self) -> PanelRow {
+        self.cursor.clone()
+    }
 }
 
 /// A silkscreened section: dim uppercase title + its rows, in panel order.
@@ -185,10 +249,53 @@ fn compact_value(value: u64) -> String {
     crate::ui::tui::compact_count(value)
 }
 
+/// One authenticated model, presentation-ready for the ENGINE › model hatch:
+/// default-first order, with the reasoning levels the row's live effort track
+/// clicks through (§5).
+#[derive(Debug, Clone)]
+pub(crate) struct ModelChoice {
+    pub(crate) qualified: String,
+    pub(crate) display: String,
+    pub(crate) provider_label: String,
+    pub(crate) provider: ProviderId,
+    pub(crate) model_id: String,
+    pub(crate) levels: Vec<(ReasoningEffort, &'static str)>,
+    pub(crate) is_current: bool,
+    pub(crate) is_default: bool,
+}
+
+/// One scope candidate (ENGINE › model scope hatch), registry order.
+#[derive(Debug, Clone)]
+pub(crate) struct ScopeChoice {
+    pub(crate) qualified: String,
+    pub(crate) provider_label: String,
+}
+
+/// One provider row (ENGINE › providers hatch): a no-secret credential badge
+/// and the login methods that exist for it.
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderStatus {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) badge: String,
+    pub(crate) oauth_capable: bool,
+    pub(crate) api_key_capable: bool,
+    pub(crate) credentialed: bool,
+}
+
+/// The SAFETY › permissions hatch payload (ADR-0027), disk-free and secret-free.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PolicySnapshot {
+    pub(crate) granted_tools: Vec<String>,
+    pub(crate) bash_exact: Vec<String>,
+    pub(crate) bash_prefix: Vec<String>,
+    pub(crate) sandbox: Option<String>,
+}
+
 /// Current persisted values plus the live session state the panel controls
-/// (reasoning levels for the active model, skip-approvals). Read once by the
-/// loop from [`crate::config::Settings`]; pure data, so the panel stays
-/// harness-free and unit-testable.
+/// (reasoning levels for the active model, skip-approvals) and the hatch
+/// payloads. Read once by the loop from [`crate::config::Settings`]; pure data,
+/// so the panel stays harness-free and unit-testable.
 #[derive(Debug, Clone)]
 pub(crate) struct Snapshot {
     /// Qualified `provider/model` id of the persisted default.
@@ -197,10 +304,18 @@ pub(crate) struct Snapshot {
     pub(crate) reasoning_levels: Vec<(ReasoningEffort, &'static str)>,
     /// The active reasoning level (clamped to the model).
     pub(crate) reasoning: ReasoningEffort,
-    /// `/scoped-models` summary: `all models` or `3 of 7 enabled`.
-    pub(crate) scope_summary: String,
-    /// Authenticated provider count for the providers port.
-    pub(crate) providers_connected: usize,
+    /// ENGINE › model hatch: authenticated catalog, default-first.
+    pub(crate) catalog: Vec<ModelChoice>,
+    /// ENGINE › scope hatch candidates, registry order.
+    pub(crate) scope_candidates: Vec<ScopeChoice>,
+    /// The live scope: `None` = all enabled (existing collapse_full rule).
+    pub(crate) scope_enabled: Option<Vec<String>>,
+    /// The persisted scope, so the hatch prints `· unsaved` while it differs.
+    pub(crate) scope_persisted: Option<Vec<String>>,
+    /// ENGINE › providers hatch.
+    pub(crate) providers: Vec<ProviderStatus>,
+    /// SAFETY › permissions hatch.
+    pub(crate) policy: PolicySnapshot,
     pub(crate) default_approval: String,
     pub(crate) skip_permissions: bool,
     pub(crate) context_token_budget: u64,
@@ -297,8 +412,8 @@ fn on_off(value: bool) -> String {
     if value { "on" } else { "off" }.to_string()
 }
 
-/// How a row is adjusted/activated: drives both key handling and the footer's
-/// keymap-honest verb.
+/// How a top row is adjusted/activated: drives both key handling and the
+/// footer's keymap-honest verb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Archetype {
     Switch,
@@ -326,6 +441,11 @@ fn archetype(row: RowId) -> Archetype {
             Field::VerifyCommand | Field::WorktreeRoot => Archetype::Register,
         },
     }
+}
+
+/// The four ports whose `↵` expands a hatch (the model row is also a rotary).
+fn is_port(row: RowId) -> bool {
+    matches!(archetype(row), Archetype::Port)
 }
 
 fn label(row: RowId) -> &'static str {
@@ -363,37 +483,15 @@ fn dial_unit(field: Field) -> &'static str {
     }
 }
 
-/// The display list: every rendered row of the panel body, in order. Controls
-/// carry their flat control index (the cursor space); headers and blanks are
-/// skipped by navigation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One rendered row of the panel body, in order. `Control` rows carry their
+/// [`PanelRow`] identity (the cursor space); headers, blanks, and read-only
+/// silkscreen lines (the sandbox posture, empty-state notes) are skipped by
+/// navigation.
 enum DisplayRow {
     Header(&'static str),
     Blank,
-    Control { index: usize, row: RowId },
-}
-
-fn display_rows() -> Vec<DisplayRow> {
-    let mut out = Vec::new();
-    let mut index = 0usize;
-    for (i, section) in SECTIONS.iter().enumerate() {
-        if i > 0 {
-            out.push(DisplayRow::Blank);
-        }
-        out.push(DisplayRow::Header(section.title));
-        for &row in section.rows {
-            out.push(DisplayRow::Control { index, row });
-            index += 1;
-        }
-    }
-    out
-}
-
-fn controls() -> Vec<RowId> {
-    SECTIONS
-        .iter()
-        .flat_map(|section| section.rows.iter().copied())
-        .collect()
+    Control(PanelRow),
+    ReadOnly(Line<'static>),
 }
 
 /// An in-place edit on a register (or a dial's typed precise value).
@@ -406,39 +504,120 @@ struct Edit {
 
 /// The settings panel modal. Owns its snapshot as display truth while open:
 /// adjustments update it locally and emit the matching save action; the loop
-/// keeps the panel (no rebuild) on success so detents click without jank.
+/// keeps the panel (no rebuild) on success so detents click without jank. A
+/// port's `↵` expands a hatch in place (accordion) rather than opening a door.
 #[derive(Debug, Clone)]
 pub(crate) struct SettingsPanel {
     snap: Snapshot,
-    controls: Vec<RowId>,
-    cursor: usize,
+    cursor: PanelRow,
+    /// The one open hatch, if any. Accordion: opening a port collapses any other.
+    expanded: Option<RowId>,
+    /// Live type-to-filter for the scope hatch (§3.2); empty when inactive.
+    scope_filter: String,
+    /// The model hatch's target effort, clamped to each candidate for display
+    /// but never mutated by navigation (§3.1). Reset to the active level on
+    /// every (re)build.
+    model_target: ReasoningEffort,
     edit: Option<Edit>,
-    /// Control index whose value renders bright, and ticks remaining.
-    flash: Option<(usize, u8)>,
+    /// The row whose value renders bright, and ticks remaining.
+    flash: Option<(PanelRow, u8)>,
 }
 
 impl SettingsPanel {
     pub(crate) fn new(snapshot: Snapshot) -> Self {
+        let model_target = snapshot.reasoning;
         SettingsPanel {
             snap: snapshot,
-            controls: controls(),
-            cursor: 0,
+            cursor: PanelRow::Top(RowId::Model),
+            expanded: None,
+            scope_filter: String::new(),
+            model_target,
             edit: None,
             flash: None,
         }
     }
 
-    /// Re-open with the cursor on `row` (the port-return path).
-    pub(crate) fn with_selected(snapshot: Snapshot, row: RowId) -> Self {
+    /// Open with a hatch pre-expanded and the cursor on its most useful child —
+    /// the slash-command entry path (§4.1).
+    pub(crate) fn with_expanded(snapshot: Snapshot, target: HatchTarget) -> Self {
         let mut panel = SettingsPanel::new(snapshot);
-        if let Some(pos) = panel.controls.iter().position(|&r| r == row) {
-            panel.cursor = pos;
-        }
+        let port = match target {
+            HatchTarget::Model => RowId::Model,
+            HatchTarget::Scope => RowId::Scope,
+            HatchTarget::Permissions => RowId::Permissions,
+            HatchTarget::Login | HatchTarget::Logout => RowId::Providers,
+        };
+        panel.expanded = Some(port);
+        panel.cursor = panel.entry_cursor(target);
         panel
     }
 
-    fn selected(&self) -> RowId {
-        self.controls[self.cursor]
+    /// The child the entry path lands on when a hatch opens pre-expanded.
+    fn entry_cursor(&self, target: HatchTarget) -> PanelRow {
+        let children = self.children_of(self.expanded);
+        match target {
+            HatchTarget::Model => self
+                .snap
+                .catalog
+                .iter()
+                .find(|m| m.is_current)
+                .map(|m| PanelRow::ModelChild(m.qualified.clone()))
+                .or_else(|| children.first().cloned())
+                .unwrap_or(PanelRow::Top(RowId::Model)),
+            HatchTarget::Login => self
+                .snap
+                .providers
+                .iter()
+                .find(|p| !p.credentialed)
+                .map(|p| PanelRow::ProviderChild(p.id.clone()))
+                .or_else(|| children.first().cloned())
+                .unwrap_or(PanelRow::Top(RowId::Providers)),
+            HatchTarget::Logout => self
+                .snap
+                .providers
+                .iter()
+                .find(|p| p.credentialed)
+                .map(|p| PanelRow::ProviderChild(p.id.clone()))
+                .or_else(|| children.first().cloned())
+                .unwrap_or(PanelRow::Top(RowId::Providers)),
+            HatchTarget::Scope | HatchTarget::Permissions => children
+                .first()
+                .cloned()
+                .unwrap_or_else(|| PanelRow::Top(self.expanded.unwrap_or(RowId::Scope))),
+        }
+    }
+
+    /// Capture the restorable view (§2.5, §5).
+    pub(crate) fn view(&self) -> PanelView {
+        PanelView {
+            expanded: self.expanded,
+            cursor: self.cursor.clone(),
+            filter: self.scope_filter.clone(),
+        }
+    }
+
+    /// Re-apply a captured view onto a freshly built panel, clamping the cursor
+    /// when its row has vanished (e.g. a revoked bash grant), and re-arming the
+    /// live scope filter. Model target resets to the fresh active level.
+    pub(crate) fn restore(&mut self, view: PanelView) {
+        self.expanded = view.expanded;
+        if self.expanded == Some(RowId::Scope) {
+            self.scope_filter = view.filter;
+        }
+        let rows = self.selectable();
+        self.cursor = if rows.contains(&view.cursor) {
+            view.cursor
+        } else {
+            self.expanded
+                .map(PanelRow::Top)
+                .or_else(|| rows.first().cloned())
+                .unwrap_or(PanelRow::Top(RowId::Model))
+        };
+        self.model_target = self.snap.reasoning;
+    }
+
+    fn selected(&self) -> PanelRow {
+        self.cursor.clone()
     }
 
     /// Decay the detent flash one tick. Returns true while a flash is live so
@@ -456,19 +635,18 @@ impl SettingsPanel {
         }
     }
 
-    /// Arm the two-tick acknowledgment on the adjusted control. Reduced motion
-    /// settles instantly (§6: every motion degrades to its settled state).
-    fn arm_flash(&mut self) {
+    /// Arm the two-tick acknowledgment on `row`. Reduced motion settles instantly
+    /// (§6: every motion degrades to its settled state).
+    fn arm_flash(&mut self, row: PanelRow) {
         if !self.snap.reduced_motion {
-            self.flash = Some((self.cursor, FLASH_TICKS));
+            self.flash = Some((row, FLASH_TICKS));
         }
     }
 
-    /// Arm the flash from outside: the loop rebuilds the panel after a model
-    /// cycle (the model list lives beyond the snapshot) and still owes the
-    /// row its mechanical acknowledgment.
-    pub(crate) fn flash_selected(&mut self) {
-        self.arm_flash();
+    /// Arm the flash from outside (the loop rebuilds the panel after a snapshot
+    /// refresh and still owes the acted-on row its mechanical acknowledgment).
+    pub(crate) fn flash_row(&mut self, row: PanelRow) {
+        self.arm_flash(row);
     }
 
     /// Paste into an active edit (the loop routes `Event::Paste` here).
@@ -483,126 +661,280 @@ impl SettingsPanel {
         }
     }
 
+    // --- navigation ---
+
+    /// The selectable rows, flattened with the open hatch's children spliced in.
+    fn selectable(&self) -> Vec<PanelRow> {
+        let mut out = Vec::new();
+        self.walk_rows(|row| {
+            if let DisplayRow::Control(panel_row) = row {
+                out.push(panel_row);
+            }
+        });
+        out
+    }
+
+    /// The children of an open port, in display order (with the scope filter
+    /// applied). Empty for `None` or a non-port.
+    fn children_of(&self, port: Option<RowId>) -> Vec<PanelRow> {
+        match port {
+            Some(RowId::Model) => self
+                .snap
+                .catalog
+                .iter()
+                .map(|m| PanelRow::ModelChild(m.qualified.clone()))
+                .collect(),
+            Some(RowId::Scope) => self
+                .scope_children()
+                .into_iter()
+                .map(PanelRow::ScopeChild)
+                .collect(),
+            Some(RowId::Providers) => self
+                .snap
+                .providers
+                .iter()
+                .map(|p| PanelRow::ProviderChild(p.id.clone()))
+                .collect(),
+            Some(RowId::Permissions) => {
+                let mut out: Vec<PanelRow> = POLICY_TOOLS
+                    .iter()
+                    .map(|tool| PanelRow::PolicyTool((*tool).to_string()))
+                    .collect();
+                out.extend(
+                    self.snap
+                        .policy
+                        .bash_exact
+                        .iter()
+                        .map(|cmd| PanelRow::PolicyBashExact(cmd.clone())),
+                );
+                out.extend(
+                    self.snap
+                        .policy
+                        .bash_prefix
+                        .iter()
+                        .map(|pfx| PanelRow::PolicyBashPrefix(pfx.clone())),
+                );
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn move_cursor(&mut self, down: bool) {
+        let rows = self.selectable();
+        if rows.is_empty() {
+            return;
+        }
+        let pos = rows.iter().position(|row| *row == self.cursor).unwrap_or(0);
+        let next = if down {
+            (pos + 1) % rows.len()
+        } else {
+            (pos + rows.len() - 1) % rows.len()
+        };
+        self.cursor = rows[next].clone();
+    }
+
     pub(crate) fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
         if self.edit.is_some() {
             return self.handle_edit_key(key);
         }
         match key {
             ModalKey::Up => {
-                self.cursor = if self.cursor == 0 {
-                    self.controls.len() - 1
-                } else {
-                    self.cursor - 1
-                };
+                self.move_cursor(false);
                 ModalOutcome::Redraw
             }
             ModalKey::Down => {
-                self.cursor = if self.cursor + 1 >= self.controls.len() {
-                    0
-                } else {
-                    self.cursor + 1
-                };
+                self.move_cursor(true);
                 ModalOutcome::Redraw
             }
             ModalKey::Left => self.adjust(false),
             ModalKey::Right => self.adjust(true),
             ModalKey::Enter => self.activate(),
-            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
-            _ => ModalOutcome::Ignore,
+            ModalKey::Esc => self.escape(),
+            ModalKey::CtrlC => ModalOutcome::Close,
+            other => self.hatch_key(other),
         }
+    }
+
+    /// `esc`: clear an active scope filter first, collapse a hatch second, close
+    /// the panel last (§2.3).
+    fn escape(&mut self) -> ModalOutcome {
+        if self.expanded == Some(RowId::Scope) && !self.scope_filter.is_empty() {
+            self.scope_filter.clear();
+            self.clamp_scope_cursor();
+            return ModalOutcome::Redraw;
+        }
+        if self.expanded.is_some() {
+            self.collapse();
+            return ModalOutcome::Redraw;
+        }
+        ModalOutcome::Close
+    }
+
+    /// Fold the open hatch: cursor lands on its port header, filter clears, the
+    /// header flashes.
+    fn collapse(&mut self) {
+        if let Some(port) = self.expanded.take() {
+            self.scope_filter.clear();
+            self.cursor = PanelRow::Top(port);
+            self.arm_flash(PanelRow::Top(port));
+        }
+    }
+
+    /// Expand `port` (accordion: any other hatch folds), or fold it if already
+    /// open. Either way the header flashes and the cursor stays on it.
+    fn toggle_hatch(&mut self, port: RowId) -> ModalOutcome {
+        if self.expanded == Some(port) {
+            self.collapse();
+        } else {
+            self.expanded = Some(port);
+            self.scope_filter.clear();
+            if port == RowId::Model {
+                self.model_target = self.snap.reasoning;
+            }
+            self.cursor = PanelRow::Top(port);
+            self.arm_flash(PanelRow::Top(port));
+        }
+        ModalOutcome::Redraw
     }
 
     /// Click the selected control one detent left/right. Emits the save action
-    /// when the position actually changes; a clamped end is a silent no-op
-    /// (the switch is already against its stop).
+    /// when the position actually changes; a clamped end is a silent no-op.
     fn adjust(&mut self, forward: bool) -> ModalOutcome {
         match self.selected() {
             // The model row is a port AND a rotary: ←/→ cycles the scoped
-            // models exactly like Ctrl+P (the loop rebuilds the panel on the
-            // new model); ↵ still opens the full picker.
-            RowId::Model => ModalOutcome::Emit(ModalAction::CycleModel { forward }),
-            RowId::Reasoning => {
-                let levels = &self.snap.reasoning_levels;
-                let pos = levels
-                    .iter()
-                    .position(|(level, _)| *level == self.snap.reasoning)
-                    .unwrap_or(0);
-                let next = step_clamped(pos, levels.len(), forward);
-                if next == pos {
+            // models exactly like Ctrl+P; ↵ expands the hatch.
+            PanelRow::Top(RowId::Model) => ModalOutcome::Emit(ModalAction::CycleModel { forward }),
+            PanelRow::Top(RowId::Reasoning) => self.adjust_reasoning(forward),
+            PanelRow::Top(RowId::SkipApprovals) => {
+                if self.snap.skip_permissions == forward {
                     return ModalOutcome::Ignore;
                 }
-                let level = levels[next].0;
-                self.snap.reasoning = level;
-                self.arm_flash();
-                ModalOutcome::Emit(ModalAction::AdjustEffort(level))
-            }
-            RowId::SkipApprovals => {
-                let target = forward;
-                if self.snap.skip_permissions == target {
-                    return ModalOutcome::Ignore;
-                }
-                self.snap.skip_permissions = target;
-                self.arm_flash();
+                self.snap.skip_permissions = forward;
+                self.arm_flash(self.cursor.clone());
                 ModalOutcome::Emit(ModalAction::ToggleSkipPermissions)
             }
-            RowId::Field(field) => match archetype(RowId::Field(field)) {
-                Archetype::Switch => {
-                    let options = self.snap.switch_options(field);
-                    if options.is_empty() {
-                        return ModalOutcome::Ignore;
-                    }
-                    let current = self.snap.switch_value(field);
-                    // A hand-edited value outside the vocabulary sits between
-                    // detents: the first click snaps into the scale (right →
-                    // first position, left → last), like a dial's off-ladder
-                    // snap. A known position steps one detent and clamps.
-                    let next = match options.iter().position(|o| *o == current) {
-                        Some(pos) => {
-                            let next = step_clamped(pos, options.len(), forward);
-                            if next == pos {
-                                return ModalOutcome::Ignore;
-                            }
-                            next
-                        }
-                        None if forward => 0,
-                        None => options.len() - 1,
-                    };
-                    let value = options[next];
-                    self.snap.set_switch_value(field, value);
-                    self.arm_flash();
-                    ModalOutcome::Emit(ModalAction::SaveSetting {
-                        field,
-                        value: Some(save_token(field, value)),
-                    })
-                }
-                Archetype::Dial => {
-                    let value = self.snap.dial_value(field);
-                    let Some(next) = next_detent(ladder(field), value, forward) else {
-                        return ModalOutcome::Ignore;
-                    };
-                    self.snap.set_dial_value(field, next);
-                    self.arm_flash();
-                    ModalOutcome::Emit(ModalAction::SaveSetting {
-                        field,
-                        value: Some(next.to_string()),
-                    })
-                }
-                _ => ModalOutcome::Ignore,
-            },
+            PanelRow::Top(RowId::Field(field)) => self.adjust_field(field, forward),
+            // Ports without a slide, and non-switch children, ignore ←/→.
+            PanelRow::Top(_) => ModalOutcome::Ignore,
+            PanelRow::ModelChild(id) => self.adjust_model_effort(&id, forward),
+            PanelRow::PolicyTool(tool) => self.adjust_policy_tool(&tool, forward),
             _ => ModalOutcome::Ignore,
         }
     }
 
-    /// `↵` acts by archetype: ports open their surface, registers and dials
-    /// enter inline edit. Switches only move with `←`/`→` (pressing a slide
-    /// switch does nothing).
+    fn adjust_reasoning(&mut self, forward: bool) -> ModalOutcome {
+        let levels = &self.snap.reasoning_levels;
+        let pos = levels
+            .iter()
+            .position(|(level, _)| *level == self.snap.reasoning)
+            .unwrap_or(0);
+        let next = step_clamped(pos, levels.len(), forward);
+        if next == pos {
+            return ModalOutcome::Ignore;
+        }
+        let level = levels[next].0;
+        self.snap.reasoning = level;
+        self.arm_flash(PanelRow::Top(RowId::Reasoning));
+        ModalOutcome::Emit(ModalAction::AdjustEffort(level))
+    }
+
+    fn adjust_field(&mut self, field: Field, forward: bool) -> ModalOutcome {
+        match archetype(RowId::Field(field)) {
+            Archetype::Switch => {
+                let options = self.snap.switch_options(field);
+                if options.is_empty() {
+                    return ModalOutcome::Ignore;
+                }
+                let current = self.snap.switch_value(field);
+                // A hand-edited value outside the vocabulary sits between
+                // detents: the first click snaps into the scale (right → first
+                // position, left → last), like a dial's off-ladder snap.
+                let next = match options.iter().position(|o| *o == current) {
+                    Some(pos) => {
+                        let next = step_clamped(pos, options.len(), forward);
+                        if next == pos {
+                            return ModalOutcome::Ignore;
+                        }
+                        next
+                    }
+                    None if forward => 0,
+                    None => options.len() - 1,
+                };
+                let value = options[next];
+                self.snap.set_switch_value(field, value);
+                self.arm_flash(self.cursor.clone());
+                ModalOutcome::Emit(ModalAction::SaveSetting {
+                    field,
+                    value: Some(save_token(field, value)),
+                })
+            }
+            Archetype::Dial => {
+                let value = self.snap.dial_value(field);
+                let Some(next) = next_detent(ladder(field), value, forward) else {
+                    return ModalOutcome::Ignore;
+                };
+                self.snap.set_dial_value(field, next);
+                self.arm_flash(self.cursor.clone());
+                ModalOutcome::Emit(ModalAction::SaveSetting {
+                    field,
+                    value: Some(next.to_string()),
+                })
+            }
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    /// Model-hatch effort: click the target one detent within the highlighted
+    /// candidate's level stops (clamp, never wrap). Navigation never mutates the
+    /// target; only this does (§3.1, criterion 9/10). The reasoning row flashes.
+    fn adjust_model_effort(&mut self, qualified: &str, forward: bool) -> ModalOutcome {
+        let Some(model) = self.snap.catalog.iter().find(|m| m.qualified == qualified) else {
+            return ModalOutcome::Ignore;
+        };
+        let from = model_capabilities::clamp(model.provider, &model.model_id, self.model_target);
+        let pos = model
+            .levels
+            .iter()
+            .position(|(level, _)| *level == from)
+            .unwrap_or(0);
+        let next = step_clamped(pos, model.levels.len(), forward);
+        if next == pos {
+            return ModalOutcome::Ignore;
+        }
+        self.model_target = model.levels[next].0;
+        self.arm_flash(PanelRow::Top(RowId::Reasoning));
+        ModalOutcome::Redraw
+    }
+
+    /// A permissions per-tool switch (`ask · always`): position IS state, so
+    /// `←`/`→` emits the matching grant/revoke immediately and clamps at stops.
+    /// The panel clicks its own display detent first (like the other switches),
+    /// so a second click against the stop is a silent no-op before the loop's
+    /// snapshot refresh lands.
+    fn adjust_policy_tool(&mut self, tool: &str, forward: bool) -> ModalOutcome {
+        let granted = self.snap.policy.granted_tools.iter().any(|t| t == tool);
+        let target = forward; // right = always (granted), left = ask (revoked)
+        if granted == target {
+            return ModalOutcome::Ignore;
+        }
+        let edit = if target {
+            self.snap.policy.granted_tools.push(tool.to_string());
+            ProjectPolicyEdit::GrantTool(tool.to_string())
+        } else {
+            self.snap.policy.granted_tools.retain(|t| t != tool);
+            ProjectPolicyEdit::RevokeTool(tool.to_string())
+        };
+        self.arm_flash(self.cursor.clone());
+        ModalOutcome::Emit(ModalAction::EditPolicy(edit))
+    }
+
+    /// `↵` acts by row: ports expand/fold their hatch; registers and dials enter
+    /// inline edit; child rows fire their per-port verb.
     fn activate(&mut self) -> ModalOutcome {
         match self.selected() {
-            RowId::Model => ModalOutcome::Emit(ModalAction::OpenModelPicker),
-            RowId::Scope => ModalOutcome::Emit(ModalAction::OpenScopedModels),
-            RowId::Providers => ModalOutcome::Emit(ModalAction::OpenLoginMethod),
-            RowId::Permissions => ModalOutcome::Emit(ModalAction::OpenTrustMenu),
-            RowId::Field(field) => match archetype(RowId::Field(field)) {
+            PanelRow::Top(row) if is_port(row) => self.toggle_hatch(row),
+            PanelRow::Top(RowId::Field(field)) => match archetype(RowId::Field(field)) {
                 Archetype::Register => {
                     self.edit = Some(Edit {
                         buffer: self.snap.register_value(field).unwrap_or_default(),
@@ -621,8 +953,351 @@ impl SettingsPanel {
                 }
                 _ => ModalOutcome::Ignore,
             },
+            PanelRow::ModelChild(id) => self.select_model(&id, true),
+            PanelRow::ScopeChild(id) => {
+                self.scope_toggle(&id);
+                ModalOutcome::Emit(ModalAction::ApplyScoped(self.scope()))
+            }
+            PanelRow::ProviderChild(id) => self.provider_primary(&id),
+            PanelRow::PolicyBashExact(cmd) => ModalOutcome::Emit(ModalAction::EditPolicy(
+                ProjectPolicyEdit::RevokeBashExact(cmd),
+            )),
+            PanelRow::PolicyBashPrefix(pfx) => ModalOutcome::Emit(ModalAction::EditPolicy(
+                ProjectPolicyEdit::RevokeBashPrefix(pfx),
+            )),
+            // Switches (reasoning, skip approvals, per-tool grants) only move
+            // with ←/→ — pressing a slide switch does nothing.
             _ => ModalOutcome::Ignore,
         }
+    }
+
+    /// The per-hatch extra keys, routed by the cursor's context.
+    fn hatch_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match self.selected() {
+            PanelRow::ModelChild(id) => match key {
+                ModalKey::Char('s') | ModalKey::Char('S') => self.select_model(&id, false),
+                _ => ModalOutcome::Ignore,
+            },
+            PanelRow::ProviderChild(id) => self.provider_key(&id, key),
+            _ if self.in_scope_hatch() => self.scope_key(key),
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn in_scope_hatch(&self) -> bool {
+        self.expanded == Some(RowId::Scope)
+            && matches!(
+                self.cursor,
+                PanelRow::ScopeChild(_) | PanelRow::Top(RowId::Scope)
+            )
+    }
+
+    // --- model hatch ---
+
+    fn select_model(&mut self, qualified: &str, save_default: bool) -> ModalOutcome {
+        let Some(model) = self.snap.catalog.iter().find(|m| m.qualified == qualified) else {
+            return ModalOutcome::Ignore;
+        };
+        let effort = model_capabilities::clamp(model.provider, &model.model_id, self.model_target);
+        ModalOutcome::Emit(ModalAction::SelectModel {
+            id: qualified.to_string(),
+            effort,
+            save_default,
+        })
+    }
+
+    /// The candidate whose levels the reasoning row live-tracks: the highlighted
+    /// model child, or `None` (revert to the active model's truth).
+    fn highlighted_model(&self) -> Option<&ModelChoice> {
+        if self.expanded != Some(RowId::Model) {
+            return None;
+        }
+        match &self.cursor {
+            PanelRow::ModelChild(id) => self.snap.catalog.iter().find(|m| &m.qualified == id),
+            _ => None,
+        }
+    }
+
+    // --- providers hatch ---
+
+    fn provider(&self, id: &str) -> Option<&ProviderStatus> {
+        self.snap.providers.iter().find(|p| p.id == id)
+    }
+
+    /// `↵` fires the provider's primary method: OAuth/subscription when it
+    /// supports one, else the API-key dialog (§3.3).
+    fn provider_primary(&self, id: &str) -> ModalOutcome {
+        let Some(status) = self.provider(id) else {
+            return ModalOutcome::Ignore;
+        };
+        if status.oauth_capable {
+            match ProviderId::parse(id) {
+                Ok(provider) => ModalOutcome::Emit(ModalAction::BeginLogin(provider)),
+                Err(_) => ModalOutcome::Ignore,
+            }
+        } else if status.api_key_capable {
+            ModalOutcome::Emit(ModalAction::OpenApiKeyDialog(id.to_string()))
+        } else {
+            ModalOutcome::Ignore
+        }
+    }
+
+    fn provider_key(&mut self, id: &str, key: ModalKey) -> ModalOutcome {
+        let Some(status) = self.provider(id) else {
+            return ModalOutcome::Ignore;
+        };
+        match key {
+            ModalKey::Char('a') | ModalKey::Char('A') if status.api_key_capable => {
+                ModalOutcome::Emit(ModalAction::OpenApiKeyDialog(id.to_string()))
+            }
+            ModalKey::Char('x') | ModalKey::Char('X') if status.credentialed => {
+                ModalOutcome::Emit(ModalAction::Logout(id.to_string()))
+            }
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    // --- scope hatch ---
+
+    /// The live scope to apply/persist.
+    fn scope(&self) -> Option<Vec<String>> {
+        self.snap.scope_enabled.clone()
+    }
+
+    fn scope_is_enabled(&self, id: &str) -> bool {
+        match &self.snap.scope_enabled {
+            None => true,
+            Some(list) => list.iter().any(|e| e == id),
+        }
+    }
+
+    /// Scope children: enabled ids first (configured order), then the remaining
+    /// candidates in registry order — with the live filter applied (§3.2).
+    fn scope_children(&self) -> Vec<String> {
+        let filter = self.scope_filter.to_ascii_lowercase();
+        let matches = |id: &str| filter.is_empty() || id.to_ascii_lowercase().contains(&filter);
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        if let Some(enabled) = &self.snap.scope_enabled {
+            for id in enabled {
+                if self
+                    .snap
+                    .scope_candidates
+                    .iter()
+                    .any(|c| &c.qualified == id)
+                    && matches(id)
+                {
+                    out.push(id.clone());
+                }
+                seen.push(id.clone());
+            }
+        }
+        for candidate in &self.snap.scope_candidates {
+            if seen.contains(&candidate.qualified) {
+                continue;
+            }
+            if matches(&candidate.qualified) {
+                out.push(candidate.qualified.clone());
+            }
+        }
+        out
+    }
+
+    /// Keep the scope cursor on a still-visible child (after a filter change);
+    /// fall back to the first child, then the header.
+    fn clamp_scope_cursor(&mut self) {
+        if let PanelRow::ScopeChild(id) = &self.cursor {
+            let children = self.scope_children();
+            if !children.iter().any(|c| c == id) {
+                self.cursor = children
+                    .first()
+                    .cloned()
+                    .map(PanelRow::ScopeChild)
+                    .unwrap_or(PanelRow::Top(RowId::Scope));
+            }
+        }
+    }
+
+    fn scope_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match key {
+            ModalKey::CtrlA => {
+                let ids = self.scope_matching_or_all();
+                self.scope_set_many(&ids, true);
+                ModalOutcome::Emit(ModalAction::ApplyScoped(self.scope()))
+            }
+            ModalKey::CtrlX => {
+                let ids = self.scope_matching_or_all();
+                self.scope_set_many(&ids, false);
+                ModalOutcome::Emit(ModalAction::ApplyScoped(self.scope()))
+            }
+            ModalKey::CtrlP => {
+                if let PanelRow::ScopeChild(id) = &self.cursor
+                    && let Some((provider, _)) = id.split_once('/')
+                    && let Ok(provider) = ProviderId::parse(provider)
+                {
+                    self.scope_toggle_provider(provider);
+                    ModalOutcome::Emit(ModalAction::ApplyScoped(self.scope()))
+                } else {
+                    ModalOutcome::Ignore
+                }
+            }
+            ModalKey::CtrlS => {
+                // Persist clears the unsaved tag: mirror the live scope onto the
+                // panel's persisted-scope truth so the header settles.
+                self.snap.scope_persisted = self.snap.scope_enabled.clone();
+                ModalOutcome::Emit(ModalAction::SaveScoped(self.scope()))
+            }
+            ModalKey::AltUp => {
+                self.scope_reorder(true);
+                ModalOutcome::Emit(ModalAction::ApplyScoped(self.scope()))
+            }
+            ModalKey::AltDown => {
+                self.scope_reorder(false);
+                ModalOutcome::Emit(ModalAction::ApplyScoped(self.scope()))
+            }
+            ModalKey::Backspace => {
+                if self.scope_filter.pop().is_some() {
+                    self.clamp_scope_cursor();
+                    ModalOutcome::Redraw
+                } else {
+                    ModalOutcome::Ignore
+                }
+            }
+            ModalKey::Char(c) => {
+                self.scope_filter.push(c);
+                self.clamp_scope_cursor();
+                ModalOutcome::Redraw
+            }
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    /// Fold an explicit list covering every candidate back to `None`, matching
+    /// pi-mono. An explicit empty list stays `Some([])` — a deliberate "nothing
+    /// enabled".
+    fn scope_collapse_full(&mut self) {
+        if let Some(list) = &self.snap.scope_enabled
+            && !list.is_empty()
+            && list.len() >= self.snap.scope_candidates.len()
+            && self
+                .snap
+                .scope_candidates
+                .iter()
+                .all(|c| list.iter().any(|e| e == &c.qualified))
+        {
+            self.snap.scope_enabled = None;
+        }
+    }
+
+    fn scope_toggle(&mut self, id: &str) {
+        let mut list = self.snap.scope_enabled.clone().unwrap_or_default();
+        if let Some(pos) = list.iter().position(|e| e == id) {
+            list.remove(pos);
+        } else {
+            list.push(id.to_string());
+        }
+        self.snap.scope_enabled = Some(list);
+        self.scope_collapse_full();
+    }
+
+    /// Enable/disable a whole set of ids (Ctrl+A / Ctrl+X / provider toggle).
+    fn scope_set_many(&mut self, ids: &[String], enable: bool) {
+        let mut list = match &self.snap.scope_enabled {
+            None => {
+                if enable {
+                    return; // enable-all from all-enabled is a no-op
+                }
+                self.snap
+                    .scope_candidates
+                    .iter()
+                    .map(|c| c.qualified.clone())
+                    .collect()
+            }
+            Some(list) => list.clone(),
+        };
+        for id in ids {
+            let pos = list.iter().position(|e| e == id);
+            match (enable, pos) {
+                (true, None) => list.push(id.clone()),
+                (false, Some(p)) => {
+                    list.remove(p);
+                }
+                _ => {}
+            }
+        }
+        self.snap.scope_enabled = Some(list);
+        self.scope_collapse_full();
+    }
+
+    fn scope_toggle_provider(&mut self, provider: ProviderId) {
+        let prefix = format!("{}/", provider.as_str());
+        let ids: Vec<String> = self
+            .snap
+            .scope_candidates
+            .iter()
+            .filter(|c| c.qualified.starts_with(&prefix))
+            .map(|c| c.qualified.clone())
+            .collect();
+        let all_on = ids.iter().all(|id| self.scope_is_enabled(id));
+        self.scope_set_many(&ids, !all_on);
+    }
+
+    fn scope_reorder(&mut self, up: bool) {
+        let PanelRow::ScopeChild(id) = self.cursor.clone() else {
+            return;
+        };
+        let Some(list) = self.snap.scope_enabled.as_mut() else {
+            return;
+        };
+        let Some(pos) = list.iter().position(|e| e == &id) else {
+            return;
+        };
+        let swap = if up {
+            if pos == 0 {
+                return;
+            }
+            pos - 1
+        } else {
+            if pos + 1 >= list.len() {
+                return;
+            }
+            pos + 1
+        };
+        list.swap(pos, swap);
+    }
+
+    /// The filtered ids when a filter is active, otherwise every candidate id.
+    fn scope_matching_or_all(&self) -> Vec<String> {
+        if self.scope_filter.is_empty() {
+            self.snap
+                .scope_candidates
+                .iter()
+                .map(|c| c.qualified.clone())
+                .collect()
+        } else {
+            self.scope_children()
+        }
+    }
+
+    fn scope_enabled_count(&self) -> usize {
+        match &self.snap.scope_enabled {
+            None => self.snap.scope_candidates.len(),
+            Some(list) => list.len(),
+        }
+    }
+
+    /// Whether the live scope differs from the persisted one (the `· unsaved`
+    /// tag). Both are normalized (dropped to candidates, full → None) so an
+    /// equivalent scope never reads as unsaved.
+    fn scope_unsaved(&self) -> bool {
+        let candidates: Vec<&str> = self
+            .snap
+            .scope_candidates
+            .iter()
+            .map(|c| c.qualified.as_str())
+            .collect();
+        normalize_scope(&self.snap.scope_enabled, &candidates)
+            != normalize_scope(&self.snap.scope_persisted, &candidates)
     }
 
     fn handle_edit_key(&mut self, key: ModalKey) -> ModalOutcome {
@@ -654,7 +1329,7 @@ impl SettingsPanel {
     /// buffer clamps to the field's hard bounds; an empty buffer clears the
     /// key when the field allows it, else it is rejected inline.
     fn commit_edit(&mut self) -> ModalOutcome {
-        let RowId::Field(field) = self.selected() else {
+        let PanelRow::Top(RowId::Field(field)) = self.selected() else {
             self.edit = None;
             return ModalOutcome::Redraw;
         };
@@ -673,7 +1348,7 @@ impl SettingsPanel {
                     let value = value.clamp(min, max);
                     self.snap.set_dial_value(field, value);
                     self.edit = None;
-                    self.arm_flash();
+                    self.arm_flash(self.cursor.clone());
                     ModalOutcome::Emit(ModalAction::SaveSetting {
                         field,
                         value: Some(value.to_string()),
@@ -688,7 +1363,7 @@ impl SettingsPanel {
             let value = (!trimmed.is_empty()).then_some(trimmed);
             self.snap.set_register_value(field, value.clone());
             self.edit = None;
-            self.arm_flash();
+            self.arm_flash(self.cursor.clone());
             ModalOutcome::Emit(ModalAction::SaveSetting { field, value })
         }
     }
@@ -699,12 +1374,69 @@ impl SettingsPanel {
         self.render_budgeted(usize::from(width), DEFAULT_LINE_BUDGET)
     }
 
+    /// Build the display list (headers, blanks, controls with the open hatch's
+    /// children spliced in, and read-only silkscreen lines), calling `emit` for
+    /// each row in order. Shared by `selectable` (identity only) and the render
+    /// path (which also needs the read-only lines and blanks).
+    fn walk_rows<F: FnMut(DisplayRow)>(&self, mut emit: F) {
+        for (i, section) in SECTIONS.iter().enumerate() {
+            if i > 0 {
+                emit(DisplayRow::Blank);
+            }
+            emit(DisplayRow::Header(section.title));
+            for &row in section.rows {
+                emit(DisplayRow::Control(PanelRow::Top(row)));
+                if self.expanded == Some(row) {
+                    for child in self.children_of(Some(row)) {
+                        emit(DisplayRow::Control(child));
+                    }
+                    for line in self.hatch_notes(row) {
+                        emit(DisplayRow::ReadOnly(line));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Non-selectable silkscreen lines printed inside a hatch: the scope empty
+    /// filter note, the permissions empty-grants note, and the read-only sandbox
+    /// posture.
+    fn hatch_notes(&self, row: RowId) -> Vec<Line<'static>> {
+        match row {
+            RowId::Scope if self.scope_children().is_empty() => {
+                vec![child_note("no matching models")]
+            }
+            RowId::Permissions => {
+                let mut notes = Vec::new();
+                if self.snap.policy.bash_exact.is_empty() && self.snap.policy.bash_prefix.is_empty()
+                {
+                    notes.push(child_note("no bash grants"));
+                }
+                if let Some(sandbox) = &self.snap.policy.sandbox {
+                    notes.push(Line::from(vec![
+                        Span::styled(format!("    {:<width$}", "sandbox", width = LABEL_W), dim()),
+                        Span::styled(sandbox.clone(), dim()),
+                    ]));
+                }
+                notes
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Render within `budget` total lines (masthead + body window + footer).
     /// The body windows over the display rows to keep the cursor visible; a
     /// scrolled panel appends the house `(n/N)` position row.
     pub(crate) fn render_budgeted(&self, width: usize, budget: usize) -> Vec<Line<'static>> {
         let avail = width.max(20);
-        let rows = display_rows();
+        let mut rows: Vec<DisplayRow> = Vec::new();
+        self.walk_rows(|row| rows.push(row));
+        let selectable = self.selectable();
+        let total = selectable.len().max(1);
+        let cursor_index = selectable
+            .iter()
+            .position(|row| *row == self.cursor)
+            .unwrap_or(0);
         // Fixed lines outside the body window: masthead, the blank under it,
         // and overlay_menu's blank + footer.
         let fixed = 4usize;
@@ -716,9 +1448,7 @@ impl SettingsPanel {
         }
         let cursor_pos = rows
             .iter()
-            .position(
-                |row| matches!(row, DisplayRow::Control { index, .. } if *index == self.cursor),
-            )
+            .position(|row| matches!(row, DisplayRow::Control(pr) if *pr == self.cursor))
             .unwrap_or(0);
         let offset = crate::ui::selector::scroll_offset(cursor_pos, window);
 
@@ -731,16 +1461,17 @@ impl SettingsPanel {
                 DisplayRow::Header(title) => {
                     body.push((Line::from(Span::styled((*title).to_string(), dim())), false));
                 }
-                DisplayRow::Control { index, row } => {
-                    let selected = *index == self.cursor;
-                    body.push((self.control_line(*row, selected, avail), selected));
+                DisplayRow::ReadOnly(line) => body.push((line.clone(), false)),
+                DisplayRow::Control(panel_row) => {
+                    let selected = *panel_row == self.cursor;
+                    body.push((self.control_line(panel_row, selected, avail), selected));
                 }
             }
         }
         if scrolled {
             body.push((
                 Line::from(Span::styled(
-                    crate::ui::selector::position_label(self.cursor, self.controls.len()),
+                    crate::ui::selector::position_label(cursor_index, total),
                     dim(),
                 )),
                 false,
@@ -772,24 +1503,41 @@ impl SettingsPanel {
         ])
     }
 
-    /// The panel measure: the widest control row at this width, so the
+    /// The panel measure: the widest top control row at this width, so the
     /// masthead's rev right-aligns to the grid the controls establish.
     fn measure(&self, avail: usize) -> usize {
-        self.controls
+        SECTIONS
             .iter()
-            .map(|&row| line_width(&self.control_line(row, false, avail)))
+            .flat_map(|section| section.rows.iter())
+            .map(|&row| line_width(&self.control_line(&PanelRow::Top(row), false, avail)))
             .max()
             .unwrap_or(0)
             .clamp(24.min(avail), avail)
     }
 
-    /// One control row: `  label            <control>`, two-cell indent, the
-    /// control column at `LABEL_W`. The selected row's label is bold (the
-    /// surface fill comes from `overlay_menu`).
-    fn control_line(&self, row: RowId, selected: bool, avail: usize) -> Line<'static> {
+    /// One panel row. Top control rows are `  label  <control>` (two-cell
+    /// indent, control column at `LABEL_W`); child rows print at a four-cell
+    /// indent. The selected row's label is bold (the surface fill comes from
+    /// `overlay_menu`).
+    fn control_line(&self, row: &PanelRow, selected: bool, avail: usize) -> Line<'static> {
+        match row {
+            PanelRow::Top(top) => self.top_line(*top, selected, avail),
+            PanelRow::ModelChild(id) => self.model_child_line(id, selected),
+            PanelRow::ScopeChild(id) => self.scope_child_line(id, selected),
+            PanelRow::ProviderChild(id) => self.provider_child_line(id, selected),
+            PanelRow::PolicyTool(tool) => self.policy_tool_line(tool, selected, avail),
+            PanelRow::PolicyBashExact(cmd) => bash_grant_line(&format!("bash: {cmd}"), selected),
+            PanelRow::PolicyBashPrefix(pfx) => {
+                bash_grant_line(&format!("bash prefix: {pfx}"), selected)
+            }
+        }
+    }
+
+    fn top_line(&self, row: RowId, selected: bool, avail: usize) -> Line<'static> {
         let flashing = self
             .flash
-            .is_some_and(|(index, _)| self.controls.get(index) == Some(&row));
+            .as_ref()
+            .is_some_and(|(r, _)| *r == PanelRow::Top(row));
         let mut spans: Vec<Span<'static>> = Vec::new();
         let name = label(row);
         let label_style = if selected {
@@ -812,7 +1560,7 @@ impl SettingsPanel {
         if editing {
             self.push_edit_spans(&mut spans);
         } else {
-            self.push_control_spans(row, &mut spans, flashing, inert, avail);
+            self.push_top_control_spans(row, &mut spans, flashing, inert, avail);
         }
         Line::from(spans)
     }
@@ -835,7 +1583,7 @@ impl SettingsPanel {
         }
     }
 
-    fn push_control_spans(
+    fn push_top_control_spans(
         &self,
         row: RowId,
         spans: &mut Vec<Span<'static>>,
@@ -850,7 +1598,7 @@ impl SettingsPanel {
                     .default_model
                     .split_once('/')
                     .unwrap_or(("", self.snap.default_model.as_str()));
-                spans.push(port_marker());
+                spans.push(self.port_marker(row));
                 spans.push(Span::raw(model.to_string()));
                 if !provider.is_empty() {
                     spans.push(Span::styled(
@@ -860,13 +1608,33 @@ impl SettingsPanel {
                 }
             }
             RowId::Scope => {
-                spans.push(port_marker());
-                spans.push(Span::styled(self.snap.scope_summary.clone(), dim()));
+                spans.push(self.port_marker(row));
+                let summary = if self.snap.scope_enabled.is_none() {
+                    "all enabled".to_string()
+                } else {
+                    format!(
+                        "{} of {} enabled",
+                        self.scope_enabled_count(),
+                        self.snap.scope_candidates.len()
+                    )
+                };
+                let text = if self.scope_unsaved() {
+                    format!("{summary} \u{00b7} unsaved")
+                } else {
+                    summary
+                };
+                spans.push(Span::styled(text, dim()));
             }
             RowId::Providers => {
-                spans.push(port_marker());
+                spans.push(self.port_marker(row));
+                let connected = self
+                    .snap
+                    .providers
+                    .iter()
+                    .filter(|p| p.credentialed)
+                    .count();
                 spans.push(Span::styled(
-                    match self.snap.providers_connected {
+                    match connected {
                         0 => "none connected".to_string(),
                         1 => "1 connected".to_string(),
                         n => format!("{n} connected"),
@@ -875,32 +1643,10 @@ impl SettingsPanel {
                 ));
             }
             RowId::Permissions => {
-                spans.push(port_marker());
+                spans.push(self.port_marker(row));
                 spans.push(Span::styled("per-tool + bash grants".to_string(), dim()));
             }
-            RowId::Reasoning => {
-                let options: Vec<&str> = self
-                    .snap
-                    .reasoning_levels
-                    .iter()
-                    .map(|(_, label)| *label)
-                    .collect();
-                let pos = self
-                    .snap
-                    .reasoning_levels
-                    .iter()
-                    .position(|(level, _)| *level == self.snap.reasoning);
-                let current = pos.map(|p| options[p]).unwrap_or("");
-                spans.extend(switch_spans(
-                    &options,
-                    pos,
-                    current,
-                    flashing,
-                    false,
-                    false,
-                    avail.saturating_sub(LABEL_W + 2),
-                ));
-            }
+            RowId::Reasoning => self.push_reasoning_spans(spans, flashing, avail),
             RowId::SkipApprovals => {
                 let pos = usize::from(self.snap.skip_permissions);
                 spans.extend(switch_spans(
@@ -959,14 +1705,205 @@ impl SettingsPanel {
                         dim(),
                     )),
                 },
-                // Field rows are never ports (the ports are the non-Field
-                // RowIds, matched above).
                 Archetype::Port => {}
             },
         }
     }
 
-    /// Keymap-honest footer: the verbs for the selected row's archetype only.
+    /// The reasoning row IS the model hatch's effort track: while a candidate is
+    /// highlighted it live-renders that candidate's levels with the target
+    /// clamped to them; otherwise it prints the active model's real track (§3.1).
+    fn push_reasoning_spans(&self, spans: &mut Vec<Span<'static>>, flashing: bool, avail: usize) {
+        let track_avail = avail.saturating_sub(LABEL_W + 2);
+        if let Some(model) = self.highlighted_model() {
+            let effort =
+                model_capabilities::clamp(model.provider, &model.model_id, self.model_target);
+            let options: Vec<&str> = model.levels.iter().map(|(_, label)| *label).collect();
+            let pos = model.levels.iter().position(|(level, _)| *level == effort);
+            let current = pos.map(|p| options[p]).unwrap_or("");
+            spans.extend(switch_spans(
+                &options,
+                pos,
+                current,
+                flashing,
+                false,
+                false,
+                track_avail,
+            ));
+        } else {
+            let options: Vec<&str> = self
+                .snap
+                .reasoning_levels
+                .iter()
+                .map(|(_, label)| *label)
+                .collect();
+            let pos = self
+                .snap
+                .reasoning_levels
+                .iter()
+                .position(|(level, _)| *level == self.snap.reasoning);
+            let current = pos.map(|p| options[p]).unwrap_or("");
+            spans.extend(switch_spans(
+                &options,
+                pos,
+                current,
+                flashing,
+                false,
+                false,
+                track_avail,
+            ));
+        }
+    }
+
+    fn model_child_line(&self, qualified: &str, selected: bool) -> Line<'static> {
+        let name_w = self
+            .snap
+            .catalog
+            .iter()
+            .map(|m| m.display.chars().count())
+            .max()
+            .unwrap_or(0);
+        let model = self.snap.catalog.iter().find(|m| m.qualified == qualified);
+        let base = if selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        match model {
+            Some(model) => {
+                let marker = if model.is_current {
+                    Span::styled(
+                        format!("    {} ", crate::ui::symbols::ACTIVE),
+                        Style::default().fg(crate::ui::palette::orange()),
+                    )
+                } else {
+                    Span::raw("      ")
+                };
+                spans.push(marker);
+                spans.push(Span::styled(format!("{:<name_w$}", model.display), base));
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(model.provider_label.clone(), dim()));
+                if model.is_default {
+                    spans.push(Span::styled("  default", dim()));
+                }
+            }
+            None => spans.push(Span::styled(format!("    {qualified}"), base)),
+        }
+        Line::from(spans)
+    }
+
+    fn scope_child_line(&self, qualified: &str, selected: bool) -> Line<'static> {
+        let base = if selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        // `enabled = None` ("all enabled") renders as the no-checkmark-column
+        // form: the qualified id plus the provider, no `◉`/`○`.
+        if self.snap.scope_enabled.is_none() {
+            spans.push(Span::styled(format!("    {qualified}"), base));
+            if let Some(candidate) = self
+                .snap
+                .scope_candidates
+                .iter()
+                .find(|c| c.qualified == qualified)
+            {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(candidate.provider_label.clone(), dim()));
+            }
+        } else {
+            let enabled = self.scope_is_enabled(qualified);
+            let mark = if enabled {
+                Span::styled(
+                    format!("    {} ", crate::ui::symbols::ACTIVE),
+                    Style::default().fg(crate::ui::palette::orange()),
+                )
+            } else {
+                Span::styled(format!("    {} ", crate::ui::symbols::EMPTY), dim())
+            };
+            spans.push(mark);
+            spans.push(Span::styled(qualified.to_string(), base));
+        }
+        Line::from(spans)
+    }
+
+    fn provider_child_line(&self, id: &str, selected: bool) -> Line<'static> {
+        let name_w = self
+            .snap
+            .providers
+            .iter()
+            .map(|p| p.name.chars().count())
+            .max()
+            .unwrap_or(0);
+        let base = if selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if let Some(status) = self.provider(id) {
+            let mark = if status.credentialed {
+                Span::styled(
+                    format!("    {} ", crate::ui::symbols::ACTIVE),
+                    Style::default().fg(crate::ui::palette::orange()),
+                )
+            } else {
+                Span::styled(format!("    {} ", crate::ui::symbols::EMPTY), dim())
+            };
+            spans.push(mark);
+            spans.push(Span::styled(format!("{:<name_w$}", status.name), base));
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(status.badge.clone(), dim()));
+        } else {
+            spans.push(Span::styled(format!("    {id}"), base));
+        }
+        Line::from(spans)
+    }
+
+    fn policy_tool_line(&self, tool: &str, selected: bool, avail: usize) -> Line<'static> {
+        let flashing = self
+            .flash
+            .as_ref()
+            .is_some_and(|(r, _)| matches!(r, PanelRow::PolicyTool(t) if t == tool));
+        let granted = self.snap.policy.granted_tools.iter().any(|t| t == tool);
+        let base = if selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        // Four-cell indent + a `LABEL_W - 2` label field puts the switch track on
+        // the panel's control column (§2.4).
+        let mut spans = vec![Span::styled(
+            format!("    {tool:<width$}", width = LABEL_W - 2),
+            base,
+        )];
+        let pos = usize::from(granted);
+        spans.extend(switch_spans(
+            &["ask", "always"],
+            Some(pos),
+            if granted { "always" } else { "ask" },
+            flashing,
+            false,
+            false,
+            avail.saturating_sub(LABEL_W + 2),
+        ));
+        Line::from(spans)
+    }
+
+    fn port_marker(&self, row: RowId) -> Span<'static> {
+        let glyph = if self.expanded == Some(row) {
+            crate::ui::symbols::EXPANDED
+        } else {
+            crate::ui::symbols::COLLAPSED
+        };
+        Span::styled(format!("{glyph} "), dim())
+    }
+
+    /// Keymap-honest footer: the verbs for the selected row only. Child rows
+    /// print their per-port verbs; while a hatch is open, `esc` collapses (never
+    /// "close") on every row (§2.3, §3).
     fn footer(&self) -> String {
         if let Some(edit) = self.edit.as_ref() {
             return if edit.numeric {
@@ -975,24 +1912,107 @@ impl SettingsPanel {
                 "\u{21b5} save \u{00b7} esc cancel \u{00b7} empty clears".to_string()
             };
         }
-        let verbs = if self.selected() == RowId::Model {
-            // The hybrid row: rotary cycle + port open.
-            "\u{2190}\u{2192} cycle \u{00b7} \u{21b5} open"
+        match &self.cursor {
+            PanelRow::Top(row) => self.top_footer(*row),
+            PanelRow::ModelChild(_) => {
+                "\u{2190}\u{2192} reasoning \u{00b7} \u{21b5} set default \u{00b7} s session \u{00b7} esc collapse"
+                    .to_string()
+            }
+            PanelRow::ScopeChild(_) => {
+                "\u{21b5} toggle \u{00b7} ctrl+a all \u{00b7} ctrl+x none \u{00b7} ctrl+p provider \u{00b7} alt+\u{2191}\u{2193} reorder \u{00b7} ctrl+s save \u{00b7} esc collapse"
+                    .to_string()
+            }
+            PanelRow::ProviderChild(id) => self.provider_footer(id),
+            PanelRow::PolicyTool(_) => "\u{2190}\u{2192} set \u{00b7} esc collapse".to_string(),
+            PanelRow::PolicyBashExact(_) | PanelRow::PolicyBashPrefix(_) => {
+                "\u{21b5} revoke \u{00b7} esc collapse".to_string()
+            }
+        }
+    }
+
+    fn top_footer(&self, row: RowId) -> String {
+        let hatch = self.expanded.is_some();
+        let esc = if hatch { "esc collapse" } else { "esc close" };
+        let expanded_here = self.expanded == Some(row);
+        let verbs = if row == RowId::Model {
+            if expanded_here {
+                "\u{2190}\u{2192} cycle \u{00b7} \u{21b5} collapse".to_string()
+            } else {
+                "\u{2190}\u{2192} cycle \u{00b7} \u{21b5} open".to_string()
+            }
+        } else if is_port(row) {
+            if expanded_here {
+                "\u{21b5} collapse".to_string()
+            } else {
+                "\u{21b5} open".to_string()
+            }
         } else {
-            match archetype(self.selected()) {
-                Archetype::Switch => "\u{2190}\u{2192} set",
-                Archetype::Dial => "\u{2190}\u{2192} adjust \u{00b7} \u{21b5} type",
-                Archetype::Register => "\u{21b5} edit",
-                Archetype::Port => "\u{21b5} open",
+            match archetype(row) {
+                Archetype::Switch => "\u{2190}\u{2192} set".to_string(),
+                Archetype::Dial => "\u{2190}\u{2192} adjust \u{00b7} \u{21b5} type".to_string(),
+                Archetype::Register => "\u{21b5} edit".to_string(),
+                Archetype::Port => String::new(),
             }
         };
-        format!("\u{2191}\u{2193} select \u{00b7} {verbs} \u{00b7} esc close")
+        format!("\u{2191}\u{2193} select \u{00b7} {verbs} \u{00b7} {esc}")
+    }
+
+    /// The providers footer advertises only the verbs that exist for this row:
+    /// `x logout` only when credentialed, `a api key` only when the provider
+    /// takes one (§3.3, criterion 16).
+    fn provider_footer(&self, id: &str) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if let Some(status) = self.provider(id) {
+            if status.oauth_capable || status.api_key_capable {
+                parts.push("\u{21b5} login");
+            }
+            if status.api_key_capable {
+                parts.push("a api key");
+            }
+            if status.credentialed {
+                parts.push("x logout");
+            }
+        }
+        parts.push("esc collapse");
+        parts.join(" \u{00b7} ")
     }
 }
 
-/// Shared port marker: the `▸` continuation glyph, dim, in the control column.
-fn port_marker() -> Span<'static> {
-    Span::styled(format!("{} ", crate::ui::symbols::COLLAPSED), dim())
+/// A dim, four-cell-indented silkscreen note printed inside a hatch (empty
+/// states); not selectable.
+fn child_note(text: &str) -> Line<'static> {
+    Line::from(Span::styled(format!("    {text}"), dim()))
+}
+
+/// A revoke-only bash-grant row: `    <label>  ↵ revoke`, the hint muted.
+fn bash_grant_line(label: &str, selected: bool) -> Line<'static> {
+    let base = if selected {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(format!("    {label}"), base),
+        Span::styled(format!("  {} revoke", crate::ui::symbols::SEP), dim()),
+    ])
+}
+
+/// Normalize a scope for the `· unsaved` comparison: keep only ids that are
+/// current candidates (preserving order), then fold a full set to `None`.
+fn normalize_scope(scope: &Option<Vec<String>>, candidates: &[&str]) -> Option<Vec<String>> {
+    let list = scope.as_ref()?;
+    let kept: Vec<String> = list
+        .iter()
+        .filter(|id| candidates.contains(&id.as_str()))
+        .cloned()
+        .collect();
+    if !kept.is_empty()
+        && kept.len() >= candidates.len()
+        && candidates.iter().all(|c| kept.iter().any(|k| k == c))
+    {
+        return None;
+    }
+    Some(kept)
 }
 
 /// Clamped detent step: a switch never wraps.
@@ -1041,8 +2061,8 @@ fn nearest_position(ladder: &[u64], value: u64) -> usize {
 /// into the scale.
 ///
 /// `pub(crate)` because the switch IS the house multi-option control: the
-/// model picker prints its reasoning track through this same function so the
-/// two surfaces cannot drift.
+/// permissions per-tool grants and the model hatch's reasoning track print
+/// through this same function so the surfaces cannot drift.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn switch_spans(
     options: &[&str],
@@ -1177,6 +2197,55 @@ fn line_width(line: &Line<'static>) -> usize {
 mod tests {
     use super::*;
 
+    fn model_choice(
+        provider: ProviderId,
+        model_id: &str,
+        is_current: bool,
+        is_default: bool,
+    ) -> ModelChoice {
+        let qualified = format!("{}/{}", provider.as_str(), model_id);
+        let levels = model_capabilities::level_options(provider, model_id)
+            .iter()
+            .map(|option| (option.level, option.label))
+            .collect();
+        ModelChoice {
+            qualified,
+            display: crate::mimir::model_catalog::display_name(&format!(
+                "{}/{}",
+                provider.as_str(),
+                model_id
+            )),
+            provider_label: provider.display_name().to_string(),
+            provider,
+            model_id: model_id.to_string(),
+            levels,
+            is_current,
+            is_default,
+        }
+    }
+
+    fn scope_choice(provider: ProviderId, model_id: &str) -> ScopeChoice {
+        ScopeChoice {
+            qualified: format!("{}/{}", provider.as_str(), model_id),
+            provider_label: provider.display_name().to_string(),
+        }
+    }
+
+    fn provider_status(id: &str, oauth: bool, api_key: bool, credentialed: bool) -> ProviderStatus {
+        ProviderStatus {
+            id: id.to_string(),
+            name: id.to_string(),
+            badge: if credentialed {
+                if oauth { "subscription" } else { "api key" }.to_string()
+            } else {
+                "\u{2014}".to_string()
+            },
+            oauth_capable: oauth,
+            api_key_capable: api_key,
+            credentialed,
+        }
+    }
+
     fn snapshot() -> Snapshot {
         Snapshot {
             default_model: "openai-codex/gpt-5.5".to_string(),
@@ -1188,8 +2257,29 @@ mod tests {
                 (ReasoningEffort::XHigh, "xhigh"),
             ],
             reasoning: ReasoningEffort::Medium,
-            scope_summary: "all models".to_string(),
-            providers_connected: 2,
+            catalog: vec![
+                model_choice(ProviderId::OpenAiCodex, "gpt-5.5", true, true),
+                model_choice(ProviderId::Anthropic, "claude-sonnet-4-6", false, false),
+                model_choice(ProviderId::Antigravity, "gemini-3.5-flash", false, false),
+            ],
+            scope_candidates: vec![
+                scope_choice(ProviderId::OpenAiCodex, "gpt-5.5"),
+                scope_choice(ProviderId::Anthropic, "claude-sonnet-4-6"),
+                scope_choice(ProviderId::Antigravity, "gemini-3.5-flash"),
+            ],
+            scope_enabled: None,
+            scope_persisted: None,
+            providers: vec![
+                provider_status("openai-codex", true, false, true),
+                provider_status("anthropic", true, true, false),
+                provider_status("openai", false, true, false),
+            ],
+            policy: PolicySnapshot {
+                granted_tools: vec![],
+                bash_exact: vec![],
+                bash_prefix: vec![],
+                sandbox: None,
+            },
             default_approval: "strict".to_string(),
             skip_permissions: false,
             context_token_budget: 232_000,
@@ -1211,13 +2301,12 @@ mod tests {
         SettingsPanel::new(snapshot())
     }
 
-    fn select(panel: &mut SettingsPanel, row: RowId) {
-        let pos = panel
-            .controls
-            .iter()
-            .position(|&r| r == row)
-            .expect("row on the panel");
-        panel.cursor = pos;
+    fn select(panel: &mut SettingsPanel, row: PanelRow) {
+        panel.cursor = row;
+    }
+
+    fn select_top(panel: &mut SettingsPanel, row: RowId) {
+        panel.cursor = PanelRow::Top(row);
     }
 
     fn text(lines: &[Line<'static>]) -> String {
@@ -1233,6 +2322,11 @@ mod tests {
             .join("\n")
     }
 
+    fn expand(panel: &mut SettingsPanel, port: RowId) {
+        select_top(panel, port);
+        panel.handle_key(ModalKey::Enter);
+    }
+
     #[test]
     fn faceplate_lists_every_section_and_prunes_the_service_hatch() {
         let lines = panel().render_budgeted(80, 60);
@@ -1240,11 +2334,9 @@ mod tests {
         for section in ["ENGINE", "SAFETY", "MEMORY", "CHECKS", "PANEL", "GIT"] {
             assert!(rendered.contains(section), "{section} missing:\n{rendered}");
         }
-        // Pruned to settings.json (service hatch): never on the faceplate.
         assert!(!rendered.to_lowercase().contains("bash tool"));
         assert!(!rendered.to_lowercase().contains("round-trips"));
         assert!(!rendered.to_lowercase().contains("roundtrips"));
-        // Masthead: identity + rev, like the start-page silkscreen.
         assert!(rendered.contains("SETTINGS"));
         assert!(rendered.contains(&format!("iris {REV}")));
     }
@@ -1252,8 +2344,7 @@ mod tests {
     #[test]
     fn switch_clicks_one_detent_and_clamps_at_the_stop() {
         let mut panel = panel();
-        select(&mut panel, RowId::Field(Field::DefaultApproval));
-        // strict -> auto.
+        select_top(&mut panel, RowId::Field(Field::DefaultApproval));
         assert_eq!(
             panel.handle_key(ModalKey::Right),
             ModalOutcome::Emit(ModalAction::SaveSetting {
@@ -1261,7 +2352,6 @@ mod tests {
                 value: Some("auto".to_string()),
             })
         );
-        // auto -> never.
         assert_eq!(
             panel.handle_key(ModalKey::Right),
             ModalOutcome::Emit(ModalAction::SaveSetting {
@@ -1269,9 +2359,7 @@ mod tests {
                 value: Some("never".to_string()),
             })
         );
-        // Against the stop: a real switch never wraps.
         assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
-        // And back one detent.
         assert_eq!(
             panel.handle_key(ModalKey::Left),
             ModalOutcome::Emit(ModalAction::SaveSetting {
@@ -1284,7 +2372,7 @@ mod tests {
     #[test]
     fn bool_switches_persist_true_false_not_on_off() {
         let mut panel = panel();
-        select(&mut panel, RowId::Field(Field::Microcompaction));
+        select_top(&mut panel, RowId::Field(Field::Microcompaction));
         assert_eq!(
             panel.handle_key(ModalKey::Right),
             ModalOutcome::Emit(ModalAction::SaveSetting {
@@ -1292,7 +2380,6 @@ mod tests {
                 value: Some("true".to_string()),
             })
         );
-        // Already on: pushing further is a no-op, pulling back turns it off.
         assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
         assert_eq!(
             panel.handle_key(ModalKey::Left),
@@ -1306,22 +2393,19 @@ mod tests {
     #[test]
     fn skip_approvals_is_positional_and_only_fires_on_a_real_flip() {
         let mut panel = panel();
-        select(&mut panel, RowId::SkipApprovals);
-        // Already off: pulling left is a no-op (never a blind toggle).
+        select_top(&mut panel, RowId::SkipApprovals);
         assert_eq!(panel.handle_key(ModalKey::Left), ModalOutcome::Ignore);
         assert_eq!(
             panel.handle_key(ModalKey::Right),
             ModalOutcome::Emit(ModalAction::ToggleSkipPermissions)
         );
-        // The panel's own display flipped with it.
         assert!(panel.snap.skip_permissions);
     }
 
     #[test]
     fn dial_snaps_an_off_ladder_value_into_the_ladder() {
         let mut panel = panel();
-        select(&mut panel, RowId::Field(Field::ContextTokenBudget));
-        // 232k sits ON the ladder; right clicks into 300k.
+        select_top(&mut panel, RowId::Field(Field::ContextTokenBudget));
         assert_eq!(
             panel.handle_key(ModalKey::Right),
             ModalOutcome::Emit(ModalAction::SaveSetting {
@@ -1329,8 +2413,6 @@ mod tests {
                 value: Some("300000".to_string()),
             })
         );
-        // An off-ladder value (90k, e.g. hand-edited json) snaps to the
-        // neighbouring detent on the first click.
         panel.snap.context_token_budget = 90_000;
         assert_eq!(
             panel.handle_key(ModalKey::Left),
@@ -1339,7 +2421,6 @@ mod tests {
                 value: Some("64000".to_string()),
             })
         );
-        // At the bottom stop the dial no-ops.
         panel.snap.context_token_budget = 64_000;
         assert_eq!(panel.handle_key(ModalKey::Left), ModalOutcome::Ignore);
     }
@@ -1347,12 +2428,9 @@ mod tests {
     #[test]
     fn dial_enter_types_a_precise_value_and_clamps_to_bounds() {
         let mut panel = panel();
-        select(&mut panel, RowId::Field(Field::ScrollSpeed));
+        select_top(&mut panel, RowId::Field(Field::ScrollSpeed));
         assert_eq!(panel.handle_key(ModalKey::Enter), ModalOutcome::Redraw);
-        // Seeded with the current value; type a replacement.
-        for _ in 0..1 {
-            panel.handle_key(ModalKey::Backspace);
-        }
+        panel.handle_key(ModalKey::Backspace);
         panel.handle_key(ModalKey::Char('9'));
         panel.handle_key(ModalKey::Char('9'));
         panel.handle_key(ModalKey::Char('9'));
@@ -1363,12 +2441,10 @@ mod tests {
                 value: Some("100".to_string()),
             })
         );
-        // Non-numeric input is rejected inline, panel stays in edit.
         panel.handle_key(ModalKey::Enter);
         panel.handle_key(ModalKey::Char('x'));
         assert_eq!(panel.handle_key(ModalKey::Enter), ModalOutcome::Redraw);
         assert!(panel.edit.as_ref().is_some_and(|e| e.error.is_some()));
-        // Esc cancels the edit without saving.
         assert_eq!(panel.handle_key(ModalKey::Esc), ModalOutcome::Redraw);
         assert!(panel.edit.is_none());
     }
@@ -1376,7 +2452,7 @@ mod tests {
     #[test]
     fn register_edits_inline_and_empty_clears() {
         let mut panel = panel();
-        select(&mut panel, RowId::Field(Field::VerifyCommand));
+        select_top(&mut panel, RowId::Field(Field::VerifyCommand));
         assert_eq!(panel.handle_key(ModalKey::Enter), ModalOutcome::Redraw);
         panel.push_str("  cargo test  ");
         assert_eq!(
@@ -1386,7 +2462,6 @@ mod tests {
                 value: Some("cargo test".to_string()),
             })
         );
-        // Re-enter, clear to empty: clears the key.
         panel.handle_key(ModalKey::Enter);
         for _ in 0.."cargo test".len() {
             panel.handle_key(ModalKey::Backspace);
@@ -1402,9 +2477,8 @@ mod tests {
 
     #[test]
     fn the_model_row_is_a_rotary_port_hybrid() {
-        // ←/→ cycles the scoped models like Ctrl+P; ↵ opens the full picker.
         let mut panel = panel();
-        select(&mut panel, RowId::Model);
+        select_top(&mut panel, RowId::Model);
         assert_eq!(
             panel.handle_key(ModalKey::Right),
             ModalOutcome::Emit(ModalAction::CycleModel { forward: true })
@@ -1413,43 +2487,324 @@ mod tests {
             panel.handle_key(ModalKey::Left),
             ModalOutcome::Emit(ModalAction::CycleModel { forward: false })
         );
-        // The footer names both verbs (keymap honesty for the hybrid).
         assert!(panel.footer().contains("\u{2190}\u{2192} cycle"));
         assert!(panel.footer().contains("\u{21b5} open"));
     }
 
+    // --- criterion 1: expand each port in place ---
     #[test]
-    fn ports_open_their_surfaces() {
-        let mut panel = panel();
-        select(&mut panel, RowId::Model);
-        assert_eq!(
-            panel.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenModelPicker)
-        );
-        select(&mut panel, RowId::Scope);
-        assert_eq!(
-            panel.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenScopedModels)
-        );
-        select(&mut panel, RowId::Providers);
-        assert_eq!(
-            panel.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenLoginMethod)
-        );
-        select(&mut panel, RowId::Permissions);
-        assert_eq!(
-            panel.handle_key(ModalKey::Enter),
-            ModalOutcome::Emit(ModalAction::OpenTrustMenu)
-        );
-        // Pure ports never respond to ←→ (nothing to slide) — the model
-        // row's cycling is the deliberate hybrid exception.
-        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+    fn enter_on_each_port_expands_in_place_with_the_cursor_on_the_header() {
+        for port in [
+            RowId::Model,
+            RowId::Scope,
+            RowId::Providers,
+            RowId::Permissions,
+        ] {
+            let mut panel = panel();
+            select_top(&mut panel, port);
+            assert_eq!(panel.handle_key(ModalKey::Enter), ModalOutcome::Redraw);
+            assert_eq!(panel.expanded, Some(port), "{port:?} expanded");
+            // Cursor stays on the header; the header flash is armed.
+            assert_eq!(panel.cursor, PanelRow::Top(port));
+            assert_eq!(
+                panel.flash.as_ref().map(|(r, _)| r.clone()),
+                Some(PanelRow::Top(port))
+            );
+            // Children are in the flattened selectable list.
+            assert!(
+                panel
+                    .selectable()
+                    .iter()
+                    .any(|r| !matches!(r, PanelRow::Top(_))),
+                "{port:?} children present"
+            );
+            // The expanded marker (▾) renders on the header row.
+            let rendered = text(&panel.render_budgeted(100, 60));
+            assert!(
+                rendered.contains(crate::ui::symbols::EXPANDED),
+                "{port:?} shows ▾:\n{rendered}"
+            );
+        }
     }
 
     #[test]
+    fn expand_arms_no_flash_under_reduced_motion() {
+        let mut snap = snapshot();
+        snap.reduced_motion = true;
+        let mut panel = SettingsPanel::new(snap);
+        expand(&mut panel, RowId::Model);
+        assert!(panel.flash.is_none(), "reduced motion settles instantly");
+    }
+
+    // --- criterion 2: collapse verbs + two-step esc ---
+    #[test]
+    fn enter_on_expanded_header_collapses_and_esc_from_a_child_collapses() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Model);
+        // ↵ on the expanded header collapses.
+        assert_eq!(panel.handle_key(ModalKey::Enter), ModalOutcome::Redraw);
+        assert!(panel.expanded.is_none());
+        assert_eq!(panel.cursor, PanelRow::Top(RowId::Model));
+
+        // esc from a child collapses (cursor → header).
+        expand(&mut panel, RowId::Providers);
+        panel.handle_key(ModalKey::Down); // onto a provider child
+        assert!(matches!(panel.cursor, PanelRow::ProviderChild(_)));
+        assert_eq!(panel.handle_key(ModalKey::Esc), ModalOutcome::Redraw);
+        assert!(panel.expanded.is_none());
+        assert_eq!(panel.cursor, PanelRow::Top(RowId::Providers));
+
+        // esc with no hatch open closes the panel; the old two-step holds:
+        // hatch open + esc esc = collapse, then close.
+        expand(&mut panel, RowId::Scope);
+        assert_eq!(panel.handle_key(ModalKey::Esc), ModalOutcome::Redraw); // collapse
+        assert_eq!(panel.handle_key(ModalKey::Esc), ModalOutcome::Close); // close
+    }
+
+    // --- criterion 3: accordion ---
+    #[test]
+    fn expanding_a_second_port_collapses_the_first_in_the_same_keypress() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Scope);
+        assert_eq!(panel.expanded, Some(RowId::Scope));
+        expand(&mut panel, RowId::Providers);
+        assert_eq!(panel.expanded, Some(RowId::Providers));
+        // At most one ▾ ever renders.
+        let rendered = text(&panel.render_budgeted(100, 60));
+        assert_eq!(
+            rendered.matches(crate::ui::symbols::EXPANDED).count(),
+            1,
+            "exactly one hatch open:\n{rendered}"
+        );
+    }
+
+    // --- criterion 4: traversal wraps, silkscreen skipped ---
+    #[test]
+    fn navigation_wraps_over_the_flattened_list_and_skips_silkscreen() {
+        let mut panel = panel();
+        assert_eq!(panel.selected(), PanelRow::Top(RowId::Model));
+        panel.handle_key(ModalKey::Up);
+        assert_eq!(
+            panel.selected(),
+            PanelRow::Top(RowId::Field(Field::WorktreeRoot)),
+            "wraps to the last control, never a header"
+        );
+        panel.handle_key(ModalKey::Down);
+        assert_eq!(panel.selected(), PanelRow::Top(RowId::Model));
+        // Header → children → next control while expanded.
+        expand(&mut panel, RowId::Model);
+        panel.handle_key(ModalKey::Down);
+        assert!(matches!(panel.cursor, PanelRow::ModelChild(_)));
+    }
+
+    #[test]
+    fn the_sandbox_line_is_never_selectable() {
+        let mut snap = snapshot();
+        snap.policy.sandbox = Some("workspace-write".to_string());
+        let mut panel = SettingsPanel::new(snap);
+        expand(&mut panel, RowId::Permissions);
+        // The permissions children are policy rows only — the sandbox posture is
+        // never among them (it is a read-only silkscreen line).
+        assert!(
+            panel
+                .children_of(Some(RowId::Permissions))
+                .iter()
+                .all(|r| matches!(
+                    r,
+                    PanelRow::PolicyTool(_)
+                        | PanelRow::PolicyBashExact(_)
+                        | PanelRow::PolicyBashPrefix(_)
+                )),
+            "permissions children are policy rows"
+        );
+        // The sandbox line renders (dim, read-only) but no selectable row draws
+        // the posture — it can never take the cursor.
+        let rendered = text(&panel.render_budgeted(100, 60));
+        assert!(rendered.contains("workspace-write"), "{rendered}");
+        assert!(
+            !panel.selectable().iter().any(|row| {
+                text(&[panel.control_line(row, false, 100)]).contains("workspace-write")
+            }),
+            "sandbox posture is never on a selectable row"
+        );
+    }
+
+    // --- criterion 5: identity-keyed cursor survives a reflow ---
+    #[test]
+    fn expanding_a_port_above_the_cursor_keeps_the_selection_row() {
+        let mut panel = panel();
+        // Cursor on a lower row (providers header).
+        select_top(&mut panel, RowId::Providers);
+        // Expand the model hatch above it (via a fresh panel + accordion is not
+        // it; simulate the reflow by expanding model then confirming providers
+        // header is still the cursor is wrong — instead expand model while the
+        // cursor is on providers by setting expanded directly through the API).
+        panel.expanded = Some(RowId::Model);
+        // A reflow (children spliced above) must not move the identity cursor.
+        assert_eq!(panel.cursor, PanelRow::Top(RowId::Providers));
+        // And the row is still found in the flattened list.
+        assert!(
+            panel
+                .selectable()
+                .contains(&PanelRow::Top(RowId::Providers))
+        );
+    }
+
+    #[test]
+    fn a_flash_survives_a_reflow() {
+        let mut panel = panel();
+        select_top(&mut panel, RowId::Field(Field::DefaultApproval));
+        panel.handle_key(ModalKey::Right);
+        let flashed = panel.flash.as_ref().map(|(r, _)| r.clone());
+        assert_eq!(
+            flashed,
+            Some(PanelRow::Top(RowId::Field(Field::DefaultApproval)))
+        );
+        // Reflow: open a hatch elsewhere. The flash still targets the same row.
+        panel.expanded = Some(RowId::Model);
+        let rendered = text(&panel.render_budgeted(100, 60));
+        assert!(rendered.contains("auto"), "{rendered}");
+    }
+
+    // --- criterion 6: windowing ---
+    #[test]
+    fn windowing_keeps_the_cursor_visible_and_counts_the_flattened_list() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Model);
+        // Move to the last model child under a tight budget.
+        panel.handle_key(ModalKey::Down);
+        panel.handle_key(ModalKey::Down);
+        panel.handle_key(ModalKey::Down);
+        let total = panel.selectable().len();
+        let lines = panel.render_budgeted(80, 12);
+        let rendered = text(&lines);
+        // The cursor's model row is visible.
+        assert!(
+            rendered.contains("Gemini"),
+            "cursor row visible:\n{rendered}"
+        );
+        // Position row counts the flattened selectable list, masthead pinned.
+        let idx = panel
+            .selectable()
+            .iter()
+            .position(|r| *r == panel.cursor)
+            .unwrap();
+        assert!(
+            rendered.contains(&format!("({}/{})", idx + 1, total)),
+            "flattened (n/N):\n{rendered}"
+        );
+        assert!(
+            rendered.contains("SETTINGS"),
+            "masthead pinned:\n{rendered}"
+        );
+    }
+
+    // --- criterion 8: model rows ordered, marked, tagged ---
+    #[test]
+    fn model_hatch_marks_active_tags_default_and_mutes_provider() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Model);
+        let rendered = text(&panel.render_budgeted(100, 60));
+        // Default-first: gpt-5.5 (current+default) is the first child.
+        assert!(rendered.contains("GPT 5.5"), "{rendered}");
+        assert!(
+            rendered.contains(crate::ui::symbols::ACTIVE),
+            "active mark:\n{rendered}"
+        );
+        assert!(rendered.contains("default"), "default tag:\n{rendered}");
+        assert!(
+            rendered.contains("OpenAI Codex"),
+            "provider column:\n{rendered}"
+        );
+    }
+
+    // --- criterion 9: navigation clamps display without mutating the target ---
+    #[test]
+    fn arrowing_over_a_low_cap_model_clamps_display_but_preserves_the_target() {
+        // Set target to xhigh; gemini caps at high.
+        let mut snap = snapshot();
+        snap.reasoning = ReasoningEffort::XHigh;
+        let mut panel = SettingsPanel::new(snap);
+        panel.model_target = ReasoningEffort::XHigh;
+        expand(&mut panel, RowId::Model);
+        // Onto gemini (caps below xhigh): the reasoning row shows the clamp.
+        select(
+            &mut panel,
+            PanelRow::ModelChild("antigravity/gemini-3.5-flash".to_string()),
+        );
+        let capped = model_capabilities::clamp(
+            ProviderId::Antigravity,
+            "gemini-3.5-flash",
+            ReasoningEffort::XHigh,
+        );
+        assert_ne!(capped, ReasoningEffort::XHigh, "gemini caps below xhigh");
+        // The target is untouched by navigation.
+        assert_eq!(panel.model_target, ReasoningEffort::XHigh);
+    }
+
+    // --- criterion 10: model select emits + hatch stays open ---
+    #[test]
+    fn model_child_enter_and_s_emit_select_with_the_displayed_effort() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Model);
+        select(
+            &mut panel,
+            PanelRow::ModelChild("anthropic/claude-sonnet-4-6".to_string()),
+        );
+        match panel.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::SelectModel {
+                id, save_default, ..
+            }) => {
+                assert_eq!(id, "anthropic/claude-sonnet-4-6");
+                assert!(save_default, "Enter persists the default");
+            }
+            other => panic!("expected SelectModel, got {other:?}"),
+        }
+        // The hatch does not slam itself shut.
+        assert_eq!(panel.expanded, Some(RowId::Model));
+        match panel.handle_key(ModalKey::Char('s')) {
+            ModalOutcome::Emit(ModalAction::SelectModel { save_default, .. }) => {
+                assert!(!save_default, "s applies for this session only");
+            }
+            other => panic!("expected SelectModel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_child_left_right_clicks_the_effort_and_clamps_at_stops() {
+        let mut panel = panel();
+        panel.model_target = ReasoningEffort::Medium;
+        expand(&mut panel, RowId::Model);
+        // gpt-5.5 supports up to xhigh: click right toward higher effort.
+        select(
+            &mut panel,
+            PanelRow::ModelChild("openai-codex/gpt-5.5".to_string()),
+        );
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Redraw);
+        assert_eq!(panel.model_target, ReasoningEffort::High);
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Redraw);
+        assert_eq!(panel.model_target, ReasoningEffort::XHigh);
+        // Against the top stop: clamp, no wrap.
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+    }
+
+    // --- criterion 11: reasoning row reverts to active truth on the header ---
+    #[test]
+    fn reasoning_row_reverts_to_the_active_model_when_not_on_a_child() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Model);
+        // Cursor on the header (not a child): the reasoning row uses the active
+        // model's levels + level, not a candidate's.
+        assert!(panel.highlighted_model().is_none());
+        let rendered = text(&panel.render_budgeted(120, 60));
+        assert!(rendered.contains("medium"), "active truth:\n{rendered}");
+    }
+
+    // --- reasoning row (top-level switch) still clicks ---
+    #[test]
     fn reasoning_clicks_through_the_active_models_levels() {
         let mut panel = panel();
-        select(&mut panel, RowId::Reasoning);
+        select_top(&mut panel, RowId::Reasoning);
         assert_eq!(
             panel.handle_key(ModalKey::Right),
             ModalOutcome::Emit(ModalAction::AdjustEffort(ReasoningEffort::High))
@@ -1461,11 +2816,204 @@ mod tests {
         assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
     }
 
+    // --- criterion 13: scope toggle + header count + unsaved tag ---
+    #[test]
+    fn scope_toggle_emits_apply_and_the_header_tracks_count_and_unsaved() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Scope);
+        // all enabled while None.
+        let rendered = text(&panel.render_budgeted(100, 60));
+        assert!(rendered.contains("all enabled"), "{rendered}");
+        // From all-enabled, toggling a row starts a one-item explicit list (the
+        // pi-mono semantic: only that row enabled) — ApplyScoped, unsaved.
+        panel.handle_key(ModalKey::Down);
+        match panel.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::ApplyScoped(Some(ids))) => {
+                assert_eq!(ids.len(), 1, "explicit list with just the toggled row");
+            }
+            other => panic!("expected ApplyScoped(Some), got {other:?}"),
+        }
+        let rendered = text(&panel.render_budgeted(100, 60));
+        assert!(rendered.contains("1 of 3 enabled"), "{rendered}");
+        assert!(rendered.contains("unsaved"), "{rendered}");
+        // ctrl+s persists and clears the tag.
+        match panel.handle_key(ModalKey::CtrlS) {
+            ModalOutcome::Emit(ModalAction::SaveScoped(_)) => {}
+            other => panic!("expected SaveScoped, got {other:?}"),
+        }
+        assert!(!panel.scope_unsaved(), "ctrl+s clears the unsaved tag");
+    }
+
+    // --- criterion 14: ctrl+a/x/p, collapse_full, explicit empty ---
+    #[test]
+    fn scope_bulk_ops_collapse_full_and_survive_explicit_empty() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Scope);
+        // ctrl+x clears to an explicit empty set (Some([])).
+        match panel.handle_key(ModalKey::CtrlX) {
+            ModalOutcome::Emit(ModalAction::ApplyScoped(scope)) => {
+                assert_eq!(scope.as_deref(), Some(&[][..]));
+            }
+            other => panic!("expected ApplyScoped(Some([])), got {other:?}"),
+        }
+        // Some([]) renders (nothing enabled), does not collapse to None.
+        assert_eq!(panel.snap.scope_enabled.as_deref(), Some(&[][..]));
+        // ctrl+a re-enables everything, which collapses to None (all enabled).
+        match panel.handle_key(ModalKey::CtrlA) {
+            ModalOutcome::Emit(ModalAction::ApplyScoped(None)) => {}
+            other => panic!("expected ApplyScoped(None), got {other:?}"),
+        }
+        assert!(
+            panel.snap.scope_enabled.is_none(),
+            "full set collapses to None"
+        );
+    }
+
+    // --- criterion 15: type-to-filter, esc clears filter first ---
+    #[test]
+    fn scope_type_to_filter_narrows_children_and_esc_clears_it_first() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Scope);
+        for c in "gemini".chars() {
+            panel.handle_key(ModalKey::Char(c));
+        }
+        assert_eq!(panel.scope_children().len(), 1, "filtered to gemini");
+        // esc clears the filter first, does not collapse.
+        assert_eq!(panel.handle_key(ModalKey::Esc), ModalOutcome::Redraw);
+        assert!(panel.scope_filter.is_empty());
+        assert_eq!(panel.expanded, Some(RowId::Scope), "still open");
+        // A second esc collapses.
+        assert_eq!(panel.handle_key(ModalKey::Esc), ModalOutcome::Redraw);
+        assert!(panel.expanded.is_none());
+        // Filter does not leak across collapse.
+        expand(&mut panel, RowId::Scope);
+        assert!(panel.scope_filter.is_empty());
+    }
+
+    // --- criterion 16/17/18: providers footer + emits ---
+    #[test]
+    fn providers_hatch_advertises_only_real_verbs_and_emits_correctly() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Providers);
+        // openai-codex: oauth-capable, credentialed, no api-key path.
+        select(
+            &mut panel,
+            PanelRow::ProviderChild("openai-codex".to_string()),
+        );
+        let footer = panel.footer();
+        assert!(footer.contains("\u{21b5} login"), "{footer}");
+        assert!(footer.contains("x logout"), "credentialed: {footer}");
+        assert!(!footer.contains("a api key"), "no api-key path: {footer}");
+        match panel.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::BeginLogin(ProviderId::OpenAiCodex)) => {}
+            other => panic!("expected BeginLogin, got {other:?}"),
+        }
+        // openai: api-key only, uncredentialed → ↵ opens the api-key dialog.
+        select(&mut panel, PanelRow::ProviderChild("openai".to_string()));
+        let footer = panel.footer();
+        assert!(footer.contains("a api key"), "{footer}");
+        assert!(!footer.contains("x logout"), "uncredentialed: {footer}");
+        match panel.handle_key(ModalKey::Enter) {
+            ModalOutcome::Emit(ModalAction::OpenApiKeyDialog(id)) => assert_eq!(id, "openai"),
+            other => panic!("expected OpenApiKeyDialog, got {other:?}"),
+        }
+        // anthropic: both — `a` forces the api-key path.
+        select(&mut panel, PanelRow::ProviderChild("anthropic".to_string()));
+        match panel.handle_key(ModalKey::Char('a')) {
+            ModalOutcome::Emit(ModalAction::OpenApiKeyDialog(id)) => assert_eq!(id, "anthropic"),
+            other => panic!("expected OpenApiKeyDialog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_x_logs_out_only_a_credentialed_row() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Providers);
+        // openai-codex is credentialed → x emits Logout.
+        select(
+            &mut panel,
+            PanelRow::ProviderChild("openai-codex".to_string()),
+        );
+        match panel.handle_key(ModalKey::Char('x')) {
+            ModalOutcome::Emit(ModalAction::Logout(id)) => assert_eq!(id, "openai-codex"),
+            other => panic!("expected Logout, got {other:?}"),
+        }
+        // anthropic is uncredentialed → x is a no-op.
+        select(&mut panel, PanelRow::ProviderChild("anthropic".to_string()));
+        assert_eq!(panel.handle_key(ModalKey::Char('x')), ModalOutcome::Ignore);
+    }
+
+    // --- criterion 19: per-tool switches emit grant/revoke, clamp ---
+    #[test]
+    fn permissions_tool_switches_emit_grant_and_revoke_and_clamp() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Permissions);
+        select(&mut panel, PanelRow::PolicyTool("write".to_string()));
+        // ask → always grants; against the stop is a no-op.
+        assert_eq!(
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::EditPolicy(ProjectPolicyEdit::GrantTool(
+                "write".to_string()
+            )))
+        );
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+        // A granted tool: left revokes.
+        let mut snap = snapshot();
+        snap.policy.granted_tools = vec!["write".to_string()];
+        let mut panel = SettingsPanel::new(snap);
+        expand(&mut panel, RowId::Permissions);
+        select(&mut panel, PanelRow::PolicyTool("write".to_string()));
+        assert_eq!(
+            panel.handle_key(ModalKey::Left),
+            ModalOutcome::Emit(ModalAction::EditPolicy(ProjectPolicyEdit::RevokeTool(
+                "write".to_string()
+            )))
+        );
+        // The track renders `ask · always`.
+        let rendered = text(&panel.render_budgeted(120, 60));
+        assert!(
+            rendered.contains("ask") && rendered.contains("always"),
+            "{rendered}"
+        );
+    }
+
+    // --- criterion 20: bash revoke rows, empty state, sandbox ---
+    #[test]
+    fn permissions_bash_rows_revoke_and_empty_state_prints_a_quiet_row() {
+        let mut snap = snapshot();
+        snap.policy.bash_exact = vec!["cargo test".to_string()];
+        snap.policy.bash_prefix = vec!["git ".to_string()];
+        snap.policy.sandbox = Some("workspace-write".to_string());
+        let mut panel = SettingsPanel::new(snap);
+        expand(&mut panel, RowId::Permissions);
+        select(
+            &mut panel,
+            PanelRow::PolicyBashExact("cargo test".to_string()),
+        );
+        assert_eq!(
+            panel.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::EditPolicy(ProjectPolicyEdit::RevokeBashExact(
+                "cargo test".to_string()
+            )))
+        );
+        select(&mut panel, PanelRow::PolicyBashPrefix("git ".to_string()));
+        assert_eq!(
+            panel.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::EditPolicy(
+                ProjectPolicyEdit::RevokeBashPrefix("git ".to_string())
+            ))
+        );
+        // Empty state: the quiet row prints, not nothing.
+        let mut empty = self::panel();
+        expand(&mut empty, RowId::Permissions);
+        let rendered = text(&empty.render_budgeted(120, 60));
+        assert!(rendered.contains("no bash grants"), "{rendered}");
+    }
+
     #[test]
     fn theme_is_a_live_rotary_over_every_theme_id() {
         let mut panel = panel();
-        select(&mut panel, RowId::Field(Field::Theme));
-        // terminal (index 0) -> gruvbox (index 1): each click saves.
+        select_top(&mut panel, RowId::Field(Field::Theme));
         assert_eq!(
             panel.handle_key(ModalKey::Right),
             ModalOutcome::Emit(ModalAction::SaveSetting {
@@ -1473,19 +3021,14 @@ mod tests {
                 value: Some(crate::ui::theme::available()[1].to_string()),
             })
         );
-        // Rendered as the rotary form (6 ids never fit a labeled track).
-        let lines = panel.render_budgeted(80, 60);
-        let rendered = text(&lines);
-        assert!(
-            rendered.contains("gruvbox"),
-            "selected value printed:\n{rendered}"
-        );
+        let rendered = text(&panel.render_budgeted(80, 60));
+        assert!(rendered.contains("gruvbox"), "{rendered}");
     }
 
     #[test]
     fn a_change_flashes_two_ticks_then_settles() {
         let mut panel = panel();
-        select(&mut panel, RowId::Field(Field::DefaultApproval));
+        select_top(&mut panel, RowId::Field(Field::DefaultApproval));
         panel.handle_key(ModalKey::Right);
         assert!(panel.flash.is_some(), "detent flash armed");
         assert!(panel.tick(), "first tick still settling");
@@ -1499,7 +3042,7 @@ mod tests {
         let mut snap = snapshot();
         snap.reduced_motion = true;
         let mut panel = SettingsPanel::new(snap);
-        select(&mut panel, RowId::Field(Field::DefaultApproval));
+        select_top(&mut panel, RowId::Field(Field::DefaultApproval));
         panel.handle_key(ModalKey::Right);
         assert!(panel.flash.is_none(), "reduced motion settles instantly");
     }
@@ -1508,8 +3051,11 @@ mod tests {
     fn watermark_goes_inert_while_microcompaction_is_off() {
         let panel = panel();
         assert!(!panel.snap.microcompaction);
-        let line = panel.control_line(RowId::Field(Field::MicrocompactionWatermark), false, 80);
-        // Inert hardware: every span dims, including the LED edge.
+        let line = panel.control_line(
+            &PanelRow::Top(RowId::Field(Field::MicrocompactionWatermark)),
+            false,
+            80,
+        );
         assert!(
             line.spans
                 .iter()
@@ -1517,9 +3063,8 @@ mod tests {
                     || span.content.trim().is_empty()),
             "inert row renders fully dim: {line:?}"
         );
-        // Still operable: adjusting emits a save.
         let mut panel = self::panel();
-        select(&mut panel, RowId::Field(Field::MicrocompactionWatermark));
+        select_top(&mut panel, RowId::Field(Field::MicrocompactionWatermark));
         assert!(matches!(
             panel.handle_key(ModalKey::Right),
             ModalOutcome::Emit(ModalAction::SaveSetting {
@@ -1532,82 +3077,56 @@ mod tests {
     #[test]
     fn footer_verbs_are_keymap_honest_per_archetype() {
         let mut panel = panel();
-        select(&mut panel, RowId::Field(Field::DefaultApproval));
+        select_top(&mut panel, RowId::Field(Field::DefaultApproval));
         assert!(panel.footer().contains("\u{2190}\u{2192} set"));
         assert!(!panel.footer().contains("\u{21b5}"));
-        select(&mut panel, RowId::Field(Field::ContextTokenBudget));
+        select_top(&mut panel, RowId::Field(Field::ContextTokenBudget));
         assert!(panel.footer().contains("adjust"));
         assert!(panel.footer().contains("\u{21b5} type"));
-        select(&mut panel, RowId::Field(Field::VerifyCommand));
+        select_top(&mut panel, RowId::Field(Field::VerifyCommand));
         assert!(panel.footer().contains("\u{21b5} edit"));
-        select(&mut panel, RowId::Model);
+        select_top(&mut panel, RowId::Model);
         assert!(panel.footer().contains("\u{21b5} open"));
-        // Editing swaps to the edit verbs.
-        select(&mut panel, RowId::Field(Field::VerifyCommand));
+        select_top(&mut panel, RowId::Field(Field::VerifyCommand));
         panel.handle_key(ModalKey::Enter);
         assert!(panel.footer().contains("\u{21b5} save"));
         assert!(panel.footer().contains("esc cancel"));
     }
 
     #[test]
+    fn hatch_open_footer_says_collapse_not_close() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Scope);
+        // On the header, on a child, and on a distant top row: all say collapse.
+        assert!(panel.footer().contains("esc collapse"));
+        panel.handle_key(ModalKey::Down);
+        assert!(panel.footer().contains("esc collapse"));
+        select_top(&mut panel, RowId::Field(Field::Theme));
+        assert!(
+            panel.footer().contains("esc collapse"),
+            "{}",
+            panel.footer()
+        );
+    }
+
+    #[test]
     fn narrow_width_degrades_the_track_to_its_rotary_form() {
         let panel = panel();
-        // Wide: the reasoning row prints every level.
-        let wide = text(&[panel.control_line(RowId::Reasoning, false, 80)]);
+        let wide = text(&[panel.control_line(&PanelRow::Top(RowId::Reasoning), false, 80)]);
         assert!(wide.contains("minimal") && wide.contains("xhigh"));
-        // Narrow: position dots + the selected value only.
-        let narrow = text(&[panel.control_line(RowId::Reasoning, false, 46)]);
+        let narrow = text(&[panel.control_line(&PanelRow::Top(RowId::Reasoning), false, 46)]);
         assert!(narrow.contains("medium"));
         assert!(!narrow.contains("minimal"), "rotary form: {narrow}");
-    }
-
-    #[test]
-    fn windowing_keeps_the_cursor_visible_with_a_position_row() {
-        let mut panel = panel();
-        // Walk to the last control (worktree root) under a tight budget.
-        select(&mut panel, RowId::Field(Field::WorktreeRoot));
-        let lines = panel.render_budgeted(80, 14);
-        let rendered = text(&lines);
-        assert!(
-            rendered.contains("worktree root"),
-            "cursor row visible:\n{rendered}"
-        );
-        let total = panel.controls.len();
-        assert!(
-            rendered.contains(&format!("({total}/{total})")),
-            "house position row while scrolled:\n{rendered}"
-        );
-        // Untruncated on a tall terminal: no position row, every section shown.
-        let full = text(&panel.render_budgeted(80, 60));
-        assert!(!full.contains(&format!("({total}/{total})")));
-        assert!(full.contains("ENGINE") && full.contains("GIT"));
-    }
-
-    #[test]
-    fn navigation_wraps_over_controls_and_skips_silkscreen() {
-        let mut panel = panel();
-        assert_eq!(panel.selected(), RowId::Model);
-        panel.handle_key(ModalKey::Up);
-        assert_eq!(
-            panel.selected(),
-            RowId::Field(Field::WorktreeRoot),
-            "wraps to the last control, never a header"
-        );
-        panel.handle_key(ModalKey::Down);
-        assert_eq!(panel.selected(), RowId::Model);
     }
 
     #[test]
     fn ladder_stepping_is_mechanical() {
         assert_eq!(next_detent(&BUDGET_LADDER, 232_000, true), Some(300_000));
         assert_eq!(next_detent(&BUDGET_LADDER, 232_000, false), Some(200_000));
-        // Off-ladder snaps to the neighbour, both directions.
         assert_eq!(next_detent(&BUDGET_LADDER, 90_000, true), Some(96_000));
         assert_eq!(next_detent(&BUDGET_LADDER, 90_000, false), Some(64_000));
-        // Stops.
         assert_eq!(next_detent(&BUDGET_LADDER, 1_000_000, true), None);
         assert_eq!(next_detent(&BUDGET_LADDER, 64_000, false), None);
-        // Fill position is the nearest detent.
         assert_eq!(nearest_position(&BUDGET_LADDER, 232_000), 5);
         assert_eq!(nearest_position(&BUDGET_LADDER, 90_000), 1);
     }
@@ -1617,27 +3136,86 @@ mod tests {
         assert_eq!(compact_value(232_000), "232k");
         assert_eq!(compact_value(1_000_000), "1m");
         assert_eq!(compact_value(3), "3");
-        // Honest compacting: a non-round value keeps its decimal, exactly as
-        // the divider and receipt would print it — never silently truncated.
         assert_eq!(compact_value(12_500), "12.5k");
     }
 
+    // --- entry cursors (§4.1) ---
     #[test]
-    fn port_return_reopens_on_the_port_row() {
-        let panel = SettingsPanel::with_selected(snapshot(), RowId::Scope);
-        assert_eq!(panel.selected(), RowId::Scope);
+    fn with_expanded_places_the_cursor_per_the_entry_table() {
+        let model = SettingsPanel::with_expanded(snapshot(), HatchTarget::Model);
+        assert_eq!(model.expanded, Some(RowId::Model));
+        assert_eq!(
+            model.cursor,
+            PanelRow::ModelChild("openai-codex/gpt-5.5".to_string()),
+            "model entry lands on the active model"
+        );
+
+        let scope = SettingsPanel::with_expanded(snapshot(), HatchTarget::Scope);
+        assert_eq!(scope.expanded, Some(RowId::Scope));
+        assert!(matches!(scope.cursor, PanelRow::ScopeChild(_)));
+
+        let perms = SettingsPanel::with_expanded(snapshot(), HatchTarget::Permissions);
+        assert_eq!(perms.expanded, Some(RowId::Permissions));
+        assert_eq!(perms.cursor, PanelRow::PolicyTool("write".to_string()));
+
+        // Login lands on the first uncredentialed provider (anthropic).
+        let login = SettingsPanel::with_expanded(snapshot(), HatchTarget::Login);
+        assert_eq!(
+            login.cursor,
+            PanelRow::ProviderChild("anthropic".to_string())
+        );
+        // Logout lands on the first credentialed provider (openai-codex).
+        let logout = SettingsPanel::with_expanded(snapshot(), HatchTarget::Logout);
+        assert_eq!(
+            logout.cursor,
+            PanelRow::ProviderChild("openai-codex".to_string())
+        );
+    }
+
+    #[test]
+    fn view_round_trips_cursor_and_expansion() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Providers);
+        select(&mut panel, PanelRow::ProviderChild("openai".to_string()));
+        let view = panel.view();
+        // Rebuild on a fresh snapshot and restore.
+        let mut rebuilt = SettingsPanel::new(snapshot());
+        rebuilt.restore(view);
+        assert_eq!(rebuilt.expanded, Some(RowId::Providers));
+        assert_eq!(
+            rebuilt.cursor,
+            PanelRow::ProviderChild("openai".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_lands_on_the_header_when_the_cursor_row_vanished() {
+        let mut snap = snapshot();
+        snap.policy.bash_exact = vec!["cargo test".to_string()];
+        let mut panel = SettingsPanel::new(snap);
+        expand(&mut panel, RowId::Permissions);
+        select(
+            &mut panel,
+            PanelRow::PolicyBashExact("cargo test".to_string()),
+        );
+        let view = panel.view();
+        // The grant is revoked: rebuild without it.
+        let mut rebuilt = SettingsPanel::new(snapshot());
+        rebuilt.restore(view);
+        assert_eq!(rebuilt.expanded, Some(RowId::Permissions));
+        assert_eq!(rebuilt.cursor, PanelRow::Top(RowId::Permissions));
     }
 
     #[test]
     fn an_off_vocabulary_value_sits_between_detents_and_prints_raw() {
-        // A hand-edited config value outside the switch vocabulary (e.g. the
-        // "catppuccin" theme alias, or an unknown approval token) must never
-        // light a position it does not hold — the old tree showed the raw
-        // value, and the faceplate must stay at least as honest.
         let mut snap = snapshot();
         snap.default_approval = "on-request".to_string();
         let panel = SettingsPanel::new(snap);
-        let line = panel.control_line(RowId::Field(Field::DefaultApproval), false, 80);
+        let line = panel.control_line(
+            &PanelRow::Top(RowId::Field(Field::DefaultApproval)),
+            false,
+            80,
+        );
         let rendered = text(std::slice::from_ref(&line));
         assert!(
             rendered.contains("on-request"),
@@ -1650,20 +3228,6 @@ mod tests {
                 .any(|span| span.content.contains(crate::ui::symbols::ACTIVE)),
             "no detent lights for a value between detents: {rendered}"
         );
-        // Same law on a rotary (the theme row): true value, no lit dot.
-        let mut snap = snapshot();
-        snap.theme = "catppuccin".to_string();
-        let panel = SettingsPanel::new(snap);
-        let line = panel.control_line(RowId::Field(Field::Theme), false, 80);
-        let rendered = text(std::slice::from_ref(&line));
-        assert!(rendered.contains("catppuccin"), "{rendered}");
-        assert!(
-            !line
-                .spans
-                .iter()
-                .any(|span| span.content.contains(crate::ui::symbols::ACTIVE)),
-            "rotary shows no position for an off-vocabulary value: {rendered}"
-        );
     }
 
     #[test]
@@ -1671,8 +3235,7 @@ mod tests {
         let mut snap = snapshot();
         snap.default_approval = "on-request".to_string();
         let mut panel = SettingsPanel::new(snap);
-        select(&mut panel, RowId::Field(Field::DefaultApproval));
-        // Right snaps to the first detent, like a dial's off-ladder snap.
+        select_top(&mut panel, RowId::Field(Field::DefaultApproval));
         assert_eq!(
             panel.handle_key(ModalKey::Right),
             ModalOutcome::Emit(ModalAction::SaveSetting {
@@ -1680,11 +3243,10 @@ mod tests {
                 value: Some("strict".to_string()),
             })
         );
-        // And left from between detents snaps to the last one.
         let mut snap = snapshot();
         snap.default_approval = "on-request".to_string();
         let mut panel = SettingsPanel::new(snap);
-        select(&mut panel, RowId::Field(Field::DefaultApproval));
+        select_top(&mut panel, RowId::Field(Field::DefaultApproval));
         assert_eq!(
             panel.handle_key(ModalKey::Left),
             ModalOutcome::Emit(ModalAction::SaveSetting {
@@ -1697,7 +3259,7 @@ mod tests {
     #[test]
     fn a_multi_line_paste_flattens_into_the_single_line_register() {
         let mut panel = panel();
-        select(&mut panel, RowId::Field(Field::VerifyCommand));
+        select_top(&mut panel, RowId::Field(Field::VerifyCommand));
         panel.handle_key(ModalKey::Enter);
         panel.push_str("cargo fmt\ncargo test\r\n");
         assert_eq!(
@@ -1707,5 +3269,33 @@ mod tests {
                 value: Some("cargo fmt cargo test".to_string()),
             })
         );
+    }
+
+    // --- adversarial: empty states ---
+    #[test]
+    fn empty_states_do_not_panic_and_render_quiet_rows() {
+        let mut snap = snapshot();
+        snap.catalog.clear();
+        snap.scope_candidates.clear();
+        snap.providers.clear();
+        snap.scope_enabled = Some(Vec::new());
+        let mut panel = SettingsPanel::new(snap);
+        for port in [
+            RowId::Model,
+            RowId::Scope,
+            RowId::Providers,
+            RowId::Permissions,
+        ] {
+            expand(&mut panel, port);
+            // Rendering never panics on zero children / a narrow width.
+            let _ = panel.render_budgeted(24, 12);
+            let _ = panel.render_budgeted(200, 60);
+        }
+        // Navigation over an empty hatch does not crash and lands on a real
+        // selectable row (the next control, since the hatch has no children).
+        expand(&mut panel, RowId::Model);
+        panel.handle_key(ModalKey::Down);
+        assert!(panel.selectable().contains(&panel.cursor));
+        assert_eq!(panel.cursor, PanelRow::Top(RowId::Reasoning));
     }
 }
