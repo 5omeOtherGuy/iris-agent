@@ -2435,7 +2435,11 @@ async fn dispatch_action<P: ChatProvider>(
             let before = sw.selection().clone();
             // Front is the confirm prompt (not the faceplate): no view to
             // preserve here — the run_modal_phase stash reopens the faceplate.
-            let result = picker::apply_action(action, None, harness, sw);
+            let sink = SettingsEventSink::default();
+            let result = picker::apply_action(action, None, harness, sw, &sink);
+            for event in sink.drain() {
+                tui.screen.apply(event);
+            }
             let after = sw.selection().clone();
             match result {
                 ActionResult::Close(lines) => {
@@ -2587,7 +2591,14 @@ async fn dispatch_action<P: ChatProvider>(
                 return Ok(None);
             };
             let before = sw.selection().clone();
-            let result = picker::apply_action(other, view, harness, sw);
+            // A settings apply runs with no `LoopBridge`; collect any
+            // harness-owned event (the settings-off compaction `Cancelled`
+            // lifecycle) and drain it onto the screen once the action returns.
+            let sink = SettingsEventSink::default();
+            let result = picker::apply_action(other, view, harness, sw, &sink);
+            for event in sink.drain() {
+                tui.screen.apply(event);
+            }
             tui.screen
                 .set_approval_policy(effective_approval_policy(harness));
             // A faceplate change can cancel the in-flight background compaction
@@ -3638,6 +3649,31 @@ fn handle_running_event(
             }
         }
         _ => false,
+    }
+}
+
+/// Collects harness-owned events emitted during an out-of-turn settings apply
+/// (e.g. the `Cancelled` compaction lifecycle when automatic compaction is
+/// disabled mid-job). The modal phase has no [`LoopBridge`], so the caller
+/// drains the collected events onto the screen once the action returns — the
+/// harness stays the event owner and the UI never fabricates the event inline.
+#[derive(Default)]
+struct SettingsEventSink {
+    events: std::cell::RefCell<Vec<UiEvent>>,
+}
+
+impl SettingsEventSink {
+    fn drain(&self) -> Vec<UiEvent> {
+        std::mem::take(&mut self.events.borrow_mut())
+    }
+}
+
+impl AgentObserver for SettingsEventSink {
+    fn on_event(&self, event: crate::nexus::AgentEvent) -> Result<()> {
+        self.events
+            .borrow_mut()
+            .push(UiEvent::from_agent_event(event));
+        Ok(())
     }
 }
 
@@ -5570,6 +5606,7 @@ mod tests {
             None,
             &mut harness,
             &mut switch,
+            &SettingsEventSink::default(),
         ) {
             ActionResult::Replace(modal, _) => *modal,
             _ => panic!("expected the large-context switch prompt"),
@@ -5649,6 +5686,7 @@ mod tests {
             None,
             &mut harness,
             &mut switch,
+            &SettingsEventSink::default(),
         ) {
             ActionResult::Replace(modal, _) => {
                 assert!(
@@ -5671,6 +5709,7 @@ mod tests {
             None,
             &mut small,
             &mut small_switch,
+            &SettingsEventSink::default(),
         );
         assert!(
             !matches!(resolved, ActionResult::Replace(modal, _) if matches!(*modal, Modal::SwitchContext(_))),
@@ -5732,6 +5771,7 @@ mod tests {
             None,
             &mut harness,
             &mut switch,
+            &SettingsEventSink::default(),
         );
         assert!(
             harness.skip_permissions(),
@@ -5762,6 +5802,7 @@ mod tests {
             None,
             &mut harness,
             &mut switch,
+            &SettingsEventSink::default(),
         );
         assert!(!harness.skip_permissions(), "the bypass is cleared live");
         let reloaded = crate::config::Settings::load(&dir.path).unwrap();

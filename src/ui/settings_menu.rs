@@ -1893,6 +1893,14 @@ impl SettingsPanel {
         inert: bool,
         avail: usize,
     ) {
+        // The label span (with its one-space gutter) is already pushed. Its
+        // width is `LABEL_W + 2` for a short label, but an over-long one
+        // (`tool result compaction`, 22 > LABEL_W) overhangs the fixed column,
+        // leaving fewer cells than `LABEL_W + 2` implies. Size width-sensitive
+        // controls against what the label actually consumed so a control never
+        // prints past a narrow panel edge.
+        let used_width: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+        let control_avail = avail.saturating_sub(used_width);
         match row {
             RowId::Model => {
                 // The collapsed value prints the ACTIVE session engine, not the
@@ -1971,7 +1979,7 @@ impl SettingsPanel {
                     flashing,
                     self.snap.skip_permissions,
                     false,
-                    avail.saturating_sub(LABEL_W + 2),
+                    control_avail,
                 ));
                 // Caution silkscreen: printed after the guard switch,
                 // `┊`-joined metadata (never key-hint `·`). At a narrow width
@@ -2002,7 +2010,7 @@ impl SettingsPanel {
                         flashing,
                         false,
                         inert,
-                        avail.saturating_sub(LABEL_W + 2),
+                        control_avail,
                     ));
                 }
                 Archetype::Dial => {
@@ -2740,6 +2748,32 @@ mod tests {
         assert!(!rendered.contains("compact at"), "{rendered}");
         assert!(!rendered.contains("trigger at"), "{rendered}");
         assert!(!rendered.contains("keep recent"), "{rendered}");
+    }
+
+    #[test]
+    fn overlong_label_control_never_overflows_a_narrow_panel() {
+        // `tool result compaction` (22 chars) overhangs the fixed LABEL_W (18)
+        // column, so a control sized against `LABEL_W + 2` is told it has more
+        // room than the label actually left. At a narrow width the switch must
+        // fall back to its rotary form instead of printing the full scale past
+        // the panel edge (the drop-rule honesty, §9.1).
+        let panel = panel();
+        let avail = 32;
+        let line = panel.control_line(
+            &PanelRow::Top(RowId::Field(Field::Microcompaction)),
+            false,
+            avail,
+        );
+        let rendered = text(std::slice::from_ref(&line));
+        assert!(
+            rendered.contains("tool result compaction"),
+            "the long label still renders: {rendered:?}"
+        );
+        assert!(
+            line_width(&line) <= avail,
+            "the control overflows the {avail}-cell panel: width {} in {rendered:?}",
+            line_width(&line),
+        );
     }
 
     #[test]

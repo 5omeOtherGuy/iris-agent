@@ -489,11 +489,32 @@ impl<P: ChatProvider> Harness<P> {
     /// turns automatic compaction off in `/settings`. The worker's cancellation
     /// token fires so the detached task unwinds, and the job slot is released
     /// immediately so diagnostics stop reporting it running (and the caller can
-    /// clear the status chip). Returns whether a job was actually cancelled.
-    pub(crate) fn cancel_auto_compaction(&mut self) -> bool {
-        let had_job = self.compaction.background.is_some();
-        self.compaction.cancel_background();
-        had_job
+    /// clear the status chip). Unlike the bare
+    /// [`CompactionEngine::cancel_background`] used by the turn-boundary paths,
+    /// this emits a `Cancelled` [`AgentEvent::CompactionLifecycle`] so
+    /// observers/logs record the Running -> Cancelled transition instead of the
+    /// job simply vanishing (spec IV.17). Returns whether a job was actually
+    /// cancelled.
+    pub(crate) fn cancel_auto_compaction(&mut self, obs: &dyn AgentObserver) -> Result<bool> {
+        let Some(job) = self.compaction.background.take() else {
+            return Ok(false);
+        };
+        // Fire the worker's cancellation token so the detached task unwinds,
+        // then record the transition before the job is dropped. The emission is
+        // harness-owned (the UI has no observer at the out-of-turn settings
+        // write) so the event carries the same job metadata every other
+        // lifecycle emission does.
+        job.token.cancel();
+        self.emit_compaction_lifecycle(
+            obs,
+            &job,
+            CompactionLifecycleState::Cancelled,
+            Some(
+                "background compaction cancelled: automatic compaction disabled in settings"
+                    .to_string(),
+            ),
+        )?;
+        Ok(true)
     }
 
     /// Enable or disable opt-in microcompaction (ADR-0048, #378). Installed once

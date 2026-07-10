@@ -616,7 +616,11 @@ fn percent_to_fraction(value: Option<&str>) -> anyhow::Result<f64> {
 /// pre-validate/clamp the value, so the parse here is a safety net; the typed
 /// `config::save_*` also clamp defensively. `value` is `None` for the
 /// empty-clears fields (unbounded round-trips, unset command/worktree root).
-fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyhow::Result<()> {
+fn save_setting_field(
+    field: settings_menu::Field,
+    value: Option<&str>,
+    workspace: &std::path::Path,
+) -> anyhow::Result<()> {
     use settings_menu::Field;
     let parse_bool = |v: Option<&str>| v == Some("true");
     match field {
@@ -627,21 +631,22 @@ fn save_setting_field(field: settings_menu::Field, value: Option<&str>) -> anyho
         Field::ContextTokenBudget => {
             config::save_context_token_budget(value.unwrap_or("0").parse()?)
         }
-        Field::CompactionEnabled => config::save_compaction_enabled(parse_bool(value)),
-        Field::CompactionReactive => config::save_compaction_reactive(parse_bool(value)),
+        Field::CompactionEnabled => config::save_compaction_enabled(workspace, parse_bool(value)),
+        Field::CompactionReactive => config::save_compaction_reactive(workspace, parse_bool(value)),
         Field::CompactionKeepRecentTokens => {
-            config::save_compaction_keep_recent_tokens(value.unwrap_or("0").parse()?)
+            config::save_compaction_keep_recent_tokens(workspace, value.unwrap_or("0").parse()?)
         }
         // The percent dials persist as fractions; the config save rejects any
-        // combination that would leave the ladder unordered.
+        // combination that would leave the merged global+project ladder
+        // unordered.
         Field::CompactionWarn => {
-            config::save_compaction_threshold_warn(percent_to_fraction(value)?)
+            config::save_compaction_threshold_warn(workspace, percent_to_fraction(value)?)
         }
         Field::CompactionStart => {
-            config::save_compaction_threshold_start(percent_to_fraction(value)?)
+            config::save_compaction_threshold_start(workspace, percent_to_fraction(value)?)
         }
         Field::CompactionHard => {
-            config::save_compaction_threshold_hard(percent_to_fraction(value)?)
+            config::save_compaction_threshold_hard(workspace, percent_to_fraction(value)?)
         }
         Field::CompactionWorkerInput => {
             config::save_compaction_worker_input(value.unwrap_or("transcript"))
@@ -706,13 +711,16 @@ fn is_auto_compaction_trigger_field(field: settings_menu::Field) -> bool {
 fn apply_compaction_trigger<P: ChatProvider>(
     harness: &mut Harness<P>,
     switch: &ModelSwitch<'_, P>,
+    obs: &dyn crate::nexus::AgentObserver,
 ) -> anyhow::Result<()> {
     let settings = config::Settings::load(harness.workspace())?;
     let selection = switch.selection().clone();
     let (window, trigger) = crate::resolved_compaction_trigger(&settings, &selection)?;
     harness.set_compaction_trigger(window, trigger);
     if !trigger.enabled {
-        harness.cancel_auto_compaction();
+        // Disabling cancels an in-flight background job; the harness emits the
+        // `Cancelled` lifecycle through `obs` so the transition is recorded.
+        harness.cancel_auto_compaction(obs)?;
     }
     Ok(())
 }
@@ -742,6 +750,7 @@ pub(crate) fn apply_action<P: ChatProvider>(
     view: Option<PanelView>,
     harness: &mut Harness<P>,
     switch: &mut ModelSwitch<'_, P>,
+    obs: &dyn crate::nexus::AgentObserver,
 ) -> ActionResult {
     match action {
         ModalAction::SelectModel {
@@ -852,7 +861,7 @@ pub(crate) fn apply_action<P: ChatProvider>(
             ActionResult::Keep(failures(lines))
         }
         ModalAction::SaveSetting { field, value } => {
-            match save_setting_field(field, value.as_deref()) {
+            match save_setting_field(field, value.as_deref(), harness.workspace()) {
                 Ok(()) => {
                     // Some settings are read live by the harness, not just at
                     // startup: mirror the persisted value onto the running
@@ -869,7 +878,7 @@ pub(crate) fn apply_action<P: ChatProvider>(
                         // the current model, and install it live. Disabling also
                         // cancels an in-flight background job (the loop then
                         // clears the chip from the live diagnostics).
-                        if let Err(error) = apply_compaction_trigger(harness, switch) {
+                        if let Err(error) = apply_compaction_trigger(harness, switch, obs) {
                             return refresh_settings(
                                 view,
                                 None,
