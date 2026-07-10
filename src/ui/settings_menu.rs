@@ -1475,11 +1475,18 @@ impl SettingsPanel {
         ]))
     }
 
-    /// Non-selectable silkscreen lines printed inside a hatch: the scope empty
+    /// Non-selectable silkscreen lines printed inside a hatch: the empty-catalog
+    /// notes (every hatch prints a quiet row, never nothing), the scope empty
     /// filter note, the permissions empty-grants note, and the read-only sandbox
     /// posture.
     fn hatch_notes(&self, row: RowId) -> Vec<Line<'static>> {
         match row {
+            RowId::Model if self.snap.catalog.is_empty() => {
+                vec![child_note("no models \u{2014} connect a provider")]
+            }
+            RowId::Providers if self.snap.providers.is_empty() => {
+                vec![child_note("no providers")]
+            }
             RowId::Scope if self.scope_children().is_empty() => {
                 vec![child_note("no matching models")]
             }
@@ -1748,12 +1755,20 @@ impl SettingsPanel {
                     false,
                     avail.saturating_sub(LABEL_W + 2),
                 ));
-                // Caution silkscreen: printed under the guard switch, always
-                // visible, `┊`-joined metadata (never key-hint `·`).
-                spans.push(Span::styled(
-                    format!("  dangerous {} session only", crate::ui::symbols::SEP),
-                    dim(),
-                ));
+                // Caution silkscreen: printed after the guard switch,
+                // `┊`-joined metadata (never key-hint `·`). At a narrow width
+                // it drops whole fields — ` ┊ session only` first, then
+                // `dangerous` — never truncating mid-word (a clipped `sessi`
+                // reads as a dead control, the footer drop-rule honesty).
+                let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+                let caution_avail = avail.saturating_sub(used);
+                let full = format!("  dangerous {} session only", crate::ui::symbols::SEP);
+                let short = "  dangerous";
+                if full.chars().count() <= caution_avail {
+                    spans.push(Span::styled(full, dim()));
+                } else if short.chars().count() <= caution_avail {
+                    spans.push(Span::styled(short.to_string(), dim()));
+                }
             }
             RowId::Field(field) => match archetype(row) {
                 Archetype::Switch => {
@@ -2098,10 +2113,11 @@ fn bash_grant_line(label: &str, selected: bool) -> Line<'static> {
 }
 
 /// Flatten a bracketed paste to a single line for a register or the scope
-/// filter: interior line breaks collapse to one space, trailing whitespace is
-/// trimmed. Neither field may ever embed a newline.
+/// filter: each line break collapses to ONE space (`\r\n` is one break, not
+/// two), trailing whitespace is trimmed. Neither field may ever embed a
+/// newline.
 fn flatten_paste(text: &str) -> String {
-    let mut flat = text.replace(['\r', '\n'], " ");
+    let mut flat = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
     flat.truncate(flat.trim_end().len());
     flat
 }
@@ -3712,5 +3728,87 @@ mod tests {
             1,
             "the paste narrowed the list"
         );
+    }
+
+    // --- finding 4: empty-catalog hatches print quiet notes, never nothing ---
+    #[test]
+    fn an_empty_model_catalog_prints_the_connect_note() {
+        let mut snap = snapshot();
+        snap.catalog.clear();
+        let mut panel = SettingsPanel::new(snap);
+        expand(&mut panel, RowId::Model);
+        let rendered = text(&panel.render_budgeted(100, 60));
+        assert!(
+            rendered.contains("no models \u{2014} connect a provider"),
+            "{rendered}"
+        );
+        // The note is silkscreen: nothing selectable joined the hatch.
+        assert!(
+            panel
+                .selectable()
+                .iter()
+                .all(|row| matches!(row, PanelRow::Top(_))),
+            "note is unselectable"
+        );
+    }
+
+    #[test]
+    fn zero_known_providers_prints_the_no_providers_note() {
+        let mut snap = snapshot();
+        snap.providers.clear();
+        let mut panel = SettingsPanel::new(snap);
+        expand(&mut panel, RowId::Providers);
+        let rendered = text(&panel.render_budgeted(100, 60));
+        assert!(rendered.contains("no providers"), "{rendered}");
+        assert!(
+            panel
+                .selectable()
+                .iter()
+                .all(|row| matches!(row, PanelRow::Top(_))),
+            "note is unselectable"
+        );
+    }
+
+    // --- finding 5: \r\n is one line break, not two spaces ---
+    #[test]
+    fn a_crlf_paste_collapses_to_one_space() {
+        let mut panel = panel();
+        select_top(&mut panel, RowId::Field(Field::VerifyCommand));
+        panel.handle_key(ModalKey::Enter);
+        panel.push_str("a\r\nb");
+        assert_eq!(
+            panel.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::VerifyCommand,
+                value: Some("a b".to_string()),
+            })
+        );
+    }
+
+    // --- finding 6: the caution silkscreen drops whole fields, never mid-word ---
+    #[test]
+    fn the_caution_silkscreen_drops_whole_fields_never_mid_word() {
+        let panel = panel();
+        let row = PanelRow::Top(RowId::SkipApprovals);
+        // Wide: the whole caution prints.
+        let wide = text(&[panel.control_line(&row, false, 80)]);
+        assert!(
+            wide.contains("dangerous") && wide.contains("session only"),
+            "{wide}"
+        );
+        // Mid: ` ┊ session only` drops first, whole.
+        let mid = text(&[panel.control_line(&row, false, 46)]);
+        assert!(mid.contains("dangerous"), "{mid}");
+        assert!(!mid.contains("session"), "{mid}");
+        // Narrow (the offending ~40 cols): `dangerous` drops too — never `sessi`.
+        let narrow = text(&[panel.control_line(&row, false, 40)]);
+        assert!(!narrow.contains("dangerous"), "{narrow}");
+        assert!(!narrow.contains("sessi"), "{narrow}");
+        // Whole-field honesty: the row always fits the width it was given, so
+        // the overlay's hard truncation never gets to clip a word.
+        for avail in [40usize, 42, 46, 57, 80] {
+            let line = panel.control_line(&row, false, avail);
+            assert!(line_width(&line) <= avail, "fits at {avail}");
+        }
     }
 }
