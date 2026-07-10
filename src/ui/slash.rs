@@ -93,7 +93,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/compact",
-        description: "Summarize older context to free the window before a switch",
+        description: "Summarize older context; optional text focuses the handoff",
         action: SlashAction::Submit,
     },
     SlashCommand {

@@ -231,3 +231,51 @@ The smoke had one exclusion and no fabricated metrics. The preceding full
 Codex run remains the slice result; the post-run change affects only hard-wait
 cancellation and the controller's borrow lifetime, while the full run's
 non-hard G1 path is unchanged.
+
+## Slice 4 worker-v2 run — 2026-07-10
+
+Base: `d9c43dc` plus the slice 4 worktree. Worker input is the new verbatim
+`transcript` default. Parent traffic used the protocol lanes; every summary
+worker used `anthropic/claude-opus-4-6` with medium thinking. The harness now
+reports the specified summarization cache-hit ratio directly from persisted
+worker usage: `cacheReadInputTokens / inputTokens`. A zero input denominator is
+`unknown`, never zero.
+
+Regeneration command:
+
+```sh
+IRIS_BENCH_LIVE=1 IRIS_AUTO_COMPACTION_SESSIONS=10 \
+  cargo test --locked auto_compaction_live_loop_ -- \
+  --ignored --nocapture --test-threads=1
+```
+
+| lane | sessions | compactions | worst G1 | worst post-apply/start | G2 | G3 | G4 | G5 | reads | cache-hit observations | exclusions |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| `anthropic/claude-haiku-4-5` | 10 | 21 | 15.0 ms | 17,133 / 21,299 (80.4%) | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 8 × 0.000; 2 × unknown | 0 |
+| `openai-codex/gpt-5.4-mini` | 0 | 0 | — | — | — | — | — | — | — | — | 1 |
+
+Haiku per-session evidence:
+
+| session | compactions | G1 | maximum post-apply | G2–G5/read | worker cache hit |
+|---:|---:|---:|---:|---|---:|
+| 00 | 2 | 15.0 ms | 17,083 | pass | unknown |
+| 01 | 2 | 0.8 ms | 17,108 | pass | unknown |
+| 02 | 2 | 0.7 ms | 16,865 | pass | 0.000 |
+| 03 | 2 | 2.1 ms | 16,907 | pass | 0.000 |
+| 04 | 2 | 0.7 ms | 17,090 | pass | 0.000 |
+| 05 | 2 | 1.0 ms | 16,908 | pass | 0.000 |
+| 06 | 2 | 1.1 ms | 16,922 | pass | 0.000 |
+| 07 | 3 | 0.7 ms | 17,133 | pass | 0.000 |
+| 08 | 2 | 0.7 ms | 17,086 | pass | 0.000 |
+| 09 | 2 | 0.7 ms | 16,917 | pass | 0.000 |
+
+The Haiku run completed in 400.57 seconds with no provider, auth, tool,
+worker, persistence, or resume errors. The Codex lane was retried separately
+after the smoke and remained unavailable before a session could start:
+
+```text
+Codex request failed [status=429 endpoint=/codex/responses model=gpt-5.4-mini error_type=usage_limit_reached]
+```
+
+This is not a passing Codex result and is not averaged into the Haiku table.
+The slice 4 two-lane exit criterion remains pending quota recovery.

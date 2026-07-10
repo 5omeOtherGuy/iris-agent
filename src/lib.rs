@@ -502,9 +502,16 @@ fn run_agent_inner(
     // is present; the command runs under the unchanged approval gate.
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
+    harness.set_compaction_worker(settings.compaction_worker_config()?);
     install_compaction_summarizer_factory(
         &mut harness,
         background_selection.clone(),
+        settings
+            .compaction_worker_model()
+            .map(|model| {
+                mimir::selection::ModelSelection::resolve_compaction_worker(&settings, model)
+            })
+            .transpose()?,
         system_prompt.clone(),
         background_session_id.clone(),
     );
@@ -696,9 +703,16 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     harness.set_compaction_trigger(effective_window, compaction_trigger);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
+    harness.set_compaction_worker(settings.compaction_worker_config()?);
     install_compaction_summarizer_factory(
         &mut harness,
         background_selection.clone(),
+        settings
+            .compaction_worker_model()
+            .map(|model| {
+                mimir::selection::ModelSelection::resolve_compaction_worker(&settings, model)
+            })
+            .transpose()?,
         system_prompt.clone(),
         background_session_id.clone(),
     );
@@ -787,14 +801,17 @@ fn project_policy_sink(cwd: &Path) -> Option<Box<dyn nexus::ProjectPolicySink>> 
 fn install_compaction_summarizer_factory(
     harness: &mut wayland::Harness<Box<dyn ChatProvider>>,
     selection: Arc<Mutex<mimir::selection::ModelSelection>>,
+    dedicated_selection: Option<mimir::selection::ModelSelection>,
     system_prompt: String,
     session_id: Arc<Mutex<String>>,
 ) {
     harness.set_compaction_summarizer_factory(Arc::new(move || {
-        let selection = selection
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
+        let selection = dedicated_selection.clone().unwrap_or_else(|| {
+            selection
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+        });
         let session_id = session_id
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -900,9 +917,16 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
     harness.set_compaction_trigger(effective_window, compaction_trigger);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
+    harness.set_compaction_worker(settings.compaction_worker_config()?);
     install_compaction_summarizer_factory(
         &mut harness,
         background_selection.clone(),
+        settings
+            .compaction_worker_model()
+            .map(|model| {
+                mimir::selection::ModelSelection::resolve_compaction_worker(&settings, model)
+            })
+            .transpose()?,
         system_prompt.clone(),
         background_session_id.clone(),
     );

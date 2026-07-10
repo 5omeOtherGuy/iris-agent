@@ -1187,7 +1187,7 @@ fn run_session_inner<P: ChatProvider>(
         // On-demand compaction at this safe inter-turn boundary. Driven like a
         // turn (runtime + Ctrl-C watcher) because the provider-backed
         // summarizer awaits a cancellable model request.
-        if prompt == "/compact" {
+        if cmd == "/compact" {
             crate::signals::reset();
             let token = CancellationToken::new();
             let done = Arc::new(AtomicBool::new(false));
@@ -1198,7 +1198,11 @@ fn run_session_inner<P: ChatProvider>(
             });
             let result = {
                 let bridge = UiBridge::new(ui);
-                runtime.block_on(harness.compact_now(&bridge, &token))
+                runtime.block_on(harness.compact_now_with_focus(
+                    &bridge,
+                    &token,
+                    (!rest.is_empty()).then_some(rest),
+                ))
             };
             done.store(true, Ordering::Relaxed);
             let _ = watcher.join();

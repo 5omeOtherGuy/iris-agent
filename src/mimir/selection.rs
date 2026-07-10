@@ -448,6 +448,24 @@ pub(crate) struct ModelSelection {
 }
 
 impl ModelSelection {
+    pub(crate) fn resolve_compaction_worker(settings: &Settings, qualified: &str) -> Result<Self> {
+        let (provider, model) = qualified
+            .split_once('/')
+            .ok_or_else(|| UsageError::new("compaction.worker.model must be provider/model"))?;
+        let provider = ProviderId::parse(provider)?;
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(UsageError::new("compaction.worker.model must be provider/model").into());
+        }
+        let mut selection = Self::resolve(settings)?;
+        selection.provider = provider;
+        selection.model = model.to_string();
+        selection.base_url = base_url_for(provider, settings.base_url.as_deref());
+        selection.reasoning = None;
+        selection.resolve_context_management_for_provider()?;
+        Ok(selection)
+    }
+
     /// Resolve the selection from settings, centralizing precedence:
     /// - provider: `settings.default_provider` -> `openai-codex`
     /// - model: `IRIS_MODEL` -> `settings.default_model` -> per-provider default
@@ -1371,5 +1389,22 @@ mod tests {
             "http://localhost:11434/v1",
             "custom OpenAI-compatible endpoints still use the configured base URL"
         );
+    }
+
+    #[test]
+    fn dedicated_compaction_worker_resolves_a_qualified_global_model() {
+        let settings = settings(Some("openai-codex"), Some("gpt-5.4-mini"), None, None);
+        let worker =
+            ModelSelection::resolve_compaction_worker(&settings, "anthropic/claude-opus-4-6")
+                .unwrap();
+        assert_eq!(worker.provider, ProviderId::Anthropic);
+        assert_eq!(worker.model, "claude-opus-4-6");
+        assert_eq!(worker.base_url, "https://api.anthropic.com");
+        assert_eq!(worker.reasoning, None);
+
+        let error = ModelSelection::resolve_compaction_worker(&settings, "claude-opus-4-6")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider/model"), "{error}");
     }
 }

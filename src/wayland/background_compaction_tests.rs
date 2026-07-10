@@ -9,7 +9,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
-use super::{ApplyContext, Harness, SummarizerKind};
+use super::{
+    ApplyContext, CompactionWorkerConfig, CompactionWorkerInput, Harness, SummarizerKind,
+    run_compaction_worker,
+};
 use crate::config::CompactionTriggerConfig;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate,
@@ -221,6 +224,177 @@ struct PendingSummaryProvider {
     started: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+struct ScriptedWorkerProvider {
+    requests: Arc<Mutex<Vec<Vec<Message>>>>,
+    turns: Arc<Mutex<VecDeque<AssistantTurn>>>,
+}
+
+impl ChatProvider for ScriptedWorkerProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        self.requests.lock().unwrap().push(messages.to_vec());
+        let turn = self
+            .turns
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted worker turn");
+        Ok(Box::pin(futures::stream::once(async move {
+            Ok(ProviderEvent::Completed(turn))
+        })))
+    }
+}
+
+fn scripted_worker_factory(
+    requests: Arc<Mutex<Vec<Vec<Message>>>>,
+    turns: Arc<Mutex<VecDeque<AssistantTurn>>>,
+) -> Arc<dyn Fn() -> Result<Box<dyn ChatProvider>> + Send + Sync + 'static> {
+    Arc::new(move || {
+        Ok(Box::new(ScriptedWorkerProvider {
+            requests: requests.clone(),
+            turns: turns.clone(),
+        }))
+    })
+}
+
+#[test]
+fn transcript_worker_sends_verbatim_covered_messages_then_instructions() {
+    let covered = vec![
+        Message::user("NEEDLE-verbatim: preserve spacing  exactly"),
+        Message::assistant("acknowledged verbatim"),
+    ];
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let turns = Arc::new(Mutex::new(VecDeque::from([AssistantTurn::text(
+        "Goal: continue. State: compacted. Decisions: none. Key facts: NEEDLE-verbatim. Next steps: proceed.",
+    )])));
+    let config = CompactionWorkerConfig {
+        input: CompactionWorkerInput::Transcript,
+        instructions: "Prioritize exact flags.".to_string(),
+        ..CompactionWorkerConfig::default()
+    };
+
+    let result = run_compaction_worker(
+        scripted_worker_factory(requests.clone(), turns),
+        temp_dir().path.clone(),
+        covered.clone(),
+        config,
+        SummarizerKind::Subagent,
+        CancellationToken::new(),
+    );
+
+    assert!(matches!(result, super::BackgroundSummaryResult::Summary(_)));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(&requests[0][..covered.len()], covered.as_slice());
+    let instruction = requests[0].last().unwrap();
+    assert_eq!(instruction.role, crate::nexus::Role::User);
+    assert!(instruction.content.starts_with(super::SUMMARY_PROMPT));
+    assert!(instruction.content.contains("Prioritize exact flags."));
+}
+
+#[test]
+fn transcript_worker_shrinks_oldest_message_on_overflow_and_terminates() {
+    let covered = vec![
+        Message::user("oldest"),
+        Message::assistant("middle"),
+        Message::user("newest"),
+    ];
+    let overflow = AssistantTurn {
+        completion_reason: Some(crate::nexus::CompletionReason::ContextWindowExceeded),
+        ..AssistantTurn::default()
+    };
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let turns = Arc::new(Mutex::new(VecDeque::from([
+        overflow,
+        AssistantTurn::text(
+            "Goal: continue. State: compacted. Decisions: none. Key facts: newest. Next steps: proceed.",
+        ),
+    ])));
+
+    let result = run_compaction_worker(
+        scripted_worker_factory(requests.clone(), turns),
+        temp_dir().path.clone(),
+        covered.clone(),
+        CompactionWorkerConfig::default(),
+        SummarizerKind::Subagent,
+        CancellationToken::new(),
+    );
+
+    assert!(matches!(result, super::BackgroundSummaryResult::Summary(_)));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(&requests[0][..3], covered.as_slice());
+    assert_eq!(&requests[1][..2], &covered[1..]);
+}
+
+#[test]
+fn transcript_worker_overflow_retry_stops_when_the_slice_is_empty() {
+    let overflow = || AssistantTurn {
+        completion_reason: Some(crate::nexus::CompletionReason::ContextWindowExceeded),
+        ..AssistantTurn::default()
+    };
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let turns = Arc::new(Mutex::new(VecDeque::from([
+        overflow(),
+        overflow(),
+        overflow(),
+    ])));
+
+    let result = run_compaction_worker(
+        scripted_worker_factory(requests.clone(), turns),
+        temp_dir().path.clone(),
+        vec![
+            Message::user("oldest"),
+            Message::assistant("middle"),
+            Message::user("newest"),
+        ],
+        CompactionWorkerConfig::default(),
+        SummarizerKind::Subagent,
+        CancellationToken::new(),
+    );
+
+    assert!(matches!(result, super::BackgroundSummaryResult::Failed(_)));
+    assert_eq!(requests.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn transcript_worker_threads_cancellation_through_the_factory_provider() {
+    let started = Arc::new(AtomicBool::new(false));
+    let token = CancellationToken::new();
+    let worker_token = token.clone();
+    let handle = std::thread::spawn({
+        let started = started.clone();
+        move || {
+            run_compaction_worker(
+                PendingSummaryProvider::factory(started),
+                temp_dir().path.clone(),
+                vec![Message::user("covered")],
+                CompactionWorkerConfig::default(),
+                SummarizerKind::Subagent,
+                worker_token,
+            )
+        }
+    });
+    for _ in 0..100 {
+        if started.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(started.load(Ordering::SeqCst));
+    token.cancel();
+
+    assert!(matches!(
+        handle.join().unwrap(),
+        super::BackgroundSummaryResult::Cancelled
+    ));
+}
+
 struct SeededHarness {
     harness: Harness<SilentProvider>,
     path: PathBuf,
@@ -422,6 +596,10 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
         prompts,
         visible_tools,
     } = seeded;
+    harness.set_compaction_worker(CompactionWorkerConfig {
+        input: CompactionWorkerInput::Investigator,
+        ..CompactionWorkerConfig::default()
+    });
     let obs = Recorder::default();
     let token = CancellationToken::new();
 
@@ -559,6 +737,10 @@ fn ready_summary_applies_mid_turn_before_queued_steering_is_injected_verbatim() 
     ladder.hard = 100_000;
     ladder.deterministic_only = false;
     harness.set_summarizer(SummarizerKind::Subagent);
+    harness.set_compaction_worker(CompactionWorkerConfig {
+        input: CompactionWorkerInput::Investigator,
+        ..CompactionWorkerConfig::default()
+    });
     harness.set_steering_source(steering);
     harness.set_compaction_summarizer_factory(SummaryProvider::factory(
         Arc::new(Mutex::new(VecDeque::from([format!(
@@ -612,7 +794,7 @@ fn ready_summary_applies_mid_turn_before_queued_steering_is_injected_verbatim() 
 }
 
 #[test]
-fn manual_compact_uses_subagent_before_provider_fallback() {
+fn manual_compact_uses_worker_pipeline_and_records_focus() {
     let root = temp_dir();
     let workspace = temp_dir();
     let mut log = SessionLog::create_in(&root.path, &workspace.path).unwrap();
@@ -660,7 +842,9 @@ fn manual_compact_uses_subagent_before_provider_fallback() {
         Some(300),
     );
     harness.set_summarizer(SummarizerKind::Subagent);
-    let worker_replies = Arc::new(Mutex::new(VecDeque::from(["".to_string()])));
+    let worker_replies = Arc::new(Mutex::new(VecDeque::from([format!(
+        "Goal: continue. State: attached. Decisions: none. Key facts: {SUMMARY_NEEDLE}. Next steps: proceed."
+    )])));
     let worker_prompts = Arc::new(Mutex::new(Vec::new()));
     let worker_tools = Arc::new(Mutex::new(Vec::new()));
     harness.set_compaction_summarizer_factory(SummaryProvider::factory(
@@ -671,14 +855,14 @@ fn manual_compact_uses_subagent_before_provider_fallback() {
     let obs = Recorder::default();
     let token = CancellationToken::new();
 
-    block_on(harness.compact_now(&obs, &token)).unwrap();
+    block_on(harness.compact_now_with_focus(&obs, &token, Some("preserve the exact flag")))
+        .unwrap();
 
     assert_eq!(worker_prompts.lock().unwrap().len(), 1);
-    assert_eq!(parent_prompts.lock().unwrap().len(), 1);
+    assert_eq!(parent_prompts.lock().unwrap().len(), 0);
     let worker_tools = worker_tools.lock().unwrap();
     assert_eq!(worker_tools.len(), 1);
-    assert!(worker_tools[0].contains(&"read".to_string()));
-    assert!(!worker_tools[0].contains(&"write".to_string()));
+    assert!(worker_tools[0].is_empty());
     let live = harness
         .messages()
         .iter()
@@ -690,6 +874,37 @@ fn manual_compact_uses_subagent_before_provider_fallback() {
         !live.contains(OLD_NEEDLE),
         "covered text should only remain behind recall"
     );
+    let entries = compaction_entries(&path);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0]["instructions"],
+        "Manual focus: preserve the exact flag"
+    );
+}
+
+#[test]
+fn manual_compact_attaches_to_an_existing_background_job() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let seeded = seed_harness(&root.path, &workspace.path);
+    let SeededHarness {
+        mut harness,
+        prompts,
+        ..
+    } = seeded;
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
+    assert_eq!(obs.lifecycle(CompactionLifecycleState::Running), 1);
+    block_on(harness.compact_now(&obs, &token)).unwrap();
+
+    assert_eq!(
+        prompts.lock().unwrap().len(),
+        1,
+        "manual attach must not launch a replacement worker"
+    );
+    assert_eq!(obs.applied(), 1);
 }
 
 #[test]
@@ -728,6 +943,10 @@ fn background_subagent_falls_back_to_provider_before_excerpts() {
         Some(300),
     );
     harness.set_summarizer(SummarizerKind::Subagent);
+    harness.set_compaction_worker(CompactionWorkerConfig {
+        input: CompactionWorkerInput::Investigator,
+        ..CompactionWorkerConfig::default()
+    });
     let replies = Arc::new(Mutex::new(VecDeque::from([
         "".to_string(),
         format!(
@@ -861,8 +1080,7 @@ fn stale_background_result_is_discarded_after_parent_revalidation() {
     let token = CancellationToken::new();
 
     block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
-    block_on(harness.compact_now(&obs, &token)).unwrap();
-    assert_eq!(compaction_entries(&path).len(), 1);
+    harness.compaction.entry_ids[0] = Some("entry_replaced_after_snapshot".to_string());
 
     for _ in 0..50 {
         block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
@@ -875,8 +1093,8 @@ fn stale_background_result_is_discarded_after_parent_revalidation() {
     assert_eq!(obs.lifecycle(CompactionLifecycleState::Discarded), 1);
     assert_eq!(
         compaction_entries(&path).len(),
-        1,
-        "stale worker result must not append a second compaction"
+        0,
+        "stale worker result must not append a compaction"
     );
 }
 

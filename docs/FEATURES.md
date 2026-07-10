@@ -302,16 +302,16 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   deterministic excerpts. An explicit `contextTokenBudget` clamps the resolved
   window. Active worker ranges freeze overlapping folds. Branch-aware
   compaction remains planned. (ADR-0054, ADR-0055) [Partial]
-- **Background summaries** — the default `compactionSummarizer: subagent` uses
-  a read-only worker and falls back through a direct provider request to
-  deterministic bounded excerpts. The parent alone validates, persists, and
-  applies the summary. Compaction entries and events record the provider-neutral
-  origin plus reported worker token/cache usage. `provider` skips the read-only
-  worker; `excerpts` makes the deterministic floor explicit. Cancellation skips
-  compaction for the turn. (ADR-0041) [Implemented]
-- **Manual `/compact`** — compacts on demand at the inter-turn boundary in the
-  TUI (turn-style spinner, Ctrl-C cancel) and the text path, keeping a small
-  recent tail and reporting the token shrink; works without a budget.
+- **Background summaries** — `compactionSummarizer` selects the answering
+  worker. `compaction.worker.input` defaults to a verbatim transcript request;
+  `investigator` enables read-only workspace probes. Transcript overflow
+  shrinks the covered slice and retries finitely. An optional global-only
+  `worker.model` routes the worker through Mimir. The parent alone validates,
+  persists, and applies. Entries record origin, instructions, and reported
+  worker token/cache usage. (ADR-0041) [Implemented]
+- **Manual `/compact [focus]`** — uses the same one-slot worker pipeline at the
+  inter-turn boundary. It attaches to an existing job, supports a bounded focus
+  instruction, keeps a small recent tail, and works without a budget.
   [Implemented]
 - **Hierarchical compaction** — layered raw turns, compacted older turns, task
   facts, file-change facts, decisions/blockers, and project memory. [Research]

@@ -66,9 +66,9 @@ impl CompactionEngine {
         self.next_job_seq = self.next_job_seq.saturating_add(1);
         let token = CancellationToken::new();
         let worker_token = token.clone();
-        let prompt = summary_worker_prompt(&covered);
         let workspace_for_worker = workspace.to_path_buf();
         let mode = self.summarizer;
+        let worker = self.worker.clone();
         let origin = match mode {
             SummarizerKind::Subagent => CompactionOrigin::Subagent,
             SummarizerKind::Provider => CompactionOrigin::Provider,
@@ -78,13 +78,13 @@ impl CompactionEngine {
         thread::Builder::new()
             .name(format!("iris-{job_id}"))
             .spawn(move || {
-                let result = run_background_summary_worker(
+                let result = run_compaction_worker(
                     factory,
                     workspace_for_worker,
-                    prompt,
+                    covered,
+                    worker,
                     mode,
                     worker_token,
-                    covered_messages,
                 );
                 let _ = tx.send(result);
             })?;

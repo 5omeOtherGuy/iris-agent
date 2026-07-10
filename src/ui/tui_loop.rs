@@ -213,7 +213,7 @@ enum RouteOutcome {
     Swap(SessionSource),
     /// Run an on-demand compaction at the boundary (driven like a turn, so the
     /// provider-backed summarizer stays cancellable and the spinner runs).
-    Compact,
+    Compact(String),
 }
 
 /// Outcome of the idle (between-turns) input phase.
@@ -537,7 +537,7 @@ async fn session_loop<P: ChatProvider>(
                     // Consumed: a modal may now be open; the top-of-loop modal
                     // phase runs it on the next iteration.
                     RouteOutcome::Consumed => {}
-                    RouteOutcome::Compact => {
+                    RouteOutcome::Compact(focus) => {
                         tui.screen.start_turn();
                         tui.draw()?;
                         run_harness_op(
@@ -546,7 +546,7 @@ async fn session_loop<P: ChatProvider>(
                             &mut input_rx,
                             &mut tick,
                             &current_turn,
-                            HarnessOp::Compact,
+                            HarnessOp::Compact(&focus),
                             steering.as_ref(),
                             &git_cache,
                             &mut git_generation,
@@ -1598,9 +1598,9 @@ fn route_command<P: ChatProvider>(
             apply_notices(tui, lines);
             Ok(RouteOutcome::Consumed)
         }
-        "/compact" if rest.is_empty() => {
+        "/compact" => {
             tui.screen.commit_user(prompt);
-            Ok(RouteOutcome::Compact)
+            Ok(RouteOutcome::Compact(rest.to_string()))
         }
         "/copy" => {
             tui.screen.commit_user(prompt);
@@ -1879,7 +1879,7 @@ async fn idle_phase(
 /// treatment as a turn).
 enum HarnessOp<'a> {
     Turn(&'a str),
-    Compact,
+    Compact(&'a str),
 }
 
 /// Drive one cancellable harness operation (a turn or an on-demand
@@ -1930,7 +1930,7 @@ async fn run_harness_op<P: ChatProvider>(
     // into the steering queue while the `/compact` spinner ran must not be
     // carried forward: `compact_now` never drains steering, so it would
     // otherwise be silently merged into the next real prompt.
-    let is_compact = matches!(op, HarnessOp::Compact);
+    let is_compact = matches!(op, HarnessOp::Compact(_));
     let result = {
         let mut turn: futures::future::LocalBoxFuture<'_, Result<()>> = match op {
             HarnessOp::Turn(prompt) => Box::pin(async {
@@ -1939,7 +1939,11 @@ async fn run_harness_op<P: ChatProvider>(
                     .await
                     .map(|_| ())
             }),
-            HarnessOp::Compact => Box::pin(harness.compact_now(&bridge, &token)),
+            HarnessOp::Compact(focus) => Box::pin(harness.compact_now_with_focus(
+                &bridge,
+                &token,
+                (!focus.is_empty()).then_some(focus),
+            )),
         };
         loop {
             // Compute the next coalesced-draw deadline. When nothing is pending
@@ -2244,7 +2248,7 @@ async fn dispatch_action<P: ChatProvider>(
                 input_rx,
                 tick,
                 current_turn,
-                HarnessOp::Compact,
+                HarnessOp::Compact(""),
                 steering,
                 git_cache,
                 git_generation,
