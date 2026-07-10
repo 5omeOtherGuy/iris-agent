@@ -735,6 +735,30 @@ fn degraded_mode_does_not_external_settle() {
     );
 }
 
+// Issue #565 (degraded fence): the content-snapshot fallback never records an
+// outside-workspace target, so a rollback cannot delete or rewrite a file
+// outside the fence (ADR-0028 tier table: outside is Tier 3, no guarantee).
+#[test]
+fn degraded_rollback_never_touches_outside_workspace_paths() {
+    let dir = temp_dir(); // non-git workspace -> degraded mode
+    let outside = temp_dir();
+    let inside = dir.path.join("inside.txt");
+    let outside_target = outside.path.join("outside.txt");
+
+    let guard = GitSafety::new(&dir.path);
+    guard.note_mutation();
+    iris_write_degraded(&guard, &inside, b"iris inside\n");
+    iris_write_degraded(&guard, &outside_target, b"iris outside\n");
+
+    guard.rollback(0).unwrap();
+    assert!(!inside.exists(), "the inside create is undone by rollback");
+    assert_eq!(
+        fs::read(&outside_target).unwrap(),
+        b"iris outside\n",
+        "rollback never deletes or rewrites a file outside the workspace"
+    );
+}
+
 /// Degraded-mode write helper: no gating, so `after_exec` records a fallback
 /// content snapshot for the targets. The confirm hash is irrelevant in degraded
 /// mode (no attribution), so a plain write suffices.

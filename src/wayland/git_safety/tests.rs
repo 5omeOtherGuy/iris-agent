@@ -1864,7 +1864,15 @@ fn compaction_task_state_drops_symlink_resolved_outside_paths() {
     guard.before_exec(&targets);
     fs::write(&link, "secret\n").unwrap();
     let violations = guard.after_exec(&targets, Some(&crate::tools::content_hash(b"secret\n")));
-    assert!(violations.is_empty(), "symlink write should be ledgered");
+    assert!(
+        violations.is_empty(),
+        "an outside-resolving symlink write is Tier 3: not a violation, not ledgered (issue #565)"
+    );
+    assert_eq!(
+        guard.ledger_len(),
+        0,
+        "a target resolving outside the workspace is never ledgered"
+    );
 
     let (body, paths) = guard
         .active_task_compaction_state(10)
@@ -1874,4 +1882,43 @@ fn compaction_task_state_drops_symlink_resolved_outside_paths() {
         paths.is_empty(),
         "canonical outside ledger path must not enter compaction carry: {paths:?}"
     );
+}
+
+// Issue #565: the guard is scoped to its workspace (ADR-0028 tier table --
+// outside the fence is Tier 3, no guarantee). An Iris write to a path outside
+// the workspace (a sibling worktree, /tmp) is never snapshotted, ledgered, or
+// protected, so a later out-of-band change -- e.g. deleting already-merged
+// work during worktree cleanup -- is not halted and the file is never
+// resurrected from snapshot.
+#[test]
+fn outside_workspace_targets_are_never_protected_or_restored() {
+    let repo = init_repo();
+    let outside = temp_dir();
+    let target = outside.path.join("derived.txt");
+
+    let guard = guard(&repo.path);
+    guard.note_mutation();
+
+    // Confirmed Iris write to the outside path: clean, but never protected.
+    guard.before_exec(std::slice::from_ref(&target));
+    fs::write(&target, "iris\n").unwrap();
+    let violation = guard.after_exec(
+        std::slice::from_ref(&target),
+        Some(&crate::tools::content_hash(b"iris\n")),
+    );
+    assert!(
+        violation.is_empty(),
+        "outside write is clean: {violation:?}"
+    );
+    assert_eq!(guard.ledger_len(), 0, "outside path is never ledgered");
+
+    // A bash-like call deletes it: no violation, no resurrection.
+    guard.before_exec(&[]);
+    fs::remove_file(&target).unwrap();
+    let violation = guard.after_exec(&[], None);
+    assert!(
+        violation.is_empty(),
+        "deleting an outside path is not a violation: {violation:?}"
+    );
+    assert!(!target.exists(), "the outside file stays deleted");
 }
