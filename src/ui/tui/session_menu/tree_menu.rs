@@ -16,7 +16,7 @@ use crate::ui::symbols;
 use crate::wayland::git_safety::git;
 
 use super::super::wrap::truncate_line;
-use super::super::{dim_style, prompt_style};
+use super::super::{dim_style, prompt_style, stdout_style};
 use super::{
     MenuAction, MenuKey, MenuOutcome, cap_block, dim_lines, footer_hints, fuzzy_match, home_rel,
     input_row, internal_rule, match_count, menu_row, readonly_footer, step_wrapped,
@@ -479,6 +479,19 @@ impl TreeMenu {
         line
     }
 
+    /// Convert a row path (relative to the current `root`) back to a
+    /// cwd-relative path — the frame the status partition and composer
+    /// references live in — so attribution survives a breadcrumb re-root.
+    /// `None` = the row lives outside the cwd subtree (degrade that row only,
+    /// never all-or-nothing).
+    fn cwd_rel(&self, rel: &str) -> Option<String> {
+        self.root
+            .join(rel)
+            .strip_prefix(&self.cwd)
+            .ok()
+            .map(|relative| relative.display().to_string())
+    }
+
     /// The attribution marker meta for a path, from the status partition.
     fn attribution(
         &self,
@@ -487,10 +500,13 @@ impl TreeMenu {
         git: Option<&GitStatus>,
         referenced: &[String],
     ) -> Vec<Span<'static>> {
-        // Markers only apply while the root is the session cwd (paths align).
-        if self.root != self.cwd {
+        // Markers describe the FILE, not the viewpoint: compare in the
+        // cwd-relative frame so attribution renders at any re-root. A row
+        // outside the cwd subtree has no cwd-relative form — no marker there.
+        let Some(rel) = self.cwd_rel(rel) else {
             return Vec::new();
-        }
+        };
+        let rel = rel.as_str();
         if !dir && referenced.iter().any(|r| r == rel) {
             return vec![Span::styled(
                 format!("{} open", symbols::ACTIVE),
@@ -643,10 +659,7 @@ impl TreeMenu {
             label.push(Span::styled(format!("{glyph} "), dim_style()));
             label.push(Span::raw(format!("{}/", row.entry.name)));
         } else {
-            label.push(Span::styled(
-                row.entry.name.clone(),
-                ratatui::style::Style::default().fg(ratatui::style::Color::Gray),
-            ));
+            label.push(Span::styled(row.entry.name.clone(), stdout_style()));
         }
         let mut meta = self.attribution(&row.entry.rel, row.entry.dir, git, referenced);
         if meta.is_empty()
@@ -791,6 +804,41 @@ mod tests {
         assert!(text.contains("◇ iris"), "{text}");
         assert!(text.contains("± yours"), "{text}");
         assert!(text.contains("◉ open"), "{text}");
+    }
+
+    #[test]
+    fn attribution_survives_reroot_above_cwd() {
+        // Re-rooted one level up: `root = /`, session cwd = `/repo`, files
+        // listed relative to the new root. Markers describe the file, so a
+        // dirty file and a referenced file keep their metas even though the
+        // viewpoint moved above the cwd.
+        let mut t = TreeMenu {
+            root: PathBuf::from("/"),
+            cwd: PathBuf::from("/repo"),
+            files: Some(vec![
+                "repo/src/main.rs".to_string(),
+                "repo/Cargo.toml".to_string(),
+                "other/README.md".to_string(),
+            ]),
+            children: BTreeMap::new(),
+            expanded: BTreeSet::new(),
+            selected: 0,
+            mode: Mode::Browse,
+        };
+        t.expanded.insert("repo".to_string());
+        t.expanded.insert("repo/src".to_string());
+        // Status/reference paths stay cwd-relative (`src/main.rs`,
+        // `Cargo.toml`); the row paths are root-relative (`repo/...`).
+        let status = GitStatus {
+            user_paths: vec!["src/main.rs".to_string()],
+            ..GitStatus::default()
+        };
+        let text =
+            lines_text(&t.render_lines(60, 20, false, Some(&status), &["Cargo.toml".to_string()]));
+        assert!(text.contains("± yours"), "dirty file keeps its marker: {text}");
+        assert!(text.contains("◉ open"), "referenced file keeps its marker: {text}");
+        // A row outside the cwd subtree degrades to no marker, not a panic.
+        assert!(text.contains("other/"), "out-of-cwd row still renders: {text}");
     }
 
     #[test]
