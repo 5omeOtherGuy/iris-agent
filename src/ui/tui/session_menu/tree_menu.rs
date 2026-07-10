@@ -492,11 +492,13 @@ impl TreeMenu {
             .map(|relative| relative.display().to_string())
     }
 
-    /// The attribution marker meta for a path, from the status partition.
+    /// The attribution marker meta for a FILE, from the status partition:
+    /// `◉ open` (composer-referenced), `◇ iris` (unsettled ledger), `± yours`
+    /// (user-dirty). Collapsed directories carry the [`Self::dir_rollup`]
+    /// instead. Empty for a row outside the cwd subtree.
     fn attribution(
         &self,
         rel: &str,
-        dir: bool,
         git: Option<&GitStatus>,
         referenced: &[String],
     ) -> Vec<Span<'static>> {
@@ -507,7 +509,7 @@ impl TreeMenu {
             return Vec::new();
         };
         let rel = rel.as_str();
-        if !dir && referenced.iter().any(|r| r == rel) {
+        if referenced.iter().any(|r| r == rel) {
             return vec![Span::styled(
                 format!("{} open", symbols::ACTIVE),
                 prompt_style(),
@@ -516,25 +518,65 @@ impl TreeMenu {
         let Some(status) = git else {
             return Vec::new();
         };
-        let prefix = format!("{rel}/");
-        let has = |paths: &[String]| {
-            if dir {
-                paths.iter().any(|p| p.starts_with(&prefix))
-            } else {
-                paths.iter().any(|p| p == rel)
-            }
-        };
-        if has(&status.iris_paths) {
+        if status.iris_paths.iter().any(|p| p == rel) {
             return vec![Span::styled(
                 format!("{} iris", symbols::PREVIEW),
                 dim_style(),
             )];
         }
-        if has(&status.user_paths) {
-            let style = if dir { dim_style() } else { prompt_style() };
-            return vec![Span::styled(format!("{} yours", symbols::DIRTY), style)];
+        if status.user_paths.iter().any(|p| p == rel) {
+            return vec![Span::styled(
+                format!("{} yours", symbols::DIRTY),
+                prompt_style(),
+            )];
         }
         Vec::new()
+    }
+
+    /// Collapsed-directory rollup: the §9.1 state cluster computed from the
+    /// already-fetched status path sets — `±N` (orange) user-dirty files
+    /// beneath, `◇M` (muted) iris-ledger files beneath, each half omitted at
+    /// zero — plus the muted file-count tail. Returned as `(state, count)` so
+    /// the row can drop the count first under width pressure: state outranks
+    /// inventory (§9.1.1). No new git calls — a prefix-match over the sets the
+    /// session bar already fetched.
+    fn dir_rollup(
+        &self,
+        rel: &str,
+        git: Option<&GitStatus>,
+    ) -> (Vec<Span<'static>>, Option<Span<'static>>) {
+        let mut state: Vec<Span<'static>> = Vec::new();
+        if let Some(status) = git
+            && let Some(cwd_rel) = self.cwd_rel(rel)
+        {
+            let prefix = format!("{cwd_rel}/");
+            let under = |paths: &[String]| paths.iter().filter(|p| p.starts_with(&prefix)).count();
+            let user = under(&status.user_paths);
+            let iris = under(&status.iris_paths);
+            if user > 0 {
+                state.push(Span::styled(
+                    format!("{}{user}", symbols::DIRTY),
+                    prompt_style(),
+                ));
+            }
+            if iris > 0 {
+                if !state.is_empty() {
+                    state.push(Span::raw(" ".to_string()));
+                }
+                state.push(Span::styled(
+                    format!("{}{iris}", symbols::PREVIEW),
+                    dim_style(),
+                ));
+            }
+        }
+        let count = self.files_under(rel).map(|n| {
+            let noun = if n == 1 { "file" } else { "files" };
+            // The `·` joins state to inventory only when state is present
+            // (`±3 ◇1 · 41 files`); a clean dir reads `41 files` alone.
+            let joiner = if state.is_empty() { "" } else { " · " };
+            Span::styled(format!("{joiner}{n} {noun}"), dim_style())
+        });
+        (state, count)
     }
 
     pub(crate) fn render_lines(
@@ -567,7 +609,6 @@ impl TreeMenu {
                         width,
                         git,
                         referenced,
-                        &walker,
                     ));
                 }
                 if overflow > 0 {
@@ -638,7 +679,10 @@ impl TreeMenu {
     }
 
     /// One tree row: 2-cells-per-level indent · disclosure (dirs only, dim) ·
-    /// name (dirs ink + `/`, files stdout grey) · right-aligned dim meta.
+    /// name (dirs ink + `/`, files stdout grey) · right-aligned dim meta. A
+    /// file's meta is its attribution marker; a COLLAPSED directory's is the
+    /// state rollup (`±N ◇M · N files`); an EXPANDED directory carries none
+    /// (its children speak for themselves).
     fn tree_row(
         &self,
         row: &VisRow,
@@ -646,12 +690,12 @@ impl TreeMenu {
         width: usize,
         git: Option<&GitStatus>,
         referenced: &[String],
-        walker: &TreeMenu,
     ) -> Line<'static> {
         let indent = " ".repeat(row.depth * 2 + 1);
         let mut label: Vec<Span<'static>> = vec![Span::raw(indent)];
+        let expanded = self.expanded.contains(&row.entry.rel);
         if row.entry.dir {
-            let glyph = if self.expanded.contains(&row.entry.rel) {
+            let glyph = if expanded {
                 symbols::EXPANDED
             } else {
                 symbols::COLLAPSED
@@ -661,18 +705,25 @@ impl TreeMenu {
         } else {
             label.push(Span::styled(row.entry.name.clone(), stdout_style()));
         }
-        let mut meta = self.attribution(&row.entry.rel, row.entry.dir, git, referenced);
-        if meta.is_empty()
-            && row.entry.dir
-            && !self.expanded.contains(&row.entry.rel)
-            && let Some(count) = walker.files_under(&row.entry.rel)
-        {
-            let noun = if count == 1 { "file" } else { "files" };
-            meta = vec![Span::styled(format!("{count} {noun}"), dim_style())];
-        }
+        // A collapsed dir rolls up its dirty state + inventory; the count is
+        // droppable, the state is not. Files carry a single attribution marker.
+        let (mut meta, count): (Vec<Span<'static>>, Option<Span<'static>>) = match &row.entry {
+            entry if entry.dir && !expanded => self.dir_rollup(&entry.rel, git),
+            entry if entry.dir => (Vec::new(), None),
+            entry => (self.attribution(&entry.rel, git, referenced), None),
+        };
         // Tree rows use plain gap alignment, not the dotted leader (the tree
         // is denser than a picker; leaders would draw a wall of dots).
         let label_w: usize = label.iter().map(|s| super::display_width(&s.content)).sum();
+        // The count tail joins only when the row still holds a 1-col gap after
+        // it; otherwise it drops and the state stands alone (§9.1.1).
+        if let Some(count) = count {
+            let state_w: usize = meta.iter().map(|s| super::display_width(&s.content)).sum();
+            let count_w = super::display_width(&count.content);
+            if label_w + state_w + count_w + 1 <= width {
+                meta.push(count);
+            }
+        }
         let meta_w: usize = meta.iter().map(|s| super::display_width(&s.content)).sum();
         let gap = width.saturating_sub(label_w).saturating_sub(meta_w);
         let mut spans = label;
@@ -839,6 +890,94 @@ mod tests {
         assert!(text.contains("◉ open"), "referenced file keeps its marker: {text}");
         // A row outside the cwd subtree degrades to no marker, not a panic.
         assert!(text.contains("other/"), "out-of-cwd row still renders: {text}");
+    }
+
+    const ROLLUP_FILES: &[&str] = &[
+        "docs/guide.md",
+        "docs/spec.md",
+        "src/a.rs",
+        "src/b.rs",
+        "src/c.rs",
+    ];
+
+    fn rollup_status() -> GitStatus {
+        GitStatus {
+            user_paths: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            iris_paths: vec!["src/c.rs".to_string()],
+            ..GitStatus::default()
+        }
+    }
+
+    /// The rendered row (below the breadcrumb) whose label starts with `name`.
+    fn row_text(lines: &[Line<'static>], name: &str) -> String {
+        lines
+            .iter()
+            .map(super::super::line_text)
+            .find(|t| t.trim_start().contains(name))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn collapsed_dir_rolls_up_dirty_state_then_count() {
+        let t = tree(ROLLUP_FILES);
+        let status = rollup_status();
+        let lines = t.render_lines(60, 20, false, Some(&status), &[]);
+        // src/ collapsed: 2 user-dirty + 1 iris file beneath, then inventory.
+        let src = row_text(&lines, "src/");
+        assert!(src.contains("±2 ◇1 · 3 files"), "{src:?}");
+    }
+
+    #[test]
+    fn zero_state_dir_renders_count_only() {
+        let t = tree(ROLLUP_FILES);
+        let status = rollup_status();
+        let lines = t.render_lines(60, 20, false, Some(&status), &[]);
+        let docs = row_text(&lines, "docs/");
+        assert!(docs.contains("2 files"), "{docs:?}");
+        assert!(!docs.contains('±') && !docs.contains('◇'), "no state glyphs: {docs:?}");
+    }
+
+    #[test]
+    fn expanded_dir_renders_no_rollup() {
+        let mut t = tree(ROLLUP_FILES);
+        t.expanded.insert("src".to_string());
+        let status = rollup_status();
+        let lines = t.render_lines(60, 20, false, Some(&status), &[]);
+        let src = row_text(&lines, "src/");
+        // The expanded dir row carries neither state nor inventory; its
+        // children speak for themselves.
+        assert!(!src.contains("files"), "no count on expanded dir: {src:?}");
+        assert!(!src.contains("±2"), "no state rollup on expanded dir: {src:?}");
+    }
+
+    #[test]
+    fn narrow_width_drops_count_before_state() {
+        let t = tree(ROLLUP_FILES);
+        let status = rollup_status();
+        // Wide: both state and inventory fit.
+        let wide = row_text(&t.render_lines(60, 20, false, Some(&status), &[]), "src/");
+        assert!(wide.contains("±2 ◇1"), "{wide:?}");
+        assert!(wide.contains("files"), "{wide:?}");
+        // Narrow: the inventory tail drops, the state cluster survives.
+        let narrow = row_text(&t.render_lines(20, 20, false, Some(&status), &[]), "src/");
+        assert!(narrow.contains("±2 ◇1"), "state kept: {narrow:?}");
+        assert!(!narrow.contains("files"), "count dropped: {narrow:?}");
+    }
+
+    #[test]
+    fn rollup_is_dim_under_readonly() {
+        let t = tree(ROLLUP_FILES);
+        let status = rollup_status();
+        let lines = t.render_lines(60, 20, true, Some(&status), &[]);
+        // The orange `±N` half is recolored to muted like every readout row.
+        let dirty = lines.iter().flat_map(|l| &l.spans).find(|s| s.content.starts_with('±'));
+        let dirty = dirty.expect("rollup ± span present");
+        assert_eq!(
+            dirty.style.fg,
+            Some(crate::ui::palette::muted()),
+            "readonly dims the rollup: {:?}",
+            dirty.style
+        );
     }
 
     #[test]
