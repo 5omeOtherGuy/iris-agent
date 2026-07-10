@@ -78,3 +78,20 @@ instead of a phantom -3.6k.
 
 Test (in-gate, no provider):
 - `runner::tests::estimate_error_is_per_request_not_a_turn_end_broadcast`.
+
+## Run 2 — 2026-07-10 (post-#566)
+
+Verdict FAIL by the new fail-loud rule, working as intended: S1 run 0 drove five
+round-trips, crossed start, and never compacted (`S1 produced no compaction`);
+run 1 compacted at boundary 4 (gen 1, subagent). Root cause: live
+provider-anchored context ran ~15% below the estimator arithmetic the shape
+test used, so four reads topped out between start and hard (28,056 vs hard
+29,491) and compaction depended on the start-tier background race instead of
+the hard-tier deterministic backstop. Fix: six round-trips with a 20%
+provider-discount margin assertion in the shape test.
+
+Run 2 also produced the first live cache break-even point (S1 run 1, boundary
+4): the apply broke the warm prefix (cache reads 23.4k -> 2.2k, 9.7k re-write
+at 1.25x) in exchange for input dropping 25.7k -> 11.9k -- payback in roughly
+one request. Artifacts: pilot-a-2026-07-10.{jsonl,md} (run 2),
+pilot-a-2026-07-10-run1.{jsonl,md} (run 1).
