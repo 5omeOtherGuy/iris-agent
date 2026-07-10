@@ -1344,9 +1344,27 @@ fn context_breakdown_lines<P: ChatProvider>(
                 "idle"
             };
             lines.push(format!(
-                "  compaction         {state}; warn {} / start {} / hard {}; job {job}",
-                diagnostics.ladder.warn, diagnostics.ladder.start, diagnostics.ladder.hard
+                "  compaction         {state}; warn {} / start {} / hard {}; summarizer {}/{}; job {job}",
+                diagnostics.ladder.warn,
+                diagnostics.ladder.start,
+                diagnostics.ladder.hard,
+                diagnostics.summarizer.as_str(),
+                diagnostics.worker_input.as_str(),
             ));
+            if let Some(background) = diagnostics.background_job {
+                let tier = background
+                    .trigger_tier
+                    .map(|tier| tier.as_str())
+                    .unwrap_or("manual");
+                lines.push(format!(
+                    "  background job     running {}s; covering {} message(s) (~{} tokens); job {}; origin {}; trigger {tier}",
+                    background.elapsed_secs,
+                    background.covered_messages,
+                    background.original_tokens_estimate,
+                    background.job_id,
+                    background.origin.as_str(),
+                ));
+            }
         }
         None => lines.push(format!(
             "context: ~{local_total} tokens (no compaction window)"
@@ -1428,9 +1446,15 @@ fn context_breakdown_lines<P: ChatProvider>(
         }
     }
     let (pending, reclaimable) = harness.pending_fold_stats();
+    let (frozen, frozen_reclaimable) = harness.frozen_fold_stats();
     if pending > 0 {
         lines.push(format!(
             "  pending folds      {pending} detected, ~{reclaimable} tokens reclaimable (holding for a free cache break)"
+        ));
+    }
+    if frozen > 0 {
+        lines.push(format!(
+            "  frozen folds       {frozen} under active compaction job, ~{frozen_reclaimable} tokens reclaimable after apply"
         ));
     }
     lines
@@ -1612,6 +1636,21 @@ fn route_command<P: ChatProvider>(
             let lines =
                 context_breakdown_lines(harness, switch.as_ref(), &tui.screen.context_accounting);
             apply_notices(tui, lines);
+            Ok(RouteOutcome::Consumed)
+        }
+        "/compaction" => {
+            tui.screen.commit_user(prompt);
+            match crate::cli::selected_compaction(harness, rest) {
+                Ok(entry) => {
+                    let (title, detail, summary) = crate::cli::compaction_panel_parts(&entry);
+                    tui.screen.apply(UiEvent::CompactionInspection {
+                        title,
+                        detail,
+                        summary,
+                    });
+                }
+                Err(message) => apply_notices(tui, vec![message]),
+            }
             Ok(RouteOutcome::Consumed)
         }
         "/sessions" => {

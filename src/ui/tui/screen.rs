@@ -12,7 +12,9 @@ use ratatui_textarea::{TextArea, WrapMode};
 use crate::git::status::{GitStatus, JjStatus, VcsStatus};
 #[cfg(test)]
 use crate::mimir::model_catalog;
-use crate::nexus::{ApprovalDecision, ContextPressureTier, ProviderUsage, ToolCall};
+use crate::nexus::{
+    ApprovalDecision, CompactionLifecycleState, ContextPressureTier, ProviderUsage, ToolCall,
+};
 use crate::ui::UiEvent;
 use crate::ui::modal::Modal;
 use crate::ui::slash::Palette;
@@ -972,6 +974,9 @@ pub(crate) struct Screen {
     /// context/cache impact; the next provider turn replaces it with realized
     /// usage/cache/fold/compaction numbers without appending transcript notices.
     switch_status: Option<SwitchStatus>,
+    /// Quiet volatile chip while the one background compaction slot is running.
+    /// Ready/terminal lifecycle states clear it; no transcript pane is opened.
+    compaction_running: bool,
     /// The active picker/dialog, when one is open. While present it renders
     /// above the editor and the loop routes keys to it instead of the editor.
     pub(crate) modal: Option<Modal>,
@@ -1123,6 +1128,7 @@ impl Screen {
             review_offer: ReviewOffer::default(),
             footer: None,
             switch_status: None,
+            compaction_running: false,
             modal: None,
             queued: 0,
             phase: WorkPhase::default(),
@@ -1634,6 +1640,9 @@ impl Screen {
         {
             footer.context_used_tokens = Some(*measured);
             footer.context_pressure = *tier;
+        }
+        if let UiEvent::CompactionLifecycle { state, .. } = &event {
+            self.compaction_running = matches!(state, CompactionLifecycleState::Running);
         }
         // Accumulate the session-scoped reduction accounting for `/context`
         // (issue #400): fold batches with their trigger tags, and compaction
@@ -2546,11 +2555,29 @@ pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Lin
             Span::styled("mouse off".to_string(), dim_style()),
         ]
     };
+    let compaction_seg = || vec![Span::styled("compacting…".to_string(), dim_style())];
 
     // Candidates from fullest to minimum. The drop order is monotonic and
     // matches the spec: drop the mouse hint, then the policy segment, then
     // effort, leaving the minimum `◉ CODE ─ MODEL`.
     let mut candidates: Vec<Vec<Vec<Span<'static>>>> = Vec::new();
+    if screen.compaction_running && mouse_off {
+        candidates.push(vec![
+            mode_seg(),
+            model_with_effort(),
+            policy_seg(),
+            mouse_seg(),
+            compaction_seg(),
+        ]);
+    }
+    if screen.compaction_running {
+        candidates.push(vec![
+            mode_seg(),
+            model_with_effort(),
+            policy_seg(),
+            compaction_seg(),
+        ]);
+    }
     if mouse_off {
         candidates.push(vec![
             mode_seg(),

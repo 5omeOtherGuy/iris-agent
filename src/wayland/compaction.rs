@@ -33,11 +33,30 @@ pub(crate) enum SummarizerKind {
     Subagent,
 }
 
+impl SummarizerKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Excerpts => "excerpts",
+            Self::Provider => "provider",
+            Self::Subagent => "subagent",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum CompactionWorkerInput {
     #[default]
     Transcript,
     Investigator,
+}
+
+impl CompactionWorkerInput {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transcript => "transcript",
+            Self::Investigator => "investigator",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +118,8 @@ pub(super) struct BackgroundCompaction {
     pub(super) receiver: Receiver<BackgroundSummaryResult>,
     pub(super) token: CancellationToken,
     pub(super) origin: CompactionOrigin,
+    pub(super) trigger_tier: Option<ContextPressureTier>,
+    pub(super) started_at: std::time::Instant,
 }
 
 pub(super) enum BackgroundSummaryResult {
@@ -363,6 +384,12 @@ impl CompactionEngine {
             origin: summary.origin,
             worker_usage: summary.worker_usage,
         })?;
+        if generation == 5 {
+            cx.observer.on_event(AgentEvent::Notice(
+                "this session has reached compaction generation 5; consider `/new` or `/compact` for a deeper handoff, and use `recall` for covered originals."
+                    .to_string(),
+            ))?;
+        }
         if self.in_turn
             && matches!(
                 summary.origin,

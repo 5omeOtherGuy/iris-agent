@@ -54,6 +54,26 @@ use serde_json::{Value, json};
 
 use crate::nexus::{Message, ModelOrigin, Role};
 
+/// Durable detail for one range-compaction entry. This is an inspection view,
+/// not provider context: originals are counted from raw message rows and remain
+/// untouched in the JSONL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionInspection {
+    pub(crate) id: Option<String>,
+    pub(crate) generation: u64,
+    pub(crate) summary: String,
+    pub(crate) origin: String,
+    pub(crate) covered_from: String,
+    pub(crate) covered_to: String,
+    pub(crate) covered_messages: usize,
+    pub(crate) original_tokens_estimate: u64,
+    pub(crate) summary_tokens_estimate: u64,
+    pub(crate) carry_paths: Vec<String>,
+    pub(crate) worker_usage: Option<crate::nexus::ProviderUsage>,
+    pub(crate) instructions: Option<String>,
+    pub(crate) recall_handle: Option<String>,
+}
+
 /// Current transcript format version. v2 adds per-entry `id` + `parentId` to the
 /// v1 linear layout, so entries are tree-ready. The reader accepts older files
 /// too (a missing id/parentId reads as `None`).
@@ -1324,6 +1344,63 @@ pub(crate) fn read_tool_call(
         .collect())
 }
 
+/// Read every durable compaction entry with its raw covered-range accounting.
+/// Malformed lines follow the session reader's tolerant policy; malformed or
+/// missing coverage produces zero original rows rather than inventing detail.
+pub(crate) fn read_compaction_inspections(path: &Path) -> Result<Vec<CompactionInspection>> {
+    let (entries, compactions, _folds) = read_entries(path)?;
+    let index_of: HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| entry.id.as_deref().map(|id| (id, index)))
+        .collect();
+    Ok(compactions
+        .into_iter()
+        .enumerate()
+        .map(|(index, compaction)| {
+            let span = index_of
+                .get(compaction.covered_from.as_str())
+                .zip(index_of.get(compaction.covered_to.as_str()))
+                .and_then(|(from, to)| (*from <= *to).then_some((*from, *to)));
+            let covered_messages = span.map_or(0, |(from, to)| to - from + 1);
+            let original_tokens_estimate = span.map_or(0, |(from, to)| {
+                entries[from..=to]
+                    .iter()
+                    .map(|entry| entry.tokens)
+                    .fold(0u64, u64::saturating_add)
+            });
+            let summary_tokens_estimate = compaction.token_estimate.unwrap_or_else(|| {
+                estimate_tokens(&render_compaction_body_with_task_state(
+                    &compaction.summary,
+                    &compaction.carry_paths,
+                    compaction.task_state.as_ref(),
+                ))
+            });
+            CompactionInspection {
+                id: compaction.id,
+                generation: compaction.generation.unwrap_or(index as u64 + 1),
+                recall_handle: recall_handle_from_summary(&compaction.summary),
+                summary: compaction.summary,
+                origin: compaction.origin,
+                covered_from: compaction.covered_from,
+                covered_to: compaction.covered_to,
+                covered_messages,
+                original_tokens_estimate,
+                summary_tokens_estimate,
+                carry_paths: compaction.carry_paths,
+                worker_usage: compaction.worker_usage,
+                instructions: compaction.instructions,
+            }
+        })
+        .collect())
+}
+
+fn recall_handle_from_summary(summary: &str) -> Option<String> {
+    let rest = summary.split_once("recall(handle=\"")?.1;
+    let handle = rest.split_once('"')?.0;
+    (!handle.is_empty()).then(|| handle.to_string())
+}
+
 /// Parse a session transcript's raw `message` and `compaction` entries in order,
 /// applying the same per-line leniency the read path needs (a truncated or
 /// garbled line is skipped, not fatal). Shared by the rebuild read path
@@ -1419,6 +1496,7 @@ struct MessageEntry {
 /// context total). Other persisted metadata (`createdAt`) is durable but not
 /// needed to rebuild context, so it is not read here.
 struct Compaction {
+    id: Option<String>,
     covered_from: String,
     covered_to: String,
     summary: String,
@@ -1430,6 +1508,10 @@ struct Compaction {
     /// Additive task-state carry (ADR-0052): old compaction entries omit this
     /// field and therefore rebuild exactly as summary + carry did before.
     task_state: Option<CompactionTaskState>,
+    generation: Option<u64>,
+    origin: String,
+    worker_usage: Option<crate::nexus::ProviderUsage>,
+    instructions: Option<String>,
 }
 
 /// Parse a `compaction` entry's rebuild fields. `None` (skipped as malformed)
@@ -1437,6 +1519,7 @@ struct Compaction {
 /// truncated/garbled entries.
 fn parse_compaction(value: &Value) -> Option<Compaction> {
     Some(Compaction {
+        id: value.get("id").and_then(Value::as_str).map(String::from),
         covered_from: value
             .get("coveredFrom")
             .and_then(Value::as_str)?
@@ -1458,6 +1541,20 @@ fn parse_compaction(value: &Value) -> Option<Compaction> {
             })
             .unwrap_or_default(),
         task_state: value.get("taskState").and_then(parse_compaction_task_state),
+        generation: value.get("generation").and_then(Value::as_u64),
+        origin: value
+            .get("origin")
+            .and_then(Value::as_str)
+            .unwrap_or("excerpts")
+            .to_string(),
+        worker_usage: value
+            .get("workerUsage")
+            .cloned()
+            .and_then(|usage| serde_json::from_value(usage).ok()),
+        instructions: value
+            .get("instructions")
+            .and_then(Value::as_str)
+            .map(String::from),
     })
 }
 
@@ -3138,6 +3235,60 @@ mod tests {
         assert_eq!(entry["workerUsage"]["cacheReadInputTokens"], 80);
         assert_eq!(entry["workerUsage"]["cacheWriteInputTokens"], 20);
         assert_eq!(entry["workerUsage"]["totalTokens"], 150);
+    }
+
+    #[test]
+    fn compaction_inspection_reports_durable_detail_and_original_mass() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let from = log.append(&Message::user(&"alpha".repeat(20))).unwrap();
+        let to = log.append(&Message::assistant(&"beta".repeat(20))).unwrap();
+        let usage = ProviderUsage {
+            provider: "anthropic".to_string(),
+            model: "claude-opus-4-6".to_string(),
+            input_tokens: 120,
+            output_tokens: 30,
+            cache_read_input_tokens: 80,
+            cache_write_input_tokens: 20,
+            reasoning_output_tokens: 5,
+            total_tokens: 155,
+            cache_creation: None,
+        };
+        let summary = concat!(
+            "Goal: preserve the flag.\n\n",
+            "[recall] originals are retrievable with recall(handle=\"deadbeef\")."
+        );
+        let carry = vec!["src/lib.rs".to_string()];
+        log.append_compaction_with_metadata(
+            &from,
+            &to,
+            summary,
+            &carry,
+            None,
+            Some(24),
+            CompactionOrigin::Subagent,
+            Some(&usage),
+            Some("preserve the exact flag"),
+        )
+        .unwrap();
+
+        let inspected = read_compaction_inspections(log.path()).unwrap();
+        assert_eq!(inspected.len(), 1);
+        let item = &inspected[0];
+        assert_eq!(item.generation, 1);
+        assert_eq!(item.covered_from, from);
+        assert_eq!(item.covered_to, to);
+        assert_eq!(item.covered_messages, 2);
+        assert_eq!(item.original_tokens_estimate, 45);
+        assert_eq!(item.summary_tokens_estimate, 24);
+        assert_eq!(item.origin, "subagent");
+        assert_eq!(item.carry_paths, carry);
+        assert_eq!(
+            item.instructions.as_deref(),
+            Some("preserve the exact flag")
+        );
+        assert_eq!(item.recall_handle.as_deref(), Some("deadbeef"));
+        assert_eq!(item.worker_usage.as_ref(), Some(&usage));
     }
 
     #[test]

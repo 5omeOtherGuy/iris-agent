@@ -320,6 +320,12 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   inter-turn boundary. It attaches to an existing job, supports a bounded focus
   instruction, keeps a small recent tail, and works without a budget.
   [Implemented]
+- **Compaction inspection** — `/compaction [generation]` reads durable JSONL
+  detail: summary, origin, coverage and token mass, carry, instructions, recall
+  handle, and worker/cache usage. The TUI renders one foldable panel. A muted
+  `compacting…` status chip follows `Running -> Ready/Applied`; `/context`
+  reports live job and frozen-fold detail. Generation 5 emits one degradation
+  notice with `/new`, `/compact`, and recall guidance. [Implemented]
 - **Hierarchical compaction** — layered raw turns, compacted older turns, task
   facts, file-change facts, decisions/blockers, and project memory. [Research]
 - **Freshness rules** — mark summaries stale when underlying files change.

@@ -1462,6 +1462,9 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    adapter-level overflow classification, one provider-neutral reactive rewrite
    and resend per round trip, deterministic folds/excerpts/deep-cut recovery,
    an honest second-overflow error, and a two-model-compaction per-turn cap.
+   Slice 6 adds the durable `/compaction [generation]` viewer, a foldable TUI
+   inspection panel, the muted running chip, `Ready`/`Applied` lifecycle states,
+   live job/frozen-fold `/context` detail, and the generation-5 warning.
 7. Prebuilt-binary distribution ([#199](https://github.com/5omeOtherGuy/iris-agent/issues/199),
    [#233](https://github.com/5omeOtherGuy/iris-agent/issues/233)) is wired and now
    validated locally ([#252](https://github.com/5omeOtherGuy/iris-agent/issues/252)):

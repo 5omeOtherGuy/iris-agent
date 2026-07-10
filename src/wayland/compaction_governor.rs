@@ -106,6 +106,34 @@ impl CompactionEngine {
         messages: &[Message],
         workspace: &Path,
     ) -> Vec<fold::FoldPlan> {
+        let mut plans = self.all_pending_folds(messages, workspace);
+        let Some((start, end)) = self.background_range() else {
+            return plans;
+        };
+        plans.retain(|plan| plan.index < start || plan.index >= end);
+        plans
+    }
+
+    pub(super) fn frozen_fold_stats(&self, messages: &[Message], workspace: &Path) -> (usize, u64) {
+        let Some((start, end)) = self.background_range() else {
+            return (0, 0);
+        };
+        let plans = self.all_pending_folds(messages, workspace);
+        let frozen = plans
+            .into_iter()
+            .filter(|plan| plan.index >= start && plan.index < end)
+            .collect::<Vec<_>>();
+        let reclaimable = frozen
+            .iter()
+            .map(|plan| {
+                estimate_tokens(&messages[plan.index].content)
+                    .saturating_sub(estimate_tokens(&plan.stub))
+            })
+            .fold(0u64, u64::saturating_add);
+        (frozen.len(), reclaimable)
+    }
+
+    fn all_pending_folds(&self, messages: &[Message], workspace: &Path) -> Vec<fold::FoldPlan> {
         if !self.tool_result_policy.enabled || self.session.is_none() {
             return Vec::new();
         }
@@ -115,27 +143,27 @@ impl CompactionEngine {
                 .semantic_dedupe
                 .protect_recent_tokens,
         );
-        let mut plans = fold::plan_folds(
+        fold::plan_folds(
             messages,
             &self.entry_ids,
             tail_start,
             workspace,
             &self.tool_result_policy,
-        );
-        if let Some(job) = self.background.as_ref()
-            && let (Some(start), Some(end)) = (
-                self.entry_ids
-                    .iter()
-                    .position(|id| id.as_deref() == Some(job.from_id.as_str())),
-                self.entry_ids
-                    .iter()
-                    .position(|id| id.as_deref() == Some(job.to_id.as_str()))
-                    .and_then(|index| index.checked_add(1)),
-            )
-        {
-            plans.retain(|plan| plan.index < start || plan.index >= end);
-        }
-        plans
+        )
+    }
+
+    fn background_range(&self) -> Option<(usize, usize)> {
+        let job = self.background.as_ref()?;
+        let start = self
+            .entry_ids
+            .iter()
+            .position(|id| id.as_deref() == Some(job.from_id.as_str()))?;
+        let end = self
+            .entry_ids
+            .iter()
+            .position(|id| id.as_deref() == Some(job.to_id.as_str()))?
+            .checked_add(1)?;
+        Some((start, end))
     }
 
     fn flush_folds(
@@ -285,7 +313,13 @@ impl CompactionEngine {
                     && !self.model_compaction_cap_reached(CompactionOrigin::Subagent)
                     && self.consecutive_failures < self.max_consecutive_failures;
                 if model_backed {
-                    self.start_background(&current, plan, workspace, obs)?;
+                    self.start_background(
+                        &current,
+                        plan,
+                        workspace,
+                        obs,
+                        Some(ContextPressureTier::Start),
+                    )?;
                     Ok(if changed {
                         ContextDirective::Replace { messages: current }
                     } else {
