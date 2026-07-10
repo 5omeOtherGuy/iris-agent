@@ -490,3 +490,72 @@ and proves the one-shot request creates no entry until the next pair-closed
 governor boundary. That boundary compacts successfully even with automatic
 thresholds disabled. The final post-slice-9 LVP pair will cover the accumulated
 default behavior.
+
+## Slice 9 tuning probes — 2026-07-10
+
+The instrument now reconstructs the true message-context size before every
+apply from durable event fields:
+
+```text
+reclaimed = originalTokensEstimate - summaryTokensEstimate
+before = contextTokensAfterApply + reclaimed
+```
+
+It reports covered-range reduction and total-context reduction separately. The
+earlier `maximum post-apply/start` column never claimed the reduction delta and
+cannot diagnose a small eligible prefix by itself.
+
+One-session Haiku candidate probes used the same scripted LVP and Opus 4.6
+medium worker:
+
+| policy | compactions | shallowest before -> after | reclaimed | covered | total | worst G1 | G2–G5/read |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 0.55/0.65/0.85, keep 20k | 3 | 19,820 -> 18,319 | 1,501 | 83.4% | 7.6% | below 200 ms | pass |
+| 0.60/0.72/0.90, keep 6k | 2 | 28,464 -> 13,809 | 14,655 | 96.1% | 51.5% | 1.5 ms | pass |
+| 0.60/0.72/0.90, keep 8k | 2 | 30,428 -> 15,487 | 14,941 | 97.4% | 49.1% | 1.7 ms | pass |
+
+The old worker compacted its eligible prefix by 83.4%; it did not write an
+oversized summary. The 20k retained-tail target left most recent pair-closed
+tool groups outside that prefix. Starting at 65% also selected the range before
+it grew. The selected 8k policy keeps 1,678 more recent tokens than 6k while
+still removing 49.1% of the full message context.
+
+The live loop also pairs parent usage across applies. Anthropic rows use
+provider-reported cache writes. Codex rows are explicitly labeled
+`derived-fresh-input` and use `input - cache_read`, because that lane does not
+report writes.
+
+A Codex availability smoke on the selected defaults produced no eligible row
+and recorded the backend error verbatim:
+
+```text
+Codex request failed [status=429 endpoint=/codex/responses model=gpt-5.4-mini error_type=usage_limit_reached]
+```
+
+It is not a passing protocol run and contributes no metrics. The final two
+10-session pairs remain pending until Codex traffic evaluates.
+
+Selected-default Haiku full run:
+
+| lane | sessions | compactions | worst G1 | worst post/start | shallowest apply | covered / total reduction | G2–G5/read | worker cache | parent reported write, pre -> post | exclusions |
+|---|---:|---:|---:|---:|---:|---:|---|---|---:|---:|
+| `anthropic/claude-haiku-4-5` | 10 | 23 | 16.7 ms | 19,446/23,592 | 22,391 -> 16,827 | 91.7% / 24.8% | 10/10 | 9 × 0.000; 1 unknown | 45,012 -> 442,524 (9.831×) | 0 |
+
+| session | compactions | G1 | maximum post | shallowest before -> after | covered / total | G2–G5/read | worker hit | parent write pre -> post / pairs |
+|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| 00 | 2 | 2.0 ms | 15,471 | 26,009 -> 13,906 | 96.3% / 46.5% | pass | 0.000 | 2,716 -> 37,015 / 2 |
+| 01 | 2 | 1.8 ms | 19,446 | 31,572 -> 19,446 | 96.6% / 38.4% | pass | 0.000 | 2,716 -> 43,398 / 2 |
+| 02 | 2 | 3.1 ms | 15,571 | 27,658 -> 15,571 | 96.1% / 43.7% | pass | 0.000 | 4,830 -> 37,160 / 2 |
+| 03 | 3 | 15.9 ms | 16,827 | 22,391 -> 16,827 | 91.7% / 24.8% | pass | 0.000 | 5,093 -> 63,222 / 3 |
+| 04 | 2 | 1.8 ms | 16,310 | 28,361 -> 16,310 | 95.9% / 42.5% | pass | 0.000 | 2,712 -> 38,997 / 2 |
+| 05 | 2 | 2.7 ms | 15,493 | 25,888 -> 13,837 | 95.9% / 46.6% | pass | 0.000 | 2,684 -> 37,147 / 2 |
+| 06 | 3 | 16.7 ms | 15,516 | 19,020 -> 13,228 | 95.3% / 30.5% | pass | 0.000 | 3,819 -> 58,452 / 3 |
+| 07 | 3 | 13.5 ms | 16,142 | 21,949 -> 16,142 | 95.2% / 26.5% | pass | 0.000 | 5,691 -> 55,479 / 3 |
+| 08 | 2 | 2.5 ms | 16,569 | 28,622 -> 16,569 | 95.9% / 42.1% | pass | unknown | 2,707 -> 39,515 / 2 |
+| 09 | 2 | 1.2 ms | 15,456 | 30,410 -> 15,456 | 97.5% / 49.2% | pass | 0.000 | 12,044 -> 32,139 / 2 |
+
+The run completed in 620.38 seconds. `unknown` means the lane returned a
+non-null usage object with no positive input count; no hit rate is inferred.
+Every entry still passed G5 and identified the required Opus worker. The
+parent-write ratio is cache cost after a prefix rewrite, not context
+reclamation.

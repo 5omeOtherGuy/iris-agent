@@ -310,8 +310,11 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   complete tool-call/result groups and before steering injection. Ready workers
   apply without waiting; hard pressure bounds worker wait and falls back to
   deterministic excerpts. An explicit `contextTokenBudget` clamps the resolved
-  window. Active worker ranges freeze overlapping folds. Branch-aware
-  compaction remains planned. (ADR-0054, ADR-0055) [Partial]
+  window. Tuned defaults warn/start/hard at 0.60/0.72/0.90 and retain 8,000
+  recent tokens; the committed long-horizon and live evidence separates
+  covered-range reduction from total-context reclamation. Active worker ranges
+  freeze overlapping folds. Branch-aware compaction remains planned. (ADR-0054,
+  ADR-0055) [Partial]
 - **Reactive overflow recovery** — Mimir classifies adapter-specific context
   overflow responses into one typed failure. Before visible output, Nexus asks
   the provider-neutral governor for deterministic relief and resends once per
@@ -353,7 +356,10 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   facts, file-change facts, decisions/blockers, and project memory. [Research]
 - **Freshness rules** — mark summaries stale when underlying files change.
   [Research]
-- **Verification probes** — measure compaction recall and quality. [Research]
+- **Verification probes** — deterministic worker/trigger/boundary/focus and
+  recall-loop arms plus a double-gated two-lane live protocol measure blocking,
+  reclamation, retention, resume equivalence, usage, and cache economics.
+  Provider-native capability failures remain explicit. [Implemented]
 
 ## Prompt assembly
 

@@ -14,9 +14,9 @@ pub(crate) struct TriggerThresholds {
 impl Default for TriggerThresholds {
     fn default() -> Self {
         Self {
-            warn: 0.55,
-            start: 0.65,
-            hard: 0.85,
+            warn: crate::config::DEFAULT_COMPACTION_WARN,
+            start: crate::config::DEFAULT_COMPACTION_START,
+            hard: crate::config::DEFAULT_COMPACTION_HARD,
         }
     }
 }
@@ -127,15 +127,14 @@ mod tests {
     #[test]
     fn ladder_resolves_across_tiny_and_large_windows() {
         let cases = [
-            (8_000, (4_400, 5_200, 6_800), true, 2_000),
-            (32_000, (17_600, 20_800, 27_200), true, 8_000),
-            (131_072, (81_920, 98_304, 114_688), false, 20_000),
-            (1_000_000, (950_848, 967_232, 983_616), false, 20_000),
+            (8_000, (4_800, 5_760, 7_200), true, 2_000),
+            (32_000, (19_200, 23_040, 28_800), true, 8_000),
+            (131_072, (81_920, 98_304, 117_964), false, 8_000),
+            (1_000_000, (950_848, 967_232, 983_616), false, 8_000),
         ];
 
         for (window, expected, deterministic_only, keep) in cases {
-            let ladder =
-                TriggerLadder::resolve(window, TriggerThresholds::default(), 8_192, 20_000);
+            let ladder = TriggerLadder::resolve(window, TriggerThresholds::default(), 8_192, 8_000);
             assert_eq!(
                 (ladder.warn, ladder.start, ladder.hard),
                 expected,

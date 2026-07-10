@@ -71,6 +71,16 @@ cache-economics numbers stay documented methodology with measurement pending a r
 lane -- the fake-provider lane exposes no cache read/write splits, so they are never
 fabricated.
 
+The auto-compaction v2 extension is committed in
+`docs/benchmarks/auto-compaction-v2-tuning.md`. It adds transcript,
+investigator, and foreground worker arms; start/hard/reactive trigger and
+mid-turn/turn-edge/reactive boundaries; focus steering; a four-generation
+recall-loop scenario; provider-native capability rows; and default-policy A/B.
+The live loop now reconstructs total-context reclamation from apply events and
+pairs parent usage across each apply. Anthropic uses reported cache writes;
+Codex remains write-blind and is labeled with derived fresh input rather than a
+fabricated write metric.
+
 ## Alternatives Considered
 
 ### Alternative 1: Keep token-delta-only benchmarks

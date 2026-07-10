@@ -25,6 +25,7 @@ this file keeps implementation issues and decisions that span slices.
   milestone merged in PR #534.
 - Slice 7: portable provider-block persistence, Anthropic compact adapter, and
   probe-gated OpenAI v2 capability merged in PR #537.
+- Slice 8: default-off model-requested compaction tool merged in PR #538.
 
 ## Slice 5 — reactive recovery
 
@@ -186,7 +187,7 @@ summary workers reported a 0.999 cache-read/input ratio and seven reported
 
 ## Slice 8 — model tool
 
-Status: implementation complete; verification in progress.
+Status: merged in PR #538.
 
 Decision: `request_compaction` is a concrete, default-off Tier-3 tool, not a
 Nexus special case. `compaction.modelTool` is project-tunable because the tool
@@ -216,3 +217,70 @@ automatic thresholds off, and one-shot consumption. The standard LVP does not
 enable or call this default-off tool, so live provider traffic is not applicable
 for this slice; the final post-slice-9 protocols cover the unchanged default
 path.
+
+## Slice 9 — benchmark extension and default tuning
+
+Status: implementation and verification in progress.
+
+Issue: live tables showed post-apply context near 17k after triggering near
+20k, which looked like the summary worker removed little. The first hypothesis
+was fixed prompt/tool overhead. Code tracing disproved it:
+`context_tokens_after_apply` is message history only. Decision: reconstruct
+true pre-apply context as `after + (covered original - summary)` and report both
+covered-range and total-context reduction. This correction is now pinned by a
+unit test and carried in every live row.
+
+Finding: the provisional worker reduced one covered slice by 83.4%, but the
+slice represented little of the total context. The shallowest live apply was
+19,820 -> 18,319, only 7.6% total reclamation. Pair safety and the 20k retained
+tail protected recent large tool-turn groups; the 0.65 start threshold launched
+before the eligible prefix grew. The summary was not the limiting factor.
+
+Decision: select 0.60/0.72/0.90 with an 8k retained tail. A deterministic
+four-generation lane improved average total reduction from 48.5% to 58.3%,
+improved the shallowest generation from 41.2% to 54.6%, used four generations
+instead of six, and preserved the planted fact, recall-loop hit, and one marker
+per generation. A live Haiku probe's shallowest apply was 30,428 -> 15,487:
+49.1% total reclamation with two compactions and all gates passing. A 6k
+candidate removed 51.5% but retained 1,678 fewer recent tokens; the small
+additional reduction did not justify the smaller hot tail.
+
+Issue: the first deterministic investigator arm silently fell back to excerpts
+because the fake provider did not recognize the final embedded-transcript
+request. The retention assertion still passed, invalidating the comparison.
+Decision: fix the fake request shape and require `origin=subagent` for every
+model-worker arm so fallback cannot masquerade as the intended arm.
+
+Decision: extend cache accounting at the final LVP seam. Worker cache hit comes
+from durable `workerUsage`. Anthropic parent amplification uses reported cache
+writes around each apply. Codex does not report writes, so its separately
+labeled metric is derived fresh input (`input - cache_read`); no write number is
+fabricated.
+
+Verification so far: deterministic worker, start/hard/reactive boundary, focus,
+long-horizon, recall-loop, and cache-pairing tests pass. Focus retention was 0/5
+control and 5/5 focused. Background transcript and investigator arms blocked
+0.0 ms in the deterministic event timeline; the manual-await comparator blocked
+38.8 ms.
+
+Selected-default Haiku full protocol: 10/10 sessions, 23 compactions, no
+exclusions, worst G1 16.7 ms, worst post/start 19,446/23,592, and all G2–G5 plus
+real-read checks passed. The shallowest total-context reduction was 24.8% on a
+third-generation apply; that apply still reduced its covered range by 91.7%.
+Parent cache writes totaled 45,012 before versus 442,524 after paired applies
+(9.831×). This is the cache rewrite cost and is intentionally reported beside,
+not as, context reclamation.
+
+Gate issue: the initial worker-arm fixture assumed a 40 ms tool delay was long
+enough for the 20 ms fake worker to be scheduled. Under the full parallel suite,
+the worker thread lost that race and no mid-turn apply occurred. Decision:
+replace elapsed-time luck with a bounded worker-completion signal. The delay
+tool yields until ready or five seconds; the apply-to-next-request measurement
+still excludes tool time. The focused regression and the full 2,198-test gate
+then passed.
+
+Live issue: a selected-default Codex smoke produced no eligible measurement and
+returned verbatim:
+`Codex request failed [status=429 endpoint=/codex/responses model=gpt-5.4-mini
+error_type=usage_limit_reached]`. It is not counted as a pass. The final two
+full protocol pairs remain open until the external quota allows evaluated rows.
