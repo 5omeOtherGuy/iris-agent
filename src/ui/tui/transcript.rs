@@ -2389,6 +2389,12 @@ impl Transcript {
                 self.current_turn_diag = None;
             }
             UiEvent::ProviderTurnCompleted { usage, .. } => {
+                // Completion is a terminal provider event like cancel/error
+                // (§2.2): flush the live tail before the telemetry patching.
+                // Nexus emits `AssistantTextEnd` first on every path today, so
+                // this is normally a no-op — it guards a turn that completes
+                // without that terminal text event.
+                self.finish_stream();
                 if let Some(usage) = usage {
                     self.set_thinking_telemetry(usage.reasoning_output_tokens);
                     // Forward attribution. This turn's INPUT side ingested the

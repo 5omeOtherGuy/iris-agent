@@ -1918,6 +1918,41 @@ mod tests {
     }
 
     #[test]
+    fn completion_flushes_the_held_answer_tail_without_an_end() {
+        // Criterion 4 (§2.2): provider turn completion flushes the answer
+        // stream even when no AssistantTextEnd precedes it — same defensive
+        // guard as cancel/error, not a reliance on Nexus event ordering.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::AssistantTextDelta(
+            "partial answer held in the escapement.\n\n".to_string(),
+        ));
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "t1".to_string(),
+            response_id: None,
+            usage: None,
+        });
+        assert!(
+            !screen.transcript.stream.is_active() && !screen.has_stream_work(),
+            "completion finalized the stream"
+        );
+        let committed = screen
+            .transcript
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            committed
+                .matches("partial answer held in the escapement.")
+                .count(),
+            1,
+            "the held tail is committed exactly once on completion: {committed}"
+        );
+    }
+
+    #[test]
     fn reasoning_burst_paces_across_beats_and_flushes_on_end() {
         // Criterion 5: a reasoning delta burst renders across beats (not all at
         // once), and reasoning end flushes the trace.
