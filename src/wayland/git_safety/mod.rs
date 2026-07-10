@@ -672,6 +672,17 @@ impl GitSafety {
         crate::display_path::workspace_path(&self.workspace, path)
     }
 
+    /// Whether the guard is responsible for `path` (already normalized).
+    /// ADR-0028's tier table scopes protection to the workspace fence: writes
+    /// outside the repo and symlinks out of the workspace are Tier 3, "no
+    /// guarantee". The guard therefore never snapshots, ledgers, protects, or
+    /// restores an outside path -- protecting one anyway made Iris-authored
+    /// files in sibling directories un-deletable until settlement, with no
+    /// approval path and a cleanliness check that can never pass (issue #565).
+    fn in_workspace(&self, path: &Path) -> bool {
+        path.starts_with(&self.workspace)
+    }
+
     fn workspace_compaction_path(&self, path: &Path) -> Option<String> {
         crate::display_path::workspace_path_if_inside(&self.workspace, path)
     }
@@ -1316,14 +1327,24 @@ impl MutationGuard for GitSafety {
         // Snapshot the protected set (git mode) plus this call's known targets so
         // the checkpoint chain can capture a clean file's exact pre-task content
         // before Iris overwrites it. In degraded mode there is no protected set,
-        // but the targets still feed the content-snapshot fallback.
-        let targets = paths.iter().map(|path| self.normalize(path));
+        // but the targets still feed the content-snapshot fallback. Targets that
+        // normalize outside the workspace are dropped: they are Tier 3 (no
+        // guarantee, issue #565), never captured or protected.
+        let targets = paths
+            .iter()
+            .map(|path| self.normalize(path))
+            .filter(|path| self.in_workspace(path));
         let capture: BTreeSet<PathBuf> = if task.degraded {
             targets.collect()
         } else {
+            // Baseline keys can also resolve outside the fence (an in-repo
+            // symlink whose target lives elsewhere): filter them too, so the
+            // snapshot/ledger never manage an outside path. The edit/write
+            // approval gate still fires for them (baseline membership).
             task.baseline
                 .protected
                 .keys()
+                .filter(|path| self.in_workspace(path))
                 .cloned()
                 .chain(targets)
                 .collect()

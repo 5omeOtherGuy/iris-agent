@@ -392,11 +392,14 @@ impl GitSafety {
 
     /// Record a degraded (non-git) content-snapshot restore point for the call's
     /// known targets (ADR-0028 fallback). Best-effort; no gating or attribution.
+    /// Targets outside the workspace are Tier 3 (issue #565): never recorded,
+    /// so a later rollback cannot delete or rewrite a file outside the fence.
     pub(super) fn checkpoint_degraded(&self, task: &mut Task, approved: &[PathBuf]) {
         let pres: Vec<(PathBuf, Option<Vec<u8>>)> = approved
             .iter()
-            .map(|path| {
-                let norm = self.normalize(path);
+            .map(|path| self.normalize(path))
+            .filter(|path| self.in_workspace(path))
+            .map(|norm| {
                 let pre = task.snapshot.pre_bytes(&norm).and_then(|opt| opt.clone());
                 (norm, pre)
             })
