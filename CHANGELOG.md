@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.1.0...iris-agent-v0.2.0) - 2026-07-10
+
+### Added
+
+- iris --version names the exact artifact ([#532](https://github.com/5omeOtherGuy/iris-agent/pull/532))
+- first-class install and update experience ([#531](https://github.com/5omeOtherGuy/iris-agent/pull/531))
+- recover reactively from context overflow ([#530](https://github.com/5omeOtherGuy/iris-agent/pull/530))
+- iris update installs tagged releases only, never downgrades ([#529](https://github.com/5omeOtherGuy/iris-agent/pull/529))
+- the TUI instrument identity — boot, detents, receipt, faceplate, escapement, living thought ([#522](https://github.com/5omeOtherGuy/iris-agent/pull/522))
+- add transcript compaction workers ([#527](https://github.com/5omeOtherGuy/iris-agent/pull/527))
+- govern context between provider round trips ([#526](https://github.com/5omeOtherGuy/iris-agent/pull/526))
+- persist completed provider round trips ([#525](https://github.com/5omeOtherGuy/iris-agent/pull/525))
+- add model-aware compaction trigger ([#524](https://github.com/5omeOtherGuy/iris-agent/pull/524))
+- add auto-compaction engine telemetry baseline ([#523](https://github.com/5omeOtherGuy/iris-agent/pull/523))
+- add Codex-compatible native skills ([#521](https://github.com/5omeOtherGuy/iris-agent/pull/521))
+- use Codex WebSocket transport by default ([#509](https://github.com/5omeOtherGuy/iris-agent/pull/509))
+- add configurable tool result compaction ([#518](https://github.com/5omeOtherGuy/iris-agent/pull/518))
+- reveal raw thinking from collapsed summaries
+- stream raw Codex reasoning deltas ([#508](https://github.com/5omeOtherGuy/iris-agent/pull/508))
+
+### Fixed
+
+- persist permission mode defaults ([#520](https://github.com/5omeOtherGuy/iris-agent/pull/520))
+- preserve persisted reasoning effort ([#519](https://github.com/5omeOtherGuy/iris-agent/pull/519))
+- address licenser-reported tui settings ([#516](https://github.com/5omeOtherGuy/iris-agent/pull/516))
+- avoid no-op thinking disclosure
+- install zig toolchain for release cross-build ([#510](https://github.com/5omeOtherGuy/iris-agent/pull/510))
+- apply subagent summarizer to all compaction ([#507](https://github.com/5omeOtherGuy/iris-agent/pull/507))
+- prefer completed Codex reasoning summaries ([#506](https://github.com/5omeOtherGuy/iris-agent/pull/506))
+- install cargo-zigbuild in release workflow ([#504](https://github.com/5omeOtherGuy/iris-agent/pull/504))
+
 ## [0.1.0](https://github.com/5omeOtherGuy/iris-agent/releases/tag/v0.1.0) - 2026-07-09
 
 _0.1.0 was version-cut on 2026-06-17; the v0.1.0 tag, prebuilt binaries, and
