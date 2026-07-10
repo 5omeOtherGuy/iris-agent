@@ -140,6 +140,10 @@ fn dispatch() -> Result<()> {
             login_api_key(mimir::selection::ProviderId::Anthropic)
         }
         [command] if command == "update" => update_agent(),
+        [command] if command == "version" || command == "--version" || command == "-V" => {
+            println!("{}", version_line());
+            Ok(())
+        }
         [command] if command == "help" || command == "--help" || command == "-h" => {
             print_help();
             Ok(())
@@ -1386,6 +1390,16 @@ fn login_anthropic() -> Result<()> {
     Ok(())
 }
 
+/// The `iris --version` line: crate version plus the build's target triple, so
+/// a bug report or an update check names the exact artifact.
+fn version_line() -> String {
+    format!(
+        "iris {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        selfupdate::TARGET
+    )
+}
+
 fn print_help() {
     eprintln!("Usage: iris [command] [options]");
     eprintln!();
@@ -1406,7 +1420,8 @@ fn print_help() {
     eprintln!("                                   openai-compatible, antigravity, anthropic");
     eprintln!("                                   flags: --device-code (openai-codex),");
     eprintln!("                                          --api-key (anthropic)");
-    eprintln!("  iris update                       Update Iris from GitHub");
+    eprintln!("  iris update                       Update Iris to the latest stable release");
+    eprintln!("  iris -V, --version                Print the version and build target");
     eprintln!();
     eprintln!("Danger:");
     eprintln!("  --dangerously-skip-permissions   DANGER: auto-approve EVERY tool call with no");
@@ -1596,6 +1611,24 @@ mod tests {
             "unmarked sessions inherit the default"
         );
         assert_eq!(loaded.approval_mode, nexus::ApprovalMode::Auto);
+    }
+
+    #[test]
+    fn version_line_names_the_exact_artifact() {
+        let line = version_line();
+        assert_eq!(
+            line,
+            format!(
+                "iris {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                selfupdate::TARGET
+            ),
+            "version line must carry the crate version and the build target"
+        );
+        assert!(
+            line.starts_with("iris "),
+            "version line must be greppable by tooling: {line}"
+        );
     }
 
     #[test]
