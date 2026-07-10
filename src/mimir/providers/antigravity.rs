@@ -151,10 +151,11 @@ impl AntigravityProvider {
         }
 
         let body = response.text().unwrap_or_default();
-        let error = match crate::telemetry::sanitize_external_body(&body) {
-            Some(detail) => anyhow!("Antigravity request failed ({status}): {detail}"),
-            None => anyhow!("Antigravity request failed ({status})"),
+        let diagnostic = match crate::telemetry::sanitize_external_body(&body) {
+            Some(detail) => format!("Antigravity request failed ({status}): {detail}"),
+            None => format!("Antigravity request failed ({status})"),
         };
+        let error = super::classified_http_error(status.as_u16(), &body, diagnostic);
         match classify_http_status(status.as_u16()) {
             HttpClass::Reauth => Attempt::Reauth(error),
             // Antigravity uses the reauth-only loop and does not retry transient

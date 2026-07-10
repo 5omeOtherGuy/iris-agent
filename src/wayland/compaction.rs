@@ -124,6 +124,9 @@ pub(super) struct CompactionEngine {
     pub(super) ladder: Option<TriggerLadder>,
     pub(super) hard_wait: std::time::Duration,
     pub(super) max_consecutive_failures: u32,
+    pub(super) reactive_enabled: bool,
+    pub(super) in_turn: bool,
+    pub(super) model_compactions_this_turn: u8,
     pub(super) consecutive_failures: u32,
     pub(super) breaker_notice_emitted: bool,
     pub(super) tiny_notice_emitted: bool,
@@ -176,6 +179,9 @@ impl CompactionEngine {
             ladder,
             hard_wait: std::time::Duration::from_millis(10_000),
             max_consecutive_failures: 3,
+            reactive_enabled: true,
+            in_turn: false,
+            model_compactions_this_turn: 0,
             consecutive_failures: 0,
             breaker_notice_emitted: false,
             tiny_notice_emitted: false,
@@ -207,6 +213,25 @@ impl CompactionEngine {
         if let Some(job) = self.background.take() {
             job.token.cancel();
         }
+    }
+
+    pub(super) fn begin_turn(&mut self) {
+        self.in_turn = true;
+        self.model_compactions_this_turn = 0;
+    }
+
+    pub(super) fn end_turn(&mut self) {
+        self.in_turn = false;
+        self.model_compactions_this_turn = 0;
+    }
+
+    pub(super) fn model_compaction_cap_reached(&self, origin: CompactionOrigin) -> bool {
+        self.in_turn
+            && matches!(
+                origin,
+                CompactionOrigin::Subagent | CompactionOrigin::Provider
+            )
+            && self.model_compactions_this_turn >= 2
     }
 
     /// Append every message not yet durable and capture its assigned entry id.
@@ -338,6 +363,14 @@ impl CompactionEngine {
             origin: summary.origin,
             worker_usage: summary.worker_usage,
         })?;
+        if self.in_turn
+            && matches!(
+                summary.origin,
+                CompactionOrigin::Subagent | CompactionOrigin::Provider
+            )
+        {
+            self.model_compactions_this_turn = self.model_compactions_this_turn.saturating_add(1);
+        }
         Ok(Some((
             CompactionOutcome {
                 covered,

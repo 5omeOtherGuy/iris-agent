@@ -572,7 +572,11 @@ impl OpenAiCodexResponsesProvider {
             endpoint: "/codex/responses",
             last_event_type: None,
         };
-        let error = anyhow!("Codex request failed [{diag}]");
+        let error = super::classified_http_error(
+            status.as_u16(),
+            &body,
+            format!("Codex request failed [{diag}]"),
+        );
         match classify_http_status_retryable(status.as_u16()) {
             HttpClass::Reauth => Attempt::Reauth(error),
             HttpClass::Retry => Attempt::Retry(error, retry_after),

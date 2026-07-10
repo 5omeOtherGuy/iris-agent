@@ -302,6 +302,13 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   deterministic excerpts. An explicit `contextTokenBudget` clamps the resolved
   window. Active worker ranges freeze overlapping folds. Branch-aware
   compaction remains planned. (ADR-0054, ADR-0055) [Partial]
+- **Reactive overflow recovery** — Mimir classifies adapter-specific context
+  overflow responses into one typed failure. Before visible output, Nexus asks
+  the provider-neutral governor for deterministic relief and resends once per
+  provider round trip. Wayland applies folds, excerpts, then a 1,000-token deep
+  cut while preserving tool pairs and durable recall. A second overflow reports
+  the measured context/window and recovery commands. Setting
+  `compaction.reactive` to `false` disables the path. (ADR-0055) [Implemented]
 - **Background summaries** — `compactionSummarizer` selects the answering
   worker. `compaction.worker.input` defaults to a verbatim transcript request;
   `investigator` enables read-only workspace probes. Transcript overflow

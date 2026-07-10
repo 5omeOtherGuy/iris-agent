@@ -45,9 +45,10 @@ use crate::nexus::ToolOutputStore;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalGate, BoundaryContext, ChatProvider,
     CompactionLifecycleState, CompactionOrigin, ContextDirective, ContextGovernor,
-    ContextGovernorFuture, ContextMeasurementSource, ContextPressureTier, FoldTrigger, Message,
-    ProviderEvent, ProviderUsage, Role, SessionSpanReader, SteeringSource, ToolEnv, Tools,
-    TurnContextHooks, TurnInput, VerificationOutcome, VerifyRun,
+    ContextGovernorFuture, ContextMeasurementSource, ContextOverflowFuture,
+    ContextOverflowRecovery, ContextPressureTier, FoldTrigger, Message, ProviderEvent,
+    ProviderUsage, Role, SessionSpanReader, SteeringSource, ToolEnv, Tools, TurnContextHooks,
+    TurnInput, VerificationOutcome, VerifyRun,
 };
 use crate::session::{
     CompactionTaskState, SessionLog, estimate_tokens, message_token_estimate, preview_line,
@@ -132,6 +133,37 @@ impl ContextGovernor for TurnContextController<'_> {
                     self.token,
                 )
                 .await;
+            self.compaction.borrow_mut().replace(engine);
+            result
+        })
+    }
+
+    fn on_context_overflow<'a>(&'a self, cx: BoundaryContext<'a>) -> ContextOverflowFuture<'a> {
+        Box::pin(async move {
+            let task_state = if self.task_workflow_enabled {
+                self.git_safety
+                    .active_task_compaction_state_during_iris(MAX_CARRY_PATHS)
+                    .map(|(task_body, ledger_paths)| CompactionTaskState {
+                        task_body,
+                        ledger_paths,
+                    })
+            } else {
+                None
+            };
+            let engine = self
+                .compaction
+                .borrow_mut()
+                .take()
+                .expect("context engine is present at overflow entry");
+            let result = engine.recover_overflow(
+                cx.messages,
+                ApplyContext {
+                    workspace: self.workspace,
+                    output_store: self.output_store,
+                    task_state: task_state.as_ref(),
+                    observer: self.inner,
+                },
+            );
             self.compaction.borrow_mut().replace(engine);
             result
         })
@@ -408,6 +440,7 @@ impl<P: ChatProvider> Harness<P> {
         ));
         self.compaction.hard_wait = std::time::Duration::from_millis(config.hard_wait_ms);
         self.compaction.max_consecutive_failures = config.max_consecutive_failures;
+        self.compaction.reactive_enabled = config.reactive;
     }
 
     /// Install the provider builder used by background compaction workers
@@ -1053,6 +1086,7 @@ impl<P: ChatProvider> Harness<P> {
         };
         // The turn span covers the loop; `Instrument` carries it across awaits
         // (a held `enter()` guard does not).
+        self.compaction.begin_turn();
         let result = {
             let controller = TurnContextController {
                 inner: obs,
@@ -1078,6 +1112,7 @@ impl<P: ChatProvider> Harness<P> {
                 .instrument(tracing::info_span!("turn"))
                 .await
         };
+        self.compaction.end_turn();
         let changed_in_model_turn = self.agent.mutated_this_turn();
         // Persist whatever the turn produced even when it ended in an error, so
         // the transcript records the user prompt and any tool work. Best-effort:
@@ -1600,6 +1635,9 @@ impl<P: ChatProvider> Harness<P> {
                 let model_backed = !ladder.deterministic_only
                     && self.compaction.summarizer != SummarizerKind::Excerpts
                     && self.compaction.summarizer_factory.is_some()
+                    && !self
+                        .compaction
+                        .model_compaction_cap_reached(CompactionOrigin::Subagent)
                     && self.compaction.consecutive_failures
                         < self.compaction.max_consecutive_failures;
                 if model_backed {

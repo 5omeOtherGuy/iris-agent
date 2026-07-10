@@ -373,7 +373,11 @@ impl AnthropicProvider {
                 diagnostics: diag.to_string(),
             })
         } else {
-            anyhow!("Anthropic request failed [{diag}]")
+            super::classified_http_error(
+                status.as_u16(),
+                &body,
+                format!("Anthropic request failed [{diag}]"),
+            )
         };
         match classify_http_status_retryable(status.as_u16()) {
             HttpClass::Reauth if auth.kind() == AnthropicAuthKind::OAuth => Attempt::Reauth(error),

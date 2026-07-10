@@ -16,7 +16,7 @@ impl CompactionEngine {
         })
     }
 
-    fn emit_lifecycle(
+    pub(super) fn emit_lifecycle(
         &self,
         obs: &dyn AgentObserver,
         job: &BackgroundCompaction,
@@ -251,6 +251,19 @@ impl CompactionEngine {
         match result {
             BackgroundSummaryResult::Summary(summary) => {
                 let usage = summary.worker_usage.clone();
+                if self.model_compaction_cap_reached(summary.origin) {
+                    self.emit_lifecycle(
+                        cx.observer,
+                        &job,
+                        CompactionLifecycleState::Discarded,
+                        usage,
+                        Some(
+                            "per-turn model-backed compaction cap reached; using deterministic fallback"
+                                .to_string(),
+                        ),
+                    )?;
+                    return self.apply_job_fallback(&job, messages, cx);
+                }
                 let Some(plan) = self.revalidate(&job, messages) else {
                     self.emit_lifecycle(
                         cx.observer,

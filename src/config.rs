@@ -217,6 +217,7 @@ pub(crate) struct CompactionTriggerConfig {
     pub(crate) keep_recent_tokens: u64,
     pub(crate) hard_wait_ms: u64,
     pub(crate) max_consecutive_failures: u32,
+    pub(crate) reactive: bool,
 }
 
 fn merge_compaction(
@@ -569,6 +570,7 @@ impl Settings {
             keep_recent_tokens,
             hard_wait_ms,
             max_consecutive_failures,
+            reactive: compaction.and_then(|value| value.reactive).unwrap_or(true),
         })
     }
 
@@ -1588,6 +1590,7 @@ mod tests {
         assert_eq!(defaults.keep_recent_tokens, 20_000);
         assert_eq!(defaults.hard_wait_ms, 10_000);
         assert_eq!(defaults.max_consecutive_failures, 3);
+        assert!(defaults.reactive);
 
         let too_small = Settings {
             context_token_budget: Some(8_191),
@@ -1595,6 +1598,15 @@ mod tests {
         };
         let error = too_small.compaction_trigger().unwrap_err().to_string();
         assert!(error.contains("compaction.enabled=false"), "{error}");
+
+        let reactive_off = Settings {
+            compaction: Some(CompactionSettings {
+                reactive: Some(false),
+                ..CompactionSettings::default()
+            }),
+            ..Settings::default()
+        };
+        assert!(!reactive_off.compaction_trigger().unwrap().reactive);
     }
 
     #[test]
