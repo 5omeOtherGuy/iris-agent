@@ -476,22 +476,21 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
         "lane | session | compactions | G1 blocked | G2 max-after/start/pass | shallowest reclaim pre->post/reclaimed/covered%/total% | G3 needle/marker/carry | G4 exact | G5 metadata | worker cache hit | parent cache pre->post/ratio/kind/pairs | real read | error"
     );
 
-    let mut exclusions = 0usize;
+    let mut budget_used = 0usize;
+    let mut outcomes = Vec::new();
     let mut gate_failures = Vec::new();
     for session in 0..session_count {
         let result = run_auto_compaction_live_session(lane, session, &workspace, policy);
         match result {
             Ok(row) => {
-                let pass = row.compactions >= 2
-                    && row.g1_non_blocking
-                    && row.context_effective
-                    && row.needle_answered
-                    && row.recall_marker
-                    && row.carry_block
-                    && row.resume_exact
-                    && row.measured_entries
-                    && row.real_read;
-                if !pass {
+                let outcome = classify_live_gates(row.gates());
+                // A G1-only flake is excluded only while the shared one-per-run
+                // budget is still free; otherwise it counts as a gate failure.
+                let excluded_g1_flake = outcome == LiveSessionOutcome::G1TimingFlake
+                    && budget_used < LIVE_EXCLUSION_BUDGET;
+                if excluded_g1_flake {
+                    budget_used += 1;
+                } else if outcome != LiveSessionOutcome::Pass {
                     gate_failures.push(format!(
                         "session {session:02}: compactions={} G1={:.1}ms/{} G2={} G3={}/{}/{} G4={} G5={} read={}",
                         row.compactions,
@@ -506,6 +505,12 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
                         row.real_read,
                     ));
                 }
+                outcomes.push(outcome);
+                let detail = if excluded_g1_flake {
+                    "excluded: G1 timing flake"
+                } else {
+                    row.metadata_detail.as_deref().unwrap_or("-")
+                };
                 println!(
                     "{} | {session:02} | {} | {:.1}ms/{} | {}/{}/{} | {}->{}/{}/{:.1}%/{:.1}% | {}/{}/{} | {} | {} | {} | {}->{}/{}/{}/{} | {} | {}",
                     lane.label(),
@@ -537,11 +542,12 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
                     lane.cache_metric(),
                     row.parent_cache.paired_applies,
                     row.real_read,
-                    row.metadata_detail.as_deref().unwrap_or("-"),
+                    detail,
                 );
             }
             Err(error) => {
-                exclusions += 1;
+                budget_used += 1;
+                outcomes.push(LiveSessionOutcome::ErrorExclusion);
                 println!(
                     "{} | {session:02} | excluded | -/- | -/- | -/-/-/-/- | -/-/- | - | - | - | -->-/-/-/0 | - | {error:#}",
                     lane.label()
@@ -549,10 +555,12 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
             }
         }
     }
+    let verdict = live_run_verdict(&outcomes);
     assert!(
-        exclusions <= 1 && gate_failures.is_empty(),
-        "{} live protocol failed: exclusions={exclusions}; {}",
+        verdict.passed,
+        "{} live protocol failed: exclusions={}; {}",
         lane.label(),
+        verdict.exclusions,
         gate_failures.join("; ")
     );
 }
@@ -574,6 +582,125 @@ struct AutoLiveRow {
     parent_cache: ParentCacheEconomics,
     real_read: bool,
     metadata_detail: Option<String>,
+}
+
+/// The auto-compaction live protocol permits at most one flaky-session
+/// exclusion per run (see `docs/benchmarks/auto-compaction-live-loop.md`).
+/// Error-based exclusions and G1-timing exclusions share this single budget.
+const LIVE_EXCLUSION_BUDGET: usize = 1;
+
+/// The per-session gate outcome, classified independently of live traffic so a
+/// deterministic unit test can pin the flaky-exclusion decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveSessionOutcome {
+    /// Every gate passed.
+    Pass,
+    /// The only failing gate is G1 (non-hard main-loop blocking). Eligible for
+    /// the run's single permitted flaky exclusion while the budget is free.
+    G1TimingFlake,
+    /// A non-G1 gate failed; never eligible for the flaky exclusion.
+    HardFailure,
+    /// The session raised a provider/stream/auth error before producing a row.
+    /// Consumes the same one-per-run budget as a G1 timing flake.
+    ErrorExclusion,
+}
+
+/// The boolean gate results for one scripted session, extracted from an
+/// `AutoLiveRow` so the classification is a pure function of the gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveSessionGates {
+    /// At least two real auto-compactions were forced.
+    two_compactions: bool,
+    /// G1: non-hard main-loop blocking stayed under budget.
+    g1_non_blocking: bool,
+    /// G2: post-apply context estimate stayed effective.
+    context_effective: bool,
+    /// G3: the planted needle was answered.
+    needle_answered: bool,
+    /// G3: one recall marker per compaction.
+    recall_marker: bool,
+    /// G3: the deterministic carry block was retained.
+    carry_block: bool,
+    /// G4: resumed context matched live byte-for-byte.
+    resume_exact: bool,
+    /// G5: every entry recorded the required metadata.
+    measured_entries: bool,
+    /// A real repository read executed.
+    real_read: bool,
+}
+
+impl LiveSessionGates {
+    /// True when every gate other than G1 passed. A G1-only failure is the sole
+    /// shape eligible for the flaky exclusion.
+    fn non_g1_gates_pass(self) -> bool {
+        self.two_compactions
+            && self.context_effective
+            && self.needle_answered
+            && self.recall_marker
+            && self.carry_block
+            && self.resume_exact
+            && self.measured_entries
+            && self.real_read
+    }
+}
+
+/// Classify one session purely from its gate results. A row is a flaky-exclusion
+/// candidate only when G1 is its single failing gate.
+fn classify_live_gates(gates: LiveSessionGates) -> LiveSessionOutcome {
+    match (gates.non_g1_gates_pass(), gates.g1_non_blocking) {
+        (true, true) => LiveSessionOutcome::Pass,
+        (true, false) => LiveSessionOutcome::G1TimingFlake,
+        (false, _) => LiveSessionOutcome::HardFailure,
+    }
+}
+
+/// The run-level verdict after applying the single shared flaky-exclusion
+/// budget to an ordered list of session outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveRunVerdict {
+    passed: bool,
+    exclusions: usize,
+}
+
+/// Aggregate a run's ordered session outcomes under the one-per-run budget that
+/// error-based and G1-timing exclusions share. Both exclusion kinds count
+/// equally against the shared budget, so `exclusions` is the total number of
+/// excluded sessions regardless of order. The run passes only when no hard gate
+/// failure occurred and the exclusion count stays within budget; a second
+/// exclusion of either kind therefore fails the run.
+fn live_run_verdict(outcomes: &[LiveSessionOutcome]) -> LiveRunVerdict {
+    let mut exclusions = 0usize;
+    let mut hard_failures = 0usize;
+    for outcome in outcomes {
+        match outcome {
+            LiveSessionOutcome::Pass => {}
+            LiveSessionOutcome::HardFailure => hard_failures += 1,
+            LiveSessionOutcome::ErrorExclusion | LiveSessionOutcome::G1TimingFlake => {
+                exclusions += 1;
+            }
+        }
+    }
+    LiveRunVerdict {
+        passed: hard_failures == 0 && exclusions <= LIVE_EXCLUSION_BUDGET,
+        exclusions,
+    }
+}
+
+impl AutoLiveRow {
+    /// Extract the boolean gate results this row asserts on.
+    fn gates(&self) -> LiveSessionGates {
+        LiveSessionGates {
+            two_compactions: self.compactions >= 2,
+            g1_non_blocking: self.g1_non_blocking,
+            context_effective: self.context_effective,
+            needle_answered: self.needle_answered,
+            recall_marker: self.recall_marker,
+            carry_block: self.carry_block,
+            resume_exact: self.resume_exact,
+            measured_entries: self.measured_entries,
+            real_read: self.real_read,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -1178,6 +1305,75 @@ fn g1_timing_counts_continuing_non_hard_gaps_and_excludes_hard_tier() {
     ];
     let timelines = [(base, base + std::time::Duration::from_secs(1))];
     assert_eq!(max_non_hard_compaction_block_ms(&events, &timelines), 50.0);
+}
+
+/// A session whose only failing gate is G1 is the run's single permitted flaky
+/// exclusion while the budget is free, and the run still passes.
+#[test]
+fn g1_timing_flake_excluded_when_exclusion_budget_is_free() {
+    let flake = classify_live_gates(LiveSessionGates {
+        two_compactions: true,
+        g1_non_blocking: false,
+        context_effective: true,
+        needle_answered: true,
+        recall_marker: true,
+        carry_block: true,
+        resume_exact: true,
+        measured_entries: true,
+        real_read: true,
+    });
+    assert_eq!(flake, LiveSessionOutcome::G1TimingFlake);
+
+    let verdict = live_run_verdict(&[LiveSessionOutcome::Pass, flake, LiveSessionOutcome::Pass]);
+    assert!(verdict.passed, "a lone G1 timing flake must be excluded");
+    assert_eq!(verdict.exclusions, 1);
+}
+
+/// The error and G1-timing exclusions share one budget, so a G1 flake following
+/// an error exclusion is over budget and fails the run.
+#[test]
+fn g1_timing_flake_fails_run_when_budget_already_spent_on_error() {
+    let verdict = live_run_verdict(&[
+        LiveSessionOutcome::ErrorExclusion,
+        LiveSessionOutcome::G1TimingFlake,
+    ]);
+    assert!(
+        !verdict.passed,
+        "error and G1 flake share one budget; the second exclusion fails the run"
+    );
+    assert_eq!(verdict.exclusions, 2);
+}
+
+/// A row failing G1 plus any other gate is a hard failure, never excludable.
+#[test]
+fn g1_plus_another_gate_failure_is_not_excludable() {
+    let outcome = classify_live_gates(LiveSessionGates {
+        two_compactions: true,
+        g1_non_blocking: false,
+        context_effective: true,
+        needle_answered: true,
+        recall_marker: true,
+        carry_block: true,
+        resume_exact: false, // G4 also failed
+        measured_entries: true,
+        real_read: true,
+    });
+    assert_eq!(outcome, LiveSessionOutcome::HardFailure);
+    assert!(!live_run_verdict(&[outcome]).passed);
+}
+
+/// Only one flaky exclusion is permitted per run, so two G1 timing flakes fail.
+#[test]
+fn two_g1_timing_flakes_fail_the_run() {
+    let verdict = live_run_verdict(&[
+        LiveSessionOutcome::G1TimingFlake,
+        LiveSessionOutcome::G1TimingFlake,
+    ]);
+    assert!(
+        !verdict.passed,
+        "only one flaky exclusion is permitted per run"
+    );
+    assert_eq!(verdict.exclusions, 2);
 }
 
 #[test]

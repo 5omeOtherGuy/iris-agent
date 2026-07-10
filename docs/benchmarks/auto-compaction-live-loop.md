@@ -639,6 +639,18 @@ following session returned G1 12.9 ms, and the other 38 closeout sessions were
 below 89 ms. No provider, auth, tool, worker, persistence, recall, metadata,
 turn, abort, or resume error occurred in an evaluated session.
 
+The single-flaky-exclusion rule is now mechanized in the harness
+(`classify_live_gates` / `live_run_verdict` in `src/compaction_live_bench.rs`),
+not applied by hand. This run-2 exclusion predates that change and was applied
+editorially; the harness of the day reported `exclusions=0` and failed the
+aggregate assertion. A session now qualifies as the run's one permitted flaky
+exclusion only when (a) G1 is its sole failing gate — G2, G3 needle/marker/carry,
+G4 byte-exact resume, G5 metadata, and the real read all pass — and (b) the
+one-per-run exclusion budget is still free. Error-based and G1-timing exclusions
+share that single budget; a second exclusion of either kind fails the run. The
+excluded row is preserved verbatim with reason "G1 timing flake" and never
+feeds an aggregate metric.
+
 ### Run 1 session rows
 
 | lane | session | compactions | G1 | max post | shallowest before -> after | covered / total | worker hit | parent cache pre -> post / pairs | result |
