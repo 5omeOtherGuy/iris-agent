@@ -21,6 +21,12 @@
 //! (realized cache-HIT rate) and (b) the first post-compaction request (realized
 //! cache-WRITE mass vs the pre-compaction baseline).
 
+use super::live_harness::{
+    ApplyReclamation, CacheMassModel, CapturedUsage, LIVE_EXCLUSION_BUDGET, LiveLoopObserver,
+    LiveSessionGates, LiveSessionOutcome, NoToolGate, NoopObserver, ParentCacheEconomics,
+    ReadOnlyGate, RecordingProvider, TempDir, TimedEvent, apply_reclamation, block_on,
+    classify_live_gates, live_run_verdict, parent_cache_economics,
+};
 use super::*;
 use crate::config::CompactionTriggerConfig;
 use crate::mimir::auth::anthropic::claude_code_credentials_available;
@@ -32,7 +38,6 @@ use crate::mimir::selection::{
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::{ToolState, built_in_tools};
 use crate::wayland::{CompactionWorkerConfig, Harness, SummarizerKind};
-use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,32 +50,6 @@ const LIVE_MODEL: &str = "claude-sonnet-4-6";
 /// identity block itself.
 const LIVE_SYSTEM_PROMPT: &str = "You are a coding assistant. Keep answers short.";
 const AUTO_LIVE_WORKER_MODEL: &str = "claude-opus-4-6";
-/// Matches the summarizer instruction prefix (`SUMMARY_PROMPT`, private to
-/// `crate::wayland`) so the recording wrapper tags a summarization request.
-const SUMMARY_INSTRUCTION_PREFIX: &str = "Summarize this coding session";
-
-/// One provider round-trip's realized usage, tagged summarization vs normal.
-/// `tag` is the first bytes of the request's LAST message content, so a run
-/// can select a specific turn's request by its prompt without relying on
-/// positional order (a spurious model tool-call would shift positions).
-#[derive(Clone)]
-struct CapturedUsage {
-    is_summary: bool,
-    tag: String,
-    started_at: Instant,
-    usage: Option<ProviderUsage>,
-}
-
-/// Wraps a real provider and records the `ProviderUsage` on every completed
-/// turn, tagging summarization requests (last message is the summary
-/// instruction). Test-only: `provider_summary` discards usage on the production
-/// path, so this wrapper is how the summarization request's realized cache-hit
-/// rate is captured WITHOUT touching production code.
-struct RecordingProvider<P: ChatProvider> {
-    inner: P,
-    usages: Arc<Mutex<Vec<CapturedUsage>>>,
-}
-
 struct InducedOverflowProvider {
     inner: Box<dyn ChatProvider>,
     inject_next: AtomicBool,
@@ -99,120 +78,6 @@ impl ChatProvider for InducedOverflowProvider {
 
     fn capabilities(&self) -> ProviderCapabilities {
         self.inner.capabilities()
-    }
-}
-
-impl<P: ChatProvider> ChatProvider for RecordingProvider<P> {
-    fn respond_stream<'a>(
-        &'a self,
-        messages: &'a [Message],
-        tools: &'a Tools,
-        cancel: &'a CancellationToken,
-    ) -> Result<ProviderStream<'a>> {
-        let is_summary = messages
-            .last()
-            .is_some_and(|m| m.content.starts_with(SUMMARY_INSTRUCTION_PREFIX));
-        let tag = messages
-            .last()
-            .map(|m| m.content.chars().take(32).collect::<String>())
-            .unwrap_or_default();
-        let started_at = Instant::now();
-        let usages = self.usages.clone();
-        let stream = self.inner.respond_stream(messages, tools, cancel)?;
-        let mapped = stream.map(move |item| {
-            if let Ok(ProviderEvent::Completed(turn)) = &item {
-                usages.lock().expect("usages lock").push(CapturedUsage {
-                    is_summary,
-                    tag: tag.clone(),
-                    started_at,
-                    usage: turn.usage.clone(),
-                });
-            }
-            item
-        });
-        Ok(Box::pin(mapped))
-    }
-
-    fn capabilities(&self) -> ProviderCapabilities {
-        self.inner.capabilities()
-    }
-}
-
-/// A temp dir removed on drop (parallel-test safe).
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("iris-live-bench-{tag}-{nanos}"));
-        std::fs::create_dir(&path).expect("create temp dir");
-        Self { path }
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-/// A no-op approval gate (the scenario is text-only, so `review` is unreachable).
-struct NoToolGate;
-
-impl ApprovalGate for NoToolGate {
-    fn review<'a>(
-        &'a self,
-        _call: &'a ToolCall,
-        _allow_always: bool,
-        _allow_project: bool,
-        _ctx: ReviewContext,
-    ) -> ApprovalFuture<'a> {
-        Box::pin(async { Ok(ApprovalDecision::Deny) })
-    }
-}
-
-/// Allows calls against a read-only registry. The LVP advertises no mutating
-/// tools, so this gate is reached only for real repository reads.
-struct ReadOnlyGate;
-
-impl ApprovalGate for ReadOnlyGate {
-    fn review<'a>(
-        &'a self,
-        _call: &'a ToolCall,
-        _allow_always: bool,
-        _allow_project: bool,
-        _ctx: ReviewContext,
-    ) -> ApprovalFuture<'a> {
-        Box::pin(async { Ok(ApprovalDecision::Allow) })
-    }
-}
-
-#[derive(Clone)]
-struct TimedEvent {
-    at: Instant,
-    event: AgentEvent,
-}
-
-#[derive(Default)]
-struct LiveLoopObserver {
-    events: Mutex<Vec<TimedEvent>>,
-}
-
-impl AgentObserver for LiveLoopObserver {
-    fn on_event(&self, event: AgentEvent) -> Result<()> {
-        self.events
-            .lock()
-            .expect("live events lock")
-            .push(TimedEvent {
-                at: Instant::now(),
-                event,
-            });
-        Ok(())
     }
 }
 
@@ -256,11 +121,15 @@ impl LiveLoopLane {
         }
     }
 
-    fn cache_metric(self) -> &'static str {
+    fn cache_mass_model(self) -> CacheMassModel {
         match self {
-            Self::AnthropicHaiku => "reported-write",
-            Self::CodexMini => "derived-fresh-input",
+            Self::AnthropicHaiku => CacheMassModel::ReportedWrite,
+            Self::CodexMini => CacheMassModel::DerivedFreshInput,
         }
+    }
+
+    fn cache_metric(self) -> &'static str {
+        self.cache_mass_model().label()
     }
 }
 
@@ -274,24 +143,6 @@ fn build_live_compaction_worker() -> Result<Box<dyn ChatProvider>> {
         ContextManagement::default(),
         RetryPolicy::default(),
     )?))
-}
-
-/// A no-op observer: the live harness reads usage from the recording provider,
-/// not from events.
-struct NoopObserver;
-
-impl AgentObserver for NoopObserver {
-    fn on_event(&self, _event: AgentEvent) -> Result<()> {
-        Ok(())
-    }
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("current-thread runtime")
-        .block_on(future)
 }
 
 /// Near-budget synthetic history: a large needle-bearing opener plus several
@@ -584,108 +435,6 @@ struct AutoLiveRow {
     metadata_detail: Option<String>,
 }
 
-/// The auto-compaction live protocol permits at most one flaky-session
-/// exclusion per run (see `docs/benchmarks/auto-compaction-live-loop.md`).
-/// Error-based exclusions and G1-timing exclusions share this single budget.
-const LIVE_EXCLUSION_BUDGET: usize = 1;
-
-/// The per-session gate outcome, classified independently of live traffic so a
-/// deterministic unit test can pin the flaky-exclusion decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LiveSessionOutcome {
-    /// Every gate passed.
-    Pass,
-    /// The only failing gate is G1 (non-hard main-loop blocking). Eligible for
-    /// the run's single permitted flaky exclusion while the budget is free.
-    G1TimingFlake,
-    /// A non-G1 gate failed; never eligible for the flaky exclusion.
-    HardFailure,
-    /// The session raised a provider/stream/auth error before producing a row.
-    /// Consumes the same one-per-run budget as a G1 timing flake.
-    ErrorExclusion,
-}
-
-/// The boolean gate results for one scripted session, extracted from an
-/// `AutoLiveRow` so the classification is a pure function of the gates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LiveSessionGates {
-    /// At least two real auto-compactions were forced.
-    two_compactions: bool,
-    /// G1: non-hard main-loop blocking stayed under budget.
-    g1_non_blocking: bool,
-    /// G2: post-apply context estimate stayed effective.
-    context_effective: bool,
-    /// G3: the planted needle was answered.
-    needle_answered: bool,
-    /// G3: one recall marker per compaction.
-    recall_marker: bool,
-    /// G3: the deterministic carry block was retained.
-    carry_block: bool,
-    /// G4: resumed context matched live byte-for-byte.
-    resume_exact: bool,
-    /// G5: every entry recorded the required metadata.
-    measured_entries: bool,
-    /// A real repository read executed.
-    real_read: bool,
-}
-
-impl LiveSessionGates {
-    /// True when every gate other than G1 passed. A G1-only failure is the sole
-    /// shape eligible for the flaky exclusion.
-    fn non_g1_gates_pass(self) -> bool {
-        self.two_compactions
-            && self.context_effective
-            && self.needle_answered
-            && self.recall_marker
-            && self.carry_block
-            && self.resume_exact
-            && self.measured_entries
-            && self.real_read
-    }
-}
-
-/// Classify one session purely from its gate results. A row is a flaky-exclusion
-/// candidate only when G1 is its single failing gate.
-fn classify_live_gates(gates: LiveSessionGates) -> LiveSessionOutcome {
-    match (gates.non_g1_gates_pass(), gates.g1_non_blocking) {
-        (true, true) => LiveSessionOutcome::Pass,
-        (true, false) => LiveSessionOutcome::G1TimingFlake,
-        (false, _) => LiveSessionOutcome::HardFailure,
-    }
-}
-
-/// The run-level verdict after applying the single shared flaky-exclusion
-/// budget to an ordered list of session outcomes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LiveRunVerdict {
-    passed: bool,
-    exclusions: usize,
-}
-
-/// Aggregate a run's ordered session outcomes under the one-per-run budget that
-/// error-based and G1-timing exclusions share. Both exclusion kinds count
-/// equally against the shared budget, so `exclusions` is the total number of
-/// excluded sessions regardless of order. The run passes only when no hard gate
-/// failure occurred and the exclusion count stays within budget; a second
-/// exclusion of either kind therefore fails the run.
-fn live_run_verdict(outcomes: &[LiveSessionOutcome]) -> LiveRunVerdict {
-    let mut exclusions = 0usize;
-    let mut hard_failures = 0usize;
-    for outcome in outcomes {
-        match outcome {
-            LiveSessionOutcome::Pass => {}
-            LiveSessionOutcome::HardFailure => hard_failures += 1,
-            LiveSessionOutcome::ErrorExclusion | LiveSessionOutcome::G1TimingFlake => {
-                exclusions += 1;
-            }
-        }
-    }
-    LiveRunVerdict {
-        passed: hard_failures == 0 && exclusions <= LIVE_EXCLUSION_BUDGET,
-        exclusions,
-    }
-}
-
 impl AutoLiveRow {
     /// Extract the boolean gate results this row asserts on.
     fn gates(&self) -> LiveSessionGates {
@@ -701,86 +450,6 @@ impl AutoLiveRow {
             real_read: self.real_read,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct ParentCacheEconomics {
-    paired_applies: usize,
-    baseline_mass: u64,
-    post_mass: u64,
-    ratio: Option<f64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct ApplyReclamation {
-    before: u64,
-    after: u64,
-    reclaimed: u64,
-    covered_reduction_ratio: f64,
-    total_reduction_ratio: f64,
-}
-
-fn apply_reclamation(original: u64, summary: u64, after: u64) -> ApplyReclamation {
-    let reclaimed = original.saturating_sub(summary);
-    let before = after.saturating_add(reclaimed);
-    ApplyReclamation {
-        before,
-        after,
-        reclaimed,
-        covered_reduction_ratio: if original == 0 {
-            0.0
-        } else {
-            reclaimed as f64 / original as f64
-        },
-        total_reduction_ratio: if before == 0 {
-            0.0
-        } else {
-            reclaimed as f64 / before as f64
-        },
-    }
-}
-
-fn cache_mass(lane: LiveLoopLane, usage: &ProviderUsage) -> u64 {
-    match lane {
-        LiveLoopLane::AnthropicHaiku => usage.cache_write_input_tokens,
-        LiveLoopLane::CodexMini => usage
-            .input_tokens
-            .saturating_sub(usage.cache_read_input_tokens),
-    }
-}
-
-fn parent_cache_economics(
-    lane: LiveLoopLane,
-    applies: &[(Instant, ApplyReclamation)],
-    captured: &[CapturedUsage],
-) -> ParentCacheEconomics {
-    let parent = captured
-        .iter()
-        .filter(|sample| !sample.is_summary && sample.usage.is_some())
-        .collect::<Vec<_>>();
-    let mut metric = ParentCacheEconomics::default();
-    for (applied_at, _) in applies {
-        let before = parent
-            .iter()
-            .rev()
-            .find(|sample| sample.started_at < *applied_at)
-            .and_then(|sample| sample.usage.as_ref());
-        let after = parent
-            .iter()
-            .find(|sample| sample.started_at >= *applied_at)
-            .and_then(|sample| sample.usage.as_ref());
-        let (Some(before), Some(after)) = (before, after) else {
-            continue;
-        };
-        metric.paired_applies += 1;
-        metric.baseline_mass = metric
-            .baseline_mass
-            .saturating_add(cache_mass(lane, before));
-        metric.post_mass = metric.post_mass.saturating_add(cache_mass(lane, after));
-    }
-    metric.ratio =
-        (metric.baseline_mass > 0).then_some(metric.post_mass as f64 / metric.baseline_mass as f64);
-    metric
 }
 
 fn run_auto_compaction_live_session(
@@ -1028,7 +697,7 @@ fn run_auto_compaction_live_session(
     let summary_cache_hit_rate =
         (worker_input > 0).then_some(worker_cache_read as f64 / worker_input as f64);
     let parent_cache = parent_cache_economics(
-        lane,
+        lane.cache_mass_model(),
         &applies,
         &parent_usages.lock().expect("parent usages lock"),
     );
@@ -1189,60 +858,6 @@ fn reactive_overflow_live(lane: LiveLoopLane) -> Result<()> {
 }
 
 #[test]
-fn apply_reclamation_reconstructs_true_pre_apply_and_both_ratios() {
-    let metric = apply_reclamation(8_000, 1_000, 17_000);
-    assert_eq!(metric.before, 24_000);
-    assert_eq!(metric.after, 17_000);
-    assert_eq!(metric.reclaimed, 7_000);
-    assert!((metric.covered_reduction_ratio - 0.875).abs() < f64::EPSILON);
-    assert!((metric.total_reduction_ratio - 7.0 / 24.0).abs() < f64::EPSILON);
-
-    let malformed = apply_reclamation(10, 20, 30);
-    assert_eq!(malformed.reclaimed, 0);
-    assert_eq!(malformed.before, malformed.after);
-    assert_eq!(malformed.total_reduction_ratio, 0.0);
-}
-
-#[test]
-fn parent_cache_economics_pairs_requests_across_apply_without_fabricating_writes() {
-    let at = Instant::now();
-    let usage = |input, read, write| ProviderUsage {
-        provider: "test".to_string(),
-        model: "test".to_string(),
-        input_tokens: input,
-        output_tokens: 0,
-        cache_read_input_tokens: read,
-        cache_write_input_tokens: write,
-        reasoning_output_tokens: 0,
-        total_tokens: input,
-        cache_creation: None,
-    };
-    let captured = vec![
-        CapturedUsage {
-            is_summary: false,
-            tag: "before".to_string(),
-            started_at: at - std::time::Duration::from_millis(1),
-            usage: Some(usage(100, 70, 10)),
-        },
-        CapturedUsage {
-            is_summary: false,
-            tag: "after".to_string(),
-            started_at: at + std::time::Duration::from_millis(1),
-            usage: Some(usage(140, 60, 20)),
-        },
-    ];
-    let applies = vec![(at, apply_reclamation(80, 20, 100))];
-
-    let anthropic = parent_cache_economics(LiveLoopLane::AnthropicHaiku, &applies, &captured);
-    assert_eq!((anthropic.baseline_mass, anthropic.post_mass), (10, 20));
-    assert_eq!(anthropic.ratio, Some(2.0));
-
-    let codex = parent_cache_economics(LiveLoopLane::CodexMini, &applies, &captured);
-    assert_eq!((codex.baseline_mass, codex.post_mass), (30, 80));
-    assert_eq!(codex.ratio, Some(8.0 / 3.0));
-}
-
-#[test]
 fn g1_timing_counts_continuing_non_hard_gaps_and_excludes_hard_tier() {
     let base = Instant::now();
     let events = vec![
@@ -1305,75 +920,6 @@ fn g1_timing_counts_continuing_non_hard_gaps_and_excludes_hard_tier() {
     ];
     let timelines = [(base, base + std::time::Duration::from_secs(1))];
     assert_eq!(max_non_hard_compaction_block_ms(&events, &timelines), 50.0);
-}
-
-/// A session whose only failing gate is G1 is the run's single permitted flaky
-/// exclusion while the budget is free, and the run still passes.
-#[test]
-fn g1_timing_flake_excluded_when_exclusion_budget_is_free() {
-    let flake = classify_live_gates(LiveSessionGates {
-        two_compactions: true,
-        g1_non_blocking: false,
-        context_effective: true,
-        needle_answered: true,
-        recall_marker: true,
-        carry_block: true,
-        resume_exact: true,
-        measured_entries: true,
-        real_read: true,
-    });
-    assert_eq!(flake, LiveSessionOutcome::G1TimingFlake);
-
-    let verdict = live_run_verdict(&[LiveSessionOutcome::Pass, flake, LiveSessionOutcome::Pass]);
-    assert!(verdict.passed, "a lone G1 timing flake must be excluded");
-    assert_eq!(verdict.exclusions, 1);
-}
-
-/// The error and G1-timing exclusions share one budget, so a G1 flake following
-/// an error exclusion is over budget and fails the run.
-#[test]
-fn g1_timing_flake_fails_run_when_budget_already_spent_on_error() {
-    let verdict = live_run_verdict(&[
-        LiveSessionOutcome::ErrorExclusion,
-        LiveSessionOutcome::G1TimingFlake,
-    ]);
-    assert!(
-        !verdict.passed,
-        "error and G1 flake share one budget; the second exclusion fails the run"
-    );
-    assert_eq!(verdict.exclusions, 2);
-}
-
-/// A row failing G1 plus any other gate is a hard failure, never excludable.
-#[test]
-fn g1_plus_another_gate_failure_is_not_excludable() {
-    let outcome = classify_live_gates(LiveSessionGates {
-        two_compactions: true,
-        g1_non_blocking: false,
-        context_effective: true,
-        needle_answered: true,
-        recall_marker: true,
-        carry_block: true,
-        resume_exact: false, // G4 also failed
-        measured_entries: true,
-        real_read: true,
-    });
-    assert_eq!(outcome, LiveSessionOutcome::HardFailure);
-    assert!(!live_run_verdict(&[outcome]).passed);
-}
-
-/// Only one flaky exclusion is permitted per run, so two G1 timing flakes fail.
-#[test]
-fn two_g1_timing_flakes_fail_the_run() {
-    let verdict = live_run_verdict(&[
-        LiveSessionOutcome::G1TimingFlake,
-        LiveSessionOutcome::G1TimingFlake,
-    ]);
-    assert!(
-        !verdict.passed,
-        "only one flaky exclusion is permitted per run"
-    );
-    assert_eq!(verdict.exclusions, 2);
 }
 
 #[test]

@@ -3706,3 +3706,13 @@ mod compaction_bench;
 #[cfg(test)]
 #[path = "compaction_live_bench.rs"]
 mod compaction_live_bench;
+
+// Compaction live-measurement CAMPAIGN harness (design:
+// compaction-live-harness). Generalizes the per-experiment live bench above
+// into a lane x scenario x settings x n matrix runner with a uniform row
+// schema and resumable manifests. Sibling test module so it reuses the in-crate
+// provider/message types via `use super::*`; double-gated (`#[ignore]` +
+// `IRIS_BENCH_LIVE=1`) so the gate's `cargo test` never issues a live call.
+#[cfg(test)]
+#[path = "live_harness/mod.rs"]
+mod live_harness;

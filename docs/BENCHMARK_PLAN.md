@@ -169,3 +169,75 @@ cargo test --bin iris tokens_per_task_replay_report -- --nocapture
 IRIS_BENCH_REAL=1 IRIS_BENCH_N=3 \
   cargo test --bin iris tokens_per_task_headline -- --ignored --nocapture
 ```
+
+---
+
+# Campaign runbook: compaction live-measurement harness
+
+The `live_harness` module (design: `compaction-live-harness`) generalizes the
+per-experiment live bench into a lane x scenario x settings-cell x n matrix
+runner. A new experiment is a config cell, not new Rust. Every number in an
+artifact comes from real `ProviderUsage` or session-log lifecycle entries; the
+estimator's value appears only as the `estimate_error` diagnostic column.
+
+## Double-gated, never in the gate
+
+The single entry point `live_campaign` is `#[ignore]` AND guarded by
+`IRIS_BENCH_LIVE=1`, exactly like `compaction_live_bench`. `cargo test --locked`
+(the gate) and CI never issue a provider call. The deterministic tests (row
+schema round-trip, manifest resume, matrix expansion, verdict, price-table date,
+probe scoring, scenario shapes) run in-gate; the live path does not.
+
+## Row schema
+
+One JSONL row per provider request (`metrics.rs::Row`): campaign, cell_id, lane,
+scenario, run_seq, request_seq, kind (`turn|summary|native_compact|probe`), ts,
+wall_ms, input/output tokens, cache_read, cache_write_5m/1h (Anthropic; the
+write-blind Codex lane leaves both null and sets `write_unreported=true`),
+context_measured/estimate tokens, `estimate_error` (diagnostic only),
+boundary_index, tier (`none|warn|start|hard`), a lifecycle delta (compaction
+generation applied, origin, fold flushes, breaker state), the settings
+fingerprint, and a verbatim `error` or null. Per-run aggregates
+(`metrics.rs::DerivedRun`) add token-class totals, notional USD (dated price
+table, both lanes; the Luna lane price is a flagged placeholder), cache-hit
+ratio, post-apply re-write mass, wall clock, `estimate_error` stats, and the
+mechanical outcome + probe score.
+
+## Define a cell
+
+A cell is `(scenario, settings)`; combined with each lane and run index it forms
+the matrix. Scenarios are the four synthetic generators (`scenario.rs`): S1
+aggressive-fill (single mega-turn, parallel results crossing hard), S2 multi-turn
+grind, S3 fold-dominant (auto-compaction off, folds isolated), S4 cache-churn
+(alternating hot/churn). R1 (SWE-bench) and R2 (repo Q&A with recall probes) are
+out of scope for the current harness; the `Scenario` trait is ready for them.
+Settings (`campaign.rs::CellSettings`) carry start%/hard%/keep_tail/hard_wait,
+summarizer, and retention tier; `CellSettings::defaults()` is the shipped
+posture. A campaign (`CampaignSpec`) lists lanes, cells, and runs-per-cell.
+
+## Run and resume a campaign
+
+```
+# Deterministic, in-gate (no cost):
+cargo test --locked live_harness
+
+# Live campaign (opt-in, consumes rate limits / notional cost):
+IRIS_BENCH_LIVE=1 IRIS_BENCH_CAMPAIGN=pilot-a \
+  cargo test --release -- --ignored live_campaign --nocapture
+```
+
+Runs execute sequentially (rate-limit friendly). A campaign manifest
+(`<campaign>-<date>.manifest`) records each completed run key and is persisted
+per run, so an interrupted campaign resumes past finished runs instead of
+restarting. A lane with no credentials is skipped, not failed. Pilot A is
+anthropic-only, low effort, n=2, cells S1 + S3 + S4-small at compaction
+defaults -- it validates plumbing, schema, and artifact writing before spend
+widens.
+
+## Read the artifacts
+
+Artifacts land in `docs/benchmarks/data/`:
+- `<campaign>-<date>.jsonl` -- one `Row` per line; diff two campaigns by cell_id.
+- `<campaign>-<date>.md` -- verdict (flaky-exclusion rule #545), per-cell
+  headline numbers, and the row-schema reference.
+- `<campaign>-<date>.manifest` -- completed run keys (resume bookkeeping).
