@@ -1407,14 +1407,33 @@ struct OneToolParent {
 impl ChatProvider for OneToolParent {
     fn respond_stream<'a>(
         &'a self,
-        _messages: &'a [Message],
+        messages: &'a [Message],
         _tools: &'a Tools,
         _cancel: &'a CancellationToken,
     ) -> Result<ProviderStream<'a>> {
-        let turn = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+        // Keep issuing the delay tool across pair-closed Start-pressure
+        // boundaries until the background summary has actually been applied,
+        // then finish. The apply is observable because compaction replaces the
+        // large (~90 KB) covered seed block with the short worker summary, so
+        // the transcript the parent is handed collapses far below this
+        // threshold once the apply lands. Draining until the summary is
+        // genuinely applied - rather than after a fixed number of boundaries -
+        // makes the mid-turn apply deterministic no matter how long a saturated
+        // scheduler starves the worker OS thread between signaling summary
+        // completion and delivering the result to the boundary channel (the two
+        // steps run sequentially on the same worker thread, so no summarizer
+        // signal can fire after the delivery). In the common case the summary
+        // is drained at the first boundary and the parent finishes on its
+        // second call exactly as before; the bound only guards against a
+        // genuine no-apply regression looping forever. Both boundaries stay at
+        // Start pressure, so the arm still measures the opportunistic mid-turn
+        // apply.
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let awaiting_apply = messages.iter().map(|m| m.content.len()).sum::<usize>() > 20_000;
+        let turn = if awaiting_apply && call < 16 {
             AssistantTurn {
                 tool_calls: vec![ToolCall {
-                    id: "bench-delay-1".to_string(),
+                    id: format!("bench-delay-{}", call + 1),
                     name: "bench_delay".to_string(),
                     arguments: json!({}),
                     thought_signature: None,
