@@ -138,6 +138,18 @@ pub(super) struct CompactionPlan {
     pub(super) to_id: String,
 }
 
+/// Whether the planner protects the current (in-flight) assistant turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanTurnMode {
+    /// Keep the current turn intact: walk the covered range back to a turn
+    /// boundary. Used at Start/Warn and for model-requested compaction.
+    Respect,
+    /// Allow covering the current turn's completed content when the keep-tail
+    /// cut lands mid-turn. Hard tier only (governor hard arm, hard-tier
+    /// background scheduling, and reactive overflow recovery).
+    HardCurrentTurn,
+}
+
 pub(super) struct CompactionEngine {
     pub(super) session: Option<SessionLog>,
     pub(super) persisted: usize,

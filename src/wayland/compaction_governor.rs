@@ -71,7 +71,10 @@ impl CompactionEngine {
             {
                 break;
             }
-            let Some(plan) = self.plan(&current, keep) else {
+            // Provider overflow is by definition hard pressure, so the reactive
+            // planner covers the current turn's completed content too.
+            let Some(plan) = self.plan_with_mode(&current, keep, PlanTurnMode::HardCurrentTurn)
+            else {
                 break;
             };
             let ContextDirective::Replace { messages } =
@@ -394,6 +397,7 @@ impl CompactionEngine {
                 }
             }
             ContextPressureTier::Hard => {
+                // Drain (bounded-wait) any job started at a prior boundary.
                 if let Some(replacement) = self
                     .resolve_hard_at_boundary(&current, apply_cx, token)
                     .await?
@@ -403,6 +407,46 @@ impl CompactionEngine {
                 }
                 if token.is_cancelled() {
                     return Ok(ContextDirective::Proceed);
+                }
+                // Once every pre-turn message is compacted, Start could not
+                // schedule a job (its turn-respecting plan returns None mid-turn).
+                // At hard pressure, start one hard-mode model job covering the
+                // current turn's completed content and resolve it under the same
+                // bounded wait, so a model-backed summary (and its provider-native
+                // fallback) can still win before the deterministic backstop.
+                if self.background.is_none()
+                    && ladder.tier(measure_context(&current, None, 0).tokens)
+                        == ContextPressureTier::Hard
+                {
+                    let model_backed = !ladder.deterministic_only
+                        && self.has_model_worker()
+                        && !self.model_compaction_cap_reached(CompactionOrigin::Subagent)
+                        && self.consecutive_failures < self.max_consecutive_failures;
+                    if model_backed
+                        && let Some(plan) = self.plan_with_mode(
+                            &current,
+                            ladder.keep_recent_tokens,
+                            PlanTurnMode::HardCurrentTurn,
+                        )
+                    {
+                        self.start_background(
+                            &current,
+                            plan,
+                            workspace,
+                            obs,
+                            Some(ContextPressureTier::Hard),
+                        )?;
+                        if let Some(replacement) = self
+                            .resolve_hard_at_boundary(&current, apply_cx, token)
+                            .await?
+                        {
+                            current = replacement;
+                            changed = true;
+                        }
+                        if token.is_cancelled() {
+                            return Ok(ContextDirective::Proceed);
+                        }
+                    }
                 }
                 let plans = self.pending_folds(&current, workspace);
                 if !plans.is_empty() {
@@ -416,7 +460,11 @@ impl CompactionEngine {
                     {
                         break;
                     }
-                    let Some(plan) = self.plan(&current, keep) else {
+                    // Deterministic backstop: hard mode covers the current turn
+                    // so context can never run away unbounded within one turn.
+                    let Some(plan) =
+                        self.plan_with_mode(&current, keep, PlanTurnMode::HardCurrentTurn)
+                    else {
                         break;
                     };
                     let ContextDirective::Replace { messages } =

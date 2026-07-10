@@ -40,7 +40,8 @@ contracts over one `CompactionEngine`. At a governed boundary the engine:
 - drains a ready worker without waiting;
 - measures the current context and emits pressure crossings;
 - starts one worker at `start` and immediately returns;
-- waits only at `hard`, bounded by `hardWaitMs`, then uses deterministic relief;
+- waits only at `hard`, bounded by `hardWaitMs`, then falls back through the
+  provider-native rung to deterministic relief (ADR-0057 refines this);
 - durably validates and appends through the same parent-owned apply function
   used at turn edges;
 - returns the rebuilt context for Nexus to install.
@@ -102,3 +103,7 @@ rewriting different versions of the same original range.
   provider-specific policy into Nexus or duplicating visible assistant output.
 - The job slot remains process-local and at most one worker runs per session.
 - Provider-native compaction remains a later slice.
+- ADR-0057 refines the hard tier: the turn-respecting walk-back is dropped under
+  hard pressure so the current turn's completed content is coverable, and the
+  subagent fallback escalates through provider-native before deterministic
+  excerpts. Start, Warn, and model-requested compaction keep the walk-back.
