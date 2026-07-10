@@ -377,6 +377,9 @@ pub(super) struct ComposedFrame {
 pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     let width = size.width.max(1);
     let height = usize::from(size.height.max(1));
+    // Thread the frame height into the transcript so a preview built in the
+    // `apply` path breathes with the pager viewport too (reactive-density §2).
+    screen.transcript.note_pane_height(size.height.max(1));
 
     let bar = session_bar_lines(screen, width, size.height.max(1));
     let bar_rows = bar.len().min(height);

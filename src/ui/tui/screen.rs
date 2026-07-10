@@ -1874,6 +1874,10 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
     }
     let width = size.width.max(1);
     let height = size.height.max(1);
+    // Thread the frame height into the transcript so a tool block built in the
+    // width-agnostic `apply` path sizes its preview to the pane it prints into
+    // (reactive-density spec §2) — the same per-frame threading `width` gets.
+    screen.transcript.note_pane_height(height);
     // The session bar (bar + soft hairline) is reserved ahead of the
     // transcript, so its stability must be decided BEFORE choosing the
     // transcript render mode: when the bar changed (context meter movement,

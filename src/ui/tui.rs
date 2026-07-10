@@ -111,8 +111,28 @@ const MAX_TRANSCRIPT_ROWS: usize = 10_000;
 /// Tuned to Codex's compact exec cell: a finalized result keeps a head and a
 /// tail slice with a `… +N lines` marker between (see [`Transcript::push_tool_output`]).
 /// The model still receives the full output; only the terminal preview is
-/// bounded, and the omitted logical-line count is reported.
+/// bounded, and the omitted logical-line count is reported. This is now the
+/// FLOOR of the viewport-aware preview budget ([`preview_row_budget`]); a pane
+/// ≤ 40 rows still previews exactly this many rows, so nothing regresses on
+/// small terminals.
 const MAX_TOOL_OUTPUT_ROWS: usize = 8;
+/// Ceiling of the viewport-aware preview budget: a tool-output preview never
+/// claims more than this many physical rows no matter how tall the pane is.
+const PREVIEW_ROWS_CEILING: usize = 24;
+
+/// Viewport-aware tool-output preview budget: `clamp(pane_height / 5, 8, 24)`
+/// rows (reactive-density spec §2). A print-time decision — `pane_height` is the
+/// last-known terminal height at the moment the block's rows are built, and the
+/// result is immutable in scrollback (a block keeps the budget it was printed
+/// at; see docs/TUI_DESIGN_LANGUAGE.md §8.1). Divisor rationale: at height/5 the
+/// preview claims at most a fifth of the viewport, so a tool block never
+/// dominates the pane — the conversation keeps the floor. The floor is the
+/// historical fixed [`MAX_TOOL_OUTPUT_ROWS`] (8), so a pane ≤ 40 rows is
+/// byte-identical to before; taller panes let the preview breathe to the
+/// ceiling. `pane_height == 0` (before the first frame) yields the floor.
+fn preview_row_budget(pane_height: usize) -> usize {
+    (pane_height / 5).clamp(MAX_TOOL_OUTPUT_ROWS, PREVIEW_ROWS_CEILING)
+}
 /// Frameless body hang: the block body hangs one 2-cell step under the header
 /// label — the same step the reasoning rail's `┊` body and a user turn's `›`
 /// body take, so every block's body lands on ONE shared text column. (Was a

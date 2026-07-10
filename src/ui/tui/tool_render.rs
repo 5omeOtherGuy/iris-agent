@@ -42,8 +42,8 @@ use super::shell_command::{self, ShellCommand};
 use super::text::{ansi_spans, strip_ansi_for_text};
 use super::wrap::{clamp_output_line, display_width, truncate_chars, wrapped_row_estimate};
 use super::{
-    MAX_TOOL_OUTPUT_LINE_CHARS, MAX_TOOL_OUTPUT_ROWS, PANEL_BODY_CHROME_WIDTH, dim_style,
-    err_style, panel_style, stdout_style,
+    MAX_TOOL_OUTPUT_LINE_CHARS, PANEL_BODY_CHROME_WIDTH, dim_style, err_style, panel_style,
+    stdout_style,
 };
 
 /// The panel family a tool renders as. Selects the stateful dispatch path in
@@ -61,9 +61,25 @@ pub(super) enum ToolPanelKind {
 
 /// Shared, immutable context handed to a renderer. Width matches the
 /// transcript's wrap width so flood-capping and the hidden-content affordance
-/// size identically to the rest of the panel body.
+/// size identically to the rest of the panel body. `preview_rows` is the
+/// viewport-aware tool-output preview budget (`clamp(height/5, 8, 24)`) resolved
+/// from the last-known pane height — a live tail shows at most this many rows.
 pub(super) struct RenderCtx {
     pub(super) width: usize,
+    pub(super) preview_rows: usize,
+}
+
+impl RenderCtx {
+    /// A context at `width` with the floor preview budget. Test-only helper so
+    /// body-shape tests that do not exercise the live tail need not spell out
+    /// `preview_rows`; the floor equals the historical fixed cap.
+    #[cfg(test)]
+    fn for_width(width: usize) -> Self {
+        Self {
+            width,
+            preview_rows: super::MAX_TOOL_OUTPUT_ROWS,
+        }
+    }
 }
 
 /// The result state a renderer is asked to render a body for. The header state
@@ -316,7 +332,7 @@ impl ToolRenderer for ShellRenderer {
     }
 
     fn body(&self, ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
-        let mut body = PanelBody::shell(ctx.width);
+        let mut body = PanelBody::shell(ctx.width, ctx.preview_rows);
         let timeout = bash_timeout_secs(call);
         match raw_bash_command(call) {
             Some(raw) => {
@@ -390,7 +406,7 @@ impl ToolRenderer for ShellRenderer {
 /// Body shared by EDIT and the generic TOOL fallback (identical apart from the
 /// header title).
 fn generic_body(ctx: &RenderCtx, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
-    let mut body = PanelBody::new(ctx.width);
+    let mut body = PanelBody::new(ctx.width, ctx.preview_rows);
     match outcome {
         ToolOutcome::Running { .. } => body.line("running\u{2026}", dim_style()),
         ToolOutcome::Done { content, .. } => body.output(content),
@@ -509,21 +525,24 @@ fn tool_output_line(prefix: &'static str, line: &str, base: Style) -> Line<'stat
 /// transcript wrap width.
 struct PanelBody {
     width: usize,
+    /// Viewport-aware live-tail preview budget (rows); see [`RenderCtx`].
+    preview_rows: usize,
     indent: usize,
     rows: Vec<TranscriptRow>,
 }
 
 impl PanelBody {
-    fn new(width: usize) -> Self {
+    fn new(width: usize, preview_rows: usize) -> Self {
         Self {
             width,
+            preview_rows,
             indent: 0,
             rows: Vec::new(),
         }
     }
 
-    fn shell(width: usize) -> Self {
-        Self::new(width)
+    fn shell(width: usize, preview_rows: usize) -> Self {
+        Self::new(width, preview_rows)
     }
 
     fn into_rows(self) -> Vec<TranscriptRow> {
@@ -754,13 +773,17 @@ impl PanelBody {
             return;
         }
         let width = self.width;
+        // Viewport-aware budget: the live tail claims at most a fifth of the
+        // pane (floor 8, ceiling 24). Print-time only — a block keeps this size
+        // in scrollback even after a resize (reactive-density spec §2).
+        let budget = self.preview_rows;
         let lines: Vec<&str> = content.lines().collect();
         let mut physical = 0usize;
         let mut take = 0usize;
         for raw in lines.iter().rev() {
             let rows =
                 wrapped_row_estimate(&truncate_chars(raw, MAX_TOOL_OUTPUT_LINE_CHARS), width);
-            if take > 0 && physical + rows > MAX_TOOL_OUTPUT_ROWS {
+            if take > 0 && physical + rows > budget {
                 break;
             }
             physical += rows;
@@ -769,7 +792,7 @@ impl PanelBody {
         let start = lines.len() - take;
         if start == 0 {
             for (offset, raw) in lines.iter().enumerate() {
-                let clamped = clamp_output_line(raw, width, MAX_TOOL_OUTPUT_ROWS);
+                let clamped = clamp_output_line(raw, width, budget);
                 self.output_line(&clamped, offset == 0);
             }
             return;
@@ -777,7 +800,7 @@ impl PanelBody {
         // The earlier-lines marker, then the most recent tail.
         self.hidden_lines_marker(start, true);
         for raw in &lines[start..] {
-            let clamped = clamp_output_line(raw, width, MAX_TOOL_OUTPUT_ROWS);
+            let clamped = clamp_output_line(raw, width, budget);
             self.output_line(&clamped, false);
         }
     }
@@ -853,7 +876,7 @@ mod tests {
     #[test]
     fn explore_body_is_one_row_summary_or_error() {
         let renderer = resolve(&call("grep", json!({ "pattern": "needle", "path": "src" })));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let done = renderer.body(
             &ctx,
             &call("grep", json!({ "pattern": "needle", "path": "src" })),
@@ -902,7 +925,7 @@ mod tests {
     fn shell_command_row_renders_timeout_as_right_aligned_metadata() {
         let args = json!({ "command": "echo hi", "timeout": 120 });
         let renderer = resolve(&call("bash", args.clone()));
-        let ctx = RenderCtx { width: 60 };
+        let ctx = RenderCtx::for_width(60);
         let rows = renderer.body(
             &ctx,
             &call("bash", args),
@@ -928,7 +951,7 @@ mod tests {
 
     #[test]
     fn shell_command_row_omits_timeout_when_none_or_zero() {
-        let ctx = RenderCtx { width: 60 };
+        let ctx = RenderCtx::for_width(60);
         for args in [
             json!({ "command": "echo hi" }),
             json!({ "command": "echo hi", "timeout": 0 }),
@@ -951,7 +974,7 @@ mod tests {
         let command = "echo this is a fairly long command line that fills the panel width";
         let args = json!({ "command": command, "timeout": 120 });
         let renderer = resolve(&call("bash", args.clone()));
-        let ctx = RenderCtx { width: 40 };
+        let ctx = RenderCtx::for_width(40);
         let rows = renderer.body(
             &ctx,
             &call("bash", args),
@@ -970,7 +993,7 @@ mod tests {
     fn shell_output_sanitizes_plain_tabs_carriage_returns_and_osc() {
         let args = json!({ "command": "cat Makefile" });
         let renderer = resolve(&call("bash", args.clone()));
-        let ctx = RenderCtx { width: 64 };
+        let ctx = RenderCtx::for_width(64);
         let rows = renderer.body(
             &ctx,
             &call("bash", args),
@@ -1022,7 +1045,7 @@ mod tests {
     fn shell_splits_and_command_into_prompt_and_continuation_rows() {
         let args = json!({ "command": "cd \"/abs/path\" && cargo fmt" });
         let renderer = resolve(&call("bash", args.clone()));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let rows = renderer.body(
             &ctx,
             &call("bash", args),
@@ -1044,7 +1067,7 @@ mod tests {
         let command = "cd \"/abs\" && python3 - <<'PY'\nfrom pathlib import Path\np = Path('x')\nPY\ncargo fmt";
         let args = json!({ "command": command });
         let renderer = resolve(&call("bash", args.clone()));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let rows = renderer.body(
             &ctx,
             &call("bash", args),
@@ -1080,7 +1103,7 @@ mod tests {
         command.push_str("PY");
         let args = json!({ "command": command });
         let renderer = resolve(&call("bash", args.clone()));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let rows = renderer.body(
             &ctx,
             &call("bash", args),
@@ -1110,7 +1133,7 @@ mod tests {
         use crate::ui::hyperlink;
         let args = json!({ "command": "cargo build" });
         let renderer = resolve(&call("bash", args.clone()));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let rows = renderer.body(
             &ctx,
             &call("bash", args),
@@ -1193,7 +1216,7 @@ mod tests {
         // existing machinery already strips it rather than double-stripping.
         use crate::ui::hyperlink;
         let renderer = resolve(&call("bash", json!({ "command": "echo" })));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let forged = format!(
             "pre{}pwn{}post",
             hyperlink::open_marker("https://evil.example/"),
@@ -1269,7 +1292,7 @@ mod tests {
         let args = json!({ "command": command, "timeout": 120 });
         let renderer = resolve(&call("bash", args.clone()));
         let rows = renderer.body(
-            &RenderCtx { width: 120 },
+            &RenderCtx::for_width(120),
             &call("bash", args),
             &ToolOutcome::Done {
                 content: "ok",
@@ -1312,7 +1335,7 @@ mod tests {
     #[test]
     fn shell_running_skips_no_output_when_stream_empty() {
         let renderer = resolve(&call("bash", json!({ "command": "echo hi" })));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let rows = renderer.body(
             &ctx,
             &call("bash", json!({ "command": "echo hi" })),
@@ -1325,7 +1348,7 @@ mod tests {
     #[test]
     fn generic_cancelled_has_no_body_rows() {
         let renderer = resolve(&call("zonk", json!({})));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let rows = renderer.body(
             &ctx,
             &call("zonk", json!({})),
@@ -1337,7 +1360,7 @@ mod tests {
     #[test]
     fn shell_error_renders_streamed_tail_then_error_line() {
         let renderer = resolve(&call("bash", json!({ "command": "make" })));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let rows = renderer.body(
             &ctx,
             &call("bash", json!({ "command": "make" })),
@@ -1371,7 +1394,7 @@ mod tests {
         );
         assert_eq!(fields[0].plain, "EXIT 0");
         let body = renderer.body(
-            &RenderCtx { width: 80 },
+            &RenderCtx::for_width(80),
             &call("bash", json!({ "command": "echo hi" })),
             &ToolOutcome::Done {
                 content: "hi",
@@ -1415,7 +1438,7 @@ mod tests {
                 )
                 .is_empty()
         );
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let rows = renderer.body(
             &ctx,
             &call("bash", json!({ "command": "sleep 30" })),
@@ -1436,7 +1459,7 @@ mod tests {
         // The exit-status row is SHELL-specific; EDIT/generic panels never show
         // a fabricated exit code.
         let renderer = resolve(&call("zonk", json!({})));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let rows = renderer.body(
             &ctx,
             &call("zonk", json!({})),
@@ -1461,7 +1484,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let renderer = resolve(&call("bash", json!({ "command": "seq 200" })));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let rows = renderer.body(
             &ctx,
             &call("bash", json!({ "command": "seq 200" })),
@@ -1499,7 +1522,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let renderer = resolve(&call("zonk", json!({})));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let rows = renderer.body(
             &ctx,
             &call("zonk", json!({})),
@@ -1522,7 +1545,7 @@ mod tests {
     #[test]
     fn output_preserves_ansi_color_spans() {
         let renderer = resolve(&call("zonk", json!({})));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let rows = renderer.body(
             &ctx,
             &call("zonk", json!({})),
@@ -1568,7 +1591,7 @@ mod tests {
         // Silence the panic backtrace the default hook would print.
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let ctx = RenderCtx { width: 80 };
+        let ctx = RenderCtx::for_width(80);
         let c = call("anything", json!({}));
         let rows = render_body(
             &FailingRenderer,
