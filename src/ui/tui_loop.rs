@@ -5076,4 +5076,505 @@ mod tests {
         )));
         assert!(!is_modal_cancel(&key(KeyCode::Enter)));
     }
+
+    // --- faceplate stash / reopen-before-draw, dialog-guard round trips, and
+    // slash routing (spec §7 criteria 7, 12, 17–18, 21). The async loop needs a
+    // live TTY, so these drive the production functions the loop composes:
+    // `leaves_faceplate_for_guard` (the stash decision), `refresh_settings_panel`
+    // (the reopen), `apply_action` (the advisory), and the `open_settings_expanded`
+    // / `model_command` slash delegates. ---
+
+    use crate::mimir::selection::{ProviderId, ReasoningEffort};
+
+    fn null_selection() -> ModelSelection {
+        ModelSelection {
+            provider: ProviderId::OpenAiCodex,
+            model: "gpt-5.5".to_string(),
+            base_url: "https://example".to_string(),
+            reasoning: None,
+            cache_retention: crate::mimir::selection::PromptCacheRetention::Short,
+            context_management: crate::mimir::selection::ContextManagement::default(),
+            retry_policy: crate::mimir::retry::RetryPolicy::default(),
+            open_ai_compatible: crate::mimir::selection::OpenAiCompatibleConfig::default(),
+        }
+    }
+
+    /// An in-memory harness carrying `chars/4` estimated context tokens, so the
+    /// large-context switch advisory can be tripped deterministically.
+    fn harness_with_context(
+        chars: usize,
+        budget: Option<u64>,
+    ) -> (Harness<NullChat>, crate::tools::test_support::TestDir) {
+        use crate::nexus::{Agent, Message};
+        let dir = crate::tools::test_support::temp_dir();
+        let messages = vec![Message::user(&"x".repeat(chars))];
+        let agent = Agent::resumed(NullChat, crate::tools::built_in_tools(), messages);
+        let harness = crate::wayland::Harness::new(
+            agent,
+            dir.path.clone(),
+            crate::tools::ToolState::new(),
+            None,
+            budget,
+        );
+        (harness, dir)
+    }
+
+    fn model_choice(
+        provider: ProviderId,
+        model_id: &str,
+        is_current: bool,
+        is_default: bool,
+    ) -> settings_menu::ModelChoice {
+        let qualified = format!("{}/{}", provider.as_str(), model_id);
+        settings_menu::ModelChoice {
+            display: crate::mimir::model_catalog::display_name(&qualified),
+            provider_label: provider.display_name().to_string(),
+            levels: crate::mimir::model_capabilities::level_options(provider, model_id)
+                .iter()
+                .map(|option| (option.level, option.label))
+                .collect(),
+            provider,
+            model_id: model_id.to_string(),
+            is_current,
+            is_default,
+            qualified,
+        }
+    }
+
+    /// A hand-built faceplate snapshot with a real catalog + providers, so the
+    /// hatch-content assertions do not depend on the runner's auth store.
+    fn faceplate_snapshot() -> settings_menu::Snapshot {
+        settings_menu::Snapshot {
+            default_model: "openai-codex/gpt-5.5".to_string(),
+            reasoning_levels: vec![
+                (ReasoningEffort::Low, "low"),
+                (ReasoningEffort::Medium, "medium"),
+                (ReasoningEffort::High, "high"),
+            ],
+            reasoning: ReasoningEffort::Medium,
+            catalog: vec![
+                model_choice(ProviderId::OpenAiCodex, "gpt-5.5", true, true),
+                model_choice(ProviderId::Anthropic, "claude-sonnet-4-6", false, false),
+            ],
+            scope_candidates: vec![
+                settings_menu::ScopeChoice {
+                    qualified: "openai-codex/gpt-5.5".to_string(),
+                    provider_label: "OpenAI Codex".to_string(),
+                },
+                settings_menu::ScopeChoice {
+                    qualified: "anthropic/claude-sonnet-4-6".to_string(),
+                    provider_label: "Anthropic".to_string(),
+                },
+            ],
+            scope_enabled: None,
+            scope_persisted: None,
+            providers: vec![
+                settings_menu::ProviderStatus {
+                    id: "openai-codex".to_string(),
+                    name: "OpenAI Codex".to_string(),
+                    badge: "subscription".to_string(),
+                    oauth_capable: true,
+                    api_key_capable: false,
+                    credentialed: true,
+                },
+                settings_menu::ProviderStatus {
+                    id: "anthropic".to_string(),
+                    name: "Anthropic".to_string(),
+                    badge: "\u{2014}".to_string(),
+                    oauth_capable: true,
+                    api_key_capable: true,
+                    credentialed: false,
+                },
+            ],
+            policy: settings_menu::PolicySnapshot::default(),
+            default_approval: "auto".to_string(),
+            skip_permissions: false,
+            context_token_budget: 232_000,
+            compaction_summarizer: "subagent".to_string(),
+            microcompaction: true,
+            microcompaction_watermark: 32_000,
+            prompt_cache_retention: "short".to_string(),
+            verify_command: None,
+            verify_max_attempts: 3,
+            theme: "terminal".to_string(),
+            alt_screen: "auto".to_string(),
+            scroll_speed: 3,
+            reduced_motion: false,
+            worktree_root: None,
+        }
+    }
+
+    fn flatten(lines: &[ratatui::text::Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // --- criterion 7: the stash is armed for exactly the guard handoffs ---
+    #[test]
+    fn guard_handoffs_arm_the_faceplate_stash_but_inline_refreshes_do_not() {
+        // The reopen-before-draw stash must be armed exactly for the three
+        // genuine dialog-guards' handoff actions. Inline refreshes (scope,
+        // effort, policy, settings, logout) never leave the faceplate, so they
+        // must not arm it — logout in particular refreshes in place (§2.5).
+        let guards = [
+            ModalAction::SelectModel {
+                id: "anthropic/claude-sonnet-4-6".to_string(),
+                effort: ReasoningEffort::Medium,
+                save_default: true,
+            },
+            ModalAction::ConfirmModelSwitch {
+                id: "anthropic/claude-sonnet-4-6".to_string(),
+                effort: ReasoningEffort::Medium,
+                save_default: true,
+                compact_first: false,
+            },
+            ModalAction::CycleModel { forward: true },
+            ModalAction::BeginLogin(ProviderId::Anthropic),
+            ModalAction::OpenApiKeyDialog("openai".to_string()),
+        ];
+        for action in &guards {
+            assert!(
+                leaves_faceplate_for_guard(action),
+                "{action:?} must stash the faceplate"
+            );
+        }
+        let inline = [
+            ModalAction::ApplyScoped(None),
+            ModalAction::SaveScoped(None),
+            ModalAction::AdjustEffort(ReasoningEffort::High),
+            ModalAction::EditPolicy(crate::wayland::trust::ProjectPolicyEdit::GrantTool(
+                "write".to_string(),
+            )),
+            ModalAction::Logout("anthropic".to_string()),
+            ModalAction::ToggleSkipPermissions,
+        ];
+        for action in &inline {
+            assert!(
+                !leaves_faceplate_for_guard(action),
+                "{action:?} refreshes in place, not via the stash"
+            );
+        }
+    }
+
+    // --- criterion 7: no frame is ever drawn with the dock collapsed ---
+    #[test]
+    fn a_dialog_guard_round_trip_reopens_the_faceplate_before_any_frame() {
+        // Models run_modal_phase's draw ordering (~L2170–2185) over a real Screen
+        // and the production `refresh_settings_panel` reopen: the guard's own
+        // handler closes the panel (no draw in that window), then the loop reopens
+        // the faceplate BEFORE the next draw. Covers the API-key dialog and the
+        // large-context switch prompt; the login dialog is added with its draw fix.
+        let (mut harness, _dir) = harness_with_context(80_000, Some(40_000));
+        let build = |_s: &ModelSelection, _p: &str| Ok(NullChat);
+        let mut switch = ModelSwitch::new(null_selection(), "P".to_string(), &build, None);
+
+        // Mint a real large-context switch prompt to use as one guard.
+        let switch_prompt = match picker::apply_action(
+            ModalAction::SelectModel {
+                id: "anthropic/claude-sonnet-4-6".to_string(),
+                effort: ReasoningEffort::Medium,
+                save_default: false,
+            },
+            None,
+            &mut harness,
+            &mut switch,
+        ) {
+            ActionResult::Replace(modal, _) => *modal,
+            _ => panic!("expected the large-context switch prompt"),
+        };
+
+        let cases: Vec<(settings_menu::HatchTarget, Modal)> = vec![
+            (
+                settings_menu::HatchTarget::Login,
+                login::open_api_key_dialog("openai"),
+            ),
+            (settings_menu::HatchTarget::Model, switch_prompt),
+        ];
+
+        for (target, guard) in cases {
+            let mut screen = Screen::new();
+            // The faceplate is docked and drawn on the hatch (frame 0).
+            screen.open_modal(picker::open_settings_expanded(&harness, &switch, target));
+            let view = match &screen.modal {
+                Some(Modal::Settings(panel)) => panel.view(),
+                _ => panic!("faceplate front"),
+            };
+            let mut frames = vec![screen.modal.is_some()];
+            // A child-row verb hands off to the guard; the loop draws it.
+            screen.open_modal(guard);
+            frames.push(screen.modal.is_some());
+            // The guard resolves: its handler closes the modal (no draw here),
+            // then the loop reopens the faceplate before the next draw.
+            screen.close_modal();
+            screen.open_modal(picker::refresh_settings_panel(
+                view.clone(),
+                None,
+                &harness,
+                &switch,
+            ));
+            frames.push(screen.modal.is_some());
+            // Every drawn frame kept a modal — the dock never collapsed.
+            assert!(
+                frames.iter().all(|&present| present),
+                "{target:?}: a frame was drawn without the faceplate: {frames:?}"
+            );
+            // The faceplate came back, expanded, cursor held.
+            match &screen.modal {
+                Some(Modal::Settings(panel)) => {
+                    let back = panel.view();
+                    assert_eq!(
+                        back.expanded(),
+                        view.expanded(),
+                        "reopened expanded ({target:?})"
+                    );
+                    assert_eq!(back.cursor(), view.cursor(), "cursor held ({target:?})");
+                }
+                _ => panic!("faceplate reopened ({target:?})"),
+            }
+        }
+    }
+
+    // --- criterion 12: large-context select prompts, then re-homes the candidate ---
+    #[test]
+    fn a_large_context_switch_prompts_then_returns_to_the_same_candidate() {
+        let (mut harness, _dir) = harness_with_context(80_000, Some(40_000));
+        let build = |_s: &ModelSelection, _p: &str| Ok(NullChat);
+        let mut switch = ModelSwitch::new(null_selection(), "P".to_string(), &build, None);
+
+        // A real model change carrying a large context overlays the advisory.
+        match picker::apply_action(
+            ModalAction::SelectModel {
+                id: "anthropic/claude-sonnet-4-6".to_string(),
+                effort: ReasoningEffort::Medium,
+                save_default: false,
+            },
+            None,
+            &mut harness,
+            &mut switch,
+        ) {
+            ActionResult::Replace(modal, _) => {
+                assert!(
+                    matches!(*modal, Modal::SwitchContext(_)),
+                    "advisory overlays the prompt"
+                )
+            }
+            _ => panic!("large context must overlay the switch prompt"),
+        }
+
+        // Below the threshold the same switch resolves without the guard.
+        let (mut small, _small_dir) = harness_with_context(400, Some(40_000));
+        let mut small_switch = ModelSwitch::new(null_selection(), "P".to_string(), &build, None);
+        let resolved = picker::apply_action(
+            ModalAction::SelectModel {
+                id: "anthropic/claude-sonnet-4-6".to_string(),
+                effort: ReasoningEffort::Medium,
+                save_default: false,
+            },
+            None,
+            &mut small,
+            &mut small_switch,
+        );
+        assert!(
+            !matches!(resolved, ActionResult::Replace(modal, _) if matches!(*modal, Modal::SwitchContext(_))),
+            "no advisory below the threshold"
+        );
+
+        // The stashed view is the single source of truth for the return: neither
+        // a confirm nor a cancel touches it, so both re-home the same candidate.
+        let mut panel = settings_menu::SettingsPanel::with_expanded(
+            faceplate_snapshot(),
+            settings_menu::HatchTarget::Model,
+        );
+        panel.handle_key(ModalKey::Down); // off the active row, onto the next candidate
+        let candidate = panel.view().cursor();
+        assert!(
+            matches!(candidate, settings_menu::PanelRow::ModelChild(_)),
+            "cursor on a candidate row"
+        );
+        let view = panel.view();
+        for resolution in ["confirm", "cancel"] {
+            let mut back = settings_menu::SettingsPanel::new(faceplate_snapshot());
+            back.restore(view.clone());
+            assert_eq!(
+                back.view().expanded(),
+                Some(settings_menu::RowId::Model),
+                "{resolution}: returns expanded on the model hatch"
+            );
+            assert_eq!(
+                back.view().cursor(),
+                candidate,
+                "{resolution}: cursor held on the same candidate"
+            );
+        }
+    }
+
+    // --- criterion 17: a resolved login returns expanded, badge/count refreshed ---
+    #[test]
+    fn a_resolved_login_returns_to_the_provider_row_with_a_refreshed_badge() {
+        // The login/api-key dialog is a guard: on any resolution the loop reopens
+        // the providers hatch from a fresh snapshot with the cursor held. Modeled
+        // as the loop's refresh does it — a fresh panel from the post-login
+        // snapshot with the stashed view restored.
+        let panel = settings_menu::SettingsPanel::with_expanded(
+            faceplate_snapshot(),
+            settings_menu::HatchTarget::Login,
+        );
+        let view = panel.view();
+        let cursor = view.cursor();
+        assert_eq!(
+            cursor,
+            settings_menu::PanelRow::ProviderChild("anthropic".to_string()),
+            "login lands on the uncredentialed row"
+        );
+
+        // Cancel: the same snapshot, view restored — back on the row, expanded.
+        let mut cancelled = settings_menu::SettingsPanel::new(faceplate_snapshot());
+        cancelled.restore(view.clone());
+        assert_eq!(
+            cancelled.view().expanded(),
+            Some(settings_menu::RowId::Providers)
+        );
+        assert_eq!(cancelled.view().cursor(), cursor);
+
+        // Success: anthropic authenticates — badge → subscription, count 1 → 2 —
+        // and the cursor stays put across the refresh.
+        let mut snap = faceplate_snapshot();
+        snap.providers[1].credentialed = true;
+        snap.providers[1].badge = "subscription".to_string();
+        let mut back = settings_menu::SettingsPanel::new(snap);
+        back.restore(view);
+        assert_eq!(
+            back.view().cursor(),
+            cursor,
+            "cursor held across the refresh"
+        );
+        let rendered = flatten(&back.render_budgeted(100, 80));
+        assert!(
+            rendered.contains("2 connected"),
+            "header count refreshed:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("subscription"),
+            "badge refreshed:\n{rendered}"
+        );
+    }
+
+    // --- criterion 18: logout drops the row, decrements the count, refreshes catalog ---
+    #[test]
+    fn logout_drops_the_row_decrements_the_header_and_refreshes_the_catalog() {
+        // Logout is inline (not a guard, asserted above): the loop captures the
+        // view and rebuilds from the post-logout snapshot. The row drops to ○ · —,
+        // the header count decrements, and the ENGINE catalog shrinks (the logged
+        // out provider's models leave it). Cursor held.
+        let mut before = faceplate_snapshot();
+        before.providers[1].credentialed = true;
+        before.providers[1].badge = "subscription".to_string();
+        before.catalog.push(model_choice(
+            ProviderId::Anthropic,
+            "claude-opus-4-8",
+            false,
+            false,
+        ));
+        let panel =
+            settings_menu::SettingsPanel::with_expanded(before, settings_menu::HatchTarget::Logout);
+        let view = panel.view();
+        let cursor = view.cursor();
+        assert_eq!(
+            cursor,
+            settings_menu::PanelRow::ProviderChild("openai-codex".to_string()),
+            "logout lands on the first credentialed row"
+        );
+
+        // openai-codex logs out: uncredentialed, its model gone from the catalog.
+        let mut after = faceplate_snapshot();
+        after.providers[0].credentialed = false;
+        after.providers[0].badge = "\u{2014}".to_string();
+        after.providers[1].credentialed = true;
+        after.providers[1].badge = "subscription".to_string();
+        after.catalog = vec![model_choice(
+            ProviderId::Anthropic,
+            "claude-sonnet-4-6",
+            true,
+            true,
+        )];
+        let mut back = settings_menu::SettingsPanel::new(after.clone());
+        back.restore(view);
+        assert_eq!(
+            back.view().cursor(),
+            cursor,
+            "cursor held across the refresh"
+        );
+        let rendered = flatten(&back.render_budgeted(100, 80));
+        assert!(
+            rendered.contains("1 connected"),
+            "count decremented:\n{rendered}"
+        );
+        assert!(
+            rendered.contains('\u{2014}'),
+            "logged-out row dropped to —:\n{rendered}"
+        );
+
+        // The ENGINE catalog refreshed — gpt-5.5 left with its provider.
+        let catalog_view = flatten(
+            &settings_menu::SettingsPanel::with_expanded(after, settings_menu::HatchTarget::Model)
+                .render_budgeted(100, 80),
+        );
+        assert!(
+            !catalog_view.contains("GPT 5.5"),
+            "the logged-out provider's model left the catalog:\n{catalog_view}"
+        );
+    }
+
+    // --- criterion 21: slash entries open the faceplate on the named hatch ---
+    #[test]
+    fn slash_entries_open_the_faceplate_on_the_named_hatch() {
+        // route_command needs a live TuiUi, so it delegates the hatch mapping to
+        // `open_settings_expanded` (per HatchTarget) and `model_command` (bare
+        // /model / /reasoning). The expansion each target opens is auth-independent
+        // (the cursor placement and the typed fast path are pinned in the
+        // settings_menu / picker unit tests).
+        let (harness, _dir) = harness_with_context(400, None);
+        let build = |_s: &ModelSelection, _p: &str| Ok(NullChat);
+        let switch = ModelSwitch::new(null_selection(), "P".to_string(), &build, None);
+
+        for (target, want) in [
+            (
+                settings_menu::HatchTarget::Model,
+                settings_menu::RowId::Model,
+            ),
+            (
+                settings_menu::HatchTarget::Scope,
+                settings_menu::RowId::Scope,
+            ),
+            (
+                settings_menu::HatchTarget::Permissions,
+                settings_menu::RowId::Permissions,
+            ),
+            (
+                settings_menu::HatchTarget::Login,
+                settings_menu::RowId::Providers,
+            ),
+            (
+                settings_menu::HatchTarget::Logout,
+                settings_menu::RowId::Providers,
+            ),
+        ] {
+            match picker::open_settings_expanded(&harness, &switch, target) {
+                Modal::Settings(panel) => assert_eq!(
+                    panel.view().expanded(),
+                    Some(want),
+                    "{target:?} opens its hatch"
+                ),
+                _ => panic!("expected the faceplate for {target:?}"),
+            }
+        }
+    }
 }

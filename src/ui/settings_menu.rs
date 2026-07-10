@@ -154,6 +154,14 @@ impl PanelView {
     pub(crate) fn cursor(&self) -> PanelRow {
         self.cursor.clone()
     }
+
+    /// The hatch that was open when this view was captured. Inspection peer of
+    /// [`Self::cursor`], used by the loop tests to assert which hatch a slash
+    /// entry pre-expanded and that a guard round trip returns expanded.
+    #[cfg(test)]
+    pub(crate) fn expanded(&self) -> Option<RowId> {
+        self.expanded
+    }
 }
 
 /// A silkscreened section: dim uppercase title + its rows, in panel order.
