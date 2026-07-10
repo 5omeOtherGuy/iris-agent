@@ -135,6 +135,117 @@ pub fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
     actual_hex.eq_ignore_ascii_case(expected)
 }
 
+/// What `iris update` should do after comparing the latest release to the
+/// running binary. Computed by [`decide_update`] and matched on by the
+/// self-replace path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateAction {
+    /// The release is a strictly-newer stable version: download and replace.
+    Update,
+    /// The release equals the running version: nothing to do.
+    UpToDate,
+    /// The running binary is newer than the latest release (e.g. a local dev or
+    /// prerelease build): do nothing rather than downgrade.
+    Ahead,
+    /// The release must not be installed: it is a prerelease/draft, carries a
+    /// semver prerelease component, or either version could not be parsed.
+    /// `iris update` ships only stable releases to users, so it is skipped.
+    Skip,
+}
+
+/// Parse a release tag or package version as semver, tolerating a leading `v`
+/// (`v1.2.3` and `1.2.3` both parse). Returns `None` for anything that is not a
+/// valid semver version.
+#[allow(dead_code)]
+fn parse_semver(tag: &str) -> Option<semver::Version> {
+    semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag)).ok()
+}
+
+/// Decide whether to replace the running binary (`current`, this build's
+/// `CARGO_PKG_VERSION`) with the latest GitHub release (`tag`, plus its
+/// `prerelease`/`draft` flags).
+///
+/// The rules enforce "only ever install the latest *stable* release, and never
+/// downgrade", so a build we cut for testing is never pushed onto users:
+/// - a `prerelease`/`draft` release, or a tag carrying a semver prerelease
+///   component (e.g. `1.2.0-rc.1`), is [`UpdateAction::Skip`];
+/// - an unparsable `current` or `tag` is [`UpdateAction::Skip`] (refuse rather
+///   than risk a wrong or downgrade replacement);
+/// - otherwise compare by semver precedence: strictly-newer is
+///   [`UpdateAction::Update`], equal is [`UpdateAction::UpToDate`], and an older
+///   release than the running binary is [`UpdateAction::Ahead`] (no downgrade).
+#[allow(dead_code)]
+pub fn decide_update(current: &str, tag: &str, prerelease: bool, draft: bool) -> UpdateAction {
+    if prerelease || draft {
+        return UpdateAction::Skip;
+    }
+    let (Some(cur), Some(rel)) = (parse_semver(current), parse_semver(tag)) else {
+        return UpdateAction::Skip;
+    };
+    if !rel.pre.is_empty() {
+        return UpdateAction::Skip;
+    }
+    match rel.cmp(&cur) {
+        std::cmp::Ordering::Greater => UpdateAction::Update,
+        std::cmp::Ordering::Equal => UpdateAction::UpToDate,
+        std::cmp::Ordering::Less => UpdateAction::Ahead,
+    }
+}
+
+/// A GitHub release as returned by the releases API. Shared by both update
+/// paths: the self-replace path reads `assets`; the cargo-install fallback
+/// reads the version and prerelease/draft flags. Fields unused in a given build
+/// configuration are allowed dead.
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+pub struct Release {
+    pub tag_name: String,
+    // GitHub's `releases/latest` never returns prerelease/draft releases, but
+    // parse the flags anyway so `decide_update` can enforce "stable only" as an
+    // explicit invariant even under the loopback API override.
+    #[serde(default)]
+    pub prerelease: bool,
+    #[serde(default)]
+    pub draft: bool,
+    // Read only by the feature-gated self-replace path.
+    assets: Vec<Asset>,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct Asset {
+    name: String,
+    browser_download_url: String,
+}
+
+/// User-Agent sent to the GitHub API (GitHub requires one).
+const USER_AGENT: &str = concat!("iris-agent/", env!("CARGO_PKG_VERSION"));
+
+/// Query GitHub for the latest published release. `releases/latest` never
+/// returns a prerelease or draft, so the result is the latest *stable* release
+/// (and [`decide_update`] re-checks that). Compiled unconditionally because the
+/// cargo-install fallback (source builds, no `self-update` feature) also targets
+/// the latest release, not `main` — otherwise `iris update` would ship
+/// bleeding-edge/testing commits to source-build users.
+pub fn latest_release() -> anyhow::Result<Release> {
+    use anyhow::Context;
+    use std::time::Duration;
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(120))
+        .build()?;
+    let url = releases_api_url()?;
+    let release = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()?
+        .error_for_status()
+        .context("failed to query the latest release")?
+        .json()
+        .context("failed to parse the latest release metadata")?;
+    Ok(release)
+}
+
 #[cfg(feature = "self-update")]
 pub use imp::run;
 
@@ -145,25 +256,11 @@ mod imp {
 
     use anyhow::{Context, Result, anyhow, bail};
     use reqwest::blocking::Client;
-    use serde::Deserialize;
 
     use super::{
-        TARGET, asset_name, checksum_name, parse_expected_sha256, releases_api_url, sha256_matches,
+        Asset, TARGET, USER_AGENT, UpdateAction, asset_name, checksum_name, decide_update,
+        latest_release, parse_expected_sha256, sha256_matches,
     };
-
-    const USER_AGENT: &str = concat!("iris-agent/", env!("CARGO_PKG_VERSION"));
-
-    #[derive(Deserialize)]
-    struct Release {
-        tag_name: String,
-        assets: Vec<Asset>,
-    }
-
-    #[derive(Deserialize)]
-    struct Asset {
-        name: String,
-        browser_download_url: String,
-    }
 
     /// Download the latest release archive for this target, verify its SHA-256,
     /// extract the `iris` binary, and atomically replace the running executable.
@@ -177,7 +274,7 @@ mod imp {
             .timeout(Duration::from_secs(120))
             .build()?;
 
-        let releases_api = releases_api_url()?;
+        let release = latest_release()?;
         // When the releases API is redirected to a loopback mock (validation
         // only), constrain the asset download URLs to loopback too, so the
         // override cannot be used to pull the archive/checksum from a remote
@@ -185,19 +282,33 @@ mod imp {
         let override_active = std::env::var(super::RELEASES_API_ENV)
             .map(|v| !v.is_empty())
             .unwrap_or(false);
-        let release: Release = client
-            .get(&releases_api)
-            .header("Accept", "application/vnd.github+json")
-            .send()?
-            .error_for_status()
-            .context("failed to query the latest release")?
-            .json()
-            .context("failed to parse the latest release metadata")?;
 
-        let current = concat!("v", env!("CARGO_PKG_VERSION"));
-        if release.tag_name == current {
-            println!("Already on the latest version ({current}).");
-            return Ok(());
+        let current = env!("CARGO_PKG_VERSION");
+        match decide_update(
+            current,
+            &release.tag_name,
+            release.prerelease,
+            release.draft,
+        ) {
+            UpdateAction::UpToDate => {
+                println!("Already on the latest release (v{current}).");
+                return Ok(());
+            }
+            UpdateAction::Ahead => {
+                println!(
+                    "Running v{current}, newer than the latest release ({}); nothing to do.",
+                    release.tag_name
+                );
+                return Ok(());
+            }
+            UpdateAction::Skip => {
+                println!(
+                    "Latest release ({}) is not an installable stable release; iris update only installs stable releases.",
+                    release.tag_name
+                );
+                return Ok(());
+            }
+            UpdateAction::Update => {}
         }
 
         let archive_url = asset_url(&release.assets, &archive)
@@ -359,6 +470,69 @@ mod tests {
         assert_eq!(parse_expected_sha256("not-a-hash filename"), None);
         assert_eq!(parse_expected_sha256(&"a".repeat(63)), None);
         assert_eq!(parse_expected_sha256(&"g".repeat(64)), None);
+    }
+
+    #[test]
+    fn decide_update_installs_only_strictly_newer_stable_release() {
+        // Strictly newer stable release -> update; tolerate a leading `v` on
+        // either side.
+        assert_eq!(
+            decide_update("0.1.0", "v0.2.0", false, false),
+            UpdateAction::Update
+        );
+        assert_eq!(
+            decide_update("0.1.0", "0.1.1", false, false),
+            UpdateAction::Update
+        );
+        // Equal version -> already up to date.
+        assert_eq!(
+            decide_update("0.1.0", "v0.1.0", false, false),
+            UpdateAction::UpToDate
+        );
+    }
+
+    #[test]
+    fn decide_update_never_downgrades() {
+        // The running binary is newer than the latest release (a local/dev build
+        // or a prerelease build ahead of the stable line): do nothing.
+        assert_eq!(
+            decide_update("0.2.0", "v0.1.0", false, false),
+            UpdateAction::Ahead
+        );
+        // A dev prerelease build is still ahead of the older stable release, not
+        // downgraded onto it.
+        assert_eq!(
+            decide_update("0.2.0-dev", "v0.1.0", false, false),
+            UpdateAction::Ahead
+        );
+    }
+
+    #[test]
+    fn decide_update_refuses_prerelease_and_draft_and_unparsable() {
+        // Never ship a testing build to users, however the tag is flagged.
+        assert_eq!(
+            decide_update("0.1.0", "v0.2.0", true, false),
+            UpdateAction::Skip
+        );
+        assert_eq!(
+            decide_update("0.1.0", "v0.2.0", false, true),
+            UpdateAction::Skip
+        );
+        // A semver prerelease component marks a testing build even if the
+        // prerelease/draft flags are unset.
+        assert_eq!(
+            decide_update("0.1.0", "v0.2.0-rc.1", false, false),
+            UpdateAction::Skip
+        );
+        // Unparsable versions are refused rather than risking a wrong replace.
+        assert_eq!(
+            decide_update("0.1.0", "nightly", false, false),
+            UpdateAction::Skip
+        );
+        assert_eq!(
+            decide_update("not-semver", "v0.2.0", false, false),
+            UpdateAction::Skip
+        );
     }
 
     #[test]

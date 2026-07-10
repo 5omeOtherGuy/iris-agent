@@ -1123,21 +1123,25 @@ const COMMAND_NAME: &str = "iris";
 const UPDATE_REPO: &str = "https://github.com/5omeOtherGuy/iris-agent.git";
 const UPDATE_PACKAGE: &str = "iris-agent";
 const CARGO_TARGET_DIR_ENV: &str = "CARGO_TARGET_DIR";
-const UPDATE_ARGS: &[&str] = &[
-    "install",
-    "--git",
-    UPDATE_REPO,
-    UPDATE_PACKAGE,
-    "--locked",
-    "--force",
-];
-
 fn command_name() -> &'static str {
     COMMAND_NAME
 }
 
-fn update_args() -> &'static [&'static str] {
-    UPDATE_ARGS
+/// Cargo args to install a specific release `tag` from the git repo. The tag is
+/// pinned with `--tag` so the source-build fallback installs the latest
+/// *release*, never bleeding-edge `main` — `iris update` must not ship testing
+/// commits to users (see `update_via_cargo`).
+fn update_args(tag: &str) -> [String; 8] {
+    [
+        "install".to_owned(),
+        "--git".to_owned(),
+        UPDATE_REPO.to_owned(),
+        UPDATE_PACKAGE.to_owned(),
+        "--tag".to_owned(),
+        tag.to_owned(),
+        "--locked".to_owned(),
+        "--force".to_owned(),
+    ]
 }
 
 fn update_agent() -> Result<()> {
@@ -1161,19 +1165,55 @@ fn update_self_replace() -> Result<()> {
 }
 
 fn update_via_cargo() -> Result<()> {
-    println!("Updating Iris from {UPDATE_REPO} ...");
-    let status = update_command()
-        .status()
-        .context("failed to run cargo; install Rust/Cargo or update with cargo install manually")?;
-    if !status.success() {
-        bail!("cargo install failed with {status}");
+    // Source builds have no prebuilt to self-replace, but `iris update` must
+    // still track the latest *stable release*, not `main`. Resolve the latest
+    // release and gate on semver so we never downgrade or install a
+    // prerelease/testing build, then `cargo install --tag <release>`.
+    let current = env!("CARGO_PKG_VERSION");
+    let release = selfupdate::latest_release()?;
+    match selfupdate::decide_update(
+        current,
+        &release.tag_name,
+        release.prerelease,
+        release.draft,
+    ) {
+        selfupdate::UpdateAction::UpToDate => {
+            println!("Already on the latest release (v{current}).");
+            Ok(())
+        }
+        selfupdate::UpdateAction::Ahead => {
+            println!(
+                "Running v{current}, newer than the latest release ({}); nothing to do.",
+                release.tag_name
+            );
+            Ok(())
+        }
+        selfupdate::UpdateAction::Skip => {
+            println!(
+                "Latest release ({}) is not an installable stable release; iris update only installs stable releases.",
+                release.tag_name
+            );
+            Ok(())
+        }
+        selfupdate::UpdateAction::Update => {
+            println!(
+                "Updating Iris to {} from {UPDATE_REPO} ...",
+                release.tag_name
+            );
+            let status = update_command(&release.tag_name).status().context(
+                "failed to run cargo; install Rust/Cargo or update with cargo install manually",
+            )?;
+            if !status.success() {
+                bail!("cargo install failed with {status}");
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
-fn update_command() -> Command {
+fn update_command(tag: &str) -> Command {
     let mut command = Command::new("cargo");
-    command.args(update_args());
+    command.args(update_args(tag));
     // `cargo install --git` can incorrectly reuse a stale binary when pointed at
     // a shared `CARGO_TARGET_DIR` and the git checkout changes without a version
     // bump. `iris update` must install the fetched revision, so ignore inherited
@@ -1554,19 +1594,23 @@ mod tests {
     }
 
     #[test]
-    fn update_command_installs_locked_remote_with_force() {
+    fn update_command_installs_pinned_release_tag_locked_with_force() {
         assert_eq!(
             UPDATE_REPO,
             "https://github.com/5omeOtherGuy/iris-agent.git"
         );
         assert_eq!(UPDATE_PACKAGE, "iris-agent");
+        // The cargo fallback pins the release tag with `--tag` so it installs the
+        // latest release, never `main`.
         assert_eq!(
-            update_args(),
-            &[
+            update_args("v1.2.3"),
+            [
                 "install",
                 "--git",
                 UPDATE_REPO,
                 UPDATE_PACKAGE,
+                "--tag",
+                "v1.2.3",
                 "--locked",
                 "--force"
             ]
@@ -1575,7 +1619,7 @@ mod tests {
 
     #[test]
     fn update_command_removes_inherited_cargo_target_dir() {
-        let command = update_command();
+        let command = update_command("v1.2.3");
         assert!(
             command
                 .get_envs()

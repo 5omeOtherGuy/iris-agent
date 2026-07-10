@@ -1253,6 +1253,7 @@ dependencies = [
  "regex",
  "reqwest",
  "self-replace",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml_ng",
