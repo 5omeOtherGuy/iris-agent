@@ -598,6 +598,52 @@ impl Settings {
         }
     }
 
+    pub(crate) fn compaction_worker_config(
+        &self,
+    ) -> Result<crate::wayland::CompactionWorkerConfig> {
+        let compaction = self.compaction.as_ref();
+        let worker = compaction.and_then(|value| value.worker.as_ref());
+        let input = match worker.and_then(|value| value.input.as_deref()) {
+            Some("transcript") | None => crate::wayland::CompactionWorkerInput::Transcript,
+            Some("investigator") => crate::wayland::CompactionWorkerInput::Investigator,
+            Some(_) => bail!("compaction.worker.input must be transcript|investigator"),
+        };
+        let max_tool_roundtrips = worker
+            .and_then(|value| value.max_tool_roundtrips)
+            .unwrap_or(crate::wayland::SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS);
+        if max_tool_roundtrips == 0 {
+            bail!("compaction.worker.maxToolRoundtrips must be greater than zero");
+        }
+        let timeout_ms = worker.and_then(|value| value.timeout_ms).unwrap_or(120_000);
+        if timeout_ms == 0 {
+            bail!("compaction.worker.timeoutMs must be greater than zero");
+        }
+        let instructions = compaction
+            .and_then(|value| value.instructions.as_deref())
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .take(crate::wayland::MAX_COMPACTION_INSTRUCTIONS_CHARS)
+            .collect();
+        Ok(crate::wayland::CompactionWorkerConfig {
+            input,
+            max_tool_roundtrips,
+            timeout: std::time::Duration::from_millis(timeout_ms),
+            instructions,
+        })
+    }
+
+    pub(crate) fn compaction_worker_model(&self) -> Option<&str> {
+        self.compaction
+            .as_ref()?
+            .worker
+            .as_ref()?
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
     /// Whether opt-in microcompaction is enabled (ADR-0048, #378). Default off
     /// (absent/false), so a session folds spent tool results only when the user
     /// (or a project file) turns it on. The harness reads this once at startup;
@@ -1601,13 +1647,24 @@ mod tests {
         );
         assert!(!trigger.enabled);
         assert_eq!(trigger.keep_recent_tokens, 12_000);
-        let block = merged.compaction.unwrap();
+        let block = merged.compaction.as_ref().unwrap();
         assert_eq!(
-            block.worker.unwrap().model.as_deref(),
+            block.worker.as_ref().unwrap().model.as_deref(),
             Some("anthropic/claude-haiku-4-5"),
             "project config cannot redirect worker traffic"
         );
         assert_eq!(block.provider_native.as_deref(), Some("auto"));
+
+        let worker = merged.compaction_worker_config().unwrap();
+        assert_eq!(
+            worker.input,
+            crate::wayland::CompactionWorkerInput::Transcript
+        );
+        assert_eq!(worker.timeout, std::time::Duration::from_millis(1_000));
+        assert_eq!(
+            merged.compaction_worker_model(),
+            Some("anthropic/claude-haiku-4-5")
+        );
 
         let invalid = Settings {
             compaction: Some(CompactionSettings {
@@ -1631,6 +1688,36 @@ mod tests {
         };
         let error = unbounded_wait.compaction_trigger().unwrap_err().to_string();
         assert!(error.contains("at most 120000"), "{error}");
+    }
+
+    #[test]
+    fn compaction_worker_defaults_to_transcript_and_validates_input() {
+        let defaults = Settings::default().compaction_worker_config().unwrap();
+        assert_eq!(
+            defaults.input,
+            crate::wayland::CompactionWorkerInput::Transcript
+        );
+        assert_eq!(defaults.max_tool_roundtrips, 4);
+        assert_eq!(defaults.timeout, std::time::Duration::from_millis(120_000));
+        assert!(defaults.instructions.is_empty());
+
+        let invalid = Settings {
+            compaction: Some(CompactionSettings {
+                worker: Some(CompactionWorkerSettings {
+                    input: Some("opaque".to_string()),
+                    ..CompactionWorkerSettings::default()
+                }),
+                ..CompactionSettings::default()
+            }),
+            ..Settings::default()
+        };
+        assert!(
+            invalid
+                .compaction_worker_config()
+                .unwrap_err()
+                .to_string()
+                .contains("transcript|investigator")
+        );
     }
 
     #[test]

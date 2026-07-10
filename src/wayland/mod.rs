@@ -56,8 +56,12 @@ use crate::session::{
 };
 use crate::tools::ToolState;
 use crate::tools::recall;
-pub(crate) use compaction::SummarizerKind;
+use compaction::run_compaction_worker;
 use compaction::*;
+pub(crate) use compaction::{
+    CompactionWorkerConfig, CompactionWorkerInput, MAX_COMPACTION_INSTRUCTIONS_CHARS,
+    SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS, SummarizerKind,
+};
 use trigger::*;
 
 /// Read-only [`SessionSpanReader`] over a SINGLE session transcript, for the
@@ -413,6 +417,10 @@ impl<P: ChatProvider> Harness<P> {
     /// builder and any model/auth settings.
     pub(crate) fn set_compaction_summarizer_factory(&mut self, factory: SummarizerFactory) {
         self.compaction.summarizer_factory = Some(factory);
+    }
+
+    pub(crate) fn set_compaction_worker(&mut self, worker: CompactionWorkerConfig) {
+        self.compaction.worker = worker;
     }
 
     /// Enable or disable opt-in microcompaction (ADR-0048, #378). Installed once
@@ -1801,10 +1809,20 @@ impl<P: ChatProvider> Harness<P> {
     /// [`maybe_auto_compact`](Self::maybe_auto_compact) it needs no budget and
     /// reports why nothing happened instead of silently no-oping, because the
     /// user asked.
+    #[cfg(test)]
     pub(crate) async fn compact_now(
         &mut self,
         obs: &dyn AgentObserver,
         token: &CancellationToken,
+    ) -> Result<()> {
+        self.compact_now_with_focus(obs, token, None).await
+    }
+
+    pub(crate) async fn compact_now_with_focus(
+        &mut self,
+        obs: &dyn AgentObserver,
+        token: &CancellationToken,
+        focus: Option<&str>,
     ) -> Result<()> {
         if self.compaction.session.is_none() {
             return obs.on_event(AgentEvent::Notice(
@@ -1830,6 +1848,76 @@ impl<P: ChatProvider> Harness<P> {
                     .to_string(),
             ));
         };
+        let model_backed = self.compaction.summarizer != SummarizerKind::Excerpts
+            && self.compaction.summarizer_factory.is_some();
+        if model_backed {
+            if self.compaction.background.is_none() {
+                let original_instructions = self.compaction.worker.instructions.clone();
+                if let Some(focus) = focus.map(str::trim).filter(|value| !value.is_empty()) {
+                    if !self.compaction.worker.instructions.is_empty() {
+                        self.compaction.worker.instructions.push('\n');
+                    }
+                    self.compaction
+                        .worker
+                        .instructions
+                        .push_str("Manual focus: ");
+                    self.compaction.worker.instructions.push_str(focus);
+                    self.compaction.worker.instructions = self
+                        .compaction
+                        .worker
+                        .instructions
+                        .chars()
+                        .take(MAX_COMPACTION_INSTRUCTIONS_CHARS)
+                        .collect();
+                }
+                let started =
+                    self.compaction
+                        .start_background(&messages, plan, &self.workspace, obs);
+                self.compaction.worker.instructions = original_instructions;
+                started?;
+            }
+            let covered = self
+                .compaction
+                .background
+                .as_ref()
+                .map(|job| (job.covered_messages, job.original_tokens));
+            loop {
+                if token.is_cancelled() {
+                    return obs.on_event(AgentEvent::Notice(
+                        "compaction cancelled; the background summary will remain available."
+                            .to_string(),
+                    ));
+                }
+                let current = self.agent.messages().to_vec();
+                let task_state = self.compaction_task_state();
+                let cx = ApplyContext {
+                    workspace: &self.workspace,
+                    output_store: self.output_store.as_ref(),
+                    task_state: task_state.as_ref(),
+                    observer: obs,
+                };
+                if let Some(replacement) =
+                    self.compaction.drain_background_at_boundary(&current, cx)?
+                {
+                    let after = context_tokens(&replacement);
+                    self.agent.replace_messages(replacement);
+                    let (covered, original) = covered.unwrap_or_default();
+                    return obs.on_event(AgentEvent::Notice(format!(
+                        "compacted {covered} earlier message(s): ~{original} tokens replaced; context is now ~{after} tokens."
+                    )));
+                }
+                if self.compaction.background.is_none() {
+                    return obs.on_event(AgentEvent::Notice(
+                        "compaction worker finished without an applicable summary.".to_string(),
+                    ));
+                }
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => continue,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
+            }
+        }
         let Some(outcome) = self.compact_range(&messages, plan, obs, token).await? else {
             return obs.on_event(AgentEvent::Notice("compaction cancelled.".to_string()));
         };
@@ -2047,9 +2135,9 @@ impl<P: ChatProvider> Harness<P> {
         self.compaction.next_job_seq = self.compaction.next_job_seq.saturating_add(1);
         let token = CancellationToken::new();
         let worker_token = token.clone();
-        let prompt = summary_worker_prompt(&covered);
         let workspace = self.workspace.clone();
         let mode = self.compaction.summarizer;
+        let worker = self.compaction.worker.clone();
         let origin = match mode {
             SummarizerKind::Subagent => CompactionOrigin::Subagent,
             SummarizerKind::Provider => CompactionOrigin::Provider,
@@ -2059,14 +2147,8 @@ impl<P: ChatProvider> Harness<P> {
         thread::Builder::new()
             .name(format!("iris-{job_id}"))
             .spawn(move || {
-                let result = run_background_summary_worker(
-                    factory,
-                    workspace,
-                    prompt,
-                    mode,
-                    worker_token,
-                    covered_messages,
-                );
+                let result =
+                    run_compaction_worker(factory, workspace, covered, worker, mode, worker_token);
                 let _ = tx.send(result);
             })?;
         let job = BackgroundCompaction {
@@ -2174,6 +2256,7 @@ impl<P: ChatProvider> Harness<P> {
                         self.workspace.clone(),
                         summary_worker_prompt(&messages[plan.start..plan.end]),
                         token,
+                        SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS,
                     )
                     .await
                     {
@@ -2188,6 +2271,7 @@ impl<P: ChatProvider> Harness<P> {
                                     text: framed,
                                     origin: CompactionOrigin::Subagent,
                                     worker_usage,
+                                    instructions: None,
                                 });
                             }
                             tracing::warn!(
@@ -2244,6 +2328,7 @@ impl<P: ChatProvider> Harness<P> {
                             text: framed,
                             origin: CompactionOrigin::Provider,
                             worker_usage,
+                            instructions: None,
                         });
                     }
                     tracing::warn!(

@@ -1455,7 +1455,10 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    `ContextGovernor` seam: ready summaries and hard-tier deterministic relief
    can apply inside long tool loops, steering injects after the swap, governor
    failures never fail the user turn, and active job ranges freeze overlapping
-   folds.
+   folds. Slice 4 makes verbatim transcript input the worker default, adds
+   bounded overflow shrink-retry and global-only dedicated worker routing,
+   threads cancellation through both worker routes, and unifies manual
+   `/compact [focus]` with the one-slot pipeline.
 7. Prebuilt-binary distribution ([#199](https://github.com/5omeOtherGuy/iris-agent/issues/199),
    [#233](https://github.com/5omeOtherGuy/iris-agent/issues/233)) is wired and now
    validated locally ([#252](https://github.com/5omeOtherGuy/iris-agent/issues/252)):

@@ -7,13 +7,15 @@
 
 use super::trigger::{DEFAULT_SUMMARY_RESERVE, PressureTracker, TriggerLadder, TriggerThresholds};
 use super::*;
+use crate::nexus::CompletionReason;
 
 /// Maximum characters in an auto-compaction summary.
 pub(super) const MAX_SUMMARY_CHARS: usize = 4_000;
 pub(super) const MAX_EXCERPT_CHARS: usize = 160;
 pub(super) const MANUAL_COMPACT_KEEP_TOKENS: u64 = 1_000;
-pub(super) const SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS: usize = 4;
+pub(crate) const SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS: usize = 4;
 pub(super) const MAX_SUMMARY_WORKER_MESSAGE_CHARS: usize = 4_000;
+pub(crate) const MAX_COMPACTION_INSTRUCTIONS_CHARS: usize = 4_000;
 
 pub(super) const SUMMARY_PROMPT: &str = "Summarize this coding session so another model can take over \
 seamlessly. Reply with only the summary, no preamble. Use exactly these sections: Goal, State, \
@@ -31,6 +33,32 @@ pub(crate) enum SummarizerKind {
     Subagent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum CompactionWorkerInput {
+    #[default]
+    Transcript,
+    Investigator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionWorkerConfig {
+    pub(crate) input: CompactionWorkerInput,
+    pub(crate) max_tool_roundtrips: usize,
+    pub(crate) timeout: std::time::Duration,
+    pub(crate) instructions: String,
+}
+
+impl Default for CompactionWorkerConfig {
+    fn default() -> Self {
+        Self {
+            input: CompactionWorkerInput::Transcript,
+            max_tool_roundtrips: SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS,
+            timeout: std::time::Duration::from_millis(120_000),
+            instructions: String::new(),
+        }
+    }
+}
+
 pub(super) struct CompactionOutcome {
     pub(super) covered: usize,
     pub(super) original_tokens: u64,
@@ -42,6 +70,7 @@ pub(super) struct CompactionSummary {
     pub(super) text: String,
     pub(super) origin: CompactionOrigin,
     pub(super) worker_usage: Option<ProviderUsage>,
+    pub(super) instructions: Option<String>,
 }
 
 impl CompactionSummary {
@@ -50,6 +79,7 @@ impl CompactionSummary {
             text,
             origin: CompactionOrigin::Excerpts,
             worker_usage: None,
+            instructions: None,
         }
     }
 }
@@ -99,6 +129,7 @@ pub(super) struct CompactionEngine {
     pub(super) tiny_notice_emitted: bool,
     pub(super) pressure: PressureTracker,
     pub(super) summarizer: SummarizerKind,
+    pub(super) worker: CompactionWorkerConfig,
     pub(super) summarizer_factory: Option<SummarizerFactory>,
     pub(super) background: Option<BackgroundCompaction>,
     pub(super) next_job_seq: u64,
@@ -150,6 +181,7 @@ impl CompactionEngine {
             tiny_notice_emitted: false,
             pressure: PressureTracker::default(),
             summarizer: SummarizerKind::default(),
+            worker: CompactionWorkerConfig::default(),
             summarizer_factory: None,
             background: None,
             next_job_seq: 0,
@@ -257,6 +289,7 @@ impl CompactionEngine {
             Some(body_tokens),
             summary.origin,
             summary.worker_usage.as_ref(),
+            summary.instructions.as_deref(),
         )?;
         let generation = log.compaction_generation();
         tracing::info!(
@@ -350,30 +383,59 @@ pub(super) async fn provider_summary<P: ChatProvider>(
     }
 }
 
-pub(super) fn run_background_summary_worker(
+pub(super) fn run_compaction_worker(
     factory: SummarizerFactory,
     workspace: PathBuf,
-    prompt: String,
+    covered: Vec<Message>,
+    config: CompactionWorkerConfig,
     mode: SummarizerKind,
     token: CancellationToken,
-    covered_messages: usize,
 ) -> BackgroundSummaryResult {
     if token.is_cancelled() {
         return BackgroundSummaryResult::Cancelled;
     }
-    let result = match mode {
-        SummarizerKind::Subagent => {
-            let subagent = factory().and_then(|provider| {
-                run_subagent_summary(provider, workspace, prompt.clone(), &token)
-            });
-            match subagent {
-                Ok((text, usage)) => Ok((text, CompactionOrigin::Subagent, usage)),
-                Err(error) if token.is_cancelled() => Err(error),
-                Err(error) => {
-                    tracing::warn!(
-                        error = %format!("{error:#}"),
-                        "background subagent summary failed; trying provider summary"
-                    );
+    let covered_messages = covered.len();
+    let result = match config.input {
+        CompactionWorkerInput::Transcript => factory().and_then(|provider| {
+            run_transcript_summary(provider, covered, &config, &token).map(|(text, usage)| {
+                let origin = match mode {
+                    SummarizerKind::Subagent => CompactionOrigin::Subagent,
+                    SummarizerKind::Provider | SummarizerKind::Excerpts => {
+                        CompactionOrigin::Provider
+                    }
+                };
+                (text, origin, usage)
+            })
+        }),
+        CompactionWorkerInput::Investigator => {
+            let prompt = append_compaction_instructions(summary_worker_prompt(&covered), &config);
+            match mode {
+                SummarizerKind::Subagent => {
+                    let subagent = factory().and_then(|provider| {
+                        run_subagent_summary(
+                            provider,
+                            workspace,
+                            prompt.clone(),
+                            &token,
+                            config.max_tool_roundtrips,
+                        )
+                    });
+                    match subagent {
+                        Ok((text, usage)) => Ok((text, CompactionOrigin::Subagent, usage)),
+                        Err(error) if token.is_cancelled() => Err(error),
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "investigator summary failed; trying provider summary"
+                            );
+                            factory().and_then(|provider| {
+                                run_provider_prompt_summary(provider, prompt, &token)
+                                    .map(|(text, usage)| (text, CompactionOrigin::Provider, usage))
+                            })
+                        }
+                    }
+                }
+                SummarizerKind::Provider | SummarizerKind::Excerpts => {
                     factory().and_then(|provider| {
                         run_provider_prompt_summary(provider, prompt, &token)
                             .map(|(text, usage)| (text, CompactionOrigin::Provider, usage))
@@ -381,10 +443,6 @@ pub(super) fn run_background_summary_worker(
                 }
             }
         }
-        SummarizerKind::Provider | SummarizerKind::Excerpts => factory().and_then(|provider| {
-            run_provider_prompt_summary(provider, prompt, &token)
-                .map(|(text, usage)| (text, CompactionOrigin::Provider, usage))
-        }),
     };
     if token.is_cancelled() {
         return BackgroundSummaryResult::Cancelled;
@@ -398,11 +456,88 @@ pub(super) fn run_background_summary_worker(
                 ),
                 origin,
                 worker_usage,
+                instructions: (!config.instructions.is_empty())
+                    .then(|| config.instructions.clone()),
             })
         }
         Ok(_) => BackgroundSummaryResult::Failed("summarizer returned empty text".to_string()),
         Err(error) => BackgroundSummaryResult::Failed(format!("{error:#}")),
     }
+}
+
+fn append_compaction_instructions(mut prompt: String, config: &CompactionWorkerConfig) -> String {
+    if !config.instructions.is_empty() {
+        prompt.push_str("\n\nAdditional compaction instructions:\n");
+        prompt.push_str(&config.instructions);
+    }
+    prompt
+}
+
+fn transcript_instruction(config: &CompactionWorkerConfig) -> String {
+    append_compaction_instructions(SUMMARY_PROMPT.to_string(), config)
+}
+
+fn run_transcript_summary(
+    provider: Box<dyn ChatProvider>,
+    covered: Vec<Message>,
+    config: &CompactionWorkerConfig,
+    token: &CancellationToken,
+) -> Result<SummaryResult> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async move {
+            tokio::time::timeout(config.timeout, async move {
+                let tools = Tools::new(Vec::new());
+                let mut start = 0usize;
+                loop {
+                    if start >= covered.len() {
+                        anyhow::bail!(
+                            "summarization context overflowed after dropping every covered message"
+                        );
+                    }
+                    let mut request = covered[start..].to_vec();
+                    request.push(Message::user(&transcript_instruction(config)));
+                    let mut stream = provider.respond_stream(&request, &tools, token)?;
+                    loop {
+                        let event = tokio::select! {
+                            biased;
+                            _ = token.cancelled() => anyhow::bail!("summarization cancelled"),
+                            event = stream.next() => event.ok_or_else(|| anyhow::anyhow!(
+                                "provider stream ended before completing a summary"
+                            ))??,
+                        };
+                        if let ProviderEvent::Completed(turn) = event {
+                            if turn.completion_reason
+                                == Some(CompletionReason::ContextWindowExceeded)
+                            {
+                                start = start.saturating_add(1);
+                                break;
+                            }
+                            if !turn.tool_calls.is_empty() {
+                                anyhow::bail!(
+                                    "summarizer returned tool calls instead of summary text"
+                                );
+                            }
+                            let text = turn
+                                .text
+                                .filter(|text| !text.trim().is_empty())
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("provider returned no summary text")
+                                })?;
+                            return Ok((text, turn.usage));
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "compaction worker timed out after {} ms",
+                    config.timeout.as_millis()
+                )
+            })?
+        })
 }
 
 fn run_provider_prompt_summary(
@@ -443,11 +578,12 @@ pub(super) fn run_subagent_summary_async<'a>(
     workspace: PathBuf,
     prompt: String,
     token: &'a CancellationToken,
+    max_tool_roundtrips: usize,
 ) -> SummaryFuture<'a> {
     Box::pin(async move {
         let backend = subagents::SubagentBackend::new(workspace);
         let mut request = subagents::SubagentRequest::read_only(prompt);
-        request.budgets.max_tool_roundtrips = Some(SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS);
+        request.budgets.max_tool_roundtrips = Some(max_tool_roundtrips);
         request.budgets.max_output_bytes = Some(MAX_SUMMARY_CHARS);
         let handle = backend.spawn(provider, request)?;
         let result = tokio::select! {
@@ -481,12 +617,17 @@ fn run_subagent_summary(
     workspace: PathBuf,
     prompt: String,
     token: &CancellationToken,
+    max_tool_roundtrips: usize,
 ) -> Result<SummaryResult> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(run_subagent_summary_async(
-            provider, workspace, prompt, token,
+            provider,
+            workspace,
+            prompt,
+            token,
+            max_tool_roundtrips,
         ))
 }
 

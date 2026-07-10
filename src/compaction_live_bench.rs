@@ -361,7 +361,7 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
         AUTO_LIVE_BUDGET
     );
     println!(
-        "lane | session | compactions | G1 blocked | G2 max-after/start/pass | G3 needle/marker/carry | G4 exact | G5 metadata | real read | error"
+        "lane | session | compactions | G1 blocked | G2 max-after/start/pass | G3 needle/marker/carry | G4 exact | G5 metadata | worker cache hit | real read | error"
     );
 
     let mut exclusions = 0usize;
@@ -395,7 +395,7 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
                     ));
                 }
                 println!(
-                    "{} | {session:02} | {} | {:.1}ms/{} | {}/{}/{} | {}/{}/{} | {} | {} | {} | {}",
+                    "{} | {session:02} | {} | {:.1}ms/{} | {}/{}/{} | {}/{}/{} | {} | {} | {} | {} | {}",
                     lane.label(),
                     row.compactions,
                     row.g1_blocked_ms,
@@ -408,6 +408,9 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
                     row.carry_block,
                     row.resume_exact,
                     row.measured_entries,
+                    row.summary_cache_hit_rate
+                        .map(|rate| format!("{rate:.3}"))
+                        .unwrap_or_else(|| "unknown".to_string()),
                     row.real_read,
                     row.metadata_detail.as_deref().unwrap_or("-"),
                 );
@@ -415,7 +418,7 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
             Err(error) => {
                 exclusions += 1;
                 println!(
-                    "{} | {session:02} | excluded | -/- | -/- | -/-/- | - | - | - | {error:#}",
+                    "{} | {session:02} | excluded | -/- | -/- | -/-/- | - | - | - | - | {error:#}",
                     lane.label()
                 );
             }
@@ -441,6 +444,7 @@ struct AutoLiveRow {
     carry_block: bool,
     resume_exact: bool,
     measured_entries: bool,
+    summary_cache_hit_rate: Option<f64>,
     real_read: bool,
     metadata_detail: Option<String>,
 }
@@ -637,6 +641,23 @@ fn run_auto_compaction_live_session(
             .collect::<Vec<_>>()
             .join("; ")
     });
+    let (worker_input, worker_cache_read) = entries.iter().fold((0u64, 0u64), |acc, entry| {
+        let usage = entry.get("workerUsage");
+        (
+            acc.0
+                + usage
+                    .and_then(|value| value.get("inputTokens"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            acc.1
+                + usage
+                    .and_then(|value| value.get("cacheReadInputTokens"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+        )
+    });
+    let summary_cache_hit_rate =
+        (worker_input > 0).then_some(worker_cache_read as f64 / worker_input as f64);
     Ok(AutoLiveRow {
         compactions: applies.len(),
         g1_blocked_ms,
@@ -649,6 +670,7 @@ fn run_auto_compaction_live_session(
         carry_block: context_text.contains(AUTO_LIVE_CARRY_HEADER),
         resume_exact,
         measured_entries,
+        summary_cache_hit_rate,
         real_read,
         metadata_detail,
     })

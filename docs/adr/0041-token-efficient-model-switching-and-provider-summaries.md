@@ -140,3 +140,22 @@ that shape on top of Iris's existing durable compaction entry.
 - Foreign-reasoning dropping changes provider-visible bytes for existing
   transcripts that already carry foreign rows; the prefix fingerprint treats
   this as the prefix change it is (a one-time cache break at upgrade).
+
+## Addendum (2026-07-10, auto-compaction worker v2)
+
+`compactionSummarizer` now selects who answers; `compaction.worker.input`
+selects the request shape. `transcript` is the default: covered messages are
+sent verbatim, followed by the summary instruction. `investigator` retains the
+read-only workspace-probing worker. A transcript request that reports context
+overflow drops one oldest covered message and retries until it succeeds or the
+slice is empty.
+
+`compaction.worker.model` is global-only and resolves a qualified
+`provider/model` through Mimir. Unset workers follow the active selection.
+Both routes receive the same cancellation token. `compaction.instructions` and
+bounded `/compact <focus>` text are appended to the instruction and recorded on
+the durable compaction entry.
+
+Manual compaction uses the one-slot background pipeline. When a job already
+exists, `/compact` awaits it instead of cancelling and restarting it. Parent
+code remains the only apply point.

@@ -195,6 +195,7 @@ impl SessionLog {
             token_estimate,
             crate::nexus::CompactionOrigin::Excerpts,
             None,
+            None,
         )
     }
 
@@ -217,6 +218,7 @@ impl SessionLog {
             token_estimate,
             crate::nexus::CompactionOrigin::Excerpts,
             None,
+            None,
         )
     }
 
@@ -231,6 +233,7 @@ impl SessionLog {
         token_estimate: Option<u64>,
         origin: crate::nexus::CompactionOrigin,
         worker_usage: Option<&crate::nexus::ProviderUsage>,
+        instructions: Option<&str>,
     ) -> Result<String> {
         let id = self.next_id();
         // Generation ordinal (ADR-0047): 1-based count of compactions in this
@@ -258,6 +261,7 @@ impl SessionLog {
             "generation": generation,
             "origin": origin.as_str(),
             "workerUsage": worker_usage,
+            "instructions": instructions,
         });
         // Additive optional carry (ADR-0044): only written when non-empty, so an
         // empty carry leaves the serialized entry byte-identical to a pre-carry
@@ -3119,11 +3123,13 @@ mod tests {
             None,
             CompactionOrigin::Subagent,
             Some(&usage),
+            Some("preserve exact flags"),
         )
         .unwrap();
 
         let entries = lines(log.path());
         let entry = entries.last().unwrap();
+        assert_eq!(entry["instructions"], "preserve exact flags");
         assert_eq!(entry["origin"], "subagent");
         assert_eq!(entry["workerUsage"]["provider"], "anthropic");
         assert_eq!(entry["workerUsage"]["model"], "claude-haiku-4-5");
