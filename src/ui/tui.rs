@@ -1278,6 +1278,9 @@ mod tests {
             committed_mid.iter().all(|t| !t.contains("Col A")),
             "table committed incrementally would snap: {committed_mid:?}"
         );
+        // Let the escapement finish beating the table into the tail: this test
+        // pins finalize-reflow identity, not pacing.
+        settle_stream(&mut screen);
         // The live (tail) render already shows the complete table.
         let before: Vec<_> = screen
             .wrapped_lines(80)
@@ -1311,12 +1314,13 @@ mod tests {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         let mut src = String::new();
-        for i in 0..20 {
+        for i in 0..200 {
             src.push_str(&format!("Para {i}.\n\n"));
         }
         screen.apply(UiEvent::AssistantTextDelta(src));
-        // A single tick with a deep backlog (>= depth threshold) enters CatchUp
-        // and drains it, rather than committing one line.
+        // A single tick with a firehose-deep backlog: the escapement fast-
+        // forwards (half the buffer in one beat), the collector queue goes
+        // deep, and the drain enters CatchUp — rather than committing one line.
         assert!(screen.commit_stream_tick(std::time::Instant::now()));
         let committed = screen
             .transcript
@@ -1381,7 +1385,7 @@ mod tests {
         screen.apply(UiEvent::AssistantTextDelta(
             "The answer paragraph.\n\n".to_string(),
         ));
-        assert!(screen.commit_stream_tick(std::time::Instant::now()));
+        settle_stream(&mut screen);
         assert!(
             screen
                 .transcript

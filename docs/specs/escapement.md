@@ -16,7 +16,7 @@ escapement turns irregular drive force into a steady tick.
 
 Testable outcome: while streaming, the visible tail never grows by a raw
 burst; it advances by word-boundary quanta on the loop's tick cadence, with
-backlog-proportional catch-up that bounds display lag at ~300 ms; stream end
+governed, arrival-tracking cadence with ~400 ms steady-state lag; stream end
 (or cancel, error, approval gate) flushes instantly; reduced motion disables
 pacing entirely; and the committed-line pipeline (collector → table holdback
 → adaptive chunking) is byte-for-byte unaffected.
@@ -67,16 +67,23 @@ pub(super) struct Escapement {
 
 ### 2.1 The beat quantum (the policy)
 
-- Baseline drain per beat: `max(ceil(pending_len / 2), 24)` bytes, then
-  **extended to the next word boundary** (never split a word or a UTF-8
-  sequence or an ANSI-significant unit mid-emit; whitespace runs ride with
-  the word before them). Newlines pass through freely (a newline in the tail
-  hands off to the line pipeline — see §2.3 interaction note).
-- Convergence property (test it, don't just assert it in prose): with
-  arrival stopped, any backlog empties in ≤ 2 beats; under sustained arrival
-  the backlog stays ≤ ~2 beats of drain (~300 ms at the 100 ms grid). The
-  buffer is TINY by construction — it shapes rhythm, it does not hold
-  content back.
+- Governed drain per beat (recalibrated 2026-07-10 for smooth human-rhythm
+  flow, on user direction): a beat's share of the backlog —
+  `pending_len / LAG_BEATS(=4)` bytes, clamped to `[6, 32]` (about one word
+  to about five) — then **extended to the next word boundary** (never split
+  a word or a UTF-8 sequence or an ANSI-significant unit mid-emit;
+  whitespace runs ride with the word before them). Past `FIREHOSE(=1024)`
+  bytes of backlog the cap yields and the beat drains half the buffer:
+  bounded convergence beats smoothness on pathological bursts. Newlines pass
+  through freely (a newline in the tail hands off to the line pipeline — see
+  §2.3 interaction note).
+- Rhythm properties (test them, don't just assert them in prose): the
+  cadence is proportional to arrival — it speeds toward the ceiling under
+  hot arrival and, once arrival stops, successive quanta only shrink down to
+  the one-word floor (the hand eases off). Steady-state lag ≈ LAG_BEATS
+  beats (~400 ms at the 100 ms grid); with arrival stopped a backlog drains
+  at ≥ the floor per beat, monotonically easing. The buffer is TINY by
+  construction — it shapes rhythm, it does not hold content back.
 - No easing, no per-frame interpolation: the tail advances in discrete
   word-steps on the shared grid. Machines step (§6).
 
@@ -111,7 +118,7 @@ empty and stays pass-through until the next stream starts.
 ## 3 · Design-language amendments (same change)
 
 - §6 motion set: add the escapement as a numbered motion — the live tail
-  advances in word-quantized steps on the tick grid; bounded ≤ ~300 ms lag;
+  advances in word-quantized steps on the tick grid; governed cadence, ~400 ms steady-state lag;
   flush-on-finish list; reduced motion = pass-through.
 - §7.4: one sentence — live reasoning text feeds through the escapement; the
   caret steps evenly.
@@ -119,7 +126,7 @@ empty and stays pass-through until the next stream starts.
 ## 4 · Acceptance criteria
 
 1. Unit (Escapement): word-boundary integrity (never a split word/UTF-8
-   char); baseline quantum math; ≤ 2-beat convergence after arrival stops;
+   char); governed-share quantum math (floor/ceiling/firehose); monotonic ease-off after arrival stops;
    sustained-arrival backlog bound; flush returns everything; UTF-8
    multi-byte and CJK (no word boundaries) still drain within the bound —
    define and test the no-whitespace fallback (drain at the byte quantum

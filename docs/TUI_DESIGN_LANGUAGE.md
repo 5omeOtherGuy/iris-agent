@@ -356,10 +356,14 @@ itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
   6. the **escapement** — the live streaming tails (the assistant active tail
      and the reasoning stream, §7.4) advance in **word-quantized steps** on the
      same tick grid, never in raw network bursts: a tiny bounded buffer
-     releases one word-quantum per beat (baseline `max(ceil(pending/2), 24)`
-     bytes extended to the next word boundary; CJK/no-boundary text falls back
-     to the char-snapped byte quantum), so display lag is backlog-proportional
-     and bounded at **≤ ~2 beats (~300 ms)**. It **flushes instantly** on
+     releases a governed share of its backlog per beat (`pending/4` bytes,
+     clamped between about one word and about five, extended to the next word
+     boundary; CJK/no-boundary text falls back to the char-snapped share) — so
+     the cadence **tracks arrival like a hand at the keys**: it speeds up when
+     the stream runs hot, eases off as it thins, and never gulps a sentence.
+     Steady-state lag is ~4 beats (~400 ms); a pathological burst (> ~1 KB in
+     one delta) fast-forwards at half-the-buffer per beat rather than lag
+     unboundedly. It **flushes instantly** on
      stream end, provider turn completion/cancel/error, an approval gate
      opening, session reset, and entering reduced motion — the machine never
      withholds against a decision. The committed-line pipeline (collector →
