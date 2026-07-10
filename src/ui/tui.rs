@@ -7117,6 +7117,232 @@ mod tests {
         );
     }
 
+    // --- reactive density: preview budget breathes with height (spec §2) ---
+
+    #[test]
+    fn preview_row_budget_clamps_height_over_five() {
+        // Criterion 1 (the clamp): heights 20/24/40/60/120/200 → 8/8/8/12/24/24.
+        // The floor 8 is the historical fixed cap (a pane ≤ 40 rows is
+        // byte-identical to before); the ceiling 24 keeps a preview from
+        // swallowing an ultra-tall pane.
+        assert_eq!(preview_row_budget(20), 8);
+        assert_eq!(preview_row_budget(24), 8);
+        assert_eq!(preview_row_budget(40), 8);
+        assert_eq!(preview_row_budget(60), 12);
+        assert_eq!(preview_row_budget(120), 24);
+        assert_eq!(preview_row_budget(200), 24);
+        // Before the first frame (height 0) the budget is the floor, never zero.
+        assert_eq!(preview_row_budget(0), 8);
+    }
+
+    /// Stream 30 short lines into a live SHELL tail with the pane height threaded
+    /// through the real render path (`render_document` → `note_pane_height`)
+    /// BEFORE the deltas, so the tail is built against `height`. Returns the
+    /// rendered line texts.
+    fn live_shell_tail_lines(height: u16) -> Vec<String> {
+        let mut screen = Screen::new();
+        screen.start_turn();
+        // Prime last_height + last_width via the production compose path.
+        let _ = rendered_lines(&mut screen, 80, height);
+        let call = call_args("bash", json!({ "command": "seq" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        for i in 0..30 {
+            screen.apply(UiEvent::ToolOutputDelta {
+                call_id: call.id.clone(),
+                chunk: format!("Xrow{i:02}\n"),
+            });
+        }
+        rendered_lines(&mut screen, 80, height)
+            .iter()
+            .map(line_text)
+            .collect()
+    }
+
+    #[test]
+    fn live_preview_tail_previews_full_budget_on_a_tall_pane() {
+        // Criterion 1 (row-level): a 30-line output at height 120 previews 24
+        // rows + the earlier-lines elision marker.
+        let lines = live_shell_tail_lines(120);
+        let shown = lines.iter().filter(|l| l.contains("Xrow")).count();
+        assert_eq!(shown, 24, "height 120 should preview 24 rows: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("earlier lines hidden")),
+            "missing elision marker: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn live_preview_tail_stays_at_the_floor_on_a_small_pane() {
+        // Criterion 1 (row-level): at height 24 the same output previews 8 rows —
+        // today's exact behavior (the floor is the status quo).
+        let lines = live_shell_tail_lines(24);
+        let shown = lines.iter().filter(|l| l.contains("Xrow")).count();
+        assert_eq!(shown, 8, "height 24 should preview 8 rows: {lines:?}");
+    }
+
+    #[test]
+    fn printed_preview_keeps_its_size_across_a_resize() {
+        // Criterion 5: a block printed at height 24 (8 preview rows) keeps its
+        // size when the pane later grows to 120 — rows are immutable in
+        // scrollback, so a resize never reflows a printed block. Only the NEXT
+        // block built uses the new height (proven by the tall-pane test above).
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let _ = rendered_lines(&mut screen, 80, 24);
+        let call = call_args("bash", json!({ "command": "seq" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        for i in 0..30 {
+            screen.apply(UiEvent::ToolOutputDelta {
+                call_id: call.id.clone(),
+                chunk: format!("Xrow{i:02}\n"),
+            });
+        }
+        let before = rendered_lines(&mut screen, 80, 24)
+            .iter()
+            .filter(|l| line_text(l).contains("Xrow"))
+            .count();
+        assert_eq!(before, 8, "small pane previews the floor budget");
+        // Grow the pane; with no new output the printed tail must not rebuild.
+        let after = rendered_lines(&mut screen, 80, 120)
+            .iter()
+            .filter(|l| line_text(l).contains("Xrow"))
+            .count();
+        assert_eq!(
+            after, 8,
+            "a printed block must keep its size across a resize"
+        );
+    }
+
+    // --- reactive density: the prose measure (spec §3) ---
+
+    #[test]
+    fn prose_wraps_at_the_measure_while_code_keeps_full_width() {
+        // Criterion 3: on a 200-column pane an assistant paragraph rags at the
+        // 96-column measure (+ text-column indent) while a wide code fence in the
+        // SAME message keeps the full pane width (mechanical never reflows).
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let _ = rendered_lines(&mut screen, 200, 40);
+        let para = "lorem ".repeat(40); // ~240 cols, spaces let it wrap freely
+        let code_line = format!("XCODE{}", "x".repeat(120)); // 125 cols
+        let md = format!("{para}\n\n```\n{code_line}\n```");
+        screen.apply(UiEvent::AssistantText(md));
+        let lines: Vec<String> = rendered_lines(&mut screen, 200, 40)
+            .iter()
+            .map(line_text)
+            .collect();
+        let prose: Vec<&String> = lines.iter().filter(|l| l.contains("lorem")).collect();
+        assert!(
+            prose.len() >= 2,
+            "paragraph should wrap to several rows: {lines:?}"
+        );
+        for row in &prose {
+            assert!(
+                row.chars().count() <= PROSE_MEASURE + TEXT_COLUMN_X_PADDING,
+                "prose row exceeds the measure ({} cols): {row:?}",
+                row.chars().count()
+            );
+        }
+        let code = lines
+            .iter()
+            .find(|l| l.contains(&code_line))
+            .unwrap_or_else(|| panic!("wide code line not intact: {lines:?}"));
+        assert!(
+            code.chars().count() > PROSE_MEASURE,
+            "code row should exceed the measure ({} cols)",
+            code.chars().count()
+        );
+    }
+
+    #[test]
+    fn prose_continuations_align_under_content_at_the_measure() {
+        // Criterion 4: a wrapped paragraph's continuation rows hang under the
+        // same text column as the first — the measure moves only the wrap point,
+        // never the marker/indent (no marker drift).
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let _ = rendered_lines(&mut screen, 200, 40);
+        screen.apply(UiEvent::AssistantText("lorem ".repeat(40)));
+        let prose: Vec<String> = rendered_lines(&mut screen, 200, 40)
+            .iter()
+            .map(line_text)
+            .filter(|l| l.contains("lorem"))
+            .collect();
+        assert!(prose.len() >= 2, "paragraph should wrap: {prose:?}");
+        let indent = |s: &str| s.len() - s.trim_start().len();
+        let first = indent(&prose[0]);
+        for row in &prose {
+            assert_eq!(indent(row), first, "continuation drifted: {prose:?}");
+        }
+    }
+
+    #[test]
+    fn notice_wraps_at_the_prose_measure() {
+        // Criterion 3: a notice is prose — it wraps at the 96-col measure on a
+        // wide pane, not the full pane.
+        let mut screen = Screen::new();
+        screen.start_turn();
+        let _ = rendered_lines(&mut screen, 200, 40);
+        screen.apply(UiEvent::Notice("NOTICEWORD ".repeat(30)));
+        let notice: Vec<String> = rendered_lines(&mut screen, 200, 40)
+            .iter()
+            .map(line_text)
+            .filter(|l| l.contains("NOTICEWORD"))
+            .collect();
+        assert!(notice.len() >= 2, "notice should wrap: {notice:?}");
+        for row in &notice {
+            assert!(
+                row.chars().count() <= PROSE_MEASURE + TEXT_COLUMN_X_PADDING,
+                "notice row exceeds the measure ({} cols): {row:?}",
+                row.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn mechanical_output_uses_full_width_past_the_measure() {
+        // Criterion 3: a SHELL body line and a diff line keep the full pane
+        // width on a 200-column pane — mechanical content is never clamped to 96.
+        // Render the specific body rows directly so the assertion is independent
+        // of each block's arrival fold state.
+        let full_width = |row: &TranscriptRow| -> bool {
+            row.render(200)
+                .iter()
+                .any(|l| line_text(l).chars().count() > PROSE_MEASURE)
+        };
+
+        let wide = "S".repeat(150);
+        let mut screen = Screen::new();
+        let _ = rendered_lines(&mut screen, 200, 40); // prime width
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "cat wide" })),
+            content: wide.clone(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(5)),
+        });
+        let shell_row = screen
+            .transcript
+            .rows
+            .iter()
+            .find(|r| r.text.contains(&wide))
+            .expect("SHELL body row present");
+        assert!(full_width(shell_row), "SHELL body did not keep full width");
+
+        let added = format!("+DIFFWIDE{}", "d".repeat(120));
+        let diff = format!("--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n{added}\n");
+        screen.apply(UiEvent::TaskDiff {
+            summary: vec!["1 file changed, +1/-0".to_string()],
+            diff,
+        });
+        let diff_row = screen
+            .transcript
+            .rows
+            .iter()
+            .find(|r| r.text.contains("DIFFWIDE"))
+            .expect("diff body row present");
+        assert!(full_width(diff_row), "diff row did not keep full width");
+    }
+
     #[test]
     fn shell_nonzero_exit_renders_error_status() {
         let mut screen = Screen::new();

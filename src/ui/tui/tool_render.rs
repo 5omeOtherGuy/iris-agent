@@ -1610,4 +1610,37 @@ mod tests {
             rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn shell_live_tail_previews_the_ctx_budget() {
+        // Reactive-density §2: the live SHELL tail previews at most `preview_rows`
+        // stream rows — the viewport-aware budget threaded on the `RenderCtx`.
+        // A 30-line stream at budget 24 (a 120-row pane) shows 24 rows + the
+        // earlier-lines elision marker; at the floor budget 8 (a ≤ 40-row pane)
+        // it shows 8 — today's exact behavior on a small terminal.
+        let streamed = (0..30)
+            .map(|i| format!("row{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for budget in [8usize, 24] {
+            let ctx = RenderCtx {
+                width: 80,
+                preview_rows: budget,
+            };
+            let rows = render_body(
+                &SHELL,
+                &ctx,
+                &call("bash", json!({ "command": "seq 30" })),
+                &ToolOutcome::Running {
+                    streamed: &streamed,
+                },
+            );
+            let shown = rows.iter().filter(|r| r.text.contains("row")).count();
+            assert_eq!(shown, budget, "budget {budget}: {shown} tail rows");
+            assert!(
+                rows.iter().any(|r| r.text.contains("earlier lines hidden")),
+                "budget {budget}: missing elision marker"
+            );
+        }
+    }
 }
