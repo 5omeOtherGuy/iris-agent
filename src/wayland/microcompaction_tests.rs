@@ -34,6 +34,22 @@ impl AgentObserver for NullObserver {
     }
 }
 
+/// Records compaction lifecycle events so the settings-off cancellation test can
+/// assert the harness emits a `Cancelled` transition (spec IV.17) instead of
+/// dropping the job silently.
+#[derive(Default)]
+struct LifecycleRecorder {
+    events: RefCell<Vec<(crate::nexus::CompactionLifecycleState, Option<String>)>>,
+}
+impl AgentObserver for LifecycleRecorder {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        if let AgentEvent::CompactionLifecycle { state, message, .. } = event {
+            self.events.borrow_mut().push((state, message));
+        }
+        Ok(())
+    }
+}
+
 /// Records every fold observer event, so tests can assert the fold pass
 /// surfaces its trigger tag (issue #400, design §4.4).
 #[derive(Default)]
@@ -219,7 +235,10 @@ fn disabling_auto_compaction_cancels_the_background_job_and_clears_diagnostics()
     // Disable automatic compaction and cancel the job (the settings apply path).
     trigger.enabled = false;
     harness.set_compaction_trigger(200_000, trigger);
-    assert!(harness.cancel_auto_compaction(), "a job was cancelled");
+    assert!(
+        harness.cancel_auto_compaction(&NullObserver).unwrap(),
+        "a job was cancelled"
+    );
 
     let diag = harness
         .context_diagnostics()
@@ -230,7 +249,57 @@ fn disabling_auto_compaction_cancels_the_background_job_and_clears_diagnostics()
         "the chip clears: no job runs after cancel"
     );
     // A no-op cancel (no job) reports nothing to clear.
-    assert!(!harness.cancel_auto_compaction());
+    assert!(!harness.cancel_auto_compaction(&NullObserver).unwrap());
+}
+
+#[test]
+fn disabling_auto_compaction_emits_a_cancelled_lifecycle_event() {
+    // Spec IV.17: turning automatic compaction off in `/settings` must not drop
+    // an in-flight background job silently. The settings-off cancellation emits
+    // a `Cancelled` lifecycle so observers/logs record the Running -> Cancelled
+    // transition (the UI chip is reconciled separately by the loop).
+    let (root, workspace, path) = seed_session();
+    let mut harness = resume(&root.path, &workspace.path, &path, Some(200_000), false);
+
+    let (_sender, receiver) = mpsc::channel();
+    harness.compaction.background = Some(BackgroundCompaction {
+        job_id: "job".to_string(),
+        session_id: None,
+        from_id: "1".to_string(),
+        to_id: "2".to_string(),
+        covered_messages: 2,
+        original_tokens: 10,
+        receiver,
+        token: CancellationToken::new(),
+        origin: CompactionOrigin::Subagent,
+        trigger_tier: Some(ContextPressureTier::Start),
+        started_at: std::time::Instant::now(),
+        selection_generation: 0,
+    });
+
+    let recorder = LifecycleRecorder::default();
+    assert!(
+        harness.cancel_auto_compaction(&recorder).unwrap(),
+        "a job was cancelled"
+    );
+
+    let events = recorder.events.borrow();
+    assert_eq!(events.len(), 1, "exactly one lifecycle event fires");
+    let (state, message) = &events[0];
+    assert_eq!(*state, crate::nexus::CompactionLifecycleState::Cancelled);
+    let message = message.as_deref().unwrap_or_default();
+    assert!(
+        message.contains("automatic compaction disabled in settings"),
+        "the cancellation names the settings-off cause: {message}"
+    );
+
+    // A no-op cancel (no job) emits nothing.
+    let recorder = LifecycleRecorder::default();
+    assert!(!harness.cancel_auto_compaction(&recorder).unwrap());
+    assert!(
+        recorder.events.borrow().is_empty(),
+        "no job means no lifecycle event"
+    );
 }
 
 /// Count `fold` entries in a transcript.

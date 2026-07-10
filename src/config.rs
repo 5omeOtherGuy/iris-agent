@@ -901,57 +901,69 @@ pub(crate) fn save_tool_result_compaction_keep_recent_tool_uses(keep: u64) -> Re
 
 /// Persist the full-context auto-compaction master switch under `compaction`.
 /// Unknown sibling keys (routing, breaker, experimental) survive the write.
-pub(crate) fn save_compaction_enabled(enabled: bool) -> Result<()> {
+pub(crate) fn save_compaction_enabled(cwd: &Path, enabled: bool) -> Result<()> {
+    let project = project_path(cwd);
     update_global_nested(
         &["compaction"],
         &[("enabled", Value::Bool(enabled))],
-        SaveValidation::CompactionTrigger,
+        SaveValidation::CompactionTrigger {
+            project: Some(&project),
+        },
     )
 }
 
 /// Persist the reactive deterministic-recovery toggle under `compaction`.
-pub(crate) fn save_compaction_reactive(enabled: bool) -> Result<()> {
+pub(crate) fn save_compaction_reactive(cwd: &Path, enabled: bool) -> Result<()> {
+    let project = project_path(cwd);
     update_global_nested(
         &["compaction"],
         &[("reactive", Value::Bool(enabled))],
-        SaveValidation::CompactionTrigger,
+        SaveValidation::CompactionTrigger {
+            project: Some(&project),
+        },
     )
 }
 
 /// Persist the protected-tail size under `compaction.keepRecentTokens`, clamped
 /// to the same positive token range as the other budget dials.
-pub(crate) fn save_compaction_keep_recent_tokens(tokens: u64) -> Result<()> {
+pub(crate) fn save_compaction_keep_recent_tokens(cwd: &Path, tokens: u64) -> Result<()> {
     let tokens = tokens.clamp(MIN_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET);
+    let project = project_path(cwd);
     update_global_nested(
         &["compaction"],
         &[("keepRecentTokens", Value::from(tokens))],
-        SaveValidation::CompactionTrigger,
+        SaveValidation::CompactionTrigger {
+            project: Some(&project),
+        },
     )
 }
 
 /// Persist one auto-compaction threshold fraction under `compaction.thresholds`.
 /// The `CompactionTrigger` re-check rejects any write that would make the merged
 /// ladder unordered (`0 < warn < start < hard < 1`) before it reaches disk.
-fn save_compaction_threshold(key: &'static str, fraction: f64) -> Result<()> {
+fn save_compaction_threshold(cwd: &Path, key: &'static str, fraction: f64) -> Result<()> {
     let number = serde_json::Number::from_f64(fraction)
         .context("compaction threshold must be a finite fraction")?;
+    let project = project_path(cwd);
     update_global_nested(
         &["compaction", "thresholds"],
         &[(key, Value::Number(number))],
-        SaveValidation::CompactionTrigger,
+        SaveValidation::CompactionTrigger {
+            project: Some(&project),
+        },
     )
 }
 
-pub(crate) fn save_compaction_threshold_warn(fraction: f64) -> Result<()> {
-    save_compaction_threshold("warn", fraction)
+pub(crate) fn save_compaction_threshold_warn(cwd: &Path, fraction: f64) -> Result<()> {
+    save_compaction_threshold(cwd, "warn", fraction)
 }
 
-pub(crate) fn save_compaction_threshold_start(fraction: f64) -> Result<()> {
-    save_compaction_threshold("start", fraction)
+pub(crate) fn save_compaction_threshold_start(cwd: &Path, fraction: f64) -> Result<()> {
+    save_compaction_threshold(cwd, "start", fraction)
 }
 
-pub(crate) fn save_compaction_threshold_hard(fraction: f64) -> Result<()> {
-    save_compaction_threshold("hard", fraction)
+pub(crate) fn save_compaction_threshold_hard(cwd: &Path, fraction: f64) -> Result<()> {
+    save_compaction_threshold(cwd, "hard", fraction)
 }
 
 /// Persist the background worker's input mode under `compaction.worker.input`.
@@ -1103,20 +1115,23 @@ fn update_global_block(block: &str, updates: &[(&str, Value)]) -> Result<()> {
 /// combinations (an incompatible tool-result policy, an unordered auto-compaction
 /// ladder) out of both the file and the live harness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SaveValidation {
+enum SaveValidation<'a> {
     /// No cross-field re-check (the value is already bounded at the boundary).
     None,
     /// Re-parse and re-resolve the structured tool-result-compaction policy.
     ToolResultCompaction,
     /// Re-validate the auto-compaction trigger ladder (`0 < warn < start < hard
-    /// < 1`, positive tail).
-    CompactionTrigger,
+    /// < 1`, positive tail) against the MERGED global+project settings the
+    /// harness loads. `project` is the project settings path whose overrides
+    /// must be folded in before the check; `None` (no project context) keeps the
+    /// global object as the merged result.
+    CompactionTrigger { project: Option<&'a Path> },
 }
 
 fn update_global_nested(
     blocks: &[&str],
     updates: &[(&str, Value)],
-    validation: SaveValidation,
+    validation: SaveValidation<'_>,
 ) -> Result<()> {
     let path = global_path()
         .context("cannot resolve the global settings path (set HOME or IRIS_CONFIG_PATH)")?;
@@ -1150,15 +1165,83 @@ fn update_global_nested(
                 crate::mimir::selection::ModelSelection::resolve(&settings)?;
             }
         }
-        SaveValidation::CompactionTrigger => {
+        SaveValidation::CompactionTrigger { project } => {
             let settings: Settings = serde_json::from_value(Value::Object(object.clone()))
                 .context("updated settings are invalid")?;
             // Rejects an unordered/degenerate ladder before it can reach disk or
-            // the harness, so a bad threshold never persists.
-            settings.compaction_trigger()?;
+            // the harness. The check runs against the MERGED global+project
+            // ladder the harness actually loads, because warn/start/hard/
+            // keepRecentTokens/enabled/reactive are project-overridable: a
+            // globally-valid write can still yield an invalid merged ladder.
+            validate_merged_compaction_ladder(settings, project)?;
         }
     }
     write_object_atomically(&path, &object)
+}
+
+/// Validate the auto-compaction ladder against the merged global+project
+/// settings the harness loads at [`Settings::load`], not the global object
+/// alone. warn/start/hard/keepRecentTokens/enabled/reactive are
+/// project-overridable by design, so a globally-valid write can still produce an
+/// invalid merged ladder (e.g. a project `start` above a freshly-saved global
+/// `hard`). Reject that before the global write reaches disk and name the
+/// conflicting project override. With no project file (or no `compaction`
+/// block) the merged result equals the global object, preserving the prior
+/// global-only behavior.
+fn validate_merged_compaction_ladder(global: Settings, project: Option<&Path>) -> Result<()> {
+    let Some((path, project_settings)) = project
+        .map(|path| read_optional(path).map(|settings| (path, settings)))
+        .transpose()?
+        .and_then(|(path, settings)| settings.map(|settings| (path, settings)))
+    else {
+        // No project context: the global object is the merged result.
+        global.compaction_trigger()?;
+        return Ok(());
+    };
+    let overrides = project_compaction_overrides(project_settings.compaction.as_ref());
+    if let Err(error) = global.merged_with(project_settings).compaction_trigger() {
+        if overrides.is_empty() {
+            return Err(error);
+        }
+        bail!(
+            "cannot save: applying the project settings at {} makes the merged \
+             auto-compaction ladder invalid (project overrides {}): {error:#}",
+            path.display(),
+            overrides.join(", "),
+        );
+    }
+    Ok(())
+}
+
+/// The auto-compaction keys a project settings file overrides, named for the
+/// rejection message so the operator knows which project value collides with the
+/// global write.
+fn project_compaction_overrides(project: Option<&CompactionSettings>) -> Vec<&'static str> {
+    let mut keys = Vec::new();
+    let Some(compaction) = project else {
+        return keys;
+    };
+    if let Some(thresholds) = compaction.thresholds.as_ref() {
+        if thresholds.warn.is_some() {
+            keys.push("compaction.thresholds.warn");
+        }
+        if thresholds.start.is_some() {
+            keys.push("compaction.thresholds.start");
+        }
+        if thresholds.hard.is_some() {
+            keys.push("compaction.thresholds.hard");
+        }
+    }
+    if compaction.keep_recent_tokens.is_some() {
+        keys.push("compaction.keepRecentTokens");
+    }
+    if compaction.enabled.is_some() {
+        keys.push("compaction.enabled");
+    }
+    if compaction.reactive.is_some() {
+        keys.push("compaction.reactive");
+    }
+    keys
 }
 
 /// Read a settings file as a JSON object, returning an empty object when the
@@ -1613,12 +1696,12 @@ mod tests {
         .unwrap();
         let _guard = ConfigPathGuard::set(&path);
 
-        save_compaction_enabled(true).unwrap();
-        save_compaction_threshold_warn(0.20).unwrap();
-        save_compaction_threshold_start(0.30).unwrap();
-        save_compaction_threshold_hard(0.40).unwrap();
-        save_compaction_keep_recent_tokens(6_000).unwrap();
-        save_compaction_reactive(false).unwrap();
+        save_compaction_enabled(&dir.path, true).unwrap();
+        save_compaction_threshold_warn(&dir.path, 0.20).unwrap();
+        save_compaction_threshold_start(&dir.path, 0.30).unwrap();
+        save_compaction_threshold_hard(&dir.path, 0.40).unwrap();
+        save_compaction_keep_recent_tokens(&dir.path, 6_000).unwrap();
+        save_compaction_reactive(&dir.path, false).unwrap();
         save_compaction_worker_input("investigator").unwrap();
 
         let object = read_object(&path).unwrap();
@@ -1658,18 +1741,86 @@ mod tests {
         let _guard = ConfigPathGuard::set(&path);
 
         // warn must stay below start (.72): 0.80 is unordered and must fail.
-        let error = save_compaction_threshold_warn(0.80).unwrap_err();
+        let error = save_compaction_threshold_warn(&dir.path, 0.80).unwrap_err();
         assert!(format!("{error:#}").contains("warn < start"), "{error:#}");
         // The rejected write never persisted: the file still holds warn 0.6.
         let object = read_object(&path).unwrap();
         assert_eq!(object["compaction"]["thresholds"]["warn"], 0.6);
 
         // An ordered move is accepted.
-        save_compaction_threshold_warn(0.50).unwrap();
+        save_compaction_threshold_warn(&dir.path, 0.50).unwrap();
         assert_eq!(
             read_object(&path).unwrap()["compaction"]["thresholds"]["warn"],
             0.5
         );
+    }
+
+    #[test]
+    fn global_compaction_save_rejected_when_a_project_override_invalidates_the_merged_ladder() {
+        let dir = temp_dir();
+        let global = dir.path.join("settings.json");
+        // A globally-valid starting ladder (warn .60 < start .72).
+        fs::write(
+            &global,
+            r#"{"compaction":{"thresholds":{"warn":0.60,"start":0.72}}}"#,
+        )
+        .unwrap();
+        let _guard = ConfigPathGuard::set(&global);
+
+        // A project override sets start .85, above the global hard we save next.
+        let project = dir.path.join("proj");
+        fs::create_dir_all(project.join(".iris")).unwrap();
+        fs::write(
+            project.join(".iris/settings.json"),
+            r#"{"compaction":{"thresholds":{"start":0.85}}}"#,
+        )
+        .unwrap();
+
+        // Global hard .80 passes the global-only check (.60 < .72 < .80) but the
+        // merged ladder has start(.85) >= hard(.80): the save must be rejected.
+        let error = save_compaction_threshold_hard(&project, 0.80).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("compaction.thresholds.start"),
+            "error names the conflicting project override: {message}"
+        );
+        assert!(
+            message.contains(".iris/settings.json"),
+            "error names the project settings path: {message}"
+        );
+
+        // The rejected write never reached disk: global hard was never written.
+        let object = read_object(&global).unwrap();
+        assert!(
+            object["compaction"]["thresholds"].get("hard").is_none(),
+            "a rejected save must leave the global file unchanged"
+        );
+    }
+
+    #[test]
+    fn global_compaction_save_succeeds_without_a_conflicting_project_override() {
+        let dir = temp_dir();
+        let global = dir.path.join("settings.json");
+        fs::write(
+            &global,
+            r#"{"compaction":{"thresholds":{"warn":0.60,"start":0.72}}}"#,
+        )
+        .unwrap();
+        let _guard = ConfigPathGuard::set(&global);
+
+        // A project file that does not touch the compaction ladder.
+        let project = dir.path.join("proj");
+        fs::create_dir_all(project.join(".iris")).unwrap();
+        fs::write(
+            project.join(".iris/settings.json"),
+            r#"{"defaultModel":"project-model"}"#,
+        )
+        .unwrap();
+
+        // The same global hard .80 is valid in the merged ladder and persists.
+        save_compaction_threshold_hard(&project, 0.80).unwrap();
+        let object = read_object(&global).unwrap();
+        assert_eq!(object["compaction"]["thresholds"]["hard"], 0.80);
     }
 
     #[test]
