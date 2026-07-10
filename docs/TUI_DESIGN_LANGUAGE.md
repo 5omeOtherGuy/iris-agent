@@ -794,17 +794,16 @@ The composer's top edge sits directly below, so the menu needs no frame of its
 own to read as a distinct region.
 
 - **SlashMenu** — command palette (§9.5). Title-less: just the rows.
-- **Picker** — model switcher, scoped-models, **tasks**, resume, login provider
-  list. Rows: `[◉ if active] label … meta hint`. **Adjacent things share one
-  picker:** the model switcher IS the reasoning switcher (`Model & reasoning` —
-  rows pick the model on one axis, `←`/`→` clicks the effort detent on the
-  other, and the selected model's levels print as a live §10.1 **detent
-  track** above the footer, rendered through the settings panel's own switch
-  function so the two surfaces cannot drift); `/model` and a bare `/reasoning`
-  both open it, and the typed forms (`/model <id>`, `/reasoning <level>`)
-  stay as the fast path. Never a second bespoke list for a sibling of an
-  existing surface.
-- **Settings panel** — the faceplate (§10.1). Not a category tree.
+- **Picker** — **tasks** and resume. Rows: `[◉ if active] label … meta hint`.
+  The model switcher, scoped-models, providers, and project-permissions surfaces
+  are **no longer pickers** — they are hatches inside the faceplate (§10.1).
+  **Adjacent things share one picker** stands, now enforced *structurally*: the
+  model hatch's own `reasoning` row IS the effort track (§10.1), so there is no
+  second, duplicated track. `/model` and a bare `/reasoning` open the faceplate's
+  ENGINE hatch; the typed forms (`/model <id>`, `/reasoning <level>`) stay the
+  fast path. Never a second bespoke list for a sibling of an existing surface.
+- **Settings panel** — the faceplate (§10.1). Not a category tree. Its ports are
+  **hatches, not doors**: they expand in place, never swapping to another modal.
 - **HelpOverlay** — the `?` cheatsheet: grouped key→action rows (keys in ink,
   actions muted, quiet uppercase group headings). No color, no icons.
 
@@ -835,6 +834,23 @@ MEMORY
 ↑↓ select · ←→ set · esc close
 ```
 
+Pressing `↵` on a `▸` port **expands it in place** — the marker flips to `▾`
+and the surface's rows print indented directly beneath, inside the same panel.
+The model hatch open, its `reasoning` row live-tracking the highlighted
+candidate:
+
+```
+ENGINE
+  model             ▾ gpt-5.5 ┊ openai-codex
+    ◉ gpt-5.5                          openai-codex   default
+    ○ claude-sonnet-5                  anthropic
+    ○ gemini-3-pro                     google
+  reasoning         ○ off  ○ minimal  ○ low  ◉ medium  ○ high  ○ xhigh
+  model scope       ▸ all models
+
+←→ reasoning · ↵ set default · s session · esc collapse
+```
+
 **Masthead.** Row one is the panel's silkscreen: bold `SETTINGS`, the crate
 rev right-bound on the panel measure (the same identity print as the start
 page and the exit receipt). It is pinned — a windowed panel scrolls its
@@ -863,14 +879,25 @@ Never invent a fifth:
   `▋` caret), `↵` saves, `esc` cancels, an empty buffer clears the key when
   the field allows it; a rejected buffer shows an inline danger token
   (`■ whole numbers only`), never a modal.
-- **port** — a `▸` row that opens a deeper surface (model picker, scoped
-  models, project permissions, login). **Settings is home:** when that
-  surface closes — selected or cancelled — the panel re-opens on the port row
-  that launched it, snapshot refreshed, in the same frame (the dock never
-  collapses on the way back). The **model row is a rotary–port hybrid**: `←`/
-  `→` cycles the scoped models exactly like Ctrl+P (the row rebuilds on the
-  new engine and flashes), `↵` opens the full picker; its footer names both
-  verbs (`←→ cycle · ↵ open`).
+- **port** — a `▸` row that is a **hatch, not a door**: `↵` expands it in place
+  to `▾` + indented child rows inside the same panel (model picker, model scope,
+  providers, project permissions). **One hatch open at a time** (accordion —
+  expanding one folds any other in the same keypress); `↵` on the `▾` header or
+  `esc` anywhere folds it (cursor lands back on the header); `←`/`→` are never
+  collapse verbs. The panel never leaves — no surface replacement, no frame
+  without the faceplate. Child rows print at a four-cell indent and degrade like
+  their archetypes at narrow widths; the footer is contextual to the selected
+  child (its true verbs). The **model row is a rotary–port hybrid**: `←`/`→`
+  cycles the scoped models exactly like Ctrl+P (the row rebuilds on the new
+  engine and flashes), `↵` expands the hatch; its footer names both verbs
+  (`←→ cycle · ↵ open`). Inside the model hatch the panel's own `reasoning` row
+  IS the effort track — arrowing over candidates re-renders it with that model's
+  levels, target clamped, and there is no duplicated second track.
+  **Dialog-guard exception:** three genuine interrupts (the large-context switch
+  advisory, the OAuth login dialog, the API-key dialog) still overlay the
+  faceplate; when one resolves — any path — the panel's snapshot is refreshed (a
+  login can grow the catalog) and it reopens expanded with the cursor intact,
+  *before the next draw*, so the dock never collapses for a frame.
 
 **Mechanics.** `↑`/`↓` move over controls (wrapping; headers and blanks are
 skipped — silkscreen is not selectable). Every adjustment **saves
