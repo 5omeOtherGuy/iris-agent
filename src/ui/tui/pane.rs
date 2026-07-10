@@ -6,10 +6,10 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::ui::markdown::{MarkdownTheme, render_markdown_themed};
+use crate::ui::markdown::{LineClass, MarkdownTheme, render_markdown_classified};
 
 use super::panel_style;
-use super::rows::{FoldVis, TranscriptRow};
+use super::rows::{FoldVis, Measure, TranscriptRow};
 use super::wrap::line_text;
 
 /// The 2-cell gutter every transcript turn hangs its body under. It holds the
@@ -39,7 +39,7 @@ pub(super) fn assistant_rows(text: &str, content_width: usize) -> Vec<Transcript
     let theme = MarkdownTheme::default()
         .with_code_highlighting()
         .with_hyperlinks();
-    let lines = render_markdown_themed(text, &theme, markdown_width(content_width));
+    let lines = render_markdown_classified(text, &theme, markdown_width(content_width));
     let mut rows = Vec::new();
     push_assistant_markdown_lines(&mut rows, lines);
     rows
@@ -76,29 +76,39 @@ fn user_row(text: &str, show_marker: bool) -> TranscriptRow {
         Span::styled(lead, lead_style),
         Span::styled(text.to_string(), panel_style()),
     ]);
-    marker_row(text.to_string(), line)
+    // A user turn body is prose — it wraps at the reader's measure (spec §3).
+    marker_row(text.to_string(), line, Measure::Prose)
 }
 
-fn push_assistant_markdown_lines(rows: &mut Vec<TranscriptRow>, lines: Vec<Line<'static>>) {
-    for line in lines {
-        rows.push(assistant_row(line));
+fn push_assistant_markdown_lines(
+    rows: &mut Vec<TranscriptRow>,
+    lines: Vec<(Line<'static>, LineClass)>,
+) {
+    for (line, class) in lines {
+        rows.push(assistant_row(line, class));
     }
 }
 
 /// The agent speaks unmarked: its rendered markdown line hangs on the shared
 /// text column under a blank gutter, no `›` (the user's turn is the marked one,
-/// docs/TUI_DESIGN_LANGUAGE.md §7).
-fn assistant_row(mut line: Line<'static>) -> TranscriptRow {
+/// docs/TUI_DESIGN_LANGUAGE.md §7). Prose lines wrap at the reader's measure;
+/// fenced/indented code and tables stay full width (spec §3).
+fn assistant_row(mut line: Line<'static>, class: LineClass) -> TranscriptRow {
     let text = line_text(&line);
     line.spans
         .insert(0, Span::styled(TEXT_GUTTER, Style::default()));
-    marker_row(text, line)
+    let measure = match class {
+        LineClass::Prose => Measure::Prose,
+        LineClass::Mechanical => Measure::Mechanical,
+    };
+    marker_row(text, line, measure)
 }
 
 /// A conversation row: `text` is the searchable content (no gutter) and `line`
 /// is the same content with its 2-cell gutter already prepended, laid out on the
-/// shared text column and wrapping under the gutter.
-fn marker_row(text: String, line: Line<'static>) -> TranscriptRow {
+/// shared text column and wrapping under the gutter. `measure` selects prose
+/// (reader's measure) vs mechanical (full width) text wrapping.
+fn marker_row(text: String, line: Line<'static>, measure: Measure) -> TranscriptRow {
     TranscriptRow {
         text,
         style: panel_style(),
@@ -110,5 +120,6 @@ fn marker_row(text: String, line: Line<'static>) -> TranscriptRow {
         hrule: false,
         chrome: None,
         searchable: true,
+        measure,
     }
 }

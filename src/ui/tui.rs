@@ -161,6 +161,14 @@ const TEXT_COLUMN_X_PADDING_U16: u16 = TEXT_COLUMN_X_PADDING as u16;
 /// before wrapping, so one pathological line cannot dominate the row budget.
 const MAX_TOOL_OUTPUT_LINE_CHARS: usize = 2000;
 
+/// Prose measure (reactive-density spec §3): prose-classed text wraps to
+/// `min(content_width, PROSE_MEASURE)` columns so an ultrawide pane does not
+/// stretch a paragraph past a readable line length (the eye loses the line on
+/// the way back). Mechanical output — code, tool bodies, diffs, tables, rules,
+/// session chrome — keeps the full pane width. On any pane ≤ 96 columns the
+/// measure is a no-op (`min` picks the pane), so nothing regresses there.
+const PROSE_MEASURE: usize = 96;
+
 /// Cap on the live exec stream buffer re-rendered under the gutter on each
 /// delta. Only the tail (flood-capped to `MAX_TOOL_OUTPUT_ROWS`) is shown and
 /// the authoritative full output arrives with the final `ToolResult`, so

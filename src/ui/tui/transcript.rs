@@ -15,7 +15,7 @@ use super::panel::{
     FooterField, PanelHeaderSpec, PanelState, ToolDiag, diff_counts, diff_table_rows,
     edit_footer_extras, join_meta_fields, panel_state, review_footer_extras,
 };
-use super::rows::{ChromeRow, FoldVis, TranscriptRow, is_separator_row};
+use super::rows::{ChromeRow, FoldVis, Measure, TranscriptRow, is_separator_row};
 use super::streaming::StreamController;
 use super::tool_render::{self, RenderCtx, ToolOutcome, ToolPanelKind};
 use super::wrap::line_text;
@@ -97,6 +97,8 @@ fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
         hrule: false,
         chrome: None,
         searchable: true,
+        // A thinking body is prose (spec §3): wraps at the reader's measure.
+        measure: Measure::Prose,
     }
 }
 
@@ -717,6 +719,8 @@ impl Transcript {
             hrule: true,
             chrome: None,
             searchable: true,
+            // A turn divider is a full-width rule (spec §3: mechanical).
+            measure: Measure::Mechanical,
         });
         self.push_blank();
     }

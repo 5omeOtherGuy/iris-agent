@@ -38,6 +38,17 @@ const INDENT: &str = "  ";
 /// yet (e.g. the first paint before any frame has been measured).
 pub(crate) const DEFAULT_RENDER_WIDTH: usize = 80;
 
+/// Layout class of a rendered markdown line, so a caller can apply a reader's
+/// measure to reflowable prose while leaving column-aligned content at full
+/// width. `Prose` (paragraphs, headings, list items, blockquotes) may wrap to a
+/// narrower measure; `Mechanical` (fenced/indented code, tables, horizontal
+/// rules) must keep the full width or its alignment breaks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LineClass {
+    Prose,
+    Mechanical,
+}
+
 /// Optional fenced-code colorizer: `(code, lang) -> styled lines`. A caller can
 /// inject a syntax highlighter here; Iris ships no built-in implementation, so
 /// the default theme leaves it `None` and fenced blocks render dimmed.
@@ -157,6 +168,20 @@ pub(crate) fn render_markdown_themed(
     theme: &MarkdownTheme,
     width: usize,
 ) -> Vec<Line<'static>> {
+    render_markdown_classified(text, theme, width)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect()
+}
+
+/// Like [`render_markdown_themed`], but tags each line with its [`LineClass`] so
+/// the caller can wrap prose to a reader's measure while leaving code and tables
+/// at full width (reactive-density spec §3).
+pub(crate) fn render_markdown_classified(
+    text: &str,
+    theme: &MarkdownTheme,
+    width: usize,
+) -> Vec<(Line<'static>, LineClass)> {
     render_markdown_shaped(text, theme, width, zwj_shaping())
 }
 
@@ -168,7 +193,7 @@ fn render_markdown_shaped(
     theme: &MarkdownTheme,
     width: usize,
     shaping: ZwjShaping,
-) -> Vec<Line<'static>> {
+) -> Vec<(Line<'static>, LineClass)> {
     let mut renderer = Renderer::new(theme, width.max(1));
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
@@ -190,7 +215,7 @@ fn render_markdown_shaped(
 struct Renderer<'a> {
     theme: &'a MarkdownTheme,
     width: usize,
-    out: Vec<Line<'static>>,
+    out: Vec<(Line<'static>, LineClass)>,
     spans: Vec<Span<'static>>,
     /// Ordered-list counters (`Some(n)`) or bullet markers (`None`), one per
     /// open list, so nesting indents and numbering stay correct.
@@ -271,11 +296,14 @@ impl<'a> Renderer<'a> {
                     self.flush();
                 }
             }
-            // Horizontal rule: a dim divider line.
+            // Horizontal rule: a dim divider line (mechanical — a full-width
+            // rule, not reflowable prose).
             Event::Rule => {
                 self.flush();
-                self.out
-                    .push(Line::from(Span::styled("---", self.theme.rule)));
+                self.out.push((
+                    Line::from(Span::styled("---", self.theme.rule)),
+                    LineClass::Mechanical,
+                ));
             }
             // GFM task-list checkbox; arrives at the start of a list item's text.
             Event::TaskListMarker(checked) => {
@@ -505,7 +533,7 @@ impl<'a> Renderer<'a> {
                 if !prefix.is_empty() {
                     line.spans.insert(0, Span::styled(prefix.clone(), style));
                 }
-                self.out.push(line);
+                self.out.push((line, LineClass::Mechanical));
             }
             return;
         }
@@ -518,8 +546,10 @@ impl<'a> Renderer<'a> {
             if i == last && line.is_empty() {
                 continue;
             }
-            self.out
-                .push(Line::from(Span::styled(format!("{prefix}{line}"), style)));
+            self.out.push((
+                Line::from(Span::styled(format!("{prefix}{line}"), style)),
+                LineClass::Mechanical,
+            ));
         }
     }
 
@@ -560,7 +590,7 @@ impl<'a> Renderer<'a> {
             ));
         }
         line.append(&mut self.spans);
-        self.out.push(Line::from(line));
+        self.out.push((Line::from(line), LineClass::Prose));
         if !self.prefix.is_empty() && !self.prefix.chars().all(|ch| ch == ' ') {
             self.prefix = Self::continuation_prefix(&self.prefix);
         }
@@ -568,13 +598,13 @@ impl<'a> Renderer<'a> {
 
     /// Push a single blank separator line unless one is already trailing.
     fn blank(&mut self) {
-        if self.out.last().is_some_and(|l| line_is_empty(l)) {
+        if self.out.last().is_some_and(|(l, _)| line_is_empty(l)) {
             return;
         }
         if self.out.is_empty() {
             return;
         }
-        self.out.push(Line::default());
+        self.out.push((Line::default(), LineClass::Prose));
     }
 
     /// The leading indent for a block (blockquote markers + list-continuation
@@ -666,14 +696,15 @@ impl<'a> Renderer<'a> {
                 line.spans
                     .insert(0, Span::styled(prefix.clone(), prefix_style));
             }
-            self.out.push(line);
+            // A table is column-aligned box drawing: mechanical, never reflowed.
+            self.out.push((line, LineClass::Mechanical));
         }
     }
 
-    fn finish(mut self) -> Vec<Line<'static>> {
+    fn finish(mut self) -> Vec<(Line<'static>, LineClass)> {
         self.flush();
         // Trim a trailing blank introduced by the last block separator.
-        while self.out.last().is_some_and(|l| line_is_empty(l)) {
+        while self.out.last().is_some_and(|(l, _)| line_is_empty(l)) {
             self.out.pop();
         }
         self.out
@@ -1216,7 +1247,11 @@ mod tests {
             DEFAULT_RENDER_WIDTH,
             ZwjShaping::Unshaped { actual: 6 },
         );
-        let joined: String = unshaped.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        let joined: String = unshaped
+            .iter()
+            .map(|(l, _)| text_of(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             joined.contains(man),
             "expected substituted face: {joined:?}"
@@ -1228,7 +1263,11 @@ mod tests {
 
         for shaping in [ZwjShaping::Shaped, ZwjShaping::Unknown] {
             let out = render_markdown_shaped(&md, &theme, DEFAULT_RENDER_WIDTH, shaping);
-            let joined: String = out.iter().map(text_of).collect::<Vec<_>>().join("\n");
+            let joined: String = out
+                .iter()
+                .map(|(l, _)| text_of(l))
+                .collect::<Vec<_>>()
+                .join("\n");
             assert!(
                 joined.contains(family),
                 "cluster changed for {shaping:?}: {joined:?}"
