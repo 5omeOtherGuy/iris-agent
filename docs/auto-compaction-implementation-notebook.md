@@ -301,3 +301,34 @@ active, up to 14 filler turns, with five-second yields; allow one final bounded
 compactions and passed: G1 29.6 ms, worst post/start 11,394/23,592, shallowest
 26,263 -> 11,394 (56.6% total, 96.9% covered), worker hit 0.999, derived fresh
 parent input 5,249 -> 22,158 (4.221×), and all G2–G5/read checks.
+
+## Goal closeout
+
+Status: complete on merged commit `f82fc7f`.
+
+Two consecutive full protocol runs completed without an intervening code or
+settings change. Run 1 passed 10/10 sessions on both lanes with zero exclusions:
+Haiku applied 25 compactions with worst G1 18.5 ms; Codex applied 20 with worst
+G1 24.6 ms. Run 2 passed Haiku 10/10 with 25 compactions and worst G1 19.9 ms.
+Codex evaluated 9/9 after the single permitted flaky exclusion; the 18 counted
+compactions had worst G1 88.8 ms. Every evaluated session passed G2–G5, real
+read, planted-needle recall/carry, and byte-exact resume.
+
+Excluded run-2 Codex session 08: G1 measured 1,540.6 ms while G2–G5/read all
+passed. The other 38 closeout sessions were below 89 ms and the immediately
+following session measured 12.9 ms. The harness error and raw row are preserved
+verbatim in `docs/benchmarks/auto-compaction-live-loop.md`; the row is not
+averaged into any run metric.
+
+Final measurement lesson: the original 20k -> 17k observation conflated
+post-apply size with reduction. True before size is reconstructed as
+`after + original - summary`. Minimal whole-context reduction can still occur
+on a later generation when pair-safe range selection exposes only a small
+prefix: run-1 Haiku session 04 reduced that prefix by 83.3% but moved total
+message context only 21,611 -> 20,118 (6.9%). The tuned default removes roughly
+half the total context in the common two-compaction rows while preserving an 8k
+hot tail; it does not promise every later generation will expose a large range.
+
+All slices and follow-ups used per-task worktrees, green deterministic gates,
+PRs, squash merges, and cleanup. Live summaries stayed pinned to
+`anthropic/claude-opus-4-6` with medium thinking.

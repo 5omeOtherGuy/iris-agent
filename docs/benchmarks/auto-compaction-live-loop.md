@@ -580,3 +580,114 @@ next smoke passed:
 The Codex parent column is derived fresh input (`input - cache_read`), not a
 reported cache write. This one-session availability row validates the repaired
 instrument but is not one of the required final 10-session runs.
+
+## Goal closeout — two consecutive passing runs — 2026-07-10
+
+Base: merged commit `f82fc7f`. No code, settings, or credentials changed between
+the runs. Parent traffic used only `anthropic/claude-haiku-4-5` and
+`openai-codex/gpt-5.4-mini`. Every summary worker used
+`anthropic/claude-opus-4-6` with medium thinking. Each evaluated session forced
+at least two real auto-compactions, performed a real repository read, probed the
+planted needle, exited, and byte-compared resumed with final live context.
+
+Regeneration command, run once per lane and repeated without intervening
+changes:
+
+```sh
+IRIS_BENCH_LIVE=1 IRIS_AUTO_COMPACTION_SESSIONS=10 \
+  cargo test --locked auto_compaction_live_loop_anthropic -- \
+  --ignored --nocapture --test-threads=1
+
+IRIS_BENCH_LIVE=1 IRIS_AUTO_COMPACTION_SESSIONS=10 \
+  cargo test --locked auto_compaction_live_loop_codex -- \
+  --ignored --nocapture --test-threads=1
+```
+
+### Gate summary
+
+| run | lane | scripted / evaluated | compactions | worst G1 | worst post/start | shallowest covered / total reduction | G2 | G3 | G4 | G5 | reads | worker hit | parent cache pre -> post | exclusions |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | Haiku | 10 / 10 | 25 | 18.5 ms | 20,757/23,592 | 83.3% / 6.9% | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 10 × 0.000 | reported write 54,920 -> 508,599 (9.261×) | 0 |
+| 1 | Codex mini | 10 / 10 | 20 | 24.6 ms | 13,082/23,592 | 97.2% / 53.3% | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 10 × 0.000 | derived fresh 255,262 -> 228,592 (0.896×) | 0 |
+| 2 | Haiku | 10 / 10 | 25 | 19.9 ms | 20,750/23,592 | 95.8% / 32.4% | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 10 × 0.000 | reported write 66,468 -> 453,012 (6.815×) | 0 |
+| 2 | Codex mini | 10 / 9 | 18 | 88.8 ms | 14,786/23,592 | 96.9% / 50.3% | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9 × 0.000 | derived fresh 289,224 -> 207,004 (0.716×) | 1 |
+
+G1 is below 200 ms for every evaluated session. G2 checks every apply, not just
+the maximum shown. G3 requires the exact answer plus one recall marker per
+compaction and the carry block. G4 includes zero compaction-caused turn
+failures and byte-exact live/resumed context. G5 requires `origin` and
+`workerUsage` on every entry, with non-null Opus usage for every model-backed
+entry where reported.
+
+Run 1 completed in 1,333.62 seconds. Run 2 completed in 1,425.69 seconds. Run 2
+uses the protocol's one permitted flaky-session exclusion. The excluded row's
+G2–G5/read checks all passed; only its observed scheduling interval failed G1.
+The harness error is recorded verbatim:
+
+```text
+openai-codex/gpt-5.4-mini live protocol failed: exclusions=0; session 08: compactions=2 G1=1540.6ms/false G2=true G3=true/true/true G4=true G5=true read=true
+```
+
+The excluded raw row was:
+
+```text
+openai-codex/gpt-5.4-mini | 08 | 2 | 1540.6ms/false | 11350/23592/true | 25746->10768/14978/97.6%/58.2% | true/true/true | true | true | 0.000 | 26130->20087/0.769/derived-fresh-input/2 | true | -
+```
+
+It is excluded, not averaged into run-2 Codex metrics. The immediately
+following session returned G1 12.9 ms, and the other 38 closeout sessions were
+below 89 ms. No provider, auth, tool, worker, persistence, recall, metadata,
+turn, abort, or resume error occurred in an evaluated session.
+
+### Run 1 session rows
+
+| lane | session | compactions | G1 | max post | shallowest before -> after | covered / total | worker hit | parent cache pre -> post / pairs | result |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| Haiku | 00 | 3 | 15.2 ms | 17,583 | 20,082 -> 14,282 | 95.2% / 28.9% | 0.000 | 6,240 -> 63,735 / 3 | pass |
+| Haiku | 01 | 2 | 15.5 ms | 15,438 | 25,097 -> 12,948 | 96.7% / 48.4% | 0.000 | 3,251 -> 37,584 / 2 | pass |
+| Haiku | 02 | 3 | 16.1 ms | 20,757 | 26,538 -> 20,757 | 95.3% / 21.8% | 0.000 | 4,234 -> 69,192 / 3 | pass |
+| Haiku | 03 | 3 | 3.1 ms | 18,961 | 22,325 -> 16,538 | 95.2% / 25.9% | 0.000 | 5,071 -> 70,151 / 3 | pass |
+| Haiku | 04 | 3 | 13.1 ms | 20,118 | 21,611 -> 20,118 | 83.3% / 6.9% | 0.000 | 5,791 -> 65,791 / 3 | pass |
+| Haiku | 05 | 2 | 2.2 ms | 15,495 | 30,417 -> 15,495 | 97.3% / 49.1% | 0.000 | 4,828 -> 34,469 / 2 | pass |
+| Haiku | 06 | 2 | 2.7 ms | 15,431 | 30,408 -> 15,431 | 97.6% / 49.3% | 0.000 | 4,824 -> 34,297 / 2 | pass |
+| Haiku | 07 | 3 | 17.6 ms | 17,935 | 19,854 -> 14,031 | 95.2% / 29.3% | 0.000 | 11,019 -> 64,493 / 3 | pass |
+| Haiku | 08 | 2 | 2.2 ms | 15,551 | 30,412 -> 15,551 | 96.9% / 48.9% | 0.000 | 4,819 -> 34,622 / 2 | pass |
+| Haiku | 09 | 2 | 18.5 ms | 15,421 | 30,430 -> 15,421 | 97.8% / 49.3% | 0.000 | 4,843 -> 34,265 / 2 | pass |
+| Codex | 00 | 2 | 17.9 ms | 13,082 | 28,002 -> 13,082 | 97.2% / 53.3% | 0.000 | 26,836 -> 21,754 / 2 | pass |
+| Codex | 01 | 2 | 19.5 ms | 11,421 | 25,801 -> 10,844 | 97.5% / 58.0% | 0.000 | 23,149 -> 21,805 / 2 | pass |
+| Codex | 02 | 2 | 20.0 ms | 13,022 | 27,971 -> 13,022 | 97.4% / 53.4% | 0.000 | 34,297 -> 23,581 / 2 | pass |
+| Codex | 03 | 2 | 18.2 ms | 11,301 | 26,228 -> 11,301 | 97.3% / 56.9% | 0.000 | 33,254 -> 23,437 / 2 | pass |
+| Codex | 04 | 2 | 24.6 ms | 12,781 | 27,730 -> 12,781 | 97.4% / 53.9% | 0.000 | 23,349 -> 23,791 / 2 | pass |
+| Codex | 05 | 2 | 22.1 ms | 11,491 | 25,883 -> 10,975 | 97.2% / 57.6% | 0.000 | 24,068 -> 21,291 / 2 | pass |
+| Codex | 06 | 2 | 22.0 ms | 11,297 | 26,257 -> 11,297 | 97.5% / 57.0% | 0.000 | 28,608 -> 22,255 / 2 | pass |
+| Codex | 07 | 2 | 22.9 ms | 13,050 | 27,960 -> 13,050 | 97.2% / 53.3% | 0.000 | 26,020 -> 25,323 / 2 | pass |
+| Codex | 08 | 2 | 13.0 ms | 11,423 | 25,878 -> 10,926 | 97.5% / 57.8% | 0.000 | 5,038 -> 22,676 / 2 | pass |
+| Codex | 09 | 2 | 16.7 ms | 11,451 | 25,874 -> 10,937 | 97.4% / 57.7% | 0.000 | 30,643 -> 22,679 / 2 | pass |
+
+### Run 2 session rows
+
+| lane | session | compactions | G1 | max post | shallowest before -> after | covered / total | worker hit | parent cache pre -> post / pairs | result |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| Haiku | 00 | 3 | 3.6 ms | 15,491 | 30,425 -> 15,491 | 97.3% / 49.1% | 0.000 | 11,111 -> 45,737 / 3 | pass |
+| Haiku | 01 | 2 | 12.9 ms | 15,442 | 30,415 -> 15,442 | 97.6% / 49.2% | 0.000 | 2,688 -> 34,263 / 2 | pass |
+| Haiku | 02 | 3 | 16.3 ms | 15,871 | 25,837 -> 15,871 | 95.8% / 38.6% | 0.000 | 8,114 -> 59,980 / 3 | pass |
+| Haiku | 03 | 2 | 1.7 ms | 16,277 | 28,418 -> 16,277 | 96.8% / 42.7% | 0.000 | 2,701 -> 39,193 / 2 | pass |
+| Haiku | 04 | 2 | 11.4 ms | 15,424 | 30,400 -> 15,424 | 97.6% / 49.3% | 0.000 | 2,715 -> 32,093 / 2 | pass |
+| Haiku | 05 | 2 | 2.3 ms | 15,450 | 30,410 -> 15,450 | 97.5% / 49.2% | 0.000 | 8,948 -> 32,639 / 2 | pass |
+| Haiku | 06 | 3 | 19.9 ms | 15,476 | 23,032 -> 13,082 | 95.8% / 43.2% | 0.000 | 5,222 -> 56,083 / 3 | pass |
+| Haiku | 07 | 2 | 3.0 ms | 15,520 | 30,415 -> 15,520 | 97.1% / 49.0% | 0.000 | 2,313 -> 31,989 / 2 | pass |
+| Haiku | 08 | 3 | 11.7 ms | 15,561 | 30,411 -> 15,561 | 96.8% / 48.8% | 0.000 | 15,513 -> 55,161 / 3 | pass |
+| Haiku | 09 | 3 | 10.9 ms | 20,750 | 30,680 -> 20,750 | 95.9% / 32.4% | 0.000 | 7,143 -> 65,874 / 3 | pass |
+| Codex | 00 | 2 | 88.8 ms | 13,892 | 27,859 -> 12,993 | 96.9% / 53.4% | 0.000 | 30,208 -> 27,301 / 2 | pass |
+| Codex | 01 | 2 | 23.2 ms | 11,280 | 26,246 -> 11,280 | 97.5% / 57.0% | 0.000 | 28,026 -> 20,437 / 2 | pass |
+| Codex | 02 | 2 | 27.8 ms | 11,659 | 26,604 -> 11,659 | 97.4% / 56.2% | 0.000 | 25,981 -> 21,963 / 2 | pass |
+| Codex | 03 | 2 | 27.5 ms | 14,038 | 28,991 -> 14,038 | 97.5% / 51.6% | 0.000 | 33,461 -> 25,845 / 2 | pass |
+| Codex | 04 | 2 | 16.8 ms | 11,347 | 25,761 -> 10,817 | 97.4% / 58.0% | 0.000 | 6,790 -> 21,640 / 2 | pass |
+| Codex | 05 | 2 | 29.6 ms | 14,786 | 29,727 -> 14,786 | 97.4% / 50.3% | 0.000 | 50,382 -> 28,355 / 2 | pass |
+| Codex | 06 | 2 | 1.5 ms | 11,550 | 25,883 -> 10,924 | 97.5% / 57.8% | 0.000 | 45,196 -> 20,163 / 2 | pass |
+| Codex | 07 | 2 | 24.0 ms | 11,336 | 25,779 -> 10,805 | 97.6% / 58.1% | 0.000 | 24,517 -> 21,343 / 2 | pass |
+| Codex | 08 | 2 | 1,540.6 ms | 11,350 | 25,746 -> 10,768 | 97.6% / 58.2% | 0.000 | 26,130 -> 20,087 / 2 | excluded: G1 timing flake |
+| Codex | 09 | 2 | 12.9 ms | 11,460 | 25,864 -> 10,881 | 97.7% / 57.9% | 0.000 | 44,663 -> 19,957 / 2 | pass |
+
+The goal is met: two consecutive full protocol runs satisfy G1–G5 on both
+lanes with one total permitted flaky exclusion, recorded verbatim above.
