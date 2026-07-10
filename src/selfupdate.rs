@@ -169,7 +169,7 @@ fn parse_semver(tag: &str) -> Option<semver::Version> {
 /// downgrade", so a build we cut for testing is never pushed onto users:
 /// - a `prerelease`/`draft` release, or a tag carrying a semver prerelease
 ///   component (e.g. `1.2.0-rc.1`), is [`UpdateAction::Skip`];
-/// - an unparseable `current` or `tag` is [`UpdateAction::Skip`] (refuse rather
+/// - an unparsable `current` or `tag` is [`UpdateAction::Skip`] (refuse rather
 ///   than risk a wrong or downgrade replacement);
 /// - otherwise compare by semver precedence: strictly-newer is
 ///   [`UpdateAction::Update`], equal is [`UpdateAction::UpToDate`], and an older
@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn decide_update_refuses_prerelease_and_draft_and_unparseable() {
+    fn decide_update_refuses_prerelease_and_draft_and_unparsable() {
         // Never ship a testing build to users, however the tag is flagged.
         assert_eq!(
             decide_update("0.1.0", "v0.2.0", true, false),
@@ -524,7 +524,7 @@ mod tests {
             decide_update("0.1.0", "v0.2.0-rc.1", false, false),
             UpdateAction::Skip
         );
-        // Unparseable versions are refused rather than risking a wrong replace.
+        // Unparsable versions are refused rather than risking a wrong replace.
         assert_eq!(
             decide_update("0.1.0", "nightly", false, false),
             UpdateAction::Skip
