@@ -122,14 +122,14 @@
   `cache_control` markers with optional 1h TTL. Iris records provider usage/cache
   metadata and warns only on proven stable-prefix breaks, not ordinary cold
   caches. [Partial]
-- **Provider-native compaction opt-in** — global-only
-  `compaction.providerNative` accepts `off` (default) or capability-gated
-  `auto`. Entries persist a portable summary plus one adapter-owned opaque
+- **Provider-native compaction** — global-only
+  `compaction.providerNative` accepts capability-gated `auto` (default) or
+  `off`. Entries persist a portable summary plus one adapter-owned opaque
   block; only the same adapter and exact model replay the block. Anthropic's
-  compact beta is implemented above its 50k trigger floor. The Haiku 4.5 live
-  lane currently rejects the request, so automatic mode remains default-off.
-  OpenAI's v2 trigger probe succeeds on the Codex mini subscription lane but is
-  not enabled until it can satisfy the portable-text invariant. (ADR-0056)
+  compact beta is implemented above its 50k trigger floor. OpenAI's native
+  trigger persists the encrypted compaction item and pairs it with a separate
+  OpenAI-authored portable summary. Rejected model capabilities are cached for
+  the process and fall back to portable provider summarization. (ADR-0056)
   [Partial]
 - **Anthropic context-management opt-in** — global-only
   `anthropicContextManagement` supports the public clear-tool-use and

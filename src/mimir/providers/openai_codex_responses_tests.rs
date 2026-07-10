@@ -566,7 +566,7 @@ fn remote_v2_compaction_probe_is_flag_gated_and_uses_a_trigger_item() {
     assert!(openai_native_probe_enabled(Some("true")));
     assert!(!openai_native_probe_enabled(Some("0")));
 
-    let request = build_codex_native_compaction_probe_request(
+    let request = build_codex_native_compaction_request(
         "gpt-5.4-mini",
         "IRIS PROMPT",
         &[Message::user("old context")],
@@ -608,6 +608,14 @@ fn remote_v2_compaction_probe_captures_one_deduplicated_stream_item() {
     assert_eq!(block["adapter"], "openai-codex-responses");
     assert_eq!(block["model"], "gpt-5.4-mini");
     assert_eq!(block["block"]["encrypted_content"], "opaque");
+}
+
+#[test]
+fn native_compaction_portable_summary_prompt_is_text_only_and_preserves_focus() {
+    let prompt = native_compaction_summary_instructions("retain issue 42 and src/lib.rs");
+    assert!(prompt.contains("self-contained handoff summary"));
+    assert!(prompt.contains("do not call tools"));
+    assert!(prompt.contains("retain issue 42 and src/lib.rs"));
 }
 
 #[test]

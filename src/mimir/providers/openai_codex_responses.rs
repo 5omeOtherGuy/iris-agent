@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::future::Future;
-#[cfg(test)]
 use std::io::BufRead;
 use std::io::BufReader;
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,8 @@ use super::transport::{
 use crate::mimir::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
 use crate::mimir::selection::{CodexTransport, PromptCacheRetention, ReasoningEffort};
 use crate::nexus::{
-    AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderStream, ProviderUsage,
+    AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderCompactionCapability,
+    ProviderCompactionFuture, ProviderCompactionOutput, ProviderStream, ProviderUsage,
     ReasoningBlock, Role, ToolCall, Tools,
 };
 
@@ -37,6 +39,7 @@ use crate::nexus::{
 // every provider adapter.
 const PROVIDER_ID: &str = "openai-codex";
 const API_ID: &str = "openai-codex-responses";
+static NATIVE_COMPACTION_UNSUPPORTED_MODELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_MAX_AGE: Duration = Duration::from_secs(55 * 60);
@@ -148,7 +151,7 @@ impl OpenAiCodexResponsesProvider {
         ) {
             bail!("OpenAI native compaction probe is disabled");
         }
-        let request = build_codex_native_compaction_probe_request(
+        let request = build_codex_native_compaction_request(
             &self.model,
             &self.system_prompt,
             messages,
@@ -175,6 +178,87 @@ impl OpenAiCodexResponsesProvider {
             );
         }
         parse_codex_compaction_probe_reader(BufReader::new(response), &self.model, cancel)
+    }
+
+    fn compact_context_blocking(
+        &self,
+        messages: &[Message],
+        instructions: &str,
+        cancel: &CancellationToken,
+    ) -> Result<ProviderCompactionOutput> {
+        if cancel.is_cancelled() {
+            bail!("provider-native compaction cancelled");
+        }
+        let request = build_codex_native_compaction_request(
+            &self.model,
+            &self.system_prompt,
+            messages,
+            self.cache_retention,
+        );
+        let token = self.tokens.access_token(&self.client)?;
+        let response = self
+            .client
+            .post(resolve_codex_url(&self.base_url)?)
+            .headers(codex_headers(&token)?)
+            .json(&request)
+            .send()
+            .context("failed to send Codex native compaction request")?;
+        let status = response.status();
+        if !status.is_success() {
+            if status.as_u16() == 400 {
+                NATIVE_COMPACTION_UNSUPPORTED_MODELS
+                    .get_or_init(|| Mutex::new(HashSet::new()))
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .insert(self.model.clone());
+            }
+            let body = response.text().unwrap_or_default();
+            let error_type = extract_error_field(&body, "type")
+                .or_else(|| extract_error_field(&body, "code"))
+                .unwrap_or_else(|| "unknown_error".to_string());
+            bail!(
+                "Codex native compaction failed [status={} endpoint=/codex/responses model={} error_type={error_type}]",
+                status.as_u16(),
+                self.model
+            );
+        }
+        let block =
+            parse_codex_compaction_probe_reader(BufReader::new(response), &self.model, cancel)?;
+
+        let summary_request = build_codex_request(
+            &self.model,
+            &native_compaction_summary_instructions(instructions),
+            messages,
+            &Tools::new(Vec::new()),
+            self.reasoning,
+            Some(&self.prompt_cache_key),
+            None,
+            self.cache_retention,
+        );
+        let mut sink = DiscardTextSink;
+        let turn = self.run_blocking(
+            resolve_codex_url(&self.base_url)?,
+            &summary_request,
+            &mut sink,
+            cancel,
+        )?;
+        let summary = turn
+            .text
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| anyhow!("Codex native compaction returned empty portable text"))?;
+        Ok(ProviderCompactionOutput {
+            summary,
+            provider_blocks: vec![block],
+            usage: turn.usage,
+        })
+    }
+}
+
+struct DiscardTextSink;
+
+impl TurnSink for DiscardTextSink {
+    fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -229,6 +313,28 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
             move |sink, cancel| async move { provider.run_auto(url, request, sink, cancel).await },
             cancel,
         ))
+    }
+
+    fn compaction_capability(&self, _input_tokens: u64) -> ProviderCompactionCapability {
+        let unsupported = NATIVE_COMPACTION_UNSUPPORTED_MODELS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(&self.model);
+        if unsupported {
+            ProviderCompactionCapability::None
+        } else {
+            ProviderCompactionCapability::OpaqueBlocks
+        }
+    }
+
+    fn compact_context<'a>(
+        &'a self,
+        messages: &'a [Message],
+        instructions: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> ProviderCompactionFuture<'a> {
+        Box::pin(async move { self.compact_context_blocking(messages, instructions, cancel) })
     }
 }
 
@@ -716,8 +822,7 @@ fn openai_native_probe_enabled(value: Option<&str>) -> bool {
     value.is_some_and(|value| matches!(value.trim(), "1" | "true" | "on"))
 }
 
-#[cfg(test)]
-fn build_codex_native_compaction_probe_request(
+fn build_codex_native_compaction_request(
     model: &str,
     instructions: &str,
     messages: &[Message],
@@ -740,7 +845,16 @@ fn build_codex_native_compaction_probe_request(
     body
 }
 
-#[cfg(test)]
+fn native_compaction_summary_instructions(instructions: &str) -> String {
+    let instructions = instructions.trim();
+    let base = "Write a self-contained handoff summary of the supplied transcript. Preserve the goal, completed work, decisions, constraints, exact identifiers and paths, failures, and next steps. Respond with summary text only and do not call tools.";
+    if instructions.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} Additional focus: {instructions}")
+    }
+}
+
 fn extract_codex_compaction_block(response: &Value, model: &str) -> Option<Value> {
     let item = response
         .get("output")
@@ -755,7 +869,6 @@ fn extract_codex_compaction_block(response: &Value, model: &str) -> Option<Value
     }))
 }
 
-#[cfg(test)]
 fn parse_codex_compaction_probe_reader(
     reader: impl BufRead,
     model: &str,

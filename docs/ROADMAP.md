@@ -114,8 +114,9 @@ Implemented today:
   prompt-cache keys/24h retention, Anthropic `cache_control`, provider
   usage/cache metadata, and cache-break warnings only when the stable prefix
   provably changed.
-- Anthropic-only server-side context-management clear edits, with provider-side
-  compact rejected until Iris can persist and replay provider compaction blocks.
+- Anthropic server-side context-management clear edits and capability-gated
+  native compaction for Anthropic and OpenAI, with portable summaries persisted
+  beside provider-owned replay blocks.
 - Mimir provider auth/token loading for OpenAI Codex, Anthropic Claude Code
   subscription OAuth reuse, Antigravity Google OAuth, Anthropic/OpenAI API keys,
   and dedicated keys for configured OpenAI-compatible endpoints.
@@ -1445,8 +1446,8 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    Next: prove the token-efficiency thesis with benchmark evidence, then add the
    missing consumer slices: selective handle dereferencing and a richer
    micro-summary schema. Done (2026-07-02, ADR-0041): provider-quality
-   compaction summaries (default `compactionSummarizer: subagent`, direct
-   provider request then deterministic excerpts as fallbacks), a manual
+   compaction summaries (provider request with subagent and deterministic
+   excerpt alternatives), a manual
    `/compact` command in both front-ends, switch-time context-cost advisories on
    `/model`/picker/cycle
    switches, and dropping foreign-origin reasoning from every provider request
@@ -1475,10 +1476,11 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    live job/frozen-fold `/context` detail, and the generation-5 warning. Slice 7
    (ADR-0056) adds the provider-neutral capability seam, additive opaque-block
    persistence, portable cross-provider rebuild, discard-on-selection-change,
-   and the Anthropic compact beta adapter. The route remains default-off: the
-   required Haiku 4.5 live probe returned a provider `400 invalid_request_error`.
-   OpenAI v2's live Codex mini probe succeeds but remains probe-only because its
-   opaque item has no portable text. Slice 8 adds the default-off,
+   and the Anthropic compact beta adapter. OpenAI native compaction now pairs
+   the encrypted item with a separate provider-authored portable summary.
+   Provider-native mode and the active-provider summarizer are the defaults;
+   unsupported lanes retain the portable and deterministic fallback ladder.
+   Slice 8 adds the default-off,
    project-tunable `request_compaction` model tool. It only schedules the
    existing governor, validates an empty argument object, and consumes one
    request at the next safe continuation boundary even when automatic

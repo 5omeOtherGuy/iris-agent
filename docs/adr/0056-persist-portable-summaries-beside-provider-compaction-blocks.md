@@ -21,7 +21,7 @@ carries a self-sufficient text `summary`.
   provider-neutral output containing text, opaque JSON values, and normalized
   usage. Provider names and wire fields remain in Mimir.
 - `compaction.providerNative` is global-only, accepts `off|auto`, and defaults
-  to `off`. `auto` attempts a provider route only when the active adapter
+  to `auto`. `auto` attempts a provider route only when the active adapter
   reports capability for the planned range.
 - The parent-owned Wayland engine remains the only mutation point. Native and
   portable workers share planning, revalidation, carry, recall, persistence,
@@ -41,11 +41,11 @@ persists the returned block, and replays it only on the same Anthropic model.
 The public API requires at least 50,000 trigger tokens, so smaller plans do not
 advertise capability.
 
-OpenAI Codex v2 probing is separately live-gated: a `compaction_trigger` input
-item maps to one encrypted compaction item. The subscription backend accepted
-the probe on `gpt-5.4-mini`, but Iris does not advertise that route because the
-observed contract supplies no portable text. Enabling it would violate
-cross-provider resume until a separate text summary is produced and measured.
+OpenAI Codex uses a `compaction_trigger` input item to obtain one encrypted
+compaction item. Because that item is opaque, the same worker makes a separate
+Responses request for a portable text summary before returning success. A
+native request rejected for a model disables that capability for the process;
+the portable provider worker remains available.
 
 ## Alternatives Considered
 
@@ -63,10 +63,11 @@ cross-provider resume until a separate text summary is produced and measured.
 - **Why not**: It would create a second mutation owner and break live/resume
   equivalence, recall registration, and entry ordering.
 
-### Enable provider-native mode by default
+### Require explicit provider-native opt-in
 
-- **Why not**: Capability and economics are model- and backend-dependent. The
-  route remains an explicit optimization until live evidence clears it.
+- **Why not**: Native compaction is the established default in the reference
+  coding agents. Capability checks and per-process rejection caching preserve a
+  safe portable fallback on unsupported lanes.
 
 ## Consequences
 
