@@ -147,6 +147,10 @@ pub(crate) struct PanelView {
     expanded: Option<RowId>,
     cursor: PanelRow,
     filter: String,
+    /// The cursor's index in the flattened selectable list at capture time, so a
+    /// refresh that removes the cursor's row (a revoked bash grant) can land on
+    /// the row that took its slot instead of jumping to the port header.
+    cursor_index: usize,
 }
 
 impl PanelView {
@@ -597,16 +601,19 @@ impl SettingsPanel {
 
     /// Capture the restorable view (§2.5, §5).
     pub(crate) fn view(&self) -> PanelView {
+        let rows = self.selectable();
+        let cursor_index = rows.iter().position(|row| *row == self.cursor).unwrap_or(0);
         PanelView {
             expanded: self.expanded,
             cursor: self.cursor.clone(),
             filter: self.scope_filter.clone(),
+            cursor_index,
         }
     }
 
-    /// Re-apply a captured view onto a freshly built panel, clamping the cursor
-    /// when its row has vanished (e.g. a revoked bash grant), and re-arming the
-    /// live scope filter. Model target resets to the fresh active level.
+    /// Re-apply a captured view onto a freshly built panel, landing the cursor
+    /// on the next grant when its row has vanished (a revoked bash grant), and
+    /// re-arming the live scope filter. Model target resets to the fresh level.
     pub(crate) fn restore(&mut self, view: PanelView) {
         self.expanded = view.expanded;
         if self.expanded == Some(RowId::Scope) {
@@ -616,12 +623,34 @@ impl SettingsPanel {
         self.cursor = if rows.contains(&view.cursor) {
             view.cursor
         } else {
-            self.expanded
-                .map(PanelRow::Top)
-                .or_else(|| rows.first().cloned())
-                .unwrap_or(PanelRow::Top(RowId::Model))
+            self.landing_after_vanished(&rows, view.cursor_index)
         };
         self.model_target = self.snap.reasoning;
+    }
+
+    /// Where the cursor lands when its row vanished under it — a revoked bash
+    /// grant. The removed row's old slot now holds its successor (the list
+    /// shifted up), so land there; fall to the predecessor when the removed
+    /// grant was the hatch's last; land on the port header only when no grant
+    /// remains to hold the cursor (the per-tool switches and the next section's
+    /// controls are never a landing, so an emptied grant list yields the header).
+    fn landing_after_vanished(&self, rows: &[PanelRow], removed_index: usize) -> PanelRow {
+        let is_grant = |row: &&PanelRow| {
+            matches!(
+                row,
+                PanelRow::PolicyBashExact(_) | PanelRow::PolicyBashPrefix(_)
+            )
+        };
+        let next = rows.get(removed_index).filter(is_grant);
+        let prev = removed_index
+            .checked_sub(1)
+            .and_then(|i| rows.get(i))
+            .filter(is_grant);
+        next.or(prev)
+            .cloned()
+            .or_else(|| self.expanded.map(PanelRow::Top))
+            .or_else(|| rows.first().cloned())
+            .unwrap_or(PanelRow::Top(RowId::Model))
     }
 
     fn selected(&self) -> PanelRow {
@@ -3436,11 +3465,55 @@ mod tests {
             PanelRow::PolicyBashExact("cargo test".to_string()),
         );
         let view = panel.view();
-        // The grant is revoked: rebuild without it.
+        // Revoking the last remaining grant empties the grant list; the quiet
+        // `no bash grants` note is unselectable, so the cursor falls to the header.
         let mut rebuilt = SettingsPanel::new(snapshot());
         rebuilt.restore(view);
         assert_eq!(rebuilt.expanded, Some(RowId::Permissions));
         assert_eq!(rebuilt.cursor, PanelRow::Top(RowId::Permissions));
+    }
+
+    // --- finding 3: a revoked grant lands the cursor on the next grant ---
+    #[test]
+    fn restore_lands_on_the_next_grant_when_one_of_several_is_revoked() {
+        let mut snap = snapshot();
+        snap.policy.bash_exact = vec!["cargo test".to_string(), "npm run".to_string()];
+        let mut panel = SettingsPanel::new(snap);
+        expand(&mut panel, RowId::Permissions);
+        select(
+            &mut panel,
+            PanelRow::PolicyBashExact("cargo test".to_string()),
+        );
+        let view = panel.view();
+        // Revoking the first of two grants: the cursor lands on the (former)
+        // second grant that took its slot, not the port header.
+        let mut snap2 = snapshot();
+        snap2.policy.bash_exact = vec!["npm run".to_string()];
+        let mut rebuilt = SettingsPanel::new(snap2);
+        rebuilt.restore(view);
+        assert_eq!(rebuilt.expanded, Some(RowId::Permissions));
+        assert_eq!(
+            rebuilt.cursor,
+            PanelRow::PolicyBashExact("npm run".to_string())
+        );
+
+        // Revoking the LAST of two grants: nothing took its slot (the next
+        // selectable row sits outside the hatch), so the cursor falls back to
+        // the previous grant.
+        let mut snap3 = snapshot();
+        snap3.policy.bash_exact = vec!["cargo test".to_string(), "npm run".to_string()];
+        let mut panel = SettingsPanel::new(snap3);
+        expand(&mut panel, RowId::Permissions);
+        select(&mut panel, PanelRow::PolicyBashExact("npm run".to_string()));
+        let view = panel.view();
+        let mut snap4 = snapshot();
+        snap4.policy.bash_exact = vec!["cargo test".to_string()];
+        let mut rebuilt = SettingsPanel::new(snap4);
+        rebuilt.restore(view);
+        assert_eq!(
+            rebuilt.cursor,
+            PanelRow::PolicyBashExact("cargo test".to_string())
+        );
     }
 
     #[test]
