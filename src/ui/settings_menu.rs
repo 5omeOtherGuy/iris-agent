@@ -657,15 +657,18 @@ impl SettingsPanel {
         self.arm_flash(row);
     }
 
-    /// Paste into an active edit (the loop routes `Event::Paste` here).
-    /// Registers are single-line controls: interior line breaks collapse to
-    /// spaces so a multi-line paste can never embed a newline in a saved value.
+    /// Paste into whichever single-line field has focus (the loop routes
+    /// `Event::Paste` here): an active register/dial edit, else the scope
+    /// hatch's type-to-filter. Interior line breaks collapse to spaces so a
+    /// multi-line paste can never embed a newline in a saved value or a filter.
     pub(crate) fn push_str(&mut self, text: &str) {
+        let flat = flatten_paste(text);
         if let Some(edit) = self.edit.as_mut() {
-            let mut flat = text.replace(['\r', '\n'], " ");
-            flat.truncate(flat.trim_end().len());
             edit.buffer.push_str(&flat);
             edit.error = None;
+        } else if self.in_scope_hatch() {
+            self.scope_filter.push_str(&flat);
+            self.clamp_scope_cursor();
         }
     }
 
@@ -1287,8 +1290,23 @@ impl SettingsPanel {
         }
     }
 
+    /// The candidate ids, for the one scope normalization the header count and
+    /// the `· unsaved` tag both route through — so they can never diverge.
+    fn scope_candidate_ids(&self) -> Vec<&str> {
+        self.snap
+            .scope_candidates
+            .iter()
+            .map(|c| c.qualified.as_str())
+            .collect()
+    }
+
+    /// The enabled count printed in the header, normalized against the current
+    /// candidate set: a stale persisted scope carrying ids no longer in the
+    /// catalog must not inflate the numerator (`2 of 1 enabled`). Reuses the
+    /// `scope_unsaved` normalization so the count and the tag stay in lockstep.
     fn scope_enabled_count(&self) -> usize {
-        match &self.snap.scope_enabled {
+        let candidates = self.scope_candidate_ids();
+        match normalize_scope(&self.snap.scope_enabled, &candidates) {
             None => self.snap.scope_candidates.len(),
             Some(list) => list.len(),
         }
@@ -1298,12 +1316,7 @@ impl SettingsPanel {
     /// tag). Both are normalized (dropped to candidates, full → None) so an
     /// equivalent scope never reads as unsaved.
     fn scope_unsaved(&self) -> bool {
-        let candidates: Vec<&str> = self
-            .snap
-            .scope_candidates
-            .iter()
-            .map(|c| c.qualified.as_str())
-            .collect();
+        let candidates = self.scope_candidate_ids();
         normalize_scope(&self.snap.scope_enabled, &candidates)
             != normalize_scope(&self.snap.scope_persisted, &candidates)
     }
@@ -1395,6 +1408,11 @@ impl SettingsPanel {
             for &row in section.rows {
                 emit(DisplayRow::Control(PanelRow::Top(row)));
                 if self.expanded == Some(row) {
+                    // The scope filter echoes directly under the port header so a
+                    // live type-to-filter is visible, not a silent narrowing.
+                    if let Some(echo) = self.scope_filter_echo(row) {
+                        emit(DisplayRow::ReadOnly(echo));
+                    }
                     for child in self.children_of(Some(row)) {
                         emit(DisplayRow::Control(child));
                     }
@@ -1404,6 +1422,28 @@ impl SettingsPanel {
                 }
             }
         }
+    }
+
+    /// The dim filter-echo line printed directly under the scope port header
+    /// while a type-to-filter query is live (§3.2): the `filter` label on the
+    /// child grid, the query text, and the house caret — so the operator sees
+    /// what is narrowing the checklist rather than a silent reflow. `None`
+    /// unless this is the scope hatch with a non-empty query.
+    fn scope_filter_echo(&self, row: RowId) -> Option<Line<'static>> {
+        if row != RowId::Scope || self.scope_filter.is_empty() {
+            return None;
+        }
+        Some(Line::from(vec![
+            Span::styled(
+                format!("    {:<width$}", "filter", width = LABEL_W - 2),
+                dim(),
+            ),
+            Span::raw(self.scope_filter.clone()),
+            Span::styled(
+                crate::ui::symbols::CARET.to_string(),
+                Style::default().fg(crate::ui::palette::orange()),
+            ),
+        ]))
     }
 
     /// Non-selectable silkscreen lines printed inside a hatch: the scope empty
@@ -1579,7 +1619,7 @@ impl SettingsPanel {
         };
         spans.push(Span::raw(edit.buffer.clone()));
         spans.push(Span::styled(
-            "\u{258b}".to_string(),
+            crate::ui::symbols::CARET.to_string(),
             Style::default().fg(crate::ui::palette::orange()),
         ));
         if let Some(error) = edit.error {
@@ -1936,8 +1976,22 @@ impl SettingsPanel {
                     .to_string()
             }
             PanelRow::ScopeChild(_) => {
-                "\u{21b5} toggle \u{00b7} ctrl+a all \u{00b7} ctrl+x none \u{00b7} ctrl+p provider \u{00b7} alt+\u{2191}\u{2193} reorder \u{00b7} ctrl+s save \u{00b7} esc collapse"
-                    .to_string()
+                // `type to filter` is always live in the hatch; while a filter is
+                // active `esc` clears it first, then the collapse layering applies.
+                let mut parts = vec![
+                    "\u{21b5} toggle",
+                    "ctrl+a all",
+                    "ctrl+x none",
+                    "ctrl+p provider",
+                    "alt+\u{2191}\u{2193} reorder",
+                    "ctrl+s save",
+                    "type to filter",
+                ];
+                if !self.scope_filter.is_empty() {
+                    parts.push("esc clear");
+                }
+                parts.push("esc collapse");
+                parts.join(" \u{00b7} ")
             }
             PanelRow::ProviderChild(id) => self.provider_footer(id),
             PanelRow::PolicyTool(_) => "\u{2190}\u{2192} set \u{00b7} esc collapse".to_string(),
@@ -2012,6 +2066,15 @@ fn bash_grant_line(label: &str, selected: bool) -> Line<'static> {
         Span::styled(format!("    {label}"), base),
         Span::styled(format!("  {} revoke", crate::ui::symbols::SEP), dim()),
     ])
+}
+
+/// Flatten a bracketed paste to a single line for a register or the scope
+/// filter: interior line breaks collapse to one space, trailing whitespace is
+/// trimmed. Neither field may ever embed a newline.
+fn flatten_paste(text: &str) -> String {
+    let mut flat = text.replace(['\r', '\n'], " ");
+    flat.truncate(flat.trim_end().len());
+    flat
 }
 
 /// Normalize a scope for the `· unsaved` comparison: keep only ids that are
@@ -3471,5 +3534,110 @@ mod tests {
         panel.handle_key(ModalKey::Down);
         assert!(panel.selectable().contains(&panel.cursor));
         assert_eq!(panel.cursor, PanelRow::Top(RowId::Reasoning));
+    }
+
+    // --- finding 1: a ghost persisted scope must not inflate the header count ---
+    #[test]
+    fn a_stale_scope_id_outside_the_candidate_set_does_not_inflate_the_count() {
+        let mut snap = snapshot();
+        // One candidate, but the live scope also carries a ghost id no longer in
+        // the catalog. The header must read `1 of 1 enabled`, not `2 of 1`; the
+        // child list already drops the ghost.
+        snap.scope_candidates = vec![scope_choice(ProviderId::OpenAiCodex, "gpt-5.5")];
+        snap.scope_enabled = Some(vec![
+            "anthropic/claude-ghost".to_string(),
+            "openai-codex/gpt-5.5".to_string(),
+        ]);
+        let panel = SettingsPanel::new(snap);
+        let rendered = text(&panel.render_budgeted(100, 60));
+        assert!(rendered.contains("1 of 1 enabled"), "{rendered}");
+        assert!(!rendered.contains("2 of 1"), "{rendered}");
+        assert_eq!(
+            panel.scope_children().len(),
+            1,
+            "child list drops the ghost"
+        );
+    }
+
+    // --- finding 2: the scope filter is visible (echo line + footer verbs) ---
+    #[test]
+    fn the_scope_filter_echoes_the_query_and_caret_under_the_header() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Scope);
+        for c in "gem".chars() {
+            panel.handle_key(ModalKey::Char(c));
+        }
+        let rendered = text(&panel.render_budgeted(100, 60));
+        assert!(rendered.contains("filter"), "filter label:\n{rendered}");
+        assert!(rendered.contains("gem"), "query echoed:\n{rendered}");
+        assert!(
+            rendered.contains(crate::ui::symbols::CARET),
+            "caret:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_scope_footer_names_type_to_filter_and_esc_clear_by_state() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Scope);
+        panel.handle_key(ModalKey::Down); // onto a scope child
+        assert!(
+            panel.footer().contains("type to filter"),
+            "verb present when idle: {}",
+            panel.footer()
+        );
+        assert!(
+            !panel.footer().contains("esc clear"),
+            "no clear verb when the filter is empty: {}",
+            panel.footer()
+        );
+        for c in "gem".chars() {
+            panel.handle_key(ModalKey::Char(c));
+        }
+        assert!(
+            panel.footer().contains("type to filter"),
+            "{}",
+            panel.footer()
+        );
+        assert!(
+            panel.footer().contains("esc clear"),
+            "clear verb while a filter is active: {}",
+            panel.footer()
+        );
+    }
+
+    #[test]
+    fn esc_clears_the_scope_filter_and_the_echo_disappears() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Scope);
+        for c in "gem".chars() {
+            panel.handle_key(ModalKey::Char(c));
+        }
+        assert!(
+            text(&panel.render_budgeted(100, 60)).contains(crate::ui::symbols::CARET),
+            "echo visible while filtering"
+        );
+        // First esc clears the filter (does not collapse) and the echo vanishes.
+        assert_eq!(panel.handle_key(ModalKey::Esc), ModalOutcome::Redraw);
+        assert!(panel.scope_filter.is_empty());
+        assert_eq!(panel.expanded, Some(RowId::Scope), "still open");
+        let rendered = text(&panel.render_budgeted(100, 60));
+        assert!(
+            !rendered.contains(crate::ui::symbols::CARET),
+            "echo gone after clear:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_bracketed_paste_into_the_scope_hatch_lands_in_the_filter() {
+        let mut panel = panel();
+        expand(&mut panel, RowId::Scope);
+        panel.push_str("gemini");
+        assert_eq!(panel.scope_filter, "gemini");
+        assert_eq!(
+            panel.scope_children().len(),
+            1,
+            "the paste narrowed the list"
+        );
     }
 }

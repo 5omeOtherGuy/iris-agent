@@ -49,6 +49,10 @@ pub(crate) const EXPANDED: &str = "\u{25be}";
 /// `▸` — collapsed disclosure (capped preview; hidden lines elided).
 pub(crate) const COLLAPSED: &str = "\u{25b8}";
 
+/// `▋` — the inline edit caret: the register buffer and the settings faceplate's
+/// scope type-to-filter echo. Painted the selection color (orange) at its site.
+pub(crate) const CARET: &str = "\u{258b}";
+
 /// `+` — added line (diff).
 pub(crate) const ADDED: &str = "+";
 
