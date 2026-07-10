@@ -164,10 +164,11 @@ owns the instance). The cuts that reached this split:
    `Agent` holds no `workspace`, `ToolState`, `SessionLog`, or `SessionStore`. The Tier-2
    `Harness` (`wayland/mod.rs`) wraps the agent, owns the workspace + `ToolState`
    (injected per turn as `ToolEnv`) and the optional `SessionLog`, and persists
-   the transcript by diffing `agent.messages()` after each turn. The read-side
-   `SessionStore` lists/opens persisted transcripts for `resume <id>` and
-   compaction-aware context rebuild, still outside the core loop -- mirroring
-   pi's `AgentHarness` owning `ExecutionEnv`
+   complete provider round trips through an inert-by-default Nexus observer
+   boundary, with a final/error diff after each turn as the backstop. The
+   read-side `SessionStore` lists/opens persisted transcripts for `resume <id>`
+   and compaction-aware context rebuild, still outside the core loop --
+   mirroring pi's `AgentHarness` owning `ExecutionEnv`
    + session and appending messages itself, never in Nexus.
 
 ## Tools across the tiers

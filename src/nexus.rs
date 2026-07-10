@@ -665,11 +665,17 @@ pub(crate) type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput>>
 /// while `review` is async (and therefore raceable against cancellation).
 pub(crate) type ApprovalFuture<'a> = Pin<Box<dyn Future<Output = Result<ApprovalDecision>> + 'a>>;
 
-/// Fire-and-forget event sink the loop emits to. `&self` with no control-flow
-/// return; errors only propagate. Mirrors pi's standalone `AgentEventSink`
-/// passed as a separate argument, not a config field.
+/// Fire-and-forget observer for semantic events and provider-round-trip commit
+/// boundaries. The default boundary hook is inert; Wayland uses it to persist
+/// complete message groups without teaching Nexus about sessions or JSONL.
 pub(crate) trait AgentObserver {
     fn on_event(&self, event: AgentEvent) -> Result<()>;
+
+    /// A complete provider round trip will be followed by another provider
+    /// request. The snapshot ends on an answered assistant turn or a complete
+    /// assistant-tool-call/tool-result group. Best-effort by contract: host
+    /// persistence failures must not fail the user's turn.
+    fn on_messages_committed(&self, _messages: &[Message]) {}
 }
 
 /// Persists oversized tool output outside provider context so the transcript
@@ -1559,8 +1565,9 @@ impl<P: ChatProvider> Agent<P> {
         let unanswered_start = self.messages.len();
         self.messages.extend(input.context);
         self.messages.push(Message::user(input.prompt));
-        // The bare agent does no persistence: the harness diffs `messages()`
-        // onto its session store after the turn returns (even on error).
+        // The bare agent does no persistence. It announces complete round-trip
+        // boundaries to the host; the harness also diffs `messages()` after the
+        // turn as the final/error backstop.
         self.complete_turn(unanswered_start, obs, gate, env, token, steer)
             .await
     }
@@ -1845,6 +1852,7 @@ impl<P: ChatProvider> Agent<P> {
                             obs.on_event(AgentEvent::TurnComplete)?;
                             return Ok(());
                         }
+                        obs.on_messages_committed(&self.messages);
                         self.inject_user(injected, obs, &mut unanswered_start)?;
                         // A tool-less steering/follow-up continuation is not a
                         // tool round-trip, so it must not advance the soft-cap
@@ -1863,10 +1871,11 @@ impl<P: ChatProvider> Agent<P> {
                         );
                     }
 
-                    match self
+                    let tools_phase = self
                         .run_tools(tool_calls, obs, gate, env, token, &provider_turn_id)
-                        .await?
-                    {
+                        .await?;
+                    obs.on_messages_committed(&self.messages);
+                    match tools_phase {
                         ToolsPhase::Ended => return Ok(()),
                         ToolsPhase::Continue => {}
                     }

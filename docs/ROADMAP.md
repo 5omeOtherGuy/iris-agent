@@ -622,9 +622,10 @@ Potential scope:
 - Session transcript persistence. [Shipped, now a read/write store foundation:
   `src/session.rs` writes a JSONL transcript -- a `session` header line plus one
   `message` line per entry -- to `<root>/<cwd-slug>/<unix-ms>_<id>.jsonl`, where
-  `<root>` is `IRIS_SESSION_DIR` or `~/.iris/sessions`. The harness appends new
-  messages after each turn (best-effort: a write failure warns, never crashes
-  the session; flushed per line so a crash leaves a valid prefix). Mirrors
+  `<root>` is `IRIS_SESSION_DIR` or `~/.iris/sessions`. The harness appends each
+  complete provider round trip before the next request and keeps its after-turn
+  diff as a final/error backstop (best-effort: a write failure warns, never
+  crashes the session; flushed per line so a crash leaves a valid prefix). Mirrors
   pi-mono's session store at the smallest useful level. Session Store
   Foundation ([#42](https://github.com/5omeOtherGuy/iris-agent/issues/42),
   shipped 2026-06-17) added the tree-ready/read pieces on top of the original
