@@ -12,50 +12,35 @@ A fast coding agent for the terminal, built for token efficiency.
 
 ## Install
 
-Iris is still in pre-release. Until the first public GitHub release and crates.io
-publish are cut, install from Git with a Rust toolchain:
-
-```bash
-cargo install --git https://github.com/5omeOtherGuy/iris-agent.git iris-agent --locked
-```
-
-Or run from a source checkout:
-
-```bash
-git clone https://github.com/5omeOtherGuy/iris-agent.git
-cd iris-agent
-cargo run
-```
-
-Prebuilt release plumbing is in place for Linux and macOS (x86_64 and aarch64)
-and validated locally against real archives (installer, checksum verification,
-and `iris update` self-replace); it becomes usable only after release assets
-exist. Operators cut the first release with [docs/RELEASING.md](docs/RELEASING.md).
-At that point the install script will download `iris-agent-<target>.tar.gz`,
-verify its `.sha256` sidecar, and install `iris`:
+Prebuilt binaries ship for Linux and macOS (x86_64 and aarch64) — no Rust
+toolchain required. The installer downloads the latest release, verifies its
+SHA-256 checksum, and installs `iris`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/5omeOtherGuy/iris-agent/main/install.sh | sh
 ```
 
 Override the install directory with `IRIS_INSTALL_DIR` or pin a version with
-`IRIS_VERSION=vX.Y.Z`. Manual release installs use the same archive plus
-checksum from the [latest release](https://github.com/5omeOtherGuy/iris-agent/releases/latest).
-After the crates.io publish is live, this will also work:
+`IRIS_VERSION=vX.Y.Z`. Manual installs use the same archive plus checksum from
+the [latest release](https://github.com/5omeOtherGuy/iris-agent/releases/latest).
+
+With a Rust toolchain, install from [crates.io](https://crates.io/crates/iris-agent)
+instead:
 
 ```bash
 cargo install iris-agent --locked
 ```
 
-Update an installed copy with:
+Keep an installed copy current with:
 
 ```bash
 iris update
 ```
 
-Prebuilt release binaries self-update: `iris update` downloads the latest
-release, verifies its checksum, and atomically replaces the running binary. A
-binary built from source instead re-runs `cargo install`.
+A prebuilt binary downloads the latest release, verifies its checksum, and
+atomically replaces itself; a source build re-runs `cargo install` pinned to
+the latest release tag. Either way `iris update` installs only stable tagged
+releases — never `main`, never a prerelease — and never downgrades.
 
 **Runtime dependencies: none beyond the binary.** The `grep` and `find` tools
 search in-process via the ripgrep library crates (`grep`, `ignore`, `globset`),

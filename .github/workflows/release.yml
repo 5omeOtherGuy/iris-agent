@@ -147,10 +147,24 @@ jobs:
           done
           [ -f iris-agent-installer.sh ] || { echo "missing installer" >&2; exit 1; }
           assets="$assets iris-agent-installer.sh"
+          # A tag with a prerelease component (v0.3.0-rc.1) is a testing
+          # channel: mark the release object prerelease so it never becomes
+          # `releases/latest` — install.sh and `iris update` resolve latest, so
+          # users can never be handed a testing build (`decide_update` also
+          # refuses prerelease tags as a second, client-side gate).
+          prerelease=""
+          case "$TAG" in
+            *-*) prerelease="--prerelease" ;;
+          esac
           # Idempotent so the job can be re-run: create the release only if it is
           # absent, then upload assets with --clobber to replace any partial ones.
+          # Created as a draft and published only after every asset is attached:
+          # a draft is invisible to `releases/latest`, so an install or update
+          # can never resolve a release whose archives are still uploading.
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "Iris $TAG" --generate-notes
+            # shellcheck disable=SC2086
+            gh release create "$TAG" --draft $prerelease --title "Iris $TAG" --generate-notes
           fi
           # shellcheck disable=SC2086
           gh release upload "$TAG" --clobber $assets
+          gh release edit "$TAG" --draft=false

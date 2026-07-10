@@ -24,9 +24,28 @@ REPO="5omeOtherGuy/iris-agent"
 PKG="iris-agent"
 BIN="iris"
 
-say() { printf 'install: %s\n' "$1" >&2; }
+# Instrument-voice output on stderr: one glyph-led line per step (`●` activity,
+# `◆` settled, `□` note, `■` error) with a fixed verb column — the same symbol
+# vocabulary as the TUI. Orange glyph + dim verb only when stderr is a
+# color-capable terminal and NO_COLOR is unset; non-UTF-8 locales fall back to
+# ASCII markers. State must read from glyph + verb alone (monochrome test).
+esc=$(printf '\033')
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
+	C_GLYPH="${esc}[33m" C_DIM="${esc}[2m" C_OFF="${esc}[0m"
+else
+	C_GLYPH='' C_DIM='' C_OFF=''
+fi
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+*[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*) G_STEP='●' G_DONE='◆' G_NOTE='□' G_ERR='■' ;;
+*) G_STEP='*' G_DONE='+' G_NOTE='-' G_ERR='!' ;;
+esac
+line() { printf '%s%s%s %s%-9s%s %s\n' "$C_GLYPH" "$1" "$C_OFF" "$C_DIM" "$2" "$C_OFF" "$3" >&2; }
+masthead() { printf '%sI R I S · installer%s\n' "$C_DIM" "$C_OFF" >&2; }
+step() { line "$G_STEP" "$1" "$2"; }
+settle() { line "$G_DONE" "$1" "$2"; }
+note() { line "$G_NOTE" "$1" "$2"; }
 err() {
-	printf 'install: error: %s\n' "$1" >&2
+	line "$G_ERR" "error" "$1"
 	exit 1
 }
 need() { command -v "$1" >/dev/null 2>&1 || err "missing required command: $1"; }
@@ -66,9 +85,9 @@ fetch() {
 	url="$1"
 	out="$2"
 	if command -v curl >/dev/null 2>&1; then
-		curl -fsSL "$url" -o "$out"
+		curl -fsSL "$url" -o "$out" || err "download failed: $url"
 	elif command -v wget >/dev/null 2>&1; then
-		wget -qO "$out" "$url"
+		wget -qO "$out" "$url" || err "download failed: $url"
 	else
 		err "need curl or wget to download"
 	fi
@@ -123,14 +142,18 @@ main() {
 	base="${IRIS_RELEASE_BASE_URL:-https://github.com/$REPO/releases/download/$version}"
 	base="${base%/}"
 
-	say "installing $BIN $version ($target) to $dir"
+	masthead
+	step "check" "$target"
+	step "resolve" "$version"
 
 	workdir=$(mktemp -d)
 	trap 'rm -rf "$workdir"' EXIT INT TERM
 
+	step "download" "$archive"
 	fetch "$base/$archive" "$workdir/$archive"
 	fetch "$base/$archive.sha256" "$workdir/$archive.sha256"
 	verify_checksum "$workdir/$archive" "$workdir/$archive.sha256"
+	step "verify" "sha-256 ok"
 
 	tar -xzf "$workdir/$archive" -C "$workdir"
 	found=$(find "$workdir" -type f -name "$BIN" | head -n1)
@@ -147,10 +170,10 @@ main() {
 	chmod +x "$staged"
 	mv -f "$staged" "$dir/$BIN"
 
-	say "installed $dir/$BIN"
+	settle "installed" "$dir/$BIN"
 	case ":$PATH:" in
 	*":$dir:"*) : ;;
-	*) say "note: $dir is not on PATH; add it to use '$BIN' directly" ;;
+	*) note "path" "$dir is not on PATH; add it to use '$BIN' directly" ;;
 	esac
 }
 

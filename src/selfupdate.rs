@@ -46,6 +46,58 @@ fn select_strategy(dist_build: bool, self_update_feature: bool) -> UpdateStrateg
 #[allow(dead_code)]
 pub const TARGET: &str = env!("IRIS_TARGET");
 
+/// Plain-stdout output in the instrument voice for `iris update`, shared by
+/// both update strategies. One glyph-led line per step from the design
+/// language's symbol vocabulary (`●` activity, `◆` settled, `□` skipped),
+/// with a fixed verb column. ANSI color (orange glyph, dim verb) only when
+/// stdout is a color-capable terminal and `NO_COLOR` is unset; state must
+/// survive the monochrome test through glyph + verb alone.
+pub mod voice {
+    use std::io::IsTerminal;
+
+    const ORANGE: &str = "\x1b[33m";
+    const DIM: &str = "\x1b[2m";
+    const RESET: &str = "\x1b[0m";
+
+    fn color() -> bool {
+        std::io::stdout().is_terminal()
+            && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+            && !matches!(std::env::var("TERM").as_deref(), Ok("dumb"))
+    }
+
+    /// The `I R I S · <surface>` masthead strip, dim.
+    pub fn masthead(surface: &str) {
+        if color() {
+            println!("{DIM}I R I S · {surface}{RESET}");
+        } else {
+            println!("I R I S · {surface}");
+        }
+    }
+
+    /// An in-progress line: `● <verb>  <detail>`.
+    pub fn step(verb: &str, detail: &str) {
+        line("●", verb, detail);
+    }
+
+    /// A settled line: `◆ <verb>  <detail>`.
+    pub fn done(verb: &str, detail: &str) {
+        line("◆", verb, detail);
+    }
+
+    /// A refused/no-op line: `□ <verb>  <detail>`.
+    pub fn skip(verb: &str, detail: &str) {
+        line("□", verb, detail);
+    }
+
+    fn line(glyph: &str, verb: &str, detail: &str) {
+        if color() {
+            println!("{ORANGE}{glyph}{RESET} {DIM}{verb:<9}{RESET} {detail}");
+        } else {
+            println!("{glyph} {verb:<9} {detail}");
+        }
+    }
+}
+
 /// GitHub "latest release" endpoint queried by the self-replace path.
 const RELEASES_API: &str = "https://api.github.com/repos/5omeOtherGuy/iris-agent/releases/latest";
 
@@ -267,7 +319,9 @@ mod imp {
     pub fn run() -> Result<()> {
         let archive = asset_name(TARGET);
         let checksum = checksum_name(&archive);
-        println!("Checking for the latest Iris release ({TARGET}) ...");
+        let current = env!("CARGO_PKG_VERSION");
+        super::voice::masthead("update");
+        super::voice::step("check", &format!("{TARGET} · running v{current}"));
 
         let client = Client::builder()
             .user_agent(USER_AGENT)
@@ -283,7 +337,6 @@ mod imp {
             .map(|v| !v.is_empty())
             .unwrap_or(false);
 
-        let current = env!("CARGO_PKG_VERSION");
         match decide_update(
             current,
             &release.tag_name,
@@ -291,20 +344,29 @@ mod imp {
             release.draft,
         ) {
             UpdateAction::UpToDate => {
-                println!("Already on the latest release (v{current}).");
+                super::voice::done(
+                    "current",
+                    &format!("already on the latest release (v{current})"),
+                );
                 return Ok(());
             }
             UpdateAction::Ahead => {
-                println!(
-                    "Running v{current}, newer than the latest release ({}); nothing to do.",
-                    release.tag_name
+                super::voice::done(
+                    "ahead",
+                    &format!(
+                        "running v{current}, newer than the latest release ({}) · nothing to do",
+                        release.tag_name
+                    ),
                 );
                 return Ok(());
             }
             UpdateAction::Skip => {
-                println!(
-                    "Latest release ({}) is not an installable stable release; iris update only installs stable releases.",
-                    release.tag_name
+                super::voice::skip(
+                    "skipped",
+                    &format!(
+                        "latest release ({}) is not stable · iris update installs stable releases only",
+                        release.tag_name
+                    ),
                 );
                 return Ok(());
             }
@@ -320,7 +382,7 @@ mod imp {
             super::ensure_loopback_url(checksum_url)?;
         }
 
-        println!("Downloading {} ...", release.tag_name);
+        super::voice::step("download", &format!("{} · {archive}", release.tag_name));
         let archive_bytes = download(&client, archive_url)?;
         let checksum_body = String::from_utf8(download(&client, checksum_url)?)
             .context("checksum file is not valid UTF-8")?;
@@ -330,6 +392,7 @@ mod imp {
         if !sha256_matches(&archive_bytes, &expected) {
             bail!("checksum mismatch for {archive}; refusing to install");
         }
+        super::voice::step("verify", "sha-256 ok");
 
         let binary = extract_binary(&archive_bytes)
             .context("failed to extract the iris binary from the release archive")?;
@@ -337,7 +400,7 @@ mod imp {
         let current_exe = std::env::current_exe().context("cannot locate the running binary")?;
         write_and_replace(&current_exe, &binary)?;
 
-        println!("Updated Iris to {}.", release.tag_name);
+        super::voice::done("updated", &format!("v{current} → {}", release.tag_name));
         Ok(())
     }
 
