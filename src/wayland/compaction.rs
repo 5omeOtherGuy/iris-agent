@@ -131,6 +131,20 @@ pub(super) enum BackgroundSummaryResult {
     Cancelled,
 }
 
+/// Whether [`CompactionEngine::start_background`] actually launched a worker.
+/// `has_model_worker()` trusts the native factory's presence, but the
+/// spawn-time capability probe can still yield nothing; when it does and no
+/// portable summarizer exists, the caller degrades to the deterministic
+/// backstop instead of running a model-backed job.
+pub(super) enum BackgroundStart {
+    /// A provider-native or portable worker is running for this job.
+    Started,
+    /// No usable worker exists for this session: the caller falls through to
+    /// the deterministic-excerpts backstop.
+    NoWorker,
+}
+
+#[derive(Clone)]
 pub(super) struct CompactionPlan {
     pub(super) start: usize,
     pub(super) end: usize,

@@ -312,8 +312,12 @@ impl CompactionEngine {
                 && self.has_model_worker()
                 && !self.model_compaction_cap_reached(CompactionOrigin::Subagent)
                 && self.consecutive_failures < self.max_consecutive_failures;
-            if model_backed {
-                self.start_background(&current, plan, workspace, obs, None)?;
+            if model_backed
+                && matches!(
+                    self.start_background(&current, plan.clone(), workspace, obs, None)?,
+                    BackgroundStart::Started
+                )
+            {
                 return Ok(if changed {
                     ContextDirective::Replace { messages: current }
                 } else {
@@ -369,14 +373,18 @@ impl CompactionEngine {
                     && self.has_model_worker()
                     && !self.model_compaction_cap_reached(CompactionOrigin::Subagent)
                     && self.consecutive_failures < self.max_consecutive_failures;
-                if model_backed {
-                    self.start_background(
-                        &current,
-                        plan,
-                        workspace,
-                        obs,
-                        Some(ContextPressureTier::Start),
-                    )?;
+                if model_backed
+                    && matches!(
+                        self.start_background(
+                            &current,
+                            plan.clone(),
+                            workspace,
+                            obs,
+                            Some(ContextPressureTier::Start),
+                        )?,
+                        BackgroundStart::Started
+                    )
+                {
                     Ok(if changed {
                         ContextDirective::Replace { messages: current }
                     } else {
@@ -406,7 +414,15 @@ impl CompactionEngine {
                     changed = true;
                 }
                 if token.is_cancelled() {
-                    return Ok(ContextDirective::Proceed);
+                    // A durable mutation already landed if `changed`; return it
+                    // even under a post-apply cancellation so the live context
+                    // matches what a resume would rebuild. Only suppress work
+                    // when cancellation is observed before any mutation.
+                    return Ok(if changed {
+                        ContextDirective::Replace { messages: current }
+                    } else {
+                        ContextDirective::Proceed
+                    });
                 }
                 // Once every pre-turn message is compacted, Start could not
                 // schedule a job (its turn-respecting plan returns None mid-turn).
@@ -428,14 +444,17 @@ impl CompactionEngine {
                             ladder.keep_recent_tokens,
                             PlanTurnMode::HardCurrentTurn,
                         )
+                        && matches!(
+                            self.start_background(
+                                &current,
+                                plan,
+                                workspace,
+                                obs,
+                                Some(ContextPressureTier::Hard),
+                            )?,
+                            BackgroundStart::Started
+                        )
                     {
-                        self.start_background(
-                            &current,
-                            plan,
-                            workspace,
-                            obs,
-                            Some(ContextPressureTier::Hard),
-                        )?;
                         if let Some(replacement) = self
                             .resolve_hard_at_boundary(&current, apply_cx, token)
                             .await?
@@ -444,7 +463,13 @@ impl CompactionEngine {
                             changed = true;
                         }
                         if token.is_cancelled() {
-                            return Ok(ContextDirective::Proceed);
+                            // As above: a durable mid-turn apply must survive a
+                            // post-apply cancellation instead of being dropped.
+                            return Ok(if changed {
+                                ContextDirective::Replace { messages: current }
+                            } else {
+                                ContextDirective::Proceed
+                            });
                         }
                     }
                 }

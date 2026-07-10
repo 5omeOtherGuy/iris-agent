@@ -1727,8 +1727,15 @@ impl<P: ChatProvider> Harness<P> {
                     && self.compaction.consecutive_failures
                         < self.compaction.max_consecutive_failures;
                 if model_backed {
-                    match self.start_background_compaction(&messages, plan, obs) {
-                        Ok(()) => Ok(()),
+                    match self.start_background_compaction(&messages, plan.clone(), obs) {
+                        Ok(BackgroundStart::Started) => Ok(()),
+                        // No usable worker despite `has_model_worker()`: degrade
+                        // to the deterministic excerpts backstop rather than
+                        // skipping relief.
+                        Ok(BackgroundStart::NoWorker) => {
+                            self.maybe_emit_breaker_notice(obs)?;
+                            self.apply_excerpts_plan(&messages, plan, obs)
+                        }
                         Err(error) => {
                             self.record_compaction_failure();
                             Err(error)
@@ -1795,8 +1802,11 @@ impl<P: ChatProvider> Harness<P> {
         if allow_background_start
             && self.compaction.background.is_none()
             && self.compaction.has_model_worker()
+            && matches!(
+                self.start_background_compaction(&messages, plan.clone(), obs)?,
+                BackgroundStart::Started
+            )
         {
-            self.start_background_compaction(&messages, plan, obs)?;
             return Ok(());
         }
         let Some(outcome) = self.compact_range(&messages, plan, obs, token).await? else {
@@ -2264,7 +2274,7 @@ impl<P: ChatProvider> Harness<P> {
         messages: &[Message],
         plan: CompactionPlan,
         obs: &dyn AgentObserver,
-    ) -> Result<()> {
+    ) -> Result<BackgroundStart> {
         self.compaction.start_background(
             messages,
             plan,

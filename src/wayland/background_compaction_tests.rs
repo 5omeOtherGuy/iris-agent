@@ -287,6 +287,69 @@ impl ChatProvider for NativeCompactionProvider {
     }
 }
 
+/// A provider-native adapter whose `compact_context` blocks until the worker
+/// token is cancelled, so the hard-wait always times out. It records every
+/// invocation so a test can prove the native rung fired exactly once.
+#[derive(Clone)]
+struct BlockingNativeProvider {
+    requests: Arc<Mutex<Vec<Vec<Message>>>>,
+}
+
+impl ChatProvider for BlockingNativeProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    fn compaction_capability(&self, _input_tokens: u64) -> ProviderCompactionCapability {
+        ProviderCompactionCapability::OpaqueBlocks
+    }
+
+    fn compact_context<'a>(
+        &'a self,
+        messages: &'a [Message],
+        _instructions: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> ProviderCompactionFuture<'a> {
+        self.requests.lock().unwrap().push(messages.to_vec());
+        Box::pin(async move {
+            while !cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            anyhow::bail!("provider-native compaction cancelled")
+        })
+    }
+}
+
+/// Observer that cancels a shared turn token the instant a compaction is
+/// durably applied. It reproduces the cancellation-racing-the-apply window:
+/// the mutation has already hit the session log before the governor checks the
+/// token.
+struct CancelOnApply {
+    events: RefCell<Vec<AgentEvent>>,
+    token: CancellationToken,
+}
+
+impl AgentObserver for CancelOnApply {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        if matches!(
+            &event,
+            AgentEvent::CompactionLifecycle {
+                state: CompactionLifecycleState::Applied,
+                ..
+            }
+        ) {
+            self.token.cancel();
+        }
+        self.events.borrow_mut().push(event);
+        Ok(())
+    }
+}
+
 impl ChatProvider for ScriptedWorkerProvider {
     fn respond_stream<'a>(
         &'a self,
@@ -2051,10 +2114,11 @@ fn hard_tier_covers_current_turn_and_bounds_runaway_within_one_turn() {
     );
 }
 
-/// Build a single-turn transcript already at hard pressure, with a subagent
-/// primary summarizer that blocks (so it can never win the hard-wait race) and
-/// deterministic thresholds. Returns everything a hard-tier govern call needs.
-fn single_turn_hard_ladder_harness(
+/// Build a single-turn transcript already at hard pressure with deterministic
+/// thresholds, but with no summarizer wired. Callers install whatever worker
+/// (subagent, provider-native, or none) the case under test needs. Returns
+/// everything a hard-tier govern call needs.
+fn single_turn_hard_harness(
     root: &Path,
     workspace: &Path,
 ) -> (Harness<SilentProvider>, PathBuf, Vec<Message>) {
@@ -2069,12 +2133,6 @@ fn single_turn_hard_ladder_harness(
         Vec::new(),
         Some(131_072),
     );
-    harness.set_summarizer(SummarizerKind::Subagent);
-    // A subagent worker that blocks until cancelled: the hard-wait always times
-    // out, forcing the fallback ladder.
-    harness.set_compaction_summarizer_factory(BlockingSummaryProvider::factory(Arc::new(
-        Mutex::new(Vec::new()),
-    )));
     harness.set_compaction_trigger(
         131_072,
         CompactionTriggerConfig {
@@ -2101,6 +2159,23 @@ fn single_turn_hard_ladder_harness(
         push_turn_round(&mut messages, round, &format!("LADDER-NEEDLE-{round:02}"));
     }
     harness.compaction.persist_messages(&messages);
+    (harness, path, messages)
+}
+
+/// Build a single-turn transcript already at hard pressure, with a subagent
+/// primary summarizer that blocks (so it can never win the hard-wait race) and
+/// deterministic thresholds. Returns everything a hard-tier govern call needs.
+fn single_turn_hard_ladder_harness(
+    root: &Path,
+    workspace: &Path,
+) -> (Harness<SilentProvider>, PathBuf, Vec<Message>) {
+    let (mut harness, path, messages) = single_turn_hard_harness(root, workspace);
+    harness.set_summarizer(SummarizerKind::Subagent);
+    // A subagent worker that blocks until cancelled: the hard-wait always times
+    // out, forcing the fallback ladder.
+    harness.set_compaction_summarizer_factory(BlockingSummaryProvider::factory(Arc::new(
+        Mutex::new(Vec::new()),
+    )));
     (harness, path, messages)
 }
 
@@ -2206,4 +2281,248 @@ fn hard_ladder_falls_through_to_excerpts_when_native_capability_is_none() {
         AgentEvent::CompactionLifecycle { message: Some(message), .. }
             if message.contains("provider-native compaction unavailable; using deterministic excerpts")
     )));
+}
+
+#[test]
+fn hard_tier_degrades_to_excerpts_when_native_probe_yields_nothing_and_no_portable_worker() {
+    // Finding 1: `has_model_worker()` trusts the native factory's presence, but
+    // the spawn-time capability probe can yield None. With no portable
+    // summarizer this used to panic on the removed `expect`. It must instead
+    // degrade to the deterministic excerpts backstop and keep the turn going.
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let (mut harness, path, messages) = single_turn_hard_harness(&root.path, &workspace.path);
+    // Provider-native is enabled with a factory, so `has_model_worker()` is
+    // true, but the provider advertises `None` capability. No summarizer factory
+    // is installed, so there is no portable worker to fall back to.
+    harness.set_provider_native(true);
+    harness.set_provider_compaction_factory(Arc::new(|| Ok(Box::new(SilentProvider))));
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    let directive = block_on(harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 1,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: harness.output_store.as_ref(),
+            task_state: None,
+            observer: &obs,
+        },
+        &token,
+    ))
+    .expect("govern must not panic when no worker is available");
+
+    assert!(
+        matches!(directive, ContextDirective::Replace { .. }),
+        "deterministic excerpts backstop must still relieve pressure"
+    );
+    let entries = compaction_entries(&path);
+    assert!(
+        entries.iter().any(|entry| entry["origin"] == "excerpts"),
+        "expected a deterministic excerpts entry, got {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["origin"] == "providerNative"),
+        "an unusable native probe must not produce a provider-native entry: {entries:?}"
+    );
+}
+
+#[test]
+fn excerpts_summarizer_kind_never_spawns_a_model_worker_even_with_a_factory() {
+    // Finding 1 audit: when the native probe yields nothing, an Excerpts
+    // summarizer must not spawn a portable model worker just because a
+    // summarizer factory happens to be installed. Relief comes from the
+    // deterministic backstop; the summarizer provider is never invoked.
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let (mut harness, path, messages) = single_turn_hard_harness(&root.path, &workspace.path);
+    // Native probe yields None (default capability), driving the else branch.
+    harness.set_provider_native(true);
+    harness.set_provider_compaction_factory(Arc::new(|| Ok(Box::new(SilentProvider))));
+    // Summarizer kind stays Excerpts (the default) but a factory is present.
+    harness.set_summarizer(SummarizerKind::Excerpts);
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    harness.set_compaction_summarizer_factory(SummaryProvider::factory(
+        Arc::new(Mutex::new(VecDeque::new())),
+        prompts.clone(),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    // A generous hard wait so, on the buggy path, the spawned portable worker
+    // would have ample time to run and record a prompt.
+    harness.compaction.hard_wait = Duration::from_secs(2);
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    let directive = block_on(harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 1,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: harness.output_store.as_ref(),
+            task_state: None,
+            observer: &obs,
+        },
+        &token,
+    ))
+    .expect("govern must not spawn or panic for an Excerpts summarizer");
+
+    assert!(matches!(directive, ContextDirective::Replace { .. }));
+    assert!(
+        prompts.lock().unwrap().is_empty(),
+        "an Excerpts summarizer must never invoke the summarizer provider"
+    );
+    let entries = compaction_entries(&path);
+    assert!(
+        entries.iter().any(|entry| entry["origin"] == "excerpts"),
+        "expected a deterministic excerpts entry, got {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|entry| entry["origin"] == "provider"),
+        "an Excerpts summarizer must not apply a provider-origin compaction: {entries:?}"
+    );
+}
+
+#[test]
+fn provider_native_origin_timeout_falls_straight_to_excerpts_without_a_second_request() {
+    // Finding 2: a job that was already ProviderNative origin and timed out must
+    // NOT fire a second identical provider-native request in the fallback rung.
+    // It routes straight to the deterministic excerpts terminal rung.
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let (mut harness, path, messages) = single_turn_hard_harness(&root.path, &workspace.path);
+    let native_requests = Arc::new(Mutex::new(Vec::new()));
+    let requests = native_requests.clone();
+    harness.set_provider_native(true);
+    harness.set_provider_compaction_factory(Arc::new(move || {
+        Ok(Box::new(BlockingNativeProvider {
+            requests: requests.clone(),
+        }))
+    }));
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    let directive = block_on(harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 1,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: harness.output_store.as_ref(),
+            task_state: None,
+            observer: &obs,
+        },
+        &token,
+    ))
+    .unwrap();
+
+    assert!(matches!(directive, ContextDirective::Replace { .. }));
+    assert_eq!(
+        native_requests.lock().unwrap().len(),
+        1,
+        "a ProviderNative-origin failure must not retry the native rung"
+    );
+    let entries = compaction_entries(&path);
+    assert!(
+        entries.iter().any(|entry| entry["origin"] == "excerpts"),
+        "expected the deterministic excerpts terminal rung, got {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["origin"] == "providerNative"),
+        "a timed-out native job must not apply a provider-native entry: {entries:?}"
+    );
+}
+
+#[test]
+fn hard_apply_survives_cancellation_racing_after_the_durable_mutation() {
+    // Finding 3: when the turn token cancels AFTER a compaction is durably
+    // applied, the governor must still return the compacted messages. Dropping
+    // them (returning Proceed) diverges the live context from a resume rebuild.
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let (mut harness, path, messages) = single_turn_hard_harness(&root.path, &workspace.path);
+    harness.set_summarizer(SummarizerKind::Subagent);
+    // A fast subagent worker that wins the hard-wait race and applies.
+    harness.set_compaction_summarizer_factory(SummaryProvider::factory(
+        Arc::new(Mutex::new(VecDeque::from([format!(
+            "Goal: continue. State: compacted. Decisions: none. Key facts: {SUMMARY_NEEDLE}. Next steps: proceed."
+        )]))),
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    // Generous wait so the fast worker reliably wins the race, then the observer
+    // cancels the token during the durable apply.
+    harness.compaction.hard_wait = Duration::from_secs(5);
+    let token = CancellationToken::new();
+    let obs = CancelOnApply {
+        events: RefCell::new(Vec::new()),
+        token: token.clone(),
+    };
+
+    let directive = block_on(harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 1,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: harness.output_store.as_ref(),
+            task_state: None,
+            observer: &obs,
+        },
+        &token,
+    ))
+    .unwrap();
+
+    assert!(
+        token.is_cancelled(),
+        "test must exercise the post-apply cancellation race"
+    );
+    let ContextDirective::Replace {
+        messages: compacted,
+    } = directive
+    else {
+        panic!("post-apply cancellation dropped the durable compaction (returned Proceed)");
+    };
+
+    // Byte-exact: the live compacted context equals the session-log rebuild.
+    harness.compaction.persist_messages(&compacted);
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .unwrap();
+    let rebuilt = store.open(&meta).unwrap();
+    let live_json = compacted
+        .iter()
+        .map(|message| serde_json::to_string(message).unwrap())
+        .collect::<Vec<_>>();
+    let rebuilt_json = rebuilt
+        .messages
+        .iter()
+        .map(|message| serde_json::to_string(message).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        live_json, rebuilt_json,
+        "live context and resume rebuild diverged after post-apply cancellation"
+    );
 }
