@@ -2877,6 +2877,120 @@ mod tests {
         );
     }
 
+    // --- criterion 14: ctrl+p toggles a whole provider (incl. the filtered set) ---
+    #[test]
+    fn scope_ctrl_p_toggles_the_whole_provider_and_bulk_ops_honor_the_filter() {
+        let mut snap = snapshot();
+        // Two anthropic candidates so a provider-wide toggle is observable.
+        snap.scope_candidates = vec![
+            scope_choice(ProviderId::OpenAiCodex, "gpt-5.5"),
+            scope_choice(ProviderId::Anthropic, "claude-sonnet-4-6"),
+            scope_choice(ProviderId::Anthropic, "claude-haiku-4-5"),
+            scope_choice(ProviderId::Antigravity, "gemini-3.5-flash"),
+        ];
+        let mut panel = SettingsPanel::new(snap);
+        expand(&mut panel, RowId::Scope);
+        // From all-enabled (None), ctrl+p on an anthropic row disables the whole
+        // provider and leaves the others enabled.
+        select(
+            &mut panel,
+            PanelRow::ScopeChild("anthropic/claude-sonnet-4-6".to_string()),
+        );
+        match panel.handle_key(ModalKey::CtrlP) {
+            ModalOutcome::Emit(ModalAction::ApplyScoped(Some(ids))) => {
+                assert!(
+                    !ids.iter().any(|id| id.starts_with("anthropic/")),
+                    "both anthropic models dropped: {ids:?}"
+                );
+                assert!(
+                    ids.contains(&"openai-codex/gpt-5.5".to_string())
+                        && ids.contains(&"antigravity/gemini-3.5-flash".to_string()),
+                    "other providers untouched: {ids:?}"
+                );
+            }
+            other => panic!("expected ApplyScoped(Some), got {other:?}"),
+        }
+        // ctrl+p again re-enables the whole provider — back to the full set, so
+        // it collapses to None (all enabled).
+        match panel.handle_key(ModalKey::CtrlP) {
+            ModalOutcome::Emit(ModalAction::ApplyScoped(scope)) => {
+                assert!(scope.is_none(), "re-enabling the provider re-fills the set");
+            }
+            other => panic!("expected ApplyScoped, got {other:?}"),
+        }
+        // Filtered-set scoping: a live filter narrows ctrl+x to the matching rows.
+        for c in "haiku".chars() {
+            panel.handle_key(ModalKey::Char(c));
+        }
+        match panel.handle_key(ModalKey::CtrlX) {
+            ModalOutcome::Emit(ModalAction::ApplyScoped(Some(ids))) => {
+                assert!(
+                    !ids.contains(&"anthropic/claude-haiku-4-5".to_string()),
+                    "only the filtered row was disabled: {ids:?}"
+                );
+                assert!(
+                    ids.contains(&"anthropic/claude-sonnet-4-6".to_string()),
+                    "unfiltered rows stay enabled: {ids:?}"
+                );
+            }
+            other => panic!("expected ApplyScoped(Some), got {other:?}"),
+        }
+    }
+
+    // --- criterion 14: alt+↑↓ reorders an enabled id and re-applies ---
+    #[test]
+    fn scope_reorder_moves_an_enabled_id_and_emits_apply() {
+        let mut snap = snapshot();
+        snap.scope_enabled = Some(vec![
+            "openai-codex/gpt-5.5".to_string(),
+            "anthropic/claude-sonnet-4-6".to_string(),
+        ]);
+        let mut panel = SettingsPanel::new(snap);
+        expand(&mut panel, RowId::Scope);
+        // Cursor on the first enabled row; alt+down swaps it below the second and
+        // re-applies the live scope.
+        select(
+            &mut panel,
+            PanelRow::ScopeChild("openai-codex/gpt-5.5".to_string()),
+        );
+        match panel.handle_key(ModalKey::AltDown) {
+            ModalOutcome::Emit(ModalAction::ApplyScoped(Some(ids))) => {
+                assert_eq!(
+                    ids,
+                    vec![
+                        "anthropic/claude-sonnet-4-6".to_string(),
+                        "openai-codex/gpt-5.5".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected ApplyScoped(Some), got {other:?}"),
+        }
+        // The identity-keyed cursor rode the move — still on the same model.
+        assert_eq!(
+            panel.cursor,
+            PanelRow::ScopeChild("openai-codex/gpt-5.5".to_string())
+        );
+        // Reorder is bounded: on the top enabled row alt+up cannot climb further,
+        // so the order is unchanged (still re-applied as the live scope).
+        select(
+            &mut panel,
+            PanelRow::ScopeChild("anthropic/claude-sonnet-4-6".to_string()),
+        );
+        match panel.handle_key(ModalKey::AltUp) {
+            ModalOutcome::Emit(ModalAction::ApplyScoped(Some(ids))) => {
+                assert_eq!(
+                    ids,
+                    vec![
+                        "anthropic/claude-sonnet-4-6".to_string(),
+                        "openai-codex/gpt-5.5".to_string(),
+                    ],
+                    "top row cannot climb further"
+                );
+            }
+            other => panic!("expected ApplyScoped(Some), got {other:?}"),
+        }
+    }
+
     // --- criterion 15: type-to-filter, esc clears filter first ---
     #[test]
     fn scope_type_to_filter_narrows_children_and_esc_clears_it_first() {
