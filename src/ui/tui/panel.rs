@@ -890,7 +890,14 @@ mod tests {
         // the disclosure gutter (col 2), the label column (col 4), and the right
         // rail (width−2) line up exactly.
         let tool = line_text(&panel_header_line(80, true, "EXPLORE", "", "1.2s"));
-        let rail = line_text(&rail_header_line(80, true, true, "THINKING", "↓2.4k 12s", false));
+        let rail = line_text(&rail_header_line(
+            80,
+            true,
+            true,
+            "THINKING",
+            "↓2.4k 12s",
+            false,
+        ));
         assert!(tool.starts_with("  \u{25be} EXPLORE"), "{tool:?}");
         assert!(rail.starts_with("  \u{25be} THINKING"), "{rail:?}");
         assert_eq!(display_width(tool.trim_end()), 78, "{tool:?}");
@@ -900,5 +907,33 @@ mod tests {
         // A non-foldable short trace keeps the gutter, so its label stays put.
         let short = line_text(&rail_header_line(80, true, false, "THINKING", "", false));
         assert!(short.starts_with("    THINKING"), "{short:?}");
+    }
+
+    #[test]
+    fn live_rail_header_lights_an_orange_lamp_after_the_label() {
+        // §7.4: while reasoning streams the header carries a static orange `●`
+        // lamp right after the label, plus the live elapsed on the right rail.
+        let line = rail_header_line(80, true, true, "THINKING", "14s", true);
+        let text = line_text(&line);
+        assert!(text.starts_with("  \u{25be} THINKING \u{25cf}"), "{text:?}");
+        assert!(text.trim_end().ends_with("14s"), "{text:?}");
+        // The lamp is the orange accent (a point signal), never the muted label
+        // tone — a state light paired with its symbol.
+        let lamp = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains('\u{25cf}'))
+            .expect("a lamp span");
+        assert_eq!(
+            lamp.style.fg,
+            Some(crate::ui::palette::orange()),
+            "the lamp is the orange accent"
+        );
+        // Unlit (settled) carries no lamp.
+        let settled = line_text(&rail_header_line(80, true, true, "THINKING", "14s", false));
+        assert!(
+            !settled.contains('\u{25cf}'),
+            "no lamp when unlit: {settled}"
+        );
     }
 }

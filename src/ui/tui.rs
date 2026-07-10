@@ -2326,6 +2326,358 @@ mod tests {
         );
     }
 
+    // --- The living thought: the streaming thinking block (living-thought spec) ---
+
+    /// Build a reasoning trace of `n` fixed-width tokens that each wrap to exactly
+    /// one rail row at width 30 (content 22, rail text area 20): an 18-cell token
+    /// fits alone, two do not — so `n` tokens render as `n` wrapped body rows.
+    fn reasoning_rows(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("ROW{i:02}xxxxxxxxxxxxx"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The THINKING header line of the current frame at width 30.
+    fn thinking_header(screen: &mut Screen) -> String {
+        rendered_lines(screen, 30, 30)
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains("THINKING"))
+            .expect("a THINKING header row")
+    }
+
+    #[test]
+    fn live_thinking_header_lights_the_lamp_and_elapsed_then_drops_on_commit() {
+        // Criterion 1: streaming shows `▾ THINKING ●` + live elapsed; commit drops
+        // the lamp and patches `↓tokens elapsed`.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(reasoning_rows(40)));
+        settle_stream(&mut screen);
+        let header = thinking_header(&mut screen);
+        assert!(header.contains('\u{25be}'), "foldable arrow ▾: {header}");
+        assert!(header.contains('\u{25cf}'), "lit lamp ●: {header}");
+        assert!(
+            header.trim_end().ends_with('s') && header.chars().any(|c| c.is_ascii_digit()),
+            "live elapsed on the right rail: {header}"
+        );
+        assert!(
+            !header.contains('\u{2193}'),
+            "no fabricated ↓tokens live: {header}"
+        );
+        // Commit: the lamp drops, the settled telemetry (`↓tokens elapsed`) lands.
+        screen.apply(UiEvent::AssistantTextDelta("Answer.".to_string()));
+        screen.apply(UiEvent::ProviderTurnCompleted {
+            turn_id: "t1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 10_000,
+                output_tokens: 3_000,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 2_400,
+                total_tokens: 13_000,
+                cache_creation: None,
+            }),
+        });
+        settle_stream(&mut screen);
+        let settled = thinking_header(&mut screen);
+        assert!(
+            !settled.contains('\u{25cf}'),
+            "lamp is dark once settled: {settled}"
+        );
+        assert!(
+            settled.contains("\u{2193}2.4k"),
+            "settled telemetry: {settled}"
+        );
+    }
+
+    #[test]
+    fn live_thinking_body_is_a_bounded_tail_window_with_honest_elision() {
+        // Criterion 2 / 7: a 40-row live stream renders 4 tail rows + `┊ … +36
+        // rows`, the tail row carries the `▋` caret at the stream edge, and the
+        // caret advances as more arrives.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(reasoning_rows(40)));
+        settle_stream(&mut screen);
+        let lines: Vec<String> = rendered_lines(&mut screen, 30, 30)
+            .iter()
+            .map(line_text)
+            .collect();
+        // Exactly four rail body rows (the `┊` rail, minus the elision) render.
+        let rail_rows: Vec<&String> = lines
+            .iter()
+            .filter(|t| t.contains('\u{250a}') && !t.contains('\u{2026}'))
+            .collect();
+        assert_eq!(rail_rows.len(), 4, "four tail rows: {lines:?}");
+        // The honest elision names the hidden count, and it is a rail readout.
+        assert!(
+            lines
+                .iter()
+                .any(|t| t.contains('\u{250a}') && t.contains("\u{2026} +36 rows")),
+            "honest elision row: {lines:?}"
+        );
+        // The tail is the LAST four rows; earlier rows are hidden.
+        assert!(
+            lines.iter().any(|t| t.contains("ROW39")),
+            "tail edge: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|t| t.contains("ROW36")),
+            "tail window: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|t| t.contains("ROW35")),
+            "earlier rows are hidden: {lines:?}"
+        );
+        // The caret rides the stream edge — the last tail row.
+        let edge = lines
+            .iter()
+            .find(|t| t.contains("ROW39"))
+            .expect("the stream-edge row");
+        assert!(
+            edge.contains('\u{258b}'),
+            "▋ caret at the stream edge: {edge}"
+        );
+    }
+
+    #[test]
+    fn live_thinking_caret_advances_with_arrival() {
+        // Criterion 2: the caret position advances as text arrives — the edge
+        // row is a later token after more has streamed.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(reasoning_rows(6)));
+        settle_stream(&mut screen);
+        let first_edge = rendered_lines(&mut screen, 30, 30)
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains('\u{258b}'))
+            .expect("a caret row");
+        assert!(
+            first_edge.contains("ROW05"),
+            "caret at first edge: {first_edge}"
+        );
+        // More arrives (appended, so the edge token is later).
+        screen.apply(UiEvent::AssistantReasoningDelta(
+            " ZED00xxxxxxxxxxxxx ZED01xxxxxxxxxxxxx".to_string(),
+        ));
+        settle_stream(&mut screen);
+        let next_edge = rendered_lines(&mut screen, 30, 30)
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains('\u{258b}'))
+            .expect("a caret row");
+        assert!(
+            next_edge.contains("ZED01"),
+            "caret advanced to the new edge: {next_edge}"
+        );
+        assert_ne!(first_edge, next_edge, "the caret row moved with arrival");
+    }
+
+    #[test]
+    fn short_live_thinking_shows_whole_and_is_not_foldable() {
+        // Criterion 2 / 3: a 3-row live stream renders whole, no elision, a caret
+        // on the last row, no disclosure arrow, and it does not participate in
+        // ctrl+o (no no-op toggle).
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(reasoning_rows(3)));
+        settle_stream(&mut screen);
+        let lines: Vec<String> = rendered_lines(&mut screen, 30, 30)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            lines.iter().any(|t| t.contains("ROW00")),
+            "whole trace: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|t| t.contains("ROW02")),
+            "whole trace: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|t| t.contains("rows") && t.contains('\u{2026}')),
+            "no elision for a short trace: {lines:?}"
+        );
+        let header = thinking_header(&mut screen);
+        assert!(
+            header.contains('\u{25cf}'),
+            "lamp still lit on a short trace: {header}"
+        );
+        assert!(
+            !header.contains('\u{25be}') && !header.contains('\u{25b8}'),
+            "a ≤4-row live trace has no disclosure arrow: {header}"
+        );
+        // Nothing hidden ⇒ ctrl+o offers no no-op toggle.
+        assert!(
+            !screen.toggle_all_panels(),
+            "short live trace is not foldable"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_toggles_live_thinking_between_tail_window_and_full_stream() {
+        // Criterion 3: ctrl+o during streaming toggles tail window ⇄ full stream.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(reasoning_rows(40)));
+        settle_stream(&mut screen);
+        let windowed: Vec<String> = rendered_lines(&mut screen, 30, 60)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            !windowed.iter().any(|t| t.contains("ROW00")),
+            "windowed: earliest row hidden: {windowed:?}"
+        );
+        // ctrl+o opens the full live stream: every row shows, no elision.
+        assert!(screen.toggle_all_panels(), "ctrl+o toggles the live block");
+        let full: Vec<String> = rendered_lines(&mut screen, 30, 60)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            full.iter().any(|t| t.contains("ROW00")),
+            "full stream: {full:?}"
+        );
+        assert!(
+            full.iter().any(|t| t.contains("ROW39")),
+            "full stream: {full:?}"
+        );
+        assert!(
+            !full
+                .iter()
+                .any(|t| t.contains("\u{2026} +") && t.contains("rows")),
+            "no elision in the full stream: {full:?}"
+        );
+        assert!(
+            full.iter().any(|t| t.contains('\u{258b}')),
+            "caret in full stream: {full:?}"
+        );
+        // ctrl+o again returns to the bounded tail window.
+        assert!(screen.toggle_all_panels(), "ctrl+o toggles back");
+        let rewindowed: Vec<String> = rendered_lines(&mut screen, 30, 60)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            !rewindowed.iter().any(|t| t.contains("ROW00")),
+            "back to the tail window: {rewindowed:?}"
+        );
+        assert!(
+            rewindowed.iter().any(|t| t.contains("\u{2026} +36 rows")),
+            "elision returns: {rewindowed:?}"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_live_thinking_renders_the_same_bounded_window() {
+        // Criterion 4: reduced motion changes no behavior here — the lamp, caret,
+        // window, and elision render identically; elapsed still updates (it is
+        // data). Under reduced motion arrival renders immediately (no beats).
+        let mut screen = Screen::new();
+        screen.set_reduced_motion(true);
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(reasoning_rows(40)));
+        let lines: Vec<String> = rendered_lines(&mut screen, 30, 30)
+            .iter()
+            .map(line_text)
+            .collect();
+        let rail_rows = lines
+            .iter()
+            .filter(|t| t.contains('\u{250a}') && !t.contains('\u{2026}'))
+            .count();
+        assert_eq!(
+            rail_rows, 4,
+            "bounded tail window under reduced motion: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|t| t.contains("\u{2026} +36 rows")),
+            "elision under reduced motion: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|t| t.contains("ROW39") && t.contains('\u{258b}')),
+            "caret at the edge under reduced motion: {lines:?}"
+        );
+        let header = thinking_header(&mut screen);
+        assert!(
+            header.contains('\u{25cf}'),
+            "lamp under reduced motion: {header}"
+        );
+        assert!(
+            header.trim_end().ends_with('s') && header.chars().any(|c| c.is_ascii_digit()),
+            "elapsed still updates under reduced motion: {header}"
+        );
+    }
+
+    #[test]
+    fn redacted_reasoning_has_no_live_body_caret_or_elision() {
+        // Criterion 6: redacted reasoning never streams a body — no live rows
+        // beyond the placeholder, no caret, no elision, no lamp.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(30);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoning {
+            text: String::new(),
+            redacted: true,
+        });
+        let lines: Vec<String> = rendered_lines(&mut screen, 30, 20)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            lines.iter().any(|t| t.contains("withheld")),
+            "placeholder: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|t| t.contains('\u{258b}')),
+            "no live caret for redacted reasoning: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|t| t.contains('\u{2026}') && t.contains("rows")),
+            "no elision for redacted reasoning: {lines:?}"
+        );
+        let header = lines
+            .iter()
+            .find(|t| t.contains("THINKING"))
+            .expect("a THINKING header");
+        assert!(
+            !header.contains('\u{25cf}'),
+            "no lamp for redacted reasoning: {header}"
+        );
+    }
+
     /// Incremental rendering (wrapped-row cache + fold-visibility cache +
     /// stable-prefix hints + surface prefix reuse) must leave the terminal
     /// surface byte-identical to a fresh full replay of the same screen after
