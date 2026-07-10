@@ -247,13 +247,26 @@ pub(crate) struct CacheProfile {
     pub(crate) min_cacheable_tokens: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContextDiagnostics {
     pub(crate) measured: u64,
     pub(crate) source: ContextMeasurementSource,
     pub(crate) ladder: TriggerLadder,
     pub(crate) automatic_enabled: bool,
     pub(crate) background_running: bool,
+    pub(crate) background_job: Option<BackgroundJobDiagnostics>,
+    pub(crate) summarizer: SummarizerKind,
+    pub(crate) worker_input: CompactionWorkerInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackgroundJobDiagnostics {
+    pub(crate) job_id: String,
+    pub(crate) elapsed_secs: u64,
+    pub(crate) covered_messages: usize,
+    pub(crate) original_tokens_estimate: u64,
+    pub(crate) origin: CompactionOrigin,
+    pub(crate) trigger_tier: Option<ContextPressureTier>,
 }
 
 impl Default for CacheProfile {
@@ -924,6 +937,18 @@ impl<P: ChatProvider> Harness<P> {
             ladder,
             automatic_enabled: self.compaction.automatic_enabled,
             background_running: self.compaction.background.is_some(),
+            background_job: self.compaction.background.as_ref().map(|job| {
+                BackgroundJobDiagnostics {
+                    job_id: job.job_id.clone(),
+                    elapsed_secs: job.started_at.elapsed().as_secs(),
+                    covered_messages: job.covered_messages,
+                    original_tokens_estimate: job.original_tokens,
+                    origin: job.origin,
+                    trigger_tier: job.trigger_tier,
+                }
+            }),
+            summarizer: self.compaction.summarizer,
+            worker_input: self.compaction.worker.input,
         })
     }
 
@@ -1364,6 +1389,11 @@ impl<P: ChatProvider> Harness<P> {
             })
             .fold(0u64, u64::saturating_add);
         (plans.len(), reclaimable)
+    }
+
+    pub(crate) fn frozen_fold_stats(&self) -> (usize, u64) {
+        self.compaction
+            .frozen_fold_stats(self.agent.messages(), &self.workspace)
     }
 
     /// Detected-but-unflushed fold count (see [`Self::pending_fold_stats`]).
@@ -1910,7 +1940,7 @@ impl<P: ChatProvider> Harness<P> {
                 }
                 let started =
                     self.compaction
-                        .start_background(&messages, plan, &self.workspace, obs);
+                        .start_background(&messages, plan, &self.workspace, obs, None);
                 self.compaction.worker.instructions = original_instructions;
                 started?;
             }
@@ -2000,6 +2030,14 @@ impl<P: ChatProvider> Harness<P> {
     ) -> Result<()> {
         match result {
             BackgroundSummaryResult::Summary(summary) => {
+                let usage = summary.worker_usage.clone();
+                self.emit_compaction_lifecycle_with_usage(
+                    obs,
+                    &job,
+                    CompactionLifecycleState::Ready,
+                    usage.clone(),
+                    Some("background compaction summary ready".to_string()),
+                )?;
                 let Some(plan) = self.revalidate_background_plan(&job) else {
                     self.emit_compaction_lifecycle_with_usage(
                         obs,
@@ -2019,6 +2057,13 @@ impl<P: ChatProvider> Harness<P> {
                     Some(_) => {
                         self.compaction.consecutive_failures = 0;
                         self.compaction.breaker_notice_emitted = false;
+                        self.emit_compaction_lifecycle_with_usage(
+                            obs,
+                            &job,
+                            CompactionLifecycleState::Applied,
+                            usage,
+                            Some("background compaction summary applied".to_string()),
+                        )?;
                         Ok(())
                     }
                     None => {
@@ -2115,6 +2160,7 @@ impl<P: ChatProvider> Harness<P> {
             original_tokens_estimate: job.original_tokens,
             origin: job.origin,
             worker_usage,
+            trigger_tier: job.trigger_tier,
             message,
         })
     }
@@ -2199,6 +2245,8 @@ impl<P: ChatProvider> Harness<P> {
             receiver,
             token,
             origin,
+            trigger_tier: Some(ContextPressureTier::Start),
+            started_at: std::time::Instant::now(),
         };
         self.emit_compaction_lifecycle(
             obs,

@@ -31,6 +31,7 @@ impl CompactionEngine {
             original_tokens_estimate: job.original_tokens,
             origin: job.origin,
             worker_usage,
+            trigger_tier: job.trigger_tier,
             message,
         })
     }
@@ -53,6 +54,7 @@ impl CompactionEngine {
         plan: CompactionPlan,
         workspace: &Path,
         obs: &dyn AgentObserver,
+        trigger_tier: Option<ContextPressureTier>,
     ) -> Result<()> {
         let factory = self
             .summarizer_factory
@@ -98,6 +100,8 @@ impl CompactionEngine {
             receiver,
             token,
             origin,
+            trigger_tier,
+            started_at: std::time::Instant::now(),
         };
         self.emit_lifecycle(
             obs,
@@ -168,6 +172,7 @@ impl CompactionEngine {
         let covered_messages = job.covered_messages;
         let original_tokens = job.original_tokens;
         let origin = job.origin;
+        let trigger_tier = job.trigger_tier;
         let worker_token = job.token.clone();
         let hard_wait = self.hard_wait;
         let waiter = tokio::task::spawn_blocking(move || {
@@ -185,6 +190,7 @@ impl CompactionEngine {
                     original_tokens_estimate: original_tokens,
                     origin,
                     worker_usage: None,
+                    trigger_tier,
                     message: Some("background compaction cancelled with the turn".to_string()),
                 })?;
                 return Ok(None);
@@ -202,6 +208,7 @@ impl CompactionEngine {
                     original_tokens_estimate: original_tokens,
                     origin,
                     worker_usage: None,
+                    trigger_tier,
                     message: Some(format!("background hard-wait task failed: {error}")),
                 })?;
                 return Ok(None);
@@ -251,6 +258,13 @@ impl CompactionEngine {
         match result {
             BackgroundSummaryResult::Summary(summary) => {
                 let usage = summary.worker_usage.clone();
+                self.emit_lifecycle(
+                    cx.observer,
+                    &job,
+                    CompactionLifecycleState::Ready,
+                    usage.clone(),
+                    Some("background compaction summary ready".to_string()),
+                )?;
                 if self.model_compaction_cap_reached(summary.origin) {
                     self.emit_lifecycle(
                         cx.observer,
@@ -281,6 +295,13 @@ impl CompactionEngine {
                     Some((_, replacement)) => {
                         self.consecutive_failures = 0;
                         self.breaker_notice_emitted = false;
+                        self.emit_lifecycle(
+                            cx.observer,
+                            &job,
+                            CompactionLifecycleState::Applied,
+                            usage,
+                            Some("background compaction summary applied".to_string()),
+                        )?;
                         Ok(Some(replacement))
                     }
                     None => {

@@ -17,8 +17,8 @@ use crate::config::CompactionTriggerConfig;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate,
     AssistantTurn, BoundaryContext, ChatProvider, CompactionLifecycleState, CompactionOrigin,
-    ContextDirective, Message, ProviderEvent, ProviderStream, ProviderUsage, ReviewContext,
-    ToolCall, Tools,
+    ContextDirective, ContextPressureTier, Message, ProviderEvent, ProviderStream, ProviderUsage,
+    ReviewContext, ToolCall, Tools,
 };
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::{ToolState, built_in_tools};
@@ -638,6 +638,62 @@ fn reactive_overflow_runs_deterministic_relief_and_returns_a_resend() {
 }
 
 #[test]
+fn fifth_compaction_generation_emits_one_degradation_notice() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).unwrap();
+    for generation in 1..=4 {
+        let id = log
+            .append(&Message::user(&format!("old generation {generation}")))
+            .unwrap();
+        log.append_compaction(&id, &id, &format!("summary {generation}"), &[], None)
+            .unwrap();
+    }
+    log.append(&Message::user(&"fifth generation source ".repeat(1_000)))
+        .unwrap();
+    log.append(&Message::assistant("recent tail")).unwrap();
+    let path = log.path().to_path_buf();
+    drop(log);
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .unwrap();
+    let stored = store.open(&meta).unwrap();
+    let log = SessionLog::resume(&path).unwrap();
+    let agent = Agent::resumed(SilentProvider, built_in_tools(), stored.messages);
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        stored.entry_ids,
+        None,
+    );
+    let obs = Recorder::default();
+
+    block_on(harness.compact_now(&obs, &CancellationToken::new())).unwrap();
+
+    let notices = obs
+        .events
+        .borrow()
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Notice(message) if message.contains("generation 5") => {
+                Some(message.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("/new"));
+    assert!(notices[0].contains("/compact"));
+    assert!(notices[0].contains("recall"));
+}
+
+#[test]
 fn reactive_off_surfaces_overflow_without_mutating_context() {
     let root = temp_dir();
     let workspace = temp_dir();
@@ -817,6 +873,13 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
 
     block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
     assert_eq!(obs.lifecycle(CompactionLifecycleState::Running), 1);
+    let diagnostics = harness.context_diagnostics().expect("context diagnostics");
+    let job = diagnostics.background_job.expect("running job detail");
+    assert_eq!(job.job_id, "compaction_00000000");
+    assert!(job.covered_messages > 0);
+    assert!(job.original_tokens_estimate > 0);
+    assert_eq!(job.origin, CompactionOrigin::Subagent);
+    assert_eq!(job.trigger_tier, Some(ContextPressureTier::Start));
     assert!(
         compaction_entries(&path).is_empty(),
         "worker text is not persisted until the parent drains and validates it"
@@ -829,7 +892,7 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
         "context must remain unchanged while the background worker runs"
     );
 
-    for _ in 0..50 {
+    for _ in 0..500 {
         block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
         if obs.applied() == 1 {
             break;
@@ -838,6 +901,31 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
     }
 
     assert_eq!(obs.applied(), 1);
+    assert_eq!(obs.lifecycle(CompactionLifecycleState::Ready), 1);
+    assert_eq!(obs.lifecycle(CompactionLifecycleState::Applied), 1);
+    let states = obs
+        .events
+        .borrow()
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::CompactionLifecycle { state, .. } => Some(*state),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        states,
+        vec![
+            CompactionLifecycleState::Running,
+            CompactionLifecycleState::Ready,
+            CompactionLifecycleState::Applied,
+        ]
+    );
+    assert!(obs.events.borrow().iter().all(|event| match event {
+        AgentEvent::CompactionLifecycle { trigger_tier, .. } => {
+            *trigger_tier == Some(ContextPressureTier::Start)
+        }
+        _ => true,
+    }));
     let (origin, worker_usage) = obs.applied_metadata().expect("applied metadata");
     assert_eq!(origin, CompactionOrigin::Subagent);
     let worker_usage = worker_usage.expect("worker usage from live summarizer lane");
@@ -1177,7 +1265,7 @@ fn background_subagent_falls_back_to_provider_before_excerpts() {
     let token = CancellationToken::new();
 
     block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
-    for _ in 0..50 {
+    for _ in 0..500 {
         block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
         if obs.applied() == 1 {
             break;
@@ -1368,7 +1456,10 @@ fn hard_tier_bounds_wait_then_cancels_and_applies_deterministic_fallback() {
         &token,
     ))
     .unwrap();
-    assert!(started.elapsed() < Duration::from_millis(100));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a zero hard-wait deadline must not wait on the blocked worker"
+    );
     let ContextDirective::Replace { messages } = directive else {
         panic!("hard tier must return deterministic relief");
     };

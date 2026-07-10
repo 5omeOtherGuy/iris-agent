@@ -918,6 +918,129 @@ pub(crate) fn session_info_lines<P: ChatProvider>(
     lines
 }
 
+/// Read one durable compaction entry for `/compaction [n]`. `n` is the
+/// 1-based generation ordinal; omission selects the latest entry.
+pub(crate) fn compaction_lines<P: ChatProvider>(harness: &Harness<P>, arg: &str) -> Vec<String> {
+    match selected_compaction(harness, arg) {
+        Ok(entry) => format_compaction_inspection(&entry),
+        Err(message) => vec![message],
+    }
+}
+
+pub(crate) fn selected_compaction<P: ChatProvider>(
+    harness: &Harness<P>,
+    arg: &str,
+) -> std::result::Result<crate::session::CompactionInspection, String> {
+    let Some(path) = harness.session_path() else {
+        return Err(
+            "no persisted session is attached; there are no compaction entries to inspect."
+                .to_string(),
+        );
+    };
+    let generation = if arg.trim().is_empty() {
+        None
+    } else {
+        match arg.trim().parse::<u64>().ok().filter(|value| *value > 0) {
+            Some(value) => Some(value),
+            None => return Err("usage: /compaction [generation]".to_string()),
+        }
+    };
+    let entries = match crate::session::read_compaction_inspections(path) {
+        Ok(entries) => entries,
+        Err(error) => return Err(format!("could not inspect compaction entries: {error:#}")),
+    };
+    let selected = generation
+        .and_then(|generation| entries.iter().find(|entry| entry.generation == generation))
+        .or_else(|| generation.is_none().then(|| entries.last()).flatten());
+    let Some(entry) = selected else {
+        return Err(match generation {
+            Some(generation) => format!("compaction generation {generation} was not found."),
+            None => "no compaction entries have been applied in this session.".to_string(),
+        });
+    };
+    Ok(entry.clone())
+}
+
+fn format_compaction_inspection(entry: &crate::session::CompactionInspection) -> Vec<String> {
+    let (title, detail, summary) = compaction_panel_parts(entry);
+    let mut lines = vec![title];
+    lines.extend(detail);
+    lines.push("  summary".to_string());
+    lines.extend(summary.lines().map(|line| format!("    {line}")));
+    lines
+}
+
+pub(crate) fn compaction_panel_parts(
+    entry: &crate::session::CompactionInspection,
+) -> (String, Vec<String>, String) {
+    let title = format!(
+        "compaction generation {}{}",
+        entry.generation,
+        entry
+            .id
+            .as_deref()
+            .map(|id| format!(" (entry {id})"))
+            .unwrap_or_default()
+    );
+    let mut lines = Vec::new();
+    lines.push(format!("  origin             {}", entry.origin));
+    lines.push(format!(
+        "  covered            {}..{} ({} message(s))",
+        entry.covered_from, entry.covered_to, entry.covered_messages
+    ));
+    lines.push(format!(
+        "  tokens             ~{} original -> ~{} summary",
+        entry.original_tokens_estimate, entry.summary_tokens_estimate
+    ));
+    lines.push(format!(
+        "  carry paths        {}",
+        if entry.carry_paths.is_empty() {
+            "none".to_string()
+        } else {
+            entry.carry_paths.join(", ")
+        }
+    ));
+    lines.push(format!(
+        "  instructions       {}",
+        entry.instructions.as_deref().unwrap_or("none")
+    ));
+    lines.push(format!(
+        "  recall handle      {}",
+        entry.recall_handle.as_deref().unwrap_or("unavailable")
+    ));
+    match &entry.worker_usage {
+        Some(usage) => {
+            let cache = usage
+                .cache_read_input_tokens
+                .saturating_mul(100)
+                .checked_div(usage.input_tokens)
+                .map(|percent| format!("{percent}%"))
+                .unwrap_or_else(|| "unknown".to_string());
+            lines.push(format!(
+                "  worker             {}/{}; input {} / output {} / reasoning {} / total {}; cache read {} ({cache}) / write {}",
+                usage.provider,
+                usage.model,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.reasoning_output_tokens,
+                usage.total_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_write_input_tokens,
+            ));
+            if let Some(creation) = &usage.cache_creation {
+                lines.push(format!(
+                    "  cache creation     5m {} / 1h {}",
+                    creation.ephemeral_5m_input_tokens, creation.ephemeral_1h_input_tokens
+                ));
+            }
+        }
+        None => lines.push(
+            "  worker             not reported (deterministic or usage-blind lane)".to_string(),
+        ),
+    }
+    (title, lines, entry.summary.clone())
+}
+
 /// Render the deterministic `/sessions <task-id>` lookup (ADR-0031): the
 /// sessions in `cwd`'s slug directory whose logs carry the task id, each
 /// followed by its deterministic extraction (user-message previews + task
@@ -1180,6 +1303,12 @@ fn run_session_inner<P: ChatProvider>(
         }
         if prompt == "/session" {
             for line in session_info_lines(harness, switch) {
+                ui.emit(UiEvent::Notice(line))?;
+            }
+            continue;
+        }
+        if cmd == "/compaction" {
+            for line in compaction_lines(harness, rest) {
                 ui.emit(UiEvent::Notice(line))?;
             }
             continue;
@@ -1661,6 +1790,53 @@ mod tests {
         assert_eq!(lines[0], format!("session: {id}"));
         assert_eq!(lines[1], format!("file: {}", path.display()));
         assert!(lines[3].contains("no budget"), "{lines:?}");
+    }
+
+    #[test]
+    fn compaction_lines_render_latest_detail_and_generation_lookup() {
+        let dir = crate::tools::test_support::temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, &dir.path).expect("session log");
+        let from = log
+            .append(&Message::user(&"old context ".repeat(20)))
+            .unwrap();
+        let to = log.append(&Message::assistant("old answer")).unwrap();
+        log.append_compaction_with_metadata(
+            &from,
+            &to,
+            "Goal: preserve NEEDLE.\n\n[recall] recall(handle=\"abc123\").",
+            &["src/lib.rs".to_string()],
+            None,
+            Some(12),
+            crate::nexus::CompactionOrigin::Excerpts,
+            None,
+            Some("preserve NEEDLE"),
+        )
+        .unwrap();
+        let agent = Agent::new(FakeProvider::new(vec![]), crate::tools::built_in_tools());
+        let harness = Harness::new(
+            agent,
+            dir.path.clone(),
+            crate::tools::ToolState::new(),
+            Some(log),
+            None,
+        );
+
+        let latest = compaction_lines(&harness, "").join("\n");
+        assert!(latest.contains("compaction generation 1"), "{latest}");
+        assert!(
+            latest.contains(&format!("{from}..{to} (2 message(s))")),
+            "{latest}"
+        );
+        assert!(latest.contains("src/lib.rs"), "{latest}");
+        assert!(latest.contains("preserve NEEDLE"), "{latest}");
+        assert!(latest.contains("abc123"), "{latest}");
+        assert!(latest.contains("Goal: preserve NEEDLE."), "{latest}");
+
+        assert!(compaction_lines(&harness, "2")[0].contains("was not found"));
+        assert_eq!(
+            compaction_lines(&harness, "nope"),
+            vec!["usage: /compaction [generation]"]
+        );
     }
 
     #[test]

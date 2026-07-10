@@ -291,6 +291,13 @@ pub(crate) enum UiEvent {
         summary: Vec<String>,
         diff: String,
     },
+    /// Read-only `/compaction [n]` detail. TUI renders a foldable panel; text
+    /// mode renders the same metadata and summary as plain lines.
+    CompactionInspection {
+        title: String,
+        detail: Vec<String>,
+        summary: String,
+    },
     TurnError {
         kind: TurnErrorKind,
         message: String,
@@ -397,6 +404,7 @@ impl UiEvent {
                 original_tokens_estimate,
                 origin: _,
                 worker_usage: _,
+                trigger_tier: _,
                 message,
             } => UiEvent::CompactionLifecycle {
                 job_id,

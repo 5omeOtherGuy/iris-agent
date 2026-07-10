@@ -588,6 +588,17 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                 body.extend(self.diff_body(&diff));
                 self.write_frame("task diff", &body)?;
             }
+            UiEvent::CompactionInspection {
+                title,
+                mut detail,
+                summary,
+            } => {
+                self.finish_assistant_stream()?;
+                self.start_block()?;
+                detail.push("summary".to_string());
+                detail.extend(summary.lines().map(String::from));
+                self.write_frame(&title, &detail)?;
+            }
             UiEvent::TurnError { kind, message } => {
                 self.finish_assistant_stream()?;
                 match kind {

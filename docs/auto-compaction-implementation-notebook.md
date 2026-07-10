@@ -19,10 +19,12 @@ this file keeps implementation issues and decisions that span slices.
   Both live lanes passed 10 sessions with no exclusions. Preliminary Codex
   probes hit `usage_limit_reached`; the quota later reopened and the full run
   passed.
+- Slice 5: typed overflow classification, bounded reactive resend, deterministic
+  recovery ladder, and induced-overflow live coverage merged in PR #530.
 
 ## Slice 5 — reactive recovery
 
-Status: ready to merge.
+Status: merged in PR #530.
 
 Initial seam decision: Nexus owns a provider-neutral overflow/retry guard;
 Wayland owns deterministic recovery and durable mutation; Mimir classifies wire
@@ -67,3 +69,48 @@ path before the worker surfaced its 90-second idle error. The process remained
 alive with its network reactor active. This is end-to-end provider/worker
 latency, not compaction main-loop blocking; no number was fabricated and the
 session was the run's sole exclusion.
+
+## Slice 6 — inspectability
+
+Status: implementation and live TUI milestone complete; awaiting merge.
+
+Decision: `/compaction [n]` treats `n` as the durable 1-based generation
+ordinal; omission selects the latest. The viewer derives covered message count
+and original token mass from raw JSONL message rows, so it works after resume
+without relying on process-local events. Missing legacy fields degrade to
+explicit defaults; recall handles are extracted only from persisted markers.
+
+Decision: the TUI viewer is one foldable transcript panel, not a modal or a new
+first-class pane. The `compacting…` chip is muted volatile composer chrome. It
+appears on `Running` and clears on `Ready` or any terminal lifecycle state.
+
+Issue: a frozen fold can have zero estimated reclaimable tokens when its
+deterministic recall stub is as large as a tiny result. The diagnostics report
+the honest zero; only the frozen count is an invariant.
+
+Live TUI milestone: passed on `anthropic/claude-haiku-4-5` with the compaction
+worker pinned to `anthropic/claude-opus-4-6` at medium reasoning. A real `read`
+turn started the worker over 5 messages (~3,864 tokens). The composer stayed
+usable and showed `compacting…`; the next short turn observed
+Running -> Ready -> Applied, cleared the chip, and applied a 205-token summary.
+`/compaction` displayed generation 1, entry/range metadata, `Cargo.toml` carry,
+the recall handle, and worker usage (8,193 input, 176 output, 8,369 total).
+Post-apply `/context` reported the job idle and ~3,864 -> ~205 summarized.
+
+Observation: the TUI top rail continued to show the model catalog's 200k native
+window while `/context` showed the 32,768-token effective override. These are
+different measurements by design; the detailed diagnostic is authoritative for
+compaction thresholds.
+
+Issue after rebasing onto the v0.2.0 release: the full parallel test suite
+starved two background worker threads past their 500 ms polling allowance and
+scheduled a zero-hard-wait assertion past its 100 ms wall-clock allowance. All
+three passed immediately in isolation. The tests now retain bounded deadlines
+but allow 5 seconds for a worker scheduled under load and 2 seconds for the
+zero-wait path; state, lifecycle ordering, cancellation, and deterministic
+fallback assertions remain unchanged.
+
+Notable repository event: PRs #522 and #529 landed during slice 5's live run.
+Slice 5 rebased cleanly. The primary checkout remains intentionally dirty with
+unrelated operator changes, so primary sync refuses; each later slice continues
+from fetched `origin/main` in its own worktree.

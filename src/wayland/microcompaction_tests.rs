@@ -19,8 +19,8 @@ use tokio_util::sync::CancellationToken;
 use super::{BackgroundCompaction, Harness};
 use crate::config::{CompactionCacheTiming, Settings};
 use crate::nexus::{
-    Agent, AgentEvent, AgentObserver, ChatProvider, CompactionOrigin, FoldTrigger, Message,
-    ProviderStream, SessionSpanReader, ToolCall, Tools,
+    Agent, AgentEvent, AgentObserver, ChatProvider, CompactionOrigin, ContextPressureTier,
+    FoldTrigger, Message, ProviderStream, SessionSpanReader, ToolCall, Tools,
 };
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::{ToolState, built_in_tools, recall};
@@ -276,8 +276,12 @@ fn active_background_range_freezes_inside_folds_but_outside_folds_flush() {
         receiver,
         token: CancellationToken::new(),
         origin: CompactionOrigin::Subagent,
+        trigger_tier: Some(ContextPressureTier::Start),
+        started_at: std::time::Instant::now(),
     });
 
+    let (frozen, _frozen_tokens) = harness.frozen_fold_stats();
+    assert_eq!(frozen, 1);
     let pending = harness.pending_folds();
     assert_eq!(pending.len(), 1, "the c1 result is frozen under the job");
     assert_eq!(pending[0].tool_call_id, "c2", "outside fold stays eligible");

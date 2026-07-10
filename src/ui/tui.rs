@@ -577,7 +577,7 @@ impl Drop for TuiUi {
 mod tests {
     use super::panel::{footer_rule_line, inset_rule_line, panel_body_line, panel_header_line};
     use super::*;
-    use crate::nexus::{ApprovalDecision, ToolCall};
+    use crate::nexus::{ApprovalDecision, CompactionLifecycleState, ToolCall};
     use crate::ui::UiEvent;
     use crate::ui::terminal_surface::{RenderKind, TerminalSurface};
     use ratatui::style::{Color, Modifier};
@@ -4397,6 +4397,58 @@ mod tests {
         for line in &texts {
             assert!(display_width(line) <= 120, "{line:?}");
         }
+    }
+
+    #[test]
+    fn compaction_status_chip_lives_only_while_the_worker_runs() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "gpt-5.4".to_string(),
+            None,
+            "~/projects/iris-agent".to_string(),
+        );
+        let lifecycle = |state| UiEvent::CompactionLifecycle {
+            job_id: "compaction_00000003".to_string(),
+            state,
+            covered_messages: 118,
+            original_tokens_estimate: 48_200,
+            message: None,
+        };
+
+        screen.apply(lifecycle(CompactionLifecycleState::Running));
+        let running = line_text(&composer_statusline(&screen, 100).unwrap());
+        assert!(running.contains("compacting…"), "{running}");
+
+        screen.apply(lifecycle(CompactionLifecycleState::Ready));
+        let ready = line_text(&composer_statusline(&screen, 100).unwrap());
+        assert!(!ready.contains("compacting"), "{ready}");
+
+        screen.apply(lifecycle(CompactionLifecycleState::Applied));
+        let applied = line_text(&composer_statusline(&screen, 100).unwrap());
+        assert!(!applied.contains("compacting"), "{applied}");
+    }
+
+    #[test]
+    fn compaction_inspection_is_a_foldable_pager_panel() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::CompactionInspection {
+            title: "compaction generation 3 (entry 0000000a)".to_string(),
+            detail: vec![
+                "origin             subagent".to_string(),
+                "covered            1..9 (8 message(s))".to_string(),
+            ],
+            summary: "Goal: preserve NEEDLE.\nNext steps: continue.".to_string(),
+        });
+
+        let expanded = rendered_text(&mut screen, 100, 24);
+        assert!(expanded.contains("COMPACTION"), "{expanded}");
+        assert!(expanded.contains("Goal: preserve NEEDLE."), "{expanded}");
+
+        screen.toggle_scrollback_focus();
+        assert!(screen.toggle_selected_entry());
+        let collapsed = rendered_text(&mut screen, 100, 24);
+        assert!(collapsed.contains("COMPACTION"), "{collapsed}");
+        assert!(!collapsed.contains("Goal: preserve NEEDLE."), "{collapsed}");
     }
 
     #[test]

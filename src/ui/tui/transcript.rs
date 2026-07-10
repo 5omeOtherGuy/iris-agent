@@ -1817,6 +1817,51 @@ impl Transcript {
         );
     }
 
+    fn push_compaction_inspection_panel(&mut self, title: &str, detail: &[String], summary: &str) {
+        self.begin_block();
+        self.push_panel_header(PanelHeaderSpec {
+            title: "COMPACTION",
+            meta: title,
+            plain_meta: title,
+            state: PanelState::Done,
+            duration: None,
+            started: None,
+        });
+        let body_from = self.rows.len();
+        for line in detail {
+            self.rows.push(TranscriptRow::chrome_with_text(
+                ChromeRow::Body {
+                    line: Line::from(Span::styled(line.clone(), dim_style())),
+                    bg: None,
+                },
+                line.clone(),
+                dim_style(),
+            ));
+        }
+        self.rows.push(TranscriptRow::chrome_with_text(
+            ChromeRow::Body {
+                line: Line::from(Span::styled("SUMMARY", dim_style())),
+                bg: None,
+            },
+            "SUMMARY".to_string(),
+            dim_style(),
+        ));
+        for line in summary.lines() {
+            self.rows.push(TranscriptRow::chrome_with_text(
+                ChromeRow::Body {
+                    line: Line::from(line.to_string()),
+                    bg: None,
+                },
+                line.to_string(),
+                Style::default(),
+            ));
+        }
+        for row in &mut self.rows[body_from..] {
+            row.fold = FoldVis::WhenExpanded;
+        }
+        self.push_block_footer(PanelState::Done, Vec::new(), None, None);
+    }
+
     /// Open (or reopen) the EDIT panel for a pending mutation: `◇ PREVIEW`,
     /// diff body, tracked as the active edit so the same panel is finalized in
     /// place when the tool runs.
@@ -2794,6 +2839,11 @@ impl Transcript {
             UiEvent::TaskDiff { summary, diff } => {
                 self.push_task_diff_panel(&summary, &diff);
             }
+            UiEvent::CompactionInspection {
+                title,
+                detail,
+                summary,
+            } => self.push_compaction_inspection_panel(&title, &detail, &summary),
             UiEvent::TurnError { kind, message } => match kind {
                 TurnErrorKind::Auth => {
                     self.push_notice_row(

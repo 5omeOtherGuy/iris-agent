@@ -318,6 +318,17 @@ pub(crate) enum ContextPressureTier {
     Hard,
 }
 
+impl ContextPressureTier {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Warn => "warn",
+            Self::Start => "start",
+            Self::Hard => "hard",
+        }
+    }
+}
+
 /// Provenance of the context size used by the trigger ladder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContextMeasurementSource {
@@ -432,6 +443,8 @@ pub(crate) enum AgentEvent {
         /// Realized usage once a worker has completed; `None` while running or
         /// when the provider does not report usage.
         worker_usage: Option<ProviderUsage>,
+        /// Pressure tier that launched the job. `None` for manual compaction.
+        trigger_tier: Option<ContextPressureTier>,
         message: Option<String>,
     },
     /// The harness flushed a batch of microcompaction folds at a safe turn
@@ -570,6 +583,8 @@ pub(crate) enum AgentEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompactionLifecycleState {
     Running,
+    Ready,
+    Applied,
     Discarded,
     Failed,
     Cancelled,
@@ -600,6 +615,8 @@ impl CompactionLifecycleState {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Ready => "ready",
+            Self::Applied => "applied",
             Self::Discarded => "discarded",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
