@@ -864,6 +864,18 @@ impl SettingsPanel {
     fn arm_flash(&mut self, row: PanelRow) {
         if !self.snap.reduced_motion {
             self.flash = Some((row, FLASH_TICKS));
+        } else {
+            self.flash = None;
+        }
+    }
+
+    /// Apply a live accessibility switch to an already-open faceplate. Any
+    /// detent acknowledgment settles in the same interaction that enables
+    /// reduced motion.
+    pub(crate) fn set_reduced_motion(&mut self, reduced_motion: bool) {
+        self.snap.reduced_motion = reduced_motion;
+        if reduced_motion {
+            self.flash = None;
         }
     }
 
@@ -3787,6 +3799,23 @@ mod tests {
         select_top(&mut panel, RowId::Field(Field::DefaultApproval));
         panel.handle_key(ModalKey::Right);
         assert!(panel.flash.is_none(), "reduced motion settles instantly");
+    }
+
+    #[test]
+    fn enabling_reduced_motion_clears_an_existing_flash() {
+        let mut panel = panel();
+        select_top(&mut panel, RowId::Field(Field::DefaultApproval));
+        panel.handle_key(ModalKey::Right);
+        assert!(panel.flash.is_some());
+
+        panel.set_reduced_motion(true);
+
+        assert!(panel.snap.reduced_motion);
+        assert!(
+            panel.flash.is_none(),
+            "transition settles in the same frame"
+        );
+        assert!(!panel.tick(), "no trailing redraw remains");
     }
 
     #[test]

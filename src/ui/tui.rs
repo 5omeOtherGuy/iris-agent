@@ -336,6 +336,10 @@ impl TuiUi {
     /// `drop`/`shutdown`, the panic hook, and the signal handler's emergency
     /// escape on a force-quit.
     pub(crate) fn new(mode: ScreenMode) -> Result<Self> {
+        // Resolve palette capability before any widget is built. Named themes
+        // stay truecolor where supported, quantize to xterm indices at 256,
+        // and fall back to semantic ANSI roles at 16 colors.
+        crate::ui::palette::configure_terminal_color_depth();
         // Capture cooked-mode termios before raw mode so the force-quit signal
         // handler can restore the tty even though Drop will not run then.
         crate::signals::save_termios_for_force_quit();
@@ -2098,6 +2102,133 @@ mod tests {
     }
 
     #[test]
+    fn live_thinking_keeps_the_same_leading_separator_as_settled_thinking() {
+        // Screenshot regression: while reasoning streamed after a tool footer,
+        // THINKING mounted directly against DONE. Finalization then inserted a
+        // blank above the committed rail and shifted the visible pane by one
+        // row. The block boundary must exist from its first live frame.
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.apply(UiEvent::ToolResult {
+            call: call_args("bash", json!({ "command": "cat /tmp/findings.md" })),
+            content: "finding".to_string(),
+            exit_code: Some(0),
+            duration: None,
+        });
+        screen.set_reduced_motion(true);
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "t1".to_string(),
+        });
+        screen.apply(UiEvent::AssistantReasoningDelta(
+            "Checking the revealed rows.".to_string(),
+        ));
+
+        let live: Vec<String> = rendered_lines(&mut screen, 80, 24)
+            .iter()
+            .map(line_text)
+            .collect();
+        let live_header = live
+            .iter()
+            .position(|line| line.contains("THINKING"))
+            .expect("live THINKING header");
+        assert!(
+            live_header > 0 && live[live_header - 1].trim().is_empty(),
+            "live rail needs its leading separator from frame one: {live:?}"
+        );
+
+        screen.apply(UiEvent::AssistantTextDelta("Done.".to_string()));
+        let settled: Vec<String> = rendered_lines(&mut screen, 80, 24)
+            .iter()
+            .map(line_text)
+            .collect();
+        let settled_header = settled
+            .iter()
+            .position(|line| line.contains("THINKING"))
+            .expect("settled THINKING header");
+        assert!(
+            settled_header > 0 && settled[settled_header - 1].trim().is_empty(),
+            "settled rail keeps the same boundary: {settled:?}"
+        );
+    }
+
+    #[test]
+    fn settled_thinking_owns_exactly_one_separator_before_the_next_tool() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.set_reduced_motion(true);
+        screen.apply(UiEvent::AssistantReasoningDelta(
+            "Inspecting the result.".to_string(),
+        ));
+        screen.apply(UiEvent::ToolResult {
+            call: call_args_id(
+                "call-after-thinking",
+                "bash",
+                json!({ "command": "echo next" }),
+            ),
+            content: "next".to_string(),
+            exit_code: Some(0),
+            duration: None,
+        });
+        let lines: Vec<String> = rendered_lines(&mut screen, 80, 24)
+            .iter()
+            .map(line_text)
+            .collect();
+        let thinking = lines
+            .iter()
+            .position(|line| line.contains("THINKING"))
+            .expect("THINKING header");
+        let shell = lines
+            .iter()
+            .enumerate()
+            .skip(thinking + 1)
+            .find_map(|(index, line)| line.contains("SHELL").then_some(index))
+            .expect("following SHELL header");
+        let gaps = lines[thinking + 1..shell]
+            .iter()
+            .filter(|line| line.trim().is_empty())
+            .count();
+        assert_eq!(
+            gaps, 1,
+            "RailEnd already supplies the one inter-block gap: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn late_thinking_owns_exactly_one_separator_before_the_existing_answer() {
+        let mut screen = Screen::new();
+        let _ = screen.wrapped_lines(80);
+        screen.set_reduced_motion(true);
+        screen.apply(UiEvent::AssistantTextDelta("Existing answer.".to_string()));
+        screen.apply(UiEvent::AssistantReasoning {
+            text: "Late trace.".to_string(),
+            redacted: false,
+        });
+        screen.apply(UiEvent::AssistantTextEnd("Existing answer.".to_string()));
+        let lines: Vec<String> = rendered_lines(&mut screen, 80, 24)
+            .iter()
+            .map(line_text)
+            .collect();
+        let thinking = lines
+            .iter()
+            .position(|line| line.contains("THINKING"))
+            .expect("THINKING header");
+        let answer = lines
+            .iter()
+            .enumerate()
+            .skip(thinking + 1)
+            .find_map(|(index, line)| line.contains("Existing answer.").then_some(index))
+            .expect("existing answer");
+        let gaps = lines[thinking + 1..answer]
+            .iter()
+            .filter(|line| line.trim().is_empty())
+            .count();
+        assert_eq!(
+            gaps, 1,
+            "RailEnd separates the late rail from the answer once: {lines:?}"
+        );
+    }
+
+    #[test]
     fn live_summary_collapses_and_raw_expands() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
@@ -2404,9 +2535,9 @@ mod tests {
 
     #[test]
     fn live_thinking_body_is_a_bounded_tail_window_with_honest_elision() {
-        // Criterion 2 / 7: a 40-row live stream renders 4 tail rows + `┊ … +36
-        // rows`, the tail row carries the `▋` caret at the stream edge, and the
-        // caret advances as more arrives.
+        // A 40-row live stream renders 4 tail rows + `┊ … +36 rows`. The lit
+        // header lamp carries liveness; generated text does not grow a channel-
+        // specific caret.
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(30);
         screen.apply(UiEvent::ProviderTurnStarted {
@@ -2444,21 +2575,14 @@ mod tests {
             !lines.iter().any(|t| t.contains("ROW35")),
             "earlier rows are hidden: {lines:?}"
         );
-        // The caret rides the stream edge — the last tail row.
-        let edge = lines
-            .iter()
-            .find(|t| t.contains("ROW39"))
-            .expect("the stream-edge row");
         assert!(
-            edge.contains('\u{258b}'),
-            "▋ caret at the stream edge: {edge}"
+            lines.iter().all(|line| !line.contains('\u{258b}')),
+            "model output must not use an asymmetric caret: {lines:?}"
         );
     }
 
     #[test]
-    fn live_thinking_caret_advances_with_arrival() {
-        // Criterion 2: the caret position advances as text arrives — the edge
-        // row is a later token after more has streamed.
+    fn thinking_and_answer_streams_share_the_no_caret_output_grammar() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(30);
         screen.apply(UiEvent::ProviderTurnStarted {
@@ -2466,36 +2590,26 @@ mod tests {
         });
         screen.apply(UiEvent::AssistantReasoningDelta(reasoning_rows(6)));
         settle_stream(&mut screen);
-        let first_edge = rendered_lines(&mut screen, 30, 30)
-            .iter()
-            .map(line_text)
-            .find(|t| t.contains('\u{258b}'))
-            .expect("a caret row");
+        let thinking = rendered_text(&mut screen, 30, 30);
         assert!(
-            first_edge.contains("ROW05"),
-            "caret at first edge: {first_edge}"
+            !thinking.contains('\u{258b}'),
+            "thinking used a model-output caret: {thinking}"
         );
-        // More arrives (appended, so the edge token is later).
-        screen.apply(UiEvent::AssistantReasoningDelta(
-            " ZED00xxxxxxxxxxxxx ZED01xxxxxxxxxxxxx".to_string(),
+        screen.apply(UiEvent::AssistantTextDelta(
+            "Answer arriving now.".to_string(),
         ));
         settle_stream(&mut screen);
-        let next_edge = rendered_lines(&mut screen, 30, 30)
-            .iter()
-            .map(line_text)
-            .find(|t| t.contains('\u{258b}'))
-            .expect("a caret row");
+        let answer = rendered_text(&mut screen, 30, 30);
         assert!(
-            next_edge.contains("ZED01"),
-            "caret advanced to the new edge: {next_edge}"
+            !answer.contains('\u{258b}'),
+            "assistant answer used a model-output caret: {answer}"
         );
-        assert_ne!(first_edge, next_edge, "the caret row moved with arrival");
     }
 
     #[test]
     fn short_live_thinking_shows_whole_and_is_not_foldable() {
-        // Criterion 2 / 3: a 3-row live stream renders whole, no elision, a caret
-        // on the last row, no disclosure arrow, and it does not participate in
+        // A 3-row live stream renders whole, no elision, no disclosure arrow,
+        // and it does not participate in
         // ctrl+o (no no-op toggle).
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(30);
@@ -2577,8 +2691,8 @@ mod tests {
             "no elision in the full stream: {full:?}"
         );
         assert!(
-            full.iter().any(|t| t.contains('\u{258b}')),
-            "caret in full stream: {full:?}"
+            full.iter().all(|t| !t.contains('\u{258b}')),
+            "no channel-specific output caret: {full:?}"
         );
         // ctrl+o again returns to the bounded tail window.
         assert!(screen.toggle_all_panels(), "ctrl+o toggles back");
@@ -2625,10 +2739,9 @@ mod tests {
             "elision under reduced motion: {lines:?}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|t| t.contains("ROW39") && t.contains('\u{258b}')),
-            "caret at the edge under reduced motion: {lines:?}"
+            lines.iter().any(|t| t.contains("ROW39"))
+                && lines.iter().all(|t| !t.contains('\u{258b}')),
+            "same no-caret output grammar under reduced motion: {lines:?}"
         );
         let header = thinking_header(&mut screen);
         assert!(
@@ -3255,10 +3368,12 @@ mod tests {
         assert!(rendered.contains("DONE"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
         assert!(rendered.contains("approved this time"), "{rendered}");
-        // One tool block, no separate APPROVAL panel, no frame anywhere.
+        // One tool block, no separate APPROVAL panel, no enclosing frame. The
+        // lone `└` is the command-to-output connector, not a box corner.
         assert_eq!(rendered.matches("SHELL").count(), 1, "{rendered}");
         assert!(!rendered.contains("APPROVAL"), "{rendered}");
-        for frame in ['┌', '┐', '└', '┘', '│'] {
+        assert_eq!(rendered.matches('└').count(), 1, "{rendered}");
+        for frame in ['┌', '┐', '┘', '│'] {
             assert!(!rendered.contains(frame), "{rendered}");
         }
 
@@ -3507,7 +3622,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_preview_drops_file_headers_and_colors_changes() {
+    fn diff_preview_keeps_hunk_location_drops_duplicate_path_headers_and_colors_changes() {
         let mut screen = Screen::new();
         screen.apply(UiEvent::DiffPreview {
             call: call("edit"),
@@ -3515,7 +3630,10 @@ mod tests {
         });
         let texts: Vec<String> = screen.transcript.rows.iter().map(row_text).collect();
         assert!(!texts.iter().any(|t| t.contains("--- a/note.txt")));
-        assert!(!texts.iter().any(|t| t.contains("@@ -1 +1 @@")));
+        assert!(
+            texts.iter().any(|t| t.contains("@@ -1 +1 @@")),
+            "the path lives in the EDIT header, but the hunk location stays visible"
+        );
         assert!(texts.iter().any(|t| t.contains("\u{2212}  old")));
         assert!(texts.iter().any(|t| t.contains("+  new")));
         let add = screen
@@ -3563,7 +3681,15 @@ mod tests {
         );
         assert!(
             !texts.iter().any(|t| t.contains("--- a/note.txt")),
-            "header dropped"
+            "raw git header dropped"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("FILE  note.txt")),
+            "task diff names the file section"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("@@ -1 +1 @@")),
+            "task diff keeps the hunk location"
         );
         assert!(
             texts.iter().any(|t| t.contains("+  new")),
@@ -3576,6 +3702,33 @@ mod tests {
             .find(|row| row.text.contains("+  new"))
             .expect("addition row");
         assert_eq!(add.style, ok_style());
+    }
+
+    #[test]
+    fn multi_file_task_diff_names_every_change_section() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::TaskDiff {
+            summary: vec!["2 files changed, +2/-2".to_string()],
+            diff: "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -10 +10 @@ fn a()\n-old_a\n+new_a\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -20 +20 @@ fn b()\n-old_b\n+new_b\n"
+                .to_string(),
+        });
+        let rendered = rendered_text(&mut screen, 90, 30);
+
+        let a_file = rendered.find("FILE  src/a.rs").expect("first file lane");
+        let a_hunk = rendered.find("@@ -10 +10 @@ fn a()").expect("first hunk");
+        let a_change = rendered.find("new_a").expect("first change");
+        let b_file = rendered.find("FILE  src/b.rs").expect("second file lane");
+        let b_hunk = rendered.find("@@ -20 +20 @@ fn b()").expect("second hunk");
+        let b_change = rendered.find("new_b").expect("second change");
+        assert!(a_file < a_hunk && a_hunk < a_change, "{rendered}");
+        assert!(
+            a_change < b_file && b_file < b_hunk && b_hunk < b_change,
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("--- a/"),
+            "raw headers stay out: {rendered}"
+        );
     }
 
     #[test]
@@ -5337,9 +5490,9 @@ mod tests {
 
     #[test]
     fn shell_block_reproduces_the_frameless_mockup() {
-        // DESIGN spec §2, SHELL — success: header (▾ SHELL  <command> … elapsed),
-        // hanging body, hairline rule, footer `◆ DONE  EXIT 0 ┊ <meta>` with the
-        // right-bound diagnostics cluster. Exact rows, exact rails.
+        // SHELL — success: a compact history header carries the command; the
+        // open posture moves that command to one bright invocation row, then a
+        // `└` result connector, hairline, and measured footer. Exact rows/rails.
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(90);
         let call = call_args("bash", json!({ "command": "cargo test -p context" }));
@@ -5359,7 +5512,14 @@ mod tests {
             exit_code: Some(0),
             duration: Some(Duration::from_millis(3200)),
         });
-        // Compact by default: expand the finalized block to inspect its body.
+        let collapsed = rendered_text(&mut screen, 90, 12);
+        assert!(
+            collapsed.contains("▸ SHELL  cargo test -p context"),
+            "folded history names what ran: {collapsed}"
+        );
+
+        // Expanded: the full command appears once in the body, never cramped
+        // into the header as a duplicate.
         screen.toggle_all_panels();
         let texts: Vec<String> = screen
             .wrapped_lines(90)
@@ -5370,9 +5530,10 @@ mod tests {
         // Right rail: header elapsed and footer diagnostics end at one column.
         let rail = 88; // width 90 − 2ch outer padding
         let header = &texts[0];
+        assert!(header.starts_with("  ▾ SHELL"), "{header:?}");
         assert!(
-            header.starts_with("  ▾ SHELL  cargo test -p context"),
-            "{header:?}"
+            !header.contains("cargo test"),
+            "open header duplicated command: {header:?}"
         );
         assert!(header.trim_end().ends_with("3.2s"), "{header:?}");
         assert_eq!(display_width(header.trim_end()), rail, "{header:?}");
@@ -5380,8 +5541,16 @@ mod tests {
         // 4), content on the shared text column (col 6) — one continuous left
         // edge from the header label down to the footer rule.
         assert_eq!(texts[1], "    ┊ $ cargo test -p context");
-        assert_eq!(texts[2], "    ┊    Compiling context v0.4.1");
-        assert_eq!(texts[3], "    ┊ test result: ok. 142 passed; 0 failed");
+        assert_eq!(texts[2], "    ┊ └    Compiling context v0.4.1");
+        assert_eq!(texts[3], "    ┊   test result: ok. 142 passed; 0 failed");
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|line| line.contains("cargo test -p context"))
+                .count(),
+            1,
+            "command renders exactly once: {texts:?}"
+        );
         // Hairline rule from the footer indent to the block's right edge.
         assert!(texts[4].starts_with("    ─"), "{:?}", texts[4]);
         assert_eq!(display_width(&texts[4]), rail, "{:?}", texts[4]);
@@ -5866,9 +6035,9 @@ mod tests {
             exit_code: None,
             duration: Some(Duration::from_millis(400)),
         });
-        // Applied: the same single EDIT block, DONE, diff + footer counts.
-        // Compact by default: the applied block collapses, so expand to inspect.
-        screen.toggle_all_panels();
+        // Applied: the same single EDIT block remains open, DONE, diff + footer
+        // counts. Consequential evidence does not vanish on finalization.
+        assert!(!screen.latest_panel_collapsed());
         let done = rendered_text(&mut screen, 100, 24);
         assert!(done.contains("DONE"), "{done}");
         assert!(done.contains("self.budget.justify(ctx)?;"), "{done}");
@@ -6152,7 +6321,7 @@ mod tests {
         assert!(rendered.contains("\u{2212}  old"));
         assert!(rendered.contains("+  new"));
         assert!(!rendered.contains("--- a/file"));
-        assert!(!rendered.contains("@@ -1 +1 @@"));
+        assert!(rendered.contains("@@ -1 +1 @@"));
     }
 
     #[test]
@@ -6383,25 +6552,27 @@ mod tests {
             redacted: false,
         });
         let collapsed = rendered_text(&mut screen, 80, 18);
-        // Summary-only thinking has no alternate expanded body, so it renders
-        // without a no-op disclosure affordance.
+        // Summary-only thinking is a real disclosure: closed history is one
+        // header; opening it reveals the complete trace.
         assert!(collapsed.contains("THINKING"), "{collapsed}");
-        assert!(!collapsed.contains("▸"), "{collapsed}");
+        assert!(collapsed.contains("▸"), "{collapsed}");
         assert!(!collapsed.contains("▾"), "{collapsed}");
-        assert!(!collapsed.contains("more paragraph"), "{collapsed}");
-        assert!(!collapsed.contains("ctrl+o to expand"), "{collapsed}");
         assert!(
-            collapsed.contains("First I check"),
-            "collapsed thinking shows the summary: {collapsed}"
+            !collapsed.contains("First I check") && !collapsed.contains("Then the cache"),
+            "closed thinking leaked its body: {collapsed}"
         );
+
+        assert!(screen.toggle_latest_panel());
+        let expanded = rendered_text(&mut screen, 80, 18);
+        assert!(expanded.contains("▾"), "{expanded}");
         assert!(
-            collapsed.contains("Then the cache"),
-            "collapsed summary includes later summary paragraphs: {collapsed}"
+            expanded.contains("First I check") && expanded.contains("Then the cache"),
+            "expanded thinking omitted its trace: {expanded}"
         );
     }
 
     #[test]
-    fn short_reasoning_without_raw_is_not_foldable() {
+    fn short_reasoning_without_raw_is_still_foldable() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         screen.apply(UiEvent::AssistantReasoning {
@@ -6410,17 +6581,19 @@ mod tests {
         });
         let collapsed = rendered_text(&mut screen, 80, 14);
         assert!(collapsed.contains("THINKING"), "{collapsed}");
-        assert!(!collapsed.contains("▸"), "{collapsed}");
+        assert!(collapsed.contains("▸"), "{collapsed}");
         assert!(!collapsed.contains("▾"), "{collapsed}");
         assert!(
-            collapsed.contains("One short thought."),
-            "short reasoning summary is visible: {collapsed}"
+            !collapsed.contains("One short thought."),
+            "closed short reasoning leaked: {collapsed}"
         );
-        assert!(!screen.toggle_latest_panel());
+        assert!(screen.toggle_latest_panel());
+        let expanded = rendered_text(&mut screen, 80, 14);
+        assert!(expanded.contains("One short thought."), "{expanded}");
     }
 
     #[test]
-    fn summary_only_thinking_does_not_offer_noop_expand() {
+    fn summary_only_thinking_offers_a_real_expand() {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         screen.apply(UiEvent::AssistantReasoning {
@@ -6430,12 +6603,14 @@ mod tests {
         let rendered = rendered_text(&mut screen, 80, 14);
         assert!(rendered.contains("THINKING"), "{rendered}");
         assert!(
-            rendered.contains("Then inspect the cache."),
-            "summary body missing: {rendered}"
+            !rendered.contains("Then inspect the cache."),
+            "closed summary body leaked: {rendered}"
         );
-        assert!(!rendered.contains("▸"), "{rendered}");
+        assert!(rendered.contains("▸"), "{rendered}");
         assert!(!rendered.contains("▾"), "{rendered}");
-        assert!(!screen.toggle_latest_panel());
+        assert!(screen.toggle_latest_panel());
+        let expanded = rendered_text(&mut screen, 80, 14);
+        assert!(expanded.contains("Then inspect the cache."), "{expanded}");
     }
 
     #[test]
@@ -6483,26 +6658,33 @@ mod tests {
                 .any(|r| matches!(r.chrome.as_ref(), Some(ChromeRow::RailEnd))),
             "rail end marker missing"
         );
-        // The header renders as a muted `THINKING` line (label, no box); the
-        // rail glyph lives on the body rows.
-        let lines: Vec<String> = rendered_lines(&mut screen, 80, 14)
+        // The header renders as a muted disclosure (label, no box). The closed
+        // state is header-only; opening it mounts body rows on the rail.
+        let collapsed_lines: Vec<String> = rendered_lines(&mut screen, 80, 14)
             .into_iter()
             .map(|line| line_text(&line))
             .collect();
-        let header = lines
+        let header = collapsed_lines
             .iter()
             .find(|t| t.contains("THINKING"))
             .expect("THINKING rail header");
         assert!(
-            !header.contains('\u{25b8}') && !header.contains('\u{25be}'),
-            "summary-only thinking has no disclosure arrow: {header}"
+            header.contains('\u{25b8}'),
+            "summary-only thinking needs a disclosure arrow: {header}"
         );
         assert!(!header.contains('\u{2502}'), "no box side │: {header}");
-        // The summary body hangs on the muted `┊` rail, never box chrome.
         assert!(
-            lines.iter().any(|t| t.contains("Weigh the options.")),
-            "collapsed thinking shows its summary body: {lines:?}"
+            !collapsed_lines
+                .iter()
+                .any(|t| t.contains("Weigh the options.")),
+            "closed thinking leaked body: {collapsed_lines:?}"
         );
+        assert!(screen.toggle_latest_panel());
+        let lines: Vec<String> = rendered_lines(&mut screen, 80, 14)
+            .into_iter()
+            .map(|line| line_text(&line))
+            .collect();
+        // The expanded summary body hangs on the muted `┊` rail, never box chrome.
         let body = lines
             .iter()
             .find(|t| t.contains("Weigh the options."))
@@ -6688,9 +6870,9 @@ mod tests {
     }
 
     #[test]
-    fn edit_preview_arrives_expanded_and_collapses_when_applied() {
-        // EXCEPTION to compact-by-default: a pending EDIT preview arrives
-        // expanded for review, then collapses once the edit is applied.
+    fn edit_diff_stays_expanded_after_it_is_applied() {
+        // The same diff remains visible across preview -> running -> applied;
+        // the mutation becoming real must not hide its evidence.
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(100);
         let call = call_args("edit", json!({ "file_path": "src/main.rs" }));
@@ -6711,16 +6893,22 @@ mod tests {
             duration: None,
         });
         assert!(
-            screen.latest_panel_collapsed(),
-            "applied edit block collapses"
+            !screen.latest_panel_collapsed(),
+            "applied edit diff must stay expanded"
         );
+        let applied = rendered_text(&mut screen, 100, 20);
+        assert!(
+            applied.contains("old") && applied.contains("new"),
+            "{applied}"
+        );
+        assert!(screen.toggle_latest_panel(), "operator can still fold it");
+        assert!(screen.latest_panel_collapsed());
     }
 
     #[test]
     fn ctrl_o_toggle_all_expands_then_collapses() {
-        // With a mix of collapsed and expanded foldable tool blocks plus a
-        // non-foldable summary-only thinking rail, toggle-all only touches the
-        // blocks that have alternate expanded bodies.
+        // Tool blocks and summary-only thinking rails share the same real fold
+        // contract, so toggle-all operates on all three.
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(80);
         screen.apply(UiEvent::ToolResult {
@@ -6741,12 +6929,11 @@ mod tests {
         });
         let headers = screen.transcript.panel_header_rows();
         assert_eq!(headers.len(), 3, "three block headers");
-        assert!(!screen.transcript.set_panel_expanded_at(headers[2], true));
         assert!(
-            headers[..2]
+            headers
                 .iter()
                 .all(|&h| screen.transcript.panel_expanded_at(h) == Some(false)),
-            "tool blocks arrive collapsed"
+            "settled blocks arrive collapsed"
         );
         // Mixed state: expand one so not all are collapsed.
         screen.transcript.set_panel_expanded_at(headers[0], true);
@@ -6758,7 +6945,6 @@ mod tests {
                 .transcript
                 .panel_header_rows()
                 .iter()
-                .take(2)
                 .all(|&h| screen.transcript.panel_expanded_at(h) == Some(true)),
             "first press expands all"
         );
@@ -6769,7 +6955,6 @@ mod tests {
                 .transcript
                 .panel_header_rows()
                 .iter()
-                .take(2)
                 .all(|&h| screen.transcript.panel_expanded_at(h) == Some(false)),
             "second press collapses all"
         );
@@ -8295,14 +8480,48 @@ mod tests {
             duration: Some(Duration::from_millis(50)),
         });
 
-        // Compact by default: expand the finalized block to inspect its body.
-        screen.toggle_all_panels();
+        assert!(
+            !screen.latest_panel_collapsed(),
+            "failed shell output stays open by default"
+        );
         let rendered = rendered_text(&mut screen, 80, 12);
         assert!(rendered.contains("SHELL"), "{rendered}");
         assert!(rendered.contains("ERROR"), "{rendered}");
         assert!(!rendered.contains("DONE"), "{rendered}");
         assert!(rendered.contains("boom"), "{rendered}");
         assert!(rendered.contains("EXIT 1"), "{rendered}");
+    }
+
+    #[test]
+    fn shell_tool_error_stays_open_and_keeps_cause_when_folded() {
+        let mut screen = Screen::new();
+        let call = call_args("bash", json!({ "command": "cargo build" }));
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        screen.apply(UiEvent::ToolOutputDelta {
+            call_id: call.id.clone(),
+            chunk: "compiling iris\n".to_string(),
+        });
+        screen.apply(UiEvent::ToolError {
+            call,
+            message: "linker unavailable\nfull diagnostic follows".to_string(),
+        });
+
+        assert!(
+            !screen.latest_panel_collapsed(),
+            "errored SHELL must keep diagnostic output open"
+        );
+        let open = rendered_text(&mut screen, 80, 16);
+        assert!(open.contains("compiling iris"), "{open}");
+        assert!(open.contains("error: linker unavailable"), "{open}");
+
+        assert!(
+            screen.toggle_latest_panel(),
+            "error remains manually foldable"
+        );
+        let folded = rendered_text(&mut screen, 80, 16);
+        assert!(folded.contains("ERROR"), "{folded}");
+        assert!(folded.contains("linker unavailable"), "{folded}");
+        assert!(!folded.contains("compiling iris"), "{folded}");
     }
 
     #[test]
@@ -8325,7 +8544,7 @@ mod tests {
         // Body rides the block spine: a dim `┊` rail at the label column, body
         // text on the shared text column — no frame, just a soft left edge.
         assert!(rendered.contains("\u{250a} $ cargo test"), "{rendered}");
-        assert!(rendered.contains("\u{250a} test result"), "{rendered}");
+        assert!(rendered.contains("\u{250a} └ test result"), "{rendered}");
         // The exit status closes the block as a footer field, after the green
         // `◆ DONE` state token.
         assert!(
@@ -8361,13 +8580,19 @@ mod tests {
             message: "patch failed".to_string(),
         });
 
-        // Compact by default: expand the finalized block to inspect its body.
+        let folded = rendered_text(&mut screen, 80, 12);
+        assert!(folded.contains("EDIT"), "{folded}");
+        assert!(folded.contains("ERROR"), "{folded}");
+        assert!(!folded.contains("DONE"), "{folded}");
+        assert!(
+            folded.contains("patch failed"),
+            "folded footer must keep the cause: {folded}"
+        );
+        assert!(!folded.contains("error: patch failed"), "{folded}");
+
         screen.toggle_all_panels();
-        let rendered = rendered_text(&mut screen, 80, 12);
-        assert!(rendered.contains("EDIT"), "{rendered}");
-        assert!(rendered.contains("ERROR"), "{rendered}");
-        assert!(!rendered.contains("DONE"), "{rendered}");
-        assert!(rendered.contains("error: patch failed"), "{rendered}");
+        let expanded = rendered_text(&mut screen, 80, 12);
+        assert!(expanded.contains("error: patch failed"), "{expanded}");
     }
 
     #[test]

@@ -2580,6 +2580,10 @@ async fn dispatch_action<P: ChatProvider>(
         }
         // Model / scoped / effort / settings / policy actions.
         other => {
+            let live_setting = match &other {
+                ModalAction::SaveSetting { field, value } => Some((*field, value.clone())),
+                _ => None,
+            };
             // Capture the faceplate's view before the action so a snapshot-
             // refreshing action rebuilds it in place without losing position.
             let view = match &tui.screen.modal {
@@ -2598,6 +2602,15 @@ async fn dispatch_action<P: ChatProvider>(
             let result = picker::apply_action(other, view, harness, sw, &sink);
             for event in sink.drain() {
                 tui.screen.apply(event);
+            }
+            // The picker reports a successful in-place setting save as an empty
+            // Keep. Apply Tier-3 settings to this live screen only after that
+            // write succeeds; a failed save rebuilds from disk and must not
+            // leave the running UI in an unpersisted posture.
+            if matches!(&result, ActionResult::Keep(lines) if lines.is_empty())
+                && let Some((field, value)) = live_setting
+            {
+                apply_live_tui_setting(&mut tui.screen, field, value.as_deref());
             }
             tui.screen
                 .set_approval_policy(effective_approval_policy(harness));
@@ -2626,6 +2639,22 @@ async fn dispatch_action<P: ChatProvider>(
         }
     }
     Ok(None)
+}
+
+/// Mirror successfully-persisted Tier-3 settings onto the current screen. The
+/// remaining fields are runtime/config concerns and already have their own live
+/// application paths in the picker or harness.
+fn apply_live_tui_setting(screen: &mut Screen, field: settings_menu::Field, value: Option<&str>) {
+    match field {
+        settings_menu::Field::ReducedMotion => screen.set_reduced_motion(value == Some("true")),
+        settings_menu::Field::ScrollSpeed => {
+            if let Some(speed) = value.and_then(|value| value.parse::<u16>().ok()) {
+                screen.scroll_speed = speed.clamp(1, 100);
+            }
+        }
+        settings_menu::Field::Theme => screen.sync_palette(),
+        _ => {}
+    }
 }
 
 /// Resolution of the blocking login task.
@@ -3779,6 +3808,34 @@ mod tests {
             switch_notice_lines(lines),
             vec!["(default not saved: config is read-only)".to_string()]
         );
+    }
+
+    #[test]
+    fn persisted_tui_settings_apply_to_the_live_screen() {
+        let mut screen = Screen::new();
+        screen.show_start_page(0, true);
+        assert!(
+            screen
+                .start_page
+                .as_ref()
+                .is_some_and(|page| page.booting())
+        );
+
+        apply_live_tui_setting(
+            &mut screen,
+            settings_menu::Field::ReducedMotion,
+            Some("true"),
+        );
+        assert!(
+            screen
+                .start_page
+                .as_ref()
+                .is_some_and(|page| !page.booting()),
+            "reduced motion applies without restart"
+        );
+
+        apply_live_tui_setting(&mut screen, settings_menu::Field::ScrollSpeed, Some("500"));
+        assert_eq!(screen.scroll_speed, 100, "live value uses persisted clamp");
     }
 
     #[test]

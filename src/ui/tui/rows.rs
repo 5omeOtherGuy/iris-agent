@@ -302,8 +302,9 @@ pub(super) enum ChromeRow {
         label: String,
         /// Right-aligned dim telemetry (`↓2.4k 12s`); empty for none.
         right: String,
-        /// Whether the block folds (drives the `▾`/`▸` disclosure arrow; a
-        /// short trace shown whole has no arrow and ignores ctrl+o).
+        /// Whether this rail phase folds (drives the `▾`/`▸` disclosure arrow).
+        /// A short live tail offers no no-op control; every non-redacted settled
+        /// trace supplies a real disclosure even when its body is one row.
         foldable: bool,
         /// The live-receiving lamp: a static orange `●` after the label while
         /// reasoning streams (§7.4). Drops when the block commits.
@@ -325,7 +326,19 @@ impl ChromeRow {
                 title,
                 meta,
                 elapsed,
-            } => panel_header_line(width, *expanded, title, meta, elapsed),
+            } => {
+                // SHELL's full command lives once, in its open command row.
+                // Its compact history posture still carries the command in the
+                // header because the body is unmounted there. This state-aware
+                // density removes the cramped duplicate without making folded
+                // history anonymous.
+                let visible_meta = if *expanded && *title == "SHELL" {
+                    ""
+                } else {
+                    meta
+                };
+                panel_header_line(width, *expanded, title, visible_meta, elapsed)
+            }
             ChromeRow::FooterRule => footer_rule_line(width),
             // The state label (and family extras) always win the footer row:
             // when the optional diagnostics cluster does not fit, it is
@@ -518,16 +531,18 @@ pub(super) fn hrule_line(label: &str, width: usize) -> Line<'static> {
     ))
 }
 
-/// A block-separator row: the empty plain row `push_blank` inserts between
-/// top-level blocks. Distinguished from a Markdown-internal blank line (which
-/// carries a styled `line`) and from a turn-rule row so block grouping remains
-/// stable while the terminal surface replays from Iris state.
+/// A rendered block-separator row: either the empty plain row `push_blank`
+/// inserts between top-level blocks or `RailEnd`, whose single blank cell row
+/// already closes THINKING. Distinguished from a Markdown-internal blank line
+/// (which carries a styled `line`) and from a turn-rule row so block grouping
+/// remains stable while the terminal surface replays from Iris state.
 pub(super) fn is_separator_row(row: &TranscriptRow) -> bool {
-    !row.hrule
-        && row.chrome.is_none()
-        && row.text.is_empty()
-        && row.line.is_none()
-        && row.background.is_none()
+    matches!(row.chrome.as_ref(), Some(ChromeRow::RailEnd))
+        || (!row.hrule
+            && row.chrome.is_none()
+            && row.text.is_empty()
+            && row.line.is_none()
+            && row.background.is_none())
 }
 
 pub(super) fn row_text_padding(row: &TranscriptRow) -> usize {

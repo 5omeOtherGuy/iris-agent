@@ -158,8 +158,11 @@ Implemented today:
   output-handle metadata.
 - TUI implementation foundations: reusable `Component`/`Container` composition,
   explicit overlay focus routing, a shared Unicode/ANSI text engine, a built-in
-  tool renderer registry, and an opt-in tmux live-rendering harness for manual
-  visual checks of pane rendering.
+  tool renderer registry, terminal-depth palette degradation, frame-owned pager
+  hit targets, grapheme-honest truncation, reactive-only motion with live reduced
+  motion, and an opt-in tmux live-rendering harness for manual visual checks of
+  pane rendering. Diff evidence and failed shell output stay open by default;
+  settled non-redacted reasoning is collapsible.
 - Unit tests for the REPL, tool loop, approvals, tool implementations, path
   safety, atomic writes, auth-file handling, URL/request shaping, and response
   parsing.

@@ -355,6 +355,23 @@ pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
     out
 }
 
+/// Truncate an escape-free string to at most `max` grapheme clusters and append
+/// the house ellipsis when anything was removed. The ellipsis occupies the last
+/// cluster, so the returned value never exceeds the caller's safety cap. This is
+/// for count-based defensive limits; visual layout should use
+/// [`ellipsize_to_width`] instead.
+pub(crate) fn truncate_clusters_with_ellipsis(text: &str, max: usize) -> String {
+    if text.graphemes(true).count() <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = truncate_chars(text, max - 1);
+    out.push('\u{2026}');
+    out
+}
+
 /// Truncate `text` to at most `max` terminal columns (display width), stopping on
 /// a grapheme-cluster boundary so wide/emoji/combining clusters are kept whole.
 pub(crate) fn truncate_to_width(text: &str, max: usize) -> String {
@@ -368,6 +385,22 @@ pub(crate) fn truncate_to_width(text: &str, max: usize) -> String {
         out.push_str(cluster);
         used += w;
     }
+    out
+}
+
+/// Truncate an escape-free string to `max` terminal columns and append the
+/// house ellipsis when anything was removed. Both the cut and the fit check are
+/// display-width/grapheme based, so CJK, emoji, ZWJ, and combining clusters are
+/// never split or measured as scalar counts.
+pub(crate) fn ellipsize_to_width(text: &str, max: usize) -> String {
+    if display_width(text) <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = truncate_to_width(text, max.saturating_sub(1));
+    out.push('\u{2026}');
     out
 }
 
@@ -543,6 +576,31 @@ mod tests {
     fn truncate_chars_counts_clusters() {
         assert_eq!(truncate_chars("abcdef", 3), "abc");
         assert_eq!(truncate_chars("a😀b", 2), "a😀");
+    }
+
+    #[test]
+    fn honest_truncation_keeps_clusters_and_reports_the_cut() {
+        let combining = "e\u{301}clair";
+        assert_eq!(ellipsize_to_width(combining, 4), "e\u{301}cl…");
+        assert_eq!(display_width(&ellipsize_to_width(combining, 4)), 4);
+
+        let cjk = "工具呼び出し";
+        let clipped = ellipsize_to_width(cjk, 5);
+        assert_eq!(clipped, "工具…");
+        assert_eq!(display_width(&clipped), 5);
+
+        let family = "👨‍👩‍👧 machine";
+        assert_eq!(ellipsize_to_width(family, 3), "👨‍👩‍👧…");
+        assert_eq!(ellipsize_to_width(family, 3).graphemes(true).count(), 2);
+
+        assert_eq!(ellipsize_to_width("already fits", 20), "already fits");
+        assert_eq!(ellipsize_to_width("cut", 1), "…");
+        assert_eq!(ellipsize_to_width("cut", 0), "");
+
+        let capped = truncate_clusters_with_ellipsis(&"界".repeat(8), 5);
+        assert_eq!(capped, "界界界界…");
+        assert_eq!(capped.graphemes(true).count(), 5);
+        assert_eq!(truncate_clusters_with_ellipsis("short", 5), "short");
     }
 
     #[test]

@@ -197,6 +197,14 @@ impl Modal {
         }
     }
 
+    /// Apply the live motion posture to modal-owned state. Today only the
+    /// settings faceplate owns reactive motion.
+    pub(crate) fn set_reduced_motion(&mut self, reduced_motion: bool) {
+        if let Modal::Settings(panel) = self {
+            panel.set_reduced_motion(reduced_motion);
+        }
+    }
+
     /// Render with an explicit line budget (the docked-menu region's height).
     /// Only the settings panel windows itself to the viewport; every other
     /// modal is already bounded by its own row cap and ignores the budget.
