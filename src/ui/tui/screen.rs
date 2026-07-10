@@ -2083,9 +2083,9 @@ impl Screen {
             self.flow_meter.tick();
         }
         let modal_settling = self.modal.as_mut().is_some_and(|modal| modal.tick());
-        // The start page reuses the loop tick only for its reactive power-on
-        // lamp test. Once settled it returns false, so an idle faceplate never
-        // redraws.
+        // The start page reuses the loop tick for the IrisMark ping-pong sweep.
+        // Reduced motion returns false, so the static accessibility posture
+        // stays CPU-idle.
         let animated = if let Some(page) = &mut self.start_page {
             page.tick()
         } else {
@@ -3437,6 +3437,8 @@ mod tests {
     use crate::nexus::{ContextPressureTier, ToolCall};
     use crate::ui::UiEvent;
     use crate::ui::tui::WORKING_FRAMES;
+    use crate::ui::tui::component::Component;
+    use crate::ui::tui::startup::MARK_DOTS;
 
     fn footer_screen(cwd: &str) -> Screen {
         let mut screen = Screen::new();
@@ -4136,12 +4138,11 @@ mod tests {
         screen.flow_meter.hold = FLOW_PEAK_HOLD_TICKS;
         screen.flow_meter.observe_bytes(bytes_for_level(24));
         screen.show_start_page(0, true);
-        assert!(
-            screen
-                .start_page
-                .as_ref()
-                .is_some_and(|page| page.booting())
-        );
+        if let Some(page) = screen.start_page.as_mut() {
+            page.advance_for_test();
+            page.advance_for_test();
+            assert_ne!(page.head(), MARK_DOTS / 2);
+        }
 
         screen.set_reduced_motion(true);
 
@@ -4156,12 +4157,15 @@ mod tests {
         assert_eq!(screen.flow_meter.display, 24, "current data survives");
         assert_eq!(screen.flow_meter.peak, 0);
         assert_eq!(screen.flow_meter.hold, 0);
-        assert!(
-            screen
-                .start_page
-                .as_ref()
-                .is_some_and(|page| !page.booting()),
-            "lamp test is interrupted"
+        let start_mark = screen
+            .start_page
+            .as_ref()
+            .map(|page| line_text(&page.render(80)[0]))
+            .expect("start page");
+        assert_eq!(
+            start_mark.matches('●').count(),
+            1,
+            "start sweep settles: {start_mark:?}"
         );
     }
 

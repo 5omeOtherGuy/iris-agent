@@ -3019,13 +3019,6 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
         return IdleKey::Continue;
     }
 
-    // Any key completes the start page's power-on lamp test instantly — the
-    // panel is an instrument, never an obstacle. The key still performs its
-    // normal action below.
-    if let Some(page) = screen.start_page.as_mut() {
-        page.skip_boot();
-    }
-
     // Start-page launcher routing: the listed ctrl-chords activate directly,
     // and while the composer is empty ↑/↓/↵ drive the launcher selection. The
     // composer stays live throughout — typing a task and submitting it starts
@@ -3814,12 +3807,11 @@ mod tests {
     fn persisted_tui_settings_apply_to_the_live_screen() {
         let mut screen = Screen::new();
         screen.show_start_page(0, true);
-        assert!(
-            screen
-                .start_page
-                .as_ref()
-                .is_some_and(|page| page.booting())
-        );
+        if let Some(page) = screen.start_page.as_mut() {
+            page.advance_for_test();
+            page.advance_for_test();
+            assert_eq!(page.head(), 2);
+        }
 
         apply_live_tui_setting(
             &mut screen,
@@ -3827,10 +3819,7 @@ mod tests {
             Some("true"),
         );
         assert!(
-            screen
-                .start_page
-                .as_ref()
-                .is_some_and(|page| !page.booting()),
+            screen.start_page.as_mut().is_some_and(|page| !page.tick()),
             "reduced motion applies without restart"
         );
 
