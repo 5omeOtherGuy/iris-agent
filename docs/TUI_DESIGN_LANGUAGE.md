@@ -563,7 +563,7 @@ transcript that is mostly successful calls does not shout a column of bold
 labels. The glyph is deliberately lossy — `Error` and `Denied` share `■` — and
 the **label carries the distinction the shape cannot**. After it, `┊`-joined
 family extras (EDIT counts + note, SHELL `EXIT <code>` + result meta, or an
-in-review block's danger-toned reason + decision affordance / approval note). Right-bound:
+in-review block's danger-toned reason + awaiting-decision note / approval note). Right-bound:
 the optional token diagnostics cluster, all muted, honest (rendered only when
 measured). The `┊` law: only BETWEEN sibling fields, one space each side,
 never leading/trailing, never after the state label — fields are joined
@@ -651,9 +651,10 @@ duplicated in a second block.
   you authorize. The body is the block's own body: the `$ command` (SHELL) or
   the **diff** (EDIT). The footer carries, in order: an optional **danger-toned
   reason** (`destructive` · `N pre-existing changes` · `unsandboxed`) in the
-  danger role, then the `┊`-joined **decision affordance** — `y approve ┊ n
-  deny` plus `a always` / `p project` **only when the loop offers them**; deny
-  is always available.
+  danger role, then a dim **`awaiting decision`** note. The block only
+  *signals* — the decision keymap (`y approve ┊ n deny` plus `a always` /
+  `p project` **only when the loop offers them**) renders exactly once, at the
+  composer (§8.5): one affordance, one place, where the keys are pressed.
 - **Manual approval** folds a muted **note** into that same footer (`approved
   this time` / `approved this session` / `approved this project`) and drops the
   affordance in place; the block then flips to `RUNNING` when it starts, and the
@@ -665,10 +666,11 @@ duplicated in a second block.
   is the honest record of what was proposed and declined.
 - While the decision is pending, the **bottom statusline** and the **composer
   frame + placeholder** take the REVIEW posture (§9.2/§9.3): the same
-  symbol+label and the same offered affordance (`y approve ┊ n deny ┊ …`),
-  echoed at the composer — the eye's resting place — so the decision is never
-  lost off-screen. Those cues carry no new state; they key on the same
-  `awaiting_approval` flag and revert with the block.
+  `▲ REVIEW` symbol+label, and the placeholder carries the full offered keymap
+  (`y approve ┊ n deny ┊ …`) — the affordance's one home, at the eye's resting
+  place, so the decision is never lost off-screen and never printed twice.
+  Those cues carry no new state; they key on the same `awaiting_approval` flag
+  and revert with the block.
 
 ### 8.6 Diff rendering (`DiffBlock`) — shared by EDIT & the in-block review
 Columns: **line number** (right-aligned, muted, non-selectable) · **marker**

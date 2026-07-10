@@ -3078,10 +3078,12 @@ mod tests {
     }
 
     #[test]
-    fn shell_review_renders_in_block_with_affordance() {
+    fn shell_review_renders_in_block_with_indicator() {
         // A gated SHELL call renders its review INSIDE its own tool block: the
-        // `REVIEW` state, the `$ command` body, and the decision affordance on
-        // the block's footer — never a separate approval panel or docked box.
+        // `REVIEW` state, the `$ command` body, and a dim awaiting-decision
+        // note on the block's footer — never a separate approval panel or
+        // docked box, and never the decision keymap (that renders once, at the
+        // composer, §8.5).
         let mut screen = Screen::new();
         screen.apply(UiEvent::ToolReview {
             call: call_args("bash", json!({ "command": "echo hi" })),
@@ -3094,10 +3096,35 @@ mod tests {
         assert!(rendered.contains("REVIEW"), "{rendered}");
         assert!(rendered.contains("SHELL"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
-        assert!(rendered.contains("y approve"), "{rendered}");
-        assert!(rendered.contains("n deny"), "{rendered}");
+        assert!(rendered.contains("awaiting decision"), "{rendered}");
+        assert!(!rendered.contains("y approve"), "{rendered}");
+        assert!(!rendered.contains("n deny"), "{rendered}");
         // The approval lives in the tool block: no separate APPROVAL panel.
         assert!(!rendered.contains("APPROVAL"), "{rendered}");
+    }
+
+    #[test]
+    fn review_keymap_lives_only_in_the_composer_echo() {
+        // The de-duplication contract: with a review pending AND the loop's
+        // approval posture raised, the offered keymap renders exactly once —
+        // in the composer placeholder — while the block carries the dim
+        // awaiting-decision note.
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::ToolReview {
+            call: call_args("bash", json!({ "command": "echo hi" })),
+            allow_always: false,
+            allow_project: false,
+            dirty_gate: false,
+            reason: None,
+        });
+        screen.show_approval(false, false, false);
+        let rendered = rendered_text(&mut screen, 80, 14);
+        assert_eq!(
+            rendered.matches("y approve").count(),
+            1,
+            "keymap once, at the composer: {rendered}"
+        );
+        assert!(rendered.contains("awaiting decision"), "{rendered}");
     }
 
     #[test]
@@ -3155,7 +3182,7 @@ mod tests {
         assert!(rendered.contains("$ printf 'global:"), "{rendered}");
         // Timeout is right-bound invocation metadata in the SHELL body.
         assert!(rendered.contains("timeout 120s"), "{rendered}");
-        assert!(rendered.contains("n deny"), "{rendered}");
+        assert!(rendered.contains("awaiting decision"), "{rendered}");
     }
 
     #[test]
@@ -3320,8 +3347,8 @@ mod tests {
         assert!(rendered.contains("RUNNING"), "{rendered}");
         assert!(rendered.contains("$ echo hi"), "{rendered}");
         assert!(
-            !rendered.contains("y approve"),
-            "affordance gone: {rendered}"
+            !rendered.contains("awaiting decision"),
+            "indicator gone: {rendered}"
         );
         assert!(!rendered.contains("REVIEW"), "no stale REVIEW: {rendered}");
         assert!(!rendered.contains("approved this"), "no note: {rendered}");
@@ -3348,7 +3375,7 @@ mod tests {
         });
         let rendered = rendered_text(&mut screen, 100, 20);
         assert!(rendered.contains("REVIEW"), "{rendered}");
-        assert!(rendered.contains("y approve"), "{rendered}");
+        assert!(rendered.contains("awaiting decision"), "{rendered}");
         // The review arrives expanded: the diff body IS the review surface.
         assert!(rendered.contains("new"), "diff body kept: {rendered}");
         assert_eq!(
@@ -3366,7 +3393,7 @@ mod tests {
     fn review_reason_shows_danger_toned_caution() {
         // A danger-toned caution (destructive / dirty paths /
         // unsandboxed) rides the review footer in the danger role, ahead of the
-        // decision affordance, so the safety fact survives the decision point.
+        // awaiting-decision note, so the safety fact survives the decision point.
         let mut screen = Screen::new();
         screen.apply(UiEvent::ToolReview {
             call: call_args("bash", json!({ "command": "rm -rf build" })),
@@ -3380,7 +3407,7 @@ mod tests {
         let marker = span_matching(line, |span| span.content.as_ref().contains("destructive"));
         assert_eq!(marker.style.fg, err_style().fg, "danger-toned reason");
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(rendered.contains("y approve"), "{rendered}");
+        assert!(rendered.contains("awaiting decision"), "{rendered}");
     }
 
     #[test]
@@ -3398,6 +3425,14 @@ mod tests {
             rendered.contains("Touches uncommitted user changes: src/main.rs"),
             "{rendered}"
         );
+        // The dirty-scoped `always` label renders at the composer echo (the
+        // keymap's one home), not on the block footer.
+        assert!(
+            !rendered.contains("a all dirty files (this task)"),
+            "{rendered}"
+        );
+        screen.show_approval(true, false, true);
+        let rendered = rendered_text(&mut screen, 140, 14);
         assert!(
             rendered.contains("a all dirty files (this task)"),
             "{rendered}"

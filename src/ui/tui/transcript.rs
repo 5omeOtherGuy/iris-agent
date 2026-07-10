@@ -13,7 +13,7 @@ use crate::ui::{TurnErrorKind, UiEvent};
 use super::pane;
 use super::panel::{
     FooterField, PanelHeaderSpec, PanelState, ToolDiag, diff_counts, diff_table_rows,
-    edit_footer_extras, join_meta_fields, panel_state, review_footer_extras,
+    edit_footer_extras, join_meta_fields, panel_state,
 };
 use super::rows::{ChromeRow, FoldVis, Measure, TranscriptRow, is_separator_row};
 use super::streaming::{Escapement, StreamController};
@@ -212,12 +212,10 @@ struct ActiveTool {
     user_expanded: Option<bool>,
 }
 
-/// The offered choices for a pending in-block approval — mirrors the loop's
-/// `ApprovalRequest` so the `▲ REVIEW` footer only shows keys the loop honors.
+/// A pending in-block approval's footer context. The block only SIGNALS the
+/// pending decision (`▲ REVIEW` + a dim `awaiting decision` note); the offered
+/// keymap renders once, at the composer (§8.5) — never in two places at once.
 struct ReviewGate {
-    allow_always: bool,
-    allow_project: bool,
-    dirty_gate: bool,
     reason: Option<String>,
 }
 
@@ -407,8 +405,9 @@ pub(super) struct Transcript {
     /// ingests the tool results. Numbers are honest: fields exist only when the
     /// runtime measured them.
     tool_diags: std::collections::HashMap<String, ToolDiag>,
-    /// Per-call review affordance, set while a gated call is `▲ REVIEW` so its
-    /// footer can render `y approve ┊ n deny ┊ …`; dropped once it runs or is
+    /// Per-call review context, set while a gated call is `▲ REVIEW` so its
+    /// footer can render the danger reason + `awaiting decision` note (the
+    /// keymap renders at the composer, §8.5); dropped once it runs or is
     /// refused. Approval lives inside the tool block — there is no separate
     /// approval panel.
     review_gates: std::collections::HashMap<String, ReviewGate>,
@@ -1164,9 +1163,10 @@ impl Transcript {
         self.rows.push(TranscriptRow::chrome(ChromeRow::BlockEnd));
     }
 
-    /// Fold the approval decision into a tool block's own footer (approval lives
-    /// in the tool block, never a separate panel): the `y approve ┊ …` affordance
-    /// while the block is `▲ REVIEW`, or the muted `approved this time/session/
+    /// Fold the approval state into a tool block's own footer (approval lives
+    /// in the tool block, never a separate panel): a dim `awaiting decision`
+    /// note while the block is `▲ REVIEW` — the decision keymap renders once,
+    /// at the composer (§8.5) — or the muted `approved this time/session/
     /// project` note once the user has manually allowed it. Auto-approved calls
     /// carry neither — the tool block alone is the record.
     fn approval_footer_fields(&self, call_id: &str, state: PanelState) -> Vec<FooterField> {
@@ -1176,16 +1176,12 @@ impl Transcript {
         if state == PanelState::Review
             && let Some(gate) = self.review_gates.get(call_id)
         {
-            // The safety caution (danger-toned) leads, then the affordance.
+            // The safety caution (danger-toned) leads, then the indicator.
             let mut fields = Vec::new();
             if let Some(reason) = &gate.reason {
                 fields.push(FooterField::styled(reason.clone(), err_style()));
             }
-            fields.extend(review_footer_extras(
-                gate.allow_always,
-                gate.allow_project,
-                gate.dirty_gate,
-            ));
+            fields.push(FooterField::styled("awaiting decision", dim_style()));
             return fields;
         }
         Vec::new()
@@ -1473,7 +1469,8 @@ impl Transcript {
     }
 
     /// Open a pending in-block review for a gated call: the tool block itself
-    /// renders `▲ REVIEW` with the affordance on its footer, so the whole
+    /// renders `▲ REVIEW` with a dim awaiting-decision note on its footer (the
+    /// keymap lives at the composer, §8.5), so the whole
     /// approval lifecycle lives inside the tool block (no separate panel). The
     /// block is adopted by `ToolStarted` (→ RUNNING) on approve, or flipped to
     /// `DENIED` in place on deny.
@@ -2699,23 +2696,12 @@ impl Transcript {
                     self.relayout_active_running();
                 }
             }
-            UiEvent::ToolReview {
-                call,
-                allow_always,
-                allow_project,
-                dirty_gate,
-                reason,
-            } => {
+            UiEvent::ToolReview { call, reason, .. } => {
                 self.assign_turn_diag(&call.id);
-                self.begin_review(
-                    call,
-                    ReviewGate {
-                        allow_always,
-                        allow_project,
-                        dirty_gate,
-                        reason,
-                    },
-                );
+                // The offered keys (`allow_always`/`allow_project`/`dirty_gate`)
+                // are the loop's business: they surface once, in the composer
+                // echo via `show_approval`. The block records only the caution.
+                self.begin_review(call, ReviewGate { reason });
             }
             UiEvent::ToolAutoApproved(_call) => {
                 // Auto-approval is implicit in the policy; the tool block alone

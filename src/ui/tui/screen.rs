@@ -925,12 +925,13 @@ pub(super) fn editor_visual_rows(editor: &TextArea<'_>, width: u16) -> u16 {
 }
 
 /// The decision keys a pending review actually offers, captured at
-/// `show_approval` time so the REVIEW posture's decision-echo placeholder (§8.5)
-/// is assembled from the SAME affordance the gated block's footer offers —
-/// never a hardcoded key list. `y approve` / `n deny` are always available;
+/// `show_approval` time. The composer placeholder (§8.5) is the offered
+/// keymap's ONE render site (the gated block's footer only signals
+/// `awaiting decision`), assembled from this offer via `review_footer_extras`
+/// — never a hardcoded key list. `y approve` / `n deny` are always available;
 /// `a always` / `p project` appear only when the loop honors them, and
-/// `dirty_gate` selects the block footer's dirty-tree `always` label so the
-/// echo cannot diverge from what pressing `a` actually approves. Meaningful
+/// `dirty_gate` selects the dirty-tree `always` label so the keymap cannot
+/// diverge from what pressing `a` actually approves. Meaningful
 /// only while `awaiting_approval`; reset to the empty offer on every exit path.
 #[derive(Clone, Copy, Default)]
 struct ReviewOffer {
@@ -1565,9 +1566,10 @@ impl Screen {
     }
 
     /// The composer placeholder text for the current posture. At rest it is the
-    /// product prompt (§9.4); while a gated tool waits (§8.5) it becomes a dim
-    /// decision echo assembled from the SAME affordance the block footer offers
-    /// (`review_footer_extras`, fed the same offer *and* dirty-gate variant) —
+    /// product prompt (§9.4); while a gated tool waits (§8.5) it becomes the
+    /// offered decision keymap — its ONE render site; the gated block's footer
+    /// only signals `awaiting decision` — assembled from the captured offer
+    /// (`review_footer_extras`, fed the offer *and* dirty-gate variant) —
     /// never a hardcoded key list, so `a`/`p` appear only when the loop actually
     /// offered them and the `always` label always matches what pressing `a`
     /// approves. A placeholder shows only on an empty buffer, so a queued
@@ -2053,10 +2055,11 @@ impl Screen {
     /// Enter the awaiting-approval state. The review itself renders inside the
     /// gated tool block (the `▲ REVIEW` state, via the `ToolReview` event); this
     /// claims the input surface, marks the phase so the composer freezes and the
-    /// working indicator steps aside, and carries the offered decision set (the
-    /// same `allow_always` / `allow_project` / `dirty_gate` the loop uses to
-    /// render the block footer) so the REVIEW posture's decision echo (§8.5) is
-    /// a single-source readout that cannot diverge from the block — never a
+    /// working indicator steps aside, and carries the offered decision set
+    /// (`allow_always` / `allow_project` / `dirty_gate` from the loop's
+    /// `ApprovalRequest`) so the REVIEW posture's composer keymap (§8.5) — the
+    /// offered affordance's ONE render site; the block footer only signals
+    /// `awaiting decision` — is built from the loop's real offer, never a
     /// hardcoded key list.
     pub(crate) fn show_approval(
         &mut self,
