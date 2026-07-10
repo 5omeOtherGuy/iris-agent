@@ -28,6 +28,12 @@ pub(crate) struct CapturedUsage {
     pub(crate) tag: String,
     pub(crate) started_at: Instant,
     pub(crate) usage: Option<ProviderUsage>,
+    /// The pure estimator's token count of the EXACT messages sent on this
+    /// request (`message_token_estimate` summed). Captured per request so the
+    /// campaign row reports a genuine like-for-like `estimate_error`
+    /// (provider-measured input minus estimator) instead of a per-turn
+    /// measurement broadcast across the turn's requests (pilot-a finding 2).
+    pub(crate) estimate_tokens: u64,
 }
 
 /// Wraps a real provider and records the `ProviderUsage` on every completed
@@ -69,6 +75,13 @@ impl<P: ChatProvider> ChatProvider for RecordingProvider<P> {
             .last()
             .map(|m| m.content.chars().take(32).collect::<String>())
             .unwrap_or_default();
+        // Estimator value for THIS request's exact payload, taken before the
+        // provider answers, so the campaign row can diff it against the
+        // provider's reported input tokens per request.
+        let estimate_tokens = messages
+            .iter()
+            .map(crate::session::message_token_estimate)
+            .fold(0u64, u64::saturating_add);
         let started_at = Instant::now();
         let usages = self.usages.clone();
         let stream = self.inner.respond_stream(messages, tools, cancel)?;
@@ -79,6 +92,7 @@ impl<P: ChatProvider> ChatProvider for RecordingProvider<P> {
                     tag: tag.clone(),
                     started_at,
                     usage: turn.usage.clone(),
+                    estimate_tokens,
                 });
             }
             item

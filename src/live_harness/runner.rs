@@ -4,8 +4,10 @@
 //! solely from the double-gated `live_campaign` entry point in `mod.rs`, never
 //! from the gate. The row assembly is best-effort pilot fidelity: every number
 //! comes from real `ProviderUsage` or observed lifecycle events, and the
-//! per-turn context estimate is sampled from `context_diagnostics()` so
-//! `estimate_error` is a genuine measured-vs-estimate diagnostic.
+//! context estimate is the pure estimator's count of each request's exact
+//! payload (captured per request in `support::RecordingProvider`), so
+//! `estimate_error` is a genuine per-request measured-vs-estimate delta rather
+//! than a turn-end measurement broadcast across the turn's requests.
 
 use super::*;
 use crate::config::CompactionTriggerConfig;
@@ -34,6 +36,11 @@ struct RunResult {
     rows: Vec<Row>,
     outcome: TaskOutcome,
     probe_score: Option<f64>,
+    /// The scenario's own failure reason when its post-run success criteria did
+    /// not hold (e.g. "S1 produced no compaction"). `None` on a clean run. This
+    /// is surfaced in the verdict and report so a scenario that silently
+    /// under-drives its target behavior is a Fail, not a green pass.
+    fail_reason: Option<String>,
 }
 
 /// Map a summarizer label to the real `SummarizerKind` surface.
@@ -104,36 +111,34 @@ fn execute_run(spec: &CampaignSpec, planned: &PlannedRun) -> Result<RunResult> {
     let observer = LiveLoopObserver::default();
     let gate = ReadOnlyGate;
     let token = CancellationToken::new();
-    let mut turn_estimates: Vec<(Instant, u64)> = Vec::new();
     for prompt in scenario.turns() {
         block_on(harness.submit_turn(&prompt, &observer, &gate, &token))?;
-        let estimate = harness
-            .context_diagnostics()
-            .map(|diagnostics| diagnostics.measured)
-            .unwrap_or(0);
-        turn_estimates.push((Instant::now(), estimate));
     }
 
     let captured = usages.lock().expect("usages lock").clone();
     let events = observer.events.lock().expect("events lock");
     let fingerprint = planned.settings.fingerprint(posture);
-    let rows = assemble_rows(
-        spec,
-        planned,
-        &captured,
-        &events,
-        &fingerprint,
-        &turn_estimates,
-    );
+    let rows = assemble_rows(spec, planned, &captured, &events, &fingerprint);
     drop(events);
 
-    // Pilot outcome: the run completed every turn without error. Probe scoring
-    // is scenario-specific (R2 supplies a bank); the synthetic pilot scenarios
-    // carry no probe bank, so the score is absent rather than fabricated.
+    // The run completed every turn without a provider error, but "completed" is
+    // not "exercised its target behavior": a scenario declares post-run success
+    // criteria (S1 must observe multiple boundaries and at least one compaction)
+    // and fails the run when they do not hold, so an under-driving scenario
+    // surfaces as a Fail instead of a silent green pass (pilot-a finding 1).
+    let (outcome, fail_reason) = match scenario.verify_run(&rows) {
+        Ok(()) => (TaskOutcome::Pass, None),
+        Err(reason) => (TaskOutcome::Fail, Some(reason)),
+    };
+
+    // Probe scoring is scenario-specific (R2 supplies a bank); the synthetic
+    // pilot scenarios carry no probe bank, so the score is absent rather than
+    // fabricated.
     Ok(RunResult {
         rows,
-        outcome: TaskOutcome::Pass,
+        outcome,
         probe_score: None,
+        fail_reason,
     })
 }
 
@@ -146,7 +151,6 @@ fn assemble_rows(
     captured: &[CapturedUsage],
     events: &[TimedEvent],
     fingerprint: &SettingsFingerprint,
-    turn_estimates: &[(Instant, u64)],
 ) -> Vec<Row> {
     let applies: Vec<(Instant, u64, String)> = events
         .iter()
@@ -208,12 +212,12 @@ fn assemble_rows(
             .filter(|(a, _, _)| *a > window_start && *a <= at)
             .map(|(_, _, reclaimed)| reclaimed)
             .sum();
-        let estimate = turn_estimates
-            .iter()
-            .find(|(end, _)| *end >= at)
-            .map(|(_, estimate)| *estimate)
-            .or_else(|| turn_estimates.last().map(|(_, estimate)| *estimate))
-            .unwrap_or(0);
+        // Per-request estimator value sampled from the exact payload this
+        // request sent (support::RecordingProvider), diffed against the same
+        // request's provider-reported input below. A per-request like-for-like
+        // delta -- not the turn-end measurement broadcast across every request
+        // that produced the phantom ~-3.6k errors in pilot-a (finding 2).
+        let estimate = sample.estimate_tokens;
 
         let usage = sample.usage.as_ref();
         let input_tokens = usage.map(|u| u.input_tokens).unwrap_or(0);
@@ -279,6 +283,7 @@ pub(crate) fn run_campaign(spec: &CampaignSpec) -> Result<()> {
 
     let mut derived: Vec<(String, DerivedRun)> = Vec::new();
     let mut outcomes: Vec<LiveSessionOutcome> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
     for run in &plan {
         if manifest.contains(&run.key) {
             println!("campaign {}: skip completed {}", spec.name, run.key);
@@ -307,7 +312,17 @@ pub(crate) fn run_campaign(spec: &CampaignSpec) -> Result<()> {
                         result.probe_score,
                     ),
                 ));
-                outcomes.push(LiveSessionOutcome::Pass);
+                // A scenario that ran clean but did not exercise its target
+                // behavior is a hard failure, not a pass: it fails the verdict
+                // and its reason is recorded in the report.
+                match &result.fail_reason {
+                    None => outcomes.push(LiveSessionOutcome::Pass),
+                    Some(reason) => {
+                        println!("campaign {}: run {} FAIL: {reason}", spec.name, run.key);
+                        failures.push((run.key.clone(), reason.clone()));
+                        outcomes.push(LiveSessionOutcome::HardFailure);
+                    }
+                }
                 manifest.mark(&run.key)?;
             }
             Err(error) => {
@@ -318,7 +333,7 @@ pub(crate) fn run_campaign(spec: &CampaignSpec) -> Result<()> {
     }
 
     let verdict = live_run_verdict(&outcomes);
-    let report = format_report(spec, &derived, verdict);
+    let report = format_report(spec, &derived, verdict, &failures);
     std::fs::write(&artifacts.markdown, report)?;
     println!(
         "campaign {} done: {} rows-cells, verdict {} (exclusions {}); artifacts {}",
@@ -329,4 +344,218 @@ pub(crate) fn run_campaign(spec: &CampaignSpec) -> Result<()> {
         artifacts.jsonl.display(),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nexus::{AssistantTurn, ProviderEvent, ProviderUsage, ToolCall};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn spec_and_planned() -> (CampaignSpec, PlannedRun, SettingsFingerprint) {
+        let spec = pilot_a();
+        let planned = expand(&spec).into_iter().next().expect("a planned run");
+        let fingerprint = planned.settings.fingerprint(ScenarioPosture {
+            auto_compaction: true,
+            folds: true,
+        });
+        (spec, planned, fingerprint)
+    }
+
+    fn usage(input: u64, output: u64) -> ProviderUsage {
+        ProviderUsage {
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: input + output,
+            cache_creation: None,
+        }
+    }
+
+    /// Finding 2: `context_estimate_tokens` is a per-request estimator value, so
+    /// `estimate_error` is a genuine like-for-like delta. The pilot-a bug
+    /// broadcast the turn-end measurement across every request, so the opening
+    /// request of a multi-round-trip turn showed a phantom multi-thousand-token
+    /// error against a context it never sent. Two requests in one turn with
+    /// distinct payloads must keep distinct, correctly-signed errors.
+    #[test]
+    fn estimate_error_is_per_request_not_a_turn_end_broadcast() {
+        let (spec, planned, fingerprint) = spec_and_planned();
+        let at = Instant::now();
+        let captured = vec![
+            CapturedUsage {
+                is_summary: false,
+                tag: "open".to_string(),
+                started_at: at,
+                usage: Some(usage(2_100, 90)),
+                estimate_tokens: 2_000,
+            },
+            CapturedUsage {
+                is_summary: false,
+                tag: "reply".to_string(),
+                started_at: at + Duration::from_millis(1),
+                usage: Some(usage(6_100, 150)),
+                estimate_tokens: 6_000,
+            },
+        ];
+        let rows = assemble_rows(&spec, &planned, &captured, &[], &fingerprint);
+
+        // Each request keeps ITS OWN estimator value and provider input.
+        assert_eq!(rows[0].context_estimate_tokens, 2_000);
+        assert_eq!(rows[1].context_estimate_tokens, 6_000);
+        assert_eq!(rows[0].context_measured_tokens, 2_100);
+        assert_eq!(rows[1].context_measured_tokens, 6_100);
+        // Like-for-like per request: measured - estimate, small and honest --
+        // NOT the -3.6k phantom the turn-end broadcast produced.
+        assert_eq!(rows[0].estimate_error, 100);
+        assert_eq!(rows[1].estimate_error, 100);
+    }
+
+    /// A fake provider that emits one `read` tool call per fixture across
+    /// several mid-turn round-trips, then a final text turn. Its reported usage
+    /// puts the anchored context above the hard tier, so the governor's #552
+    /// current-turn coverage compacts MID-TURN at a continuing boundary --
+    /// deterministic, no live traffic.
+    struct ScriptedReadProvider {
+        reads: Vec<String>,
+        call: Arc<AtomicUsize>,
+        anchor_tokens: u64,
+    }
+
+    impl ChatProvider for ScriptedReadProvider {
+        fn respond_stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _tools: &'a Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<ProviderStream<'a>> {
+            let n = self.call.fetch_add(1, Ordering::SeqCst);
+            let mut turn = if n < self.reads.len() {
+                AssistantTurn {
+                    tool_calls: vec![ToolCall {
+                        id: format!("scripted-read-{n}"),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({ "path": self.reads[n] }),
+                        thought_signature: None,
+                    }],
+                    ..AssistantTurn::default()
+                }
+            } else {
+                AssistantTurn::text("Summaries: all files read.")
+            };
+            // Anchor the measured context above hard from the first completed
+            // round-trip, so every continuing mid-turn boundary is hard.
+            turn.usage = Some(usage(self.anchor_tokens, 40));
+            Ok(Box::pin(futures::stream::once(async move {
+                Ok(ProviderEvent::Completed(turn))
+            })))
+        }
+    }
+
+    /// Finding 1: S1 drives several tool-call round-trips inside ONE turn, so a
+    /// mid-turn hard-tier boundary lets auto-compaction fire, and S1's own
+    /// `verify_run` accepts the run. Exercised deterministically through the
+    /// real Harness/governor with a scripted provider (no live traffic).
+    #[test]
+    fn s1_drives_multiple_boundaries_and_compacts_mid_turn() {
+        let s1 = AggressiveFill::pilot();
+        let workspace = TempDir::new("s1-flow-ws");
+        // The scripted reads resolve against real fixture files carrying S1's
+        // scripted bodies (several thousand tokens each).
+        let mut reads = Vec::new();
+        for i in 0..s1.round_trips {
+            let name = format!("s1_fixture_{i}.txt");
+            std::fs::write(workspace.path.join(&name), s1.scripted_read_body(i))
+                .expect("write fixture");
+            reads.push(name);
+        }
+
+        let root = TempDir::new("s1-flow-session");
+        let mut log = SessionLog::create_in(&root.path, &workspace.path).expect("create log");
+        for message in s1.seed_messages() {
+            log.append(&message).expect("append seed");
+        }
+        let path = log.path().to_path_buf();
+        drop(log);
+        let store = SessionStore::with_root(root.path.clone());
+        let meta = store
+            .list()
+            .expect("list")
+            .into_iter()
+            .find(|meta| meta.path == path)
+            .expect("seeded session listed");
+        let stored = store.open(&meta).expect("open");
+        let entry_ids = stored.entry_ids.clone();
+        let log = SessionLog::resume(&path).expect("resume");
+
+        let provider = RecordingProvider::new(ScriptedReadProvider {
+            reads,
+            call: Arc::new(AtomicUsize::new(0)),
+            // Comfortably above hard (0.90 x 32768 ~= 29.5k).
+            anchor_tokens: 40_000,
+        });
+        let usages = provider.log();
+        let agent = Agent::resumed(provider, built_in_tools().into_read_only(), stored.messages);
+        let mut harness = Harness::resumed(
+            agent,
+            workspace.path.clone(),
+            ToolState::new(),
+            Some(log),
+            entry_ids,
+            Some(s1.budget()),
+        );
+        harness.set_compaction_trigger(
+            s1.budget(),
+            CompactionTriggerConfig {
+                enabled: true,
+                warn: 0.62,
+                start: 0.72,
+                hard: 0.90,
+                keep_recent_tokens: 8_000,
+                hard_wait_ms: 10,
+                max_consecutive_failures: 3,
+                reactive: true,
+            },
+        );
+
+        let observer = LiveLoopObserver::default();
+        let gate = ReadOnlyGate;
+        let token = CancellationToken::new();
+        let turns = s1.turns();
+        block_on(harness.submit_turn(&turns[0], &observer, &gate, &token)).expect("turn");
+
+        let events = observer.events.lock().expect("events");
+        let applied = events
+            .iter()
+            .filter(|timed| matches!(timed.event, AgentEvent::CompactionApplied { .. }))
+            .count();
+        assert!(
+            applied >= 1,
+            "S1 must compact mid-turn; got {applied} applies"
+        );
+        drop(events);
+
+        let captured = usages.lock().expect("usages").clone();
+        assert!(
+            captured.len() >= 3,
+            "S1 must drive >= 3 round-trip boundaries; got {}",
+            captured.len()
+        );
+
+        let (spec, planned, fingerprint) = spec_and_planned();
+        let events = observer.events.lock().expect("events");
+        let rows = assemble_rows(&spec, &planned, &captured, &events, &fingerprint);
+        drop(events);
+        assert!(
+            s1.verify_run(&rows).is_ok(),
+            "S1 verify_run must accept a run that compacted across >= 3 boundaries: {:?}",
+            s1.verify_run(&rows)
+        );
+    }
 }

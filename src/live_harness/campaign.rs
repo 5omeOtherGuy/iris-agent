@@ -254,6 +254,7 @@ pub(crate) fn format_report(
     spec: &CampaignSpec,
     derived: &[(String, DerivedRun)],
     verdict: LiveRunVerdict,
+    failures: &[(String, String)],
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Campaign {} report\n\n", spec.name));
@@ -281,6 +282,16 @@ pub(crate) fn format_report(
             run.notional_usd,
             run.outcome,
         ));
+    }
+    if !failures.is_empty() {
+        out.push_str("\n## Scenario failures\n\n");
+        out.push_str(
+            "A run that completed without a provider error but did not exercise \
+             its target behavior is a hard failure, recorded verbatim here.\n\n",
+        );
+        for (run_key, reason) in failures {
+            out.push_str(&format!("- `{run_key}`: {reason}\n"));
+        }
     }
     out.push_str(
         "\nRow schema: one row per provider request; see the design doc \
@@ -421,10 +432,31 @@ mod tests {
             &spec,
             &derived,
             live_run_verdict(&[LiveSessionOutcome::Pass]),
+            &[],
         );
         assert!(report.contains("Verdict: PASS"));
         assert!(report.contains("S1::anthropic"));
         assert!(report.contains("Row schema"));
+        assert!(!report.contains("Scenario failures"));
+    }
+
+    #[test]
+    fn report_surfaces_scenario_failures_verbatim() {
+        let spec = pilot_a();
+        let failures = vec![(
+            "S1::anthropic/claude-sonnet-4-6@low::s72-h90-k8000-w10000-subagent-5m#run0"
+                .to_string(),
+            "S1 produced no compaction".to_string(),
+        )];
+        let report = format_report(
+            &spec,
+            &[],
+            live_run_verdict(&[LiveSessionOutcome::HardFailure]),
+            &failures,
+        );
+        assert!(report.contains("Verdict: FAIL"));
+        assert!(report.contains("## Scenario failures"));
+        assert!(report.contains("S1 produced no compaction"));
     }
 
     #[test]
