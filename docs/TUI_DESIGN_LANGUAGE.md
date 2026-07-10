@@ -193,6 +193,18 @@ where density matters. Uppercase labels get `--tracking-label` (0.06em).
 overflow a border. Continuation lines align under the content column, not the
 marker (see §7, §8).
 
+**Measure.** Prose is read, not scanned — a line that runs the full width of an
+ultrawide pane loses the reader on the way back. So **prose wraps at
+`min(pane, 96)` columns**: assistant paragraphs / list items / headings,
+thinking bodies, notices, plan-step notes, and user message bodies rag at the
+measure while the marker, rail, and indent stay exactly where they are (nothing
+is centered; the right side simply rags). **Mechanical output uses the full
+pane** — fenced/indented code, tool bodies, diffs, tables, rules/dividers, and
+session chrome are column-aligned and must not reflow. The measure is a **print-
+time** decision: a printed block reflects the terminal it was printed into and
+is never retroactively reflowed (rows are immutable in scrollback). On any pane
+≤ 96 columns the measure is a no-op.
+
 ---
 
 ## 4 · Spacing & rhythm (exact)
@@ -547,6 +559,17 @@ expand/collapse survives the block's in-place rebuilds.
 is searched even though it is unmounted from the view. Jumping to a match
 inside a collapsed block expands it; the newest match stays clear of the find
 indicator row.
+
+**Preview budget (breathes with height).** A running block's bounded live tail
+(and any streamed error/cancel tail) previews at most **`clamp(pane_height / 5,
+8, 24)`** physical rows — at height/5 the preview never claims more than a fifth
+of the viewport, so a tool block cannot dominate the pane. The **floor is the
+historical fixed 8**, so a pane ≤ 40 rows is byte-identical to before; a taller
+pane lets the tail breathe up to the ceiling of 24. This is a **print-time**
+decision measured against the last-known terminal height: a block printed before
+a resize keeps its printed preview size (rows are immutable in scrollback); only
+the next block built uses the new height. The elision affordance (`… N earlier
+lines hidden`) and the stored full output are unchanged — only the budget moves.
 
 ### 8.2 EXPLORE — read / grep / list / find
 The **single container** for every read-side op. Each op is **one row**:

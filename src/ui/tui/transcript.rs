@@ -15,7 +15,7 @@ use super::panel::{
     FooterField, PanelHeaderSpec, PanelState, ToolDiag, diff_counts, diff_table_rows,
     edit_footer_extras, join_meta_fields, panel_state, review_footer_extras,
 };
-use super::rows::{ChromeRow, FoldVis, TranscriptRow, is_separator_row};
+use super::rows::{ChromeRow, FoldVis, Measure, TranscriptRow, is_separator_row};
 use super::streaming::StreamController;
 use super::tool_render::{self, RenderCtx, ToolOutcome, ToolPanelKind};
 use super::wrap::line_text;
@@ -97,6 +97,8 @@ fn rail_body_row(mut line: Line<'static>) -> TranscriptRow {
         hrule: false,
         chrome: None,
         searchable: true,
+        // A thinking body is prose (spec §3): wraps at the reader's measure.
+        measure: Measure::Prose,
     }
 }
 
@@ -308,6 +310,12 @@ pub(super) struct Transcript {
     /// shaping in the width-agnostic `apply` path (the tool-output flood cap)
     /// uses a realistic column count. Zero until the first render.
     last_width: usize,
+    /// Last terminal HEIGHT the transcript was rendered at, threaded from the
+    /// frame `Size` the same way `last_width` is, so the viewport-aware preview
+    /// budget ([`super::preview_row_budget`]) built during the width-agnostic
+    /// `apply` path reflects a realistic pane height. Zero until the first
+    /// frame, which yields the floor budget (today's fixed 8).
+    last_height: usize,
     wrapped_cache: WrappedTranscriptCache,
     /// Memoized wrapped lines for the current active-tail preview; see
     /// [`StreamingRender`].
@@ -711,6 +719,8 @@ impl Transcript {
             hrule: true,
             chrome: None,
             searchable: true,
+            // A turn divider is a full-width rule (spec §3: mechanical).
+            measure: Measure::Mechanical,
         });
         self.push_blank();
     }
@@ -813,11 +823,28 @@ impl Transcript {
         );
     }
 
-    /// Wrap-width-aware [`RenderCtx`] for renderer body production.
+    /// Wrap-width-aware [`RenderCtx`] for renderer body production, carrying the
+    /// viewport-aware preview budget resolved from the last-known pane height.
     fn render_ctx(&self) -> RenderCtx {
         RenderCtx {
             width: self.wrap_width(),
+            preview_rows: self.preview_budget(),
         }
+    }
+
+    /// Tool-output preview budget (rows) for the current pane, `clamp(height/5,
+    /// 8, 24)`. Read at print time from the last-known frame height; before the
+    /// first frame (`last_height == 0`) it yields the floor (today's 8).
+    fn preview_budget(&self) -> usize {
+        super::preview_row_budget(self.last_height)
+    }
+
+    /// Record the frame's terminal height, threaded from the render `Size` the
+    /// same way width is, so the next block built in the `apply` path sizes its
+    /// preview to the pane it will be printed into. No global — the height flows
+    /// in from the frame just like width does.
+    pub(super) fn note_pane_height(&mut self, height: u16) {
+        self.last_height = usize::from(height);
     }
 
     /// Push a complete frameless tool block (header · hanging body · hairline
