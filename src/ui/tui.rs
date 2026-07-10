@@ -3017,7 +3017,7 @@ mod tests {
             Some("high".to_string()),
             "~/workspace/user-auth".to_string(),
         );
-        screen.show_approval(true, true);
+        screen.show_approval(true, true, false);
         let rendered = rendered_text(&mut screen, 100, 12);
 
         // The leading segment swaps to `▲ REVIEW`; the policy segment still

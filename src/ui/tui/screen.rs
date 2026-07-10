@@ -759,12 +759,15 @@ pub(super) fn editor_visual_rows(editor: &TextArea<'_>, width: u16) -> u16 {
 /// `show_approval` time so the REVIEW posture's decision-echo placeholder (§8.5)
 /// is assembled from the SAME affordance the gated block's footer offers —
 /// never a hardcoded key list. `y approve` / `n deny` are always available;
-/// `a always` / `p project` appear only when the loop honors them. Meaningful
+/// `a always` / `p project` appear only when the loop honors them, and
+/// `dirty_gate` selects the block footer's dirty-tree `always` label so the
+/// echo cannot diverge from what pressing `a` actually approves. Meaningful
 /// only while `awaiting_approval`; reset to the empty offer on every exit path.
 #[derive(Clone, Copy, Default)]
 struct ReviewOffer {
     allow_always: bool,
     allow_project: bool,
+    dirty_gate: bool,
 }
 
 /// UI state plus its rendering. Holds no terminal handle and no channels, so its
@@ -1338,10 +1341,12 @@ impl Screen {
     /// The composer placeholder text for the current posture. At rest it is the
     /// product prompt (§9.4); while a gated tool waits (§8.5) it becomes a dim
     /// decision echo assembled from the SAME affordance the block footer offers
-    /// (`review_footer_extras`) — never a hardcoded key list, so `a`/`p` appear
-    /// only when the loop actually offered them. A placeholder shows only on an
-    /// empty buffer, so a queued steering message is never overwritten; the
-    /// product prompt returns on any resolution.
+    /// (`review_footer_extras`, fed the same offer *and* dirty-gate variant) —
+    /// never a hardcoded key list, so `a`/`p` appear only when the loop actually
+    /// offered them and the `always` label always matches what pressing `a`
+    /// approves. A placeholder shows only on an empty buffer, so a queued
+    /// steering message is never overwritten; the product prompt returns on any
+    /// resolution.
     fn composer_placeholder(&self) -> String {
         if !self.awaiting_approval {
             return PLACEHOLDER_PROMPT.to_string();
@@ -1351,7 +1356,7 @@ impl Screen {
         for field in review_footer_extras(
             self.review_offer.allow_always,
             self.review_offer.allow_project,
-            false,
+            self.review_offer.dirty_gate,
         ) {
             echo.push_str(&sep);
             echo.push_str(&field.plain);
@@ -1775,10 +1780,16 @@ impl Screen {
     /// gated tool block (the `▲ REVIEW` state, via the `ToolReview` event); this
     /// claims the input surface, marks the phase so the composer freezes and the
     /// working indicator steps aside, and carries the offered decision set (the
-    /// same `allow_always` / `allow_project` the loop uses to render the block
-    /// footer) so the REVIEW posture's decision echo (§8.5) is a single-source
-    /// readout, never a hardcoded key list.
-    pub(crate) fn show_approval(&mut self, allow_always: bool, allow_project: bool) {
+    /// same `allow_always` / `allow_project` / `dirty_gate` the loop uses to
+    /// render the block footer) so the REVIEW posture's decision echo (§8.5) is
+    /// a single-source readout that cannot diverge from the block — never a
+    /// hardcoded key list.
+    pub(crate) fn show_approval(
+        &mut self,
+        allow_always: bool,
+        allow_project: bool,
+        dirty_gate: bool,
+    ) {
         // The review takes the input surface: close any dropdown.
         self.session_menu = None;
         self.phase = WorkPhase::AwaitingApproval;
@@ -1786,6 +1797,7 @@ impl Screen {
         self.review_offer = ReviewOffer {
             allow_always,
             allow_project,
+            dirty_gate,
         };
     }
 
@@ -3165,7 +3177,7 @@ mod tests {
             "internal rule is dim at rest"
         );
 
-        screen.show_approval(false, false);
+        screen.show_approval(false, false, false);
         let (top, rule) = composer_frame_styles(&mut screen);
         let accent = crate::ui::palette::orange();
         assert_eq!(
@@ -3198,7 +3210,7 @@ mod tests {
         assert_eq!(screen.composer_placeholder(), "Give Iris a task...");
 
         // {y, n}: base offer only.
-        screen.show_approval(false, false);
+        screen.show_approval(false, false, false);
         assert_eq!(
             screen.composer_placeholder(),
             "review waiting \u{250a} y approve \u{250a} n deny"
@@ -3206,7 +3218,7 @@ mod tests {
 
         // {y, n, a, p}: the loop also offers always + project.
         screen.clear_approval(false);
-        screen.show_approval(true, true);
+        screen.show_approval(true, true, false);
         assert_eq!(
             screen.composer_placeholder(),
             "review waiting \u{250a} y approve \u{250a} n deny \u{250a} a always \u{250a} p project"
@@ -3214,10 +3226,28 @@ mod tests {
 
         // Only `a` on offer: `p` never appears.
         screen.clear_approval(false);
-        screen.show_approval(true, false);
+        screen.show_approval(true, false, false);
         assert_eq!(
             screen.composer_placeholder(),
             "review waiting \u{250a} y approve \u{250a} n deny \u{250a} a always"
+        );
+
+        // Dirty-tree gate: the echo carries the block footer's dirty-variant
+        // `always` label (via the same `review_footer_extras` source, keyed by
+        // the same dirty_gate flag), so the echo names exactly what pressing
+        // `a` approves.
+        screen.clear_approval(false);
+        screen.show_approval(true, true, true);
+        assert_eq!(
+            screen.composer_placeholder(),
+            format!(
+                "review waiting \u{250a} y approve \u{250a} n deny \u{250a} a {} \u{250a} p project",
+                crate::tool_display::APPROVAL_ALL_DIRTY_LABEL
+            )
+        );
+        assert!(
+            !screen.composer_placeholder().contains("a always"),
+            "the plain `always` label must not appear on a dirty gate"
         );
 
         screen.clear_approval(false);
@@ -3230,7 +3260,7 @@ mod tests {
         // placeholder, which only paints on an empty buffer.
         let mut screen = footer_screen("~/repo");
         screen.editor.insert_str("wrap up and summarize the diff");
-        screen.show_approval(true, true);
+        screen.show_approval(true, true, false);
         let chrome = super::render_editor_chrome(&mut screen, 80, 12)
             .iter()
             .map(line_text)
@@ -3247,7 +3277,7 @@ mod tests {
     fn approve_restores_all_three_review_cues() {
         // Criterion 4: the approve exit path (`clear_approval(true)`).
         let mut screen = footer_screen("~/repo");
-        screen.show_approval(true, true);
+        screen.show_approval(true, true, false);
         assert_review_posture(&mut screen, true);
         screen.clear_approval(true);
         assert_review_posture(&mut screen, false);
@@ -3257,7 +3287,7 @@ mod tests {
     fn deny_restores_all_three_review_cues() {
         // Criterion 4: the deny/cancel exit path (`clear_approval(false)`).
         let mut screen = footer_screen("~/repo");
-        screen.show_approval(true, true);
+        screen.show_approval(true, true, false);
         assert_review_posture(&mut screen, true);
         screen.clear_approval(false);
         assert_review_posture(&mut screen, false);
@@ -3267,7 +3297,7 @@ mod tests {
     fn start_turn_cleanup_restores_all_three_review_cues() {
         // Criterion 4: the first cleanup clear (`start_turn`).
         let mut screen = footer_screen("~/repo");
-        screen.show_approval(true, true);
+        screen.show_approval(true, true, false);
         assert_review_posture(&mut screen, true);
         screen.start_turn();
         assert_review_posture(&mut screen, false);
@@ -3277,7 +3307,7 @@ mod tests {
     fn end_turn_cleanup_restores_all_three_review_cues() {
         // Criterion 4: the second cleanup clear (`end_turn` → `end_work_phase`).
         let mut screen = footer_screen("~/repo");
-        screen.show_approval(true, true);
+        screen.show_approval(true, true, false);
         assert_review_posture(&mut screen, true);
         screen.end_turn();
         assert_review_posture(&mut screen, false);
@@ -3928,7 +3958,7 @@ mod tests {
         );
 
         // While a gated tool waits, the leading segment swaps to `▲ REVIEW`.
-        screen.show_approval(false, false);
+        screen.show_approval(false, false, false);
         let review = composer_statusline(&screen, 80)
             .map(|l| line_text(&l))
             .expect("statusline");
@@ -3975,7 +4005,7 @@ mod tests {
         let mut screen = footer_screen("~/repo");
         screen.set_approval_policy(ApprovalPolicy::OnRequest);
         let before = composer_statusline(&screen, 80);
-        screen.show_approval(false, false);
+        screen.show_approval(false, false, false);
         assert_ne!(
             before,
             composer_statusline(&screen, 80),
@@ -3995,7 +4025,7 @@ mod tests {
         // `▲ REVIEW` inherits MODE's never-dropped slot.
         let mut screen = footer_screen("~/repo");
         screen.set_approval_policy(ApprovalPolicy::OnRequest);
-        screen.show_approval(false, false);
+        screen.show_approval(false, false, false);
         let status = composer_statusline(&screen, 20)
             .map(|l| line_text(&l))
             .expect("statusline");
@@ -4013,7 +4043,7 @@ mod tests {
         assert!(screen.tick(), "a live flash ticks at rest");
 
         screen.set_approval_policy(ApprovalPolicy::OnRequest);
-        screen.show_approval(false, false);
+        screen.show_approval(false, false, false);
         assert!(!screen.tick(), "the wait is CPU-idle: tick returns false");
         assert!(!screen.tick(), "and stays idle");
 
@@ -4238,7 +4268,7 @@ mod tests {
         // Approval is its own phase and, while shown, suppresses the working
         // animation so it never competes with the decision (the approval panel
         // is the primary surface).
-        screen.show_approval(false, false);
+        screen.show_approval(false, false, false);
         assert_eq!(screen.work_phase_label(), "Awaiting approval");
         assert!(
             screen.working_lines(80).is_empty(),
@@ -4281,7 +4311,7 @@ mod tests {
         // misleading "Preparing tool" label, since no tool is about to run.
         let mut screen = Screen::new();
         screen.start_turn();
-        screen.show_approval(false, false);
+        screen.show_approval(false, false, false);
         assert_eq!(screen.work_phase_label(), "Awaiting approval");
         screen.clear_approval(false);
         assert_eq!(

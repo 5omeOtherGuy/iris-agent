@@ -287,6 +287,10 @@ struct ApprovalRequest {
     call: ToolCall,
     allow_always: bool,
     allow_project: bool,
+    /// Whether the `always` choice is the dirty-tree variant (`a all dirty
+    /// files (this task)`), so the composer's decision echo renders the same
+    /// affordance label the block footer does.
+    dirty_gate: bool,
     reply: oneshot::Sender<ApprovalDecision>,
 }
 
@@ -1970,10 +1974,14 @@ async fn run_harness_op<P: ChatProvider>(
                 }
                 Some(request) = appr_rx.recv() => {
                     // The same offered decision set the loop uses for the block
-                    // footer travels into the screen, so the REVIEW posture's
-                    // decision echo is a single-source readout.
-                    tui.screen
-                        .show_approval(request.allow_always, request.allow_project);
+                    // footer travels into the screen — including the dirty-gate
+                    // variant of `always` — so the REVIEW posture's decision
+                    // echo cannot diverge from the block footer.
+                    tui.screen.show_approval(
+                        request.allow_always,
+                        request.allow_project,
+                        request.dirty_gate,
+                    );
                     pending = Some(PendingApproval {
                         call: request.call.clone(),
                         reply: request.reply,
@@ -3537,6 +3545,7 @@ impl ApprovalGate for LoopBridge {
                     call,
                     allow_always,
                     allow_project,
+                    dirty_gate,
                     reply,
                 })
                 .is_err()
