@@ -698,6 +698,13 @@ fn parse_usage(value: &Value, provider: &str, model: &str) -> Option<ProviderUsa
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    // GPT-5.6+ reports prompt-cache writes; older families omit the field.
+    let cache_write_input_tokens = usage
+        .get("prompt_tokens_details")
+        .or_else(|| usage.get("input_tokens_details"))
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let reasoning_output_tokens = usage
         .get("completion_tokens_details")
         .or_else(|| usage.get("output_tokens_details"))
@@ -710,7 +717,7 @@ fn parse_usage(value: &Value, provider: &str, model: &str) -> Option<ProviderUsa
         input_tokens,
         output_tokens,
         cache_read_input_tokens,
-        cache_write_input_tokens: 0,
+        cache_write_input_tokens,
         reasoning_output_tokens,
         total_tokens,
         cache_creation: None,
@@ -1054,8 +1061,68 @@ mod tests {
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.cache_read_input_tokens, 3);
+        assert_eq!(usage.cache_write_input_tokens, 0);
         assert_eq!(usage.reasoning_output_tokens, 2);
         assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn parse_usage_reads_cache_write_tokens_when_present() {
+        // GPT-5.6+ reports prompt-cache writes alongside reads. Both must be
+        // parsed independently from the same details object.
+        let value = json!({ "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "prompt_tokens_details": { "cached_tokens": 3, "cache_write_tokens": 7 }
+        } });
+        let usage = parse_usage(&value, "openai", "gpt-test").expect("usage");
+        assert_eq!(usage.cache_read_input_tokens, 3);
+        assert_eq!(usage.cache_write_input_tokens, 7);
+    }
+
+    #[test]
+    fn parse_usage_reads_cache_write_tokens_from_input_tokens_details() {
+        // The Responses-shaped fallback (`input_tokens_details`) must also be
+        // honored, mirroring the cached_tokens fallback.
+        let value = json!({ "usage": {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+            "input_tokens_details": { "cached_tokens": 3, "cache_write_tokens": 7 }
+        } });
+        let usage = parse_usage(&value, "openai", "gpt-test").expect("usage");
+        assert_eq!(usage.cache_read_input_tokens, 3);
+        assert_eq!(usage.cache_write_input_tokens, 7);
+    }
+
+    #[test]
+    fn parse_usage_cache_write_tokens_absent_defaults_to_zero() {
+        // Older model families never send the field; parse must fall back to 0.
+        let value = json!({ "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "prompt_tokens_details": { "cached_tokens": 3 }
+        } });
+        let usage = parse_usage(&value, "openai", "gpt-test").expect("usage");
+        assert_eq!(usage.cache_write_input_tokens, 0);
+    }
+
+    #[test]
+    fn parse_usage_passes_cache_write_tokens_through_verbatim() {
+        // Real-world observed shape: reads + writes can exceed prompt_tokens.
+        // We record faithfully and never clamp or "fix" the provider's numbers.
+        let value = json!({ "usage": {
+            "prompt_tokens": 4583,
+            "completion_tokens": 20,
+            "total_tokens": 4603,
+            "prompt_tokens_details": { "cached_tokens": 3945, "cache_write_tokens": 4580 }
+        } });
+        let usage = parse_usage(&value, "openai", "gpt-test").expect("usage");
+        assert_eq!(usage.input_tokens, 4583);
+        assert_eq!(usage.cache_read_input_tokens, 3945);
+        assert_eq!(usage.cache_write_input_tokens, 4580);
     }
 
     #[test]

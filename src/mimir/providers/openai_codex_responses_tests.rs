@@ -1127,6 +1127,59 @@ fn parses_usage_response_id_and_encrypted_reasoning_from_stream() -> Result<()> 
 }
 
 #[test]
+fn parses_cache_write_tokens_from_input_tokens_details() -> Result<()> {
+    // GPT-5.6+ reports prompt-cache writes alongside reads. Both must be
+    // parsed independently from `input_tokens_details`.
+    let stream = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20,\"total_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":64,\"cache_write_tokens\":36},\"output_tokens_details\":{\"reasoning_tokens\":7}}}}\n\n",
+    );
+
+    let turn = parse_response_stream(stream)?;
+    let usage = turn.usage.expect("usage");
+    assert_eq!(usage.cache_read_input_tokens, 64);
+    assert_eq!(usage.cache_write_input_tokens, 36);
+    Ok(())
+}
+
+#[test]
+fn cache_write_tokens_absent_defaults_to_zero() -> Result<()> {
+    // Older model families never send the field; parse must fall back to 0.
+    let stream = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20,\"total_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":64}}}}\n\n",
+    );
+
+    let turn = parse_response_stream(stream)?;
+    let usage = turn.usage.expect("usage");
+    assert_eq!(usage.cache_write_input_tokens, 0);
+    Ok(())
+}
+
+#[test]
+fn cache_write_tokens_passed_through_verbatim_even_when_exceeding_prompt() -> Result<()> {
+    // Real-world observed shape: reads + writes can exceed prompt_tokens.
+    // We record faithfully and never clamp or "fix" the provider's numbers.
+    let stream = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":4583,\"output_tokens\":20,\"total_tokens\":4603,\"input_tokens_details\":{\"cached_tokens\":3945,\"cache_write_tokens\":4580}}}}\n\n",
+    );
+
+    let turn = parse_response_stream(stream)?;
+    let usage = turn.usage.expect("usage");
+    assert_eq!(usage.input_tokens, 4583);
+    assert_eq!(usage.cache_read_input_tokens, 3945);
+    assert_eq!(usage.cache_write_input_tokens, 4580);
+    Ok(())
+}
+
+#[test]
 fn encrypted_reasoning_without_summary_is_continuity_not_redaction() {
     let origin = ModelOrigin::new("openai-codex", "openai-codex-responses", "gpt-test");
     let block = extract_reasoning_block(
