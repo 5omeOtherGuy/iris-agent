@@ -254,6 +254,142 @@ impl Spinner {
     }
 }
 
+/// Flow-meter geometry: 6 cells of 8 eighth-block quanta each — 48 levels of
+/// sub-cell resolution on one short bar.
+const FLOW_METER_CELLS: u8 = 6;
+const FLOW_QUANTA: u8 = FLOW_METER_CELLS * 8;
+
+/// Full-scale inflow in bytes per loop tick (≈ 40 KB/s at the 100 ms tick — a
+/// saturated fast stream). Fixed calibration by design: the same inflow always
+/// reads the same; never rescaled adaptively (spec §2.3, §7).
+const FLOW_FULL_SCALE: usize = 4096;
+
+/// Release ballistics: quanta the displayed level falls per silent tick, so a
+/// full-scale reading drains in ~1.2 s. Attack is instant — never eased.
+const FLOW_RELEASE: u8 = 4;
+
+/// Ticks the peak tick holds at its high-water mark before decaying one
+/// quantum per tick.
+const FLOW_PEAK_HOLD_TICKS: u8 = 5;
+
+/// Fixed log-scale quantizer: one tick's inflow bytes → display level 0..=48,
+/// `level = round(48 · ln(1 + bytes) / ln(1 + FLOW_FULL_SCALE))` (spec §2.3).
+/// Log because stream rates span orders of magnitude — a trickle must move the
+/// bar and a torrent must not need a mile of it; `1 +` anchors zero bytes at
+/// level 0. Pure function of the byte count only (fixed calibration), clamped
+/// at full scale.
+fn flow_level(bytes: usize) -> u8 {
+    if bytes == 0 {
+        return 0;
+    }
+    let full_scale = ((1 + FLOW_FULL_SCALE) as f64).ln();
+    let level = (f64::from(FLOW_QUANTA) * (1.0 + bytes as f64).ln() / full_scale).round();
+    (level as u8).min(FLOW_QUANTA)
+}
+
+/// The working indicator's flow meter (`docs/specs/flow-meter.md`): a 6-cell,
+/// 48-quantum bar metering **display-stream inflow** — the byte length of
+/// streaming delta payloads as they arrive in [`Screen::apply`] — on the fixed
+/// log scale above. It measures what is genuinely arriving over the wire into
+/// the pane: never our own commit pacing (`commit_stream_tick` is a display
+/// choice), never a fabricated tokens/sec (usage arrives per provider round,
+/// too coarse). It prints no number — an uncalibrated-unit meter that prints
+/// no unit lies about nothing, and the honest cumulative counters sit right
+/// beside it (spec §2.2).
+///
+/// Ballistics are quantized physics on the loop tick grid (§6): instant
+/// attack, [`FLOW_RELEASE`]-quanta release, and a peak that holds
+/// [`FLOW_PEAK_HOLD_TICKS`] ticks then decays one quantum per tick. The meter
+/// lives with the spinner — reset at turn start, rendered only while the
+/// spinner runs. Under reduced motion the bar renders the raw per-tick sample
+/// directly: physics removed, data never.
+#[derive(Default)]
+struct FlowMeter {
+    /// Bytes observed since the last tick — the per-tick sampler.
+    accum: usize,
+    /// Displayed level in quanta (0..=[`FLOW_QUANTA`]).
+    display: u8,
+    /// Peak-hold level in quanta; never renders below `display`.
+    peak: u8,
+    /// Peak-hold ticks remaining before the peak starts decaying.
+    hold: u8,
+    /// Mirrors the screen's reduced-motion posture (same seam as `Spinner`).
+    reduced_motion: bool,
+}
+
+impl FlowMeter {
+    /// Record one streaming payload's bytes into the current tick's sample.
+    fn observe_bytes(&mut self, bytes: usize) {
+        self.accum = self.accum.saturating_add(bytes);
+    }
+
+    /// Zero the meter for a fresh turn (spinner start). The reduced-motion
+    /// posture survives — it is a preference, not turn state.
+    fn reset(&mut self) {
+        self.accum = 0;
+        self.display = 0;
+        self.peak = 0;
+        self.hold = 0;
+    }
+
+    /// Advance one loop tick: take the accumulator as one sample and run the
+    /// quantized ballistics — integer steps on the tick grid, no easing (§6).
+    fn tick(&mut self) {
+        let sample = flow_level(std::mem::take(&mut self.accum));
+        if self.reduced_motion {
+            // Reduced motion removes physics, never data: the bar reads the
+            // raw current sample each tick; no release tail, no peak tick.
+            self.display = sample;
+            self.peak = 0;
+            self.hold = 0;
+            return;
+        }
+        // Instant attack, quantized release: a burst is never under-reported,
+        // silence drains the bar FLOW_RELEASE quanta per tick.
+        self.display = sample.max(self.display.saturating_sub(FLOW_RELEASE));
+        if self.display >= self.peak {
+            // New high-water mark (or the fill caught back up): re-arm the hold.
+            self.peak = self.display;
+            self.hold = FLOW_PEAK_HOLD_TICKS;
+        } else if self.hold > 0 {
+            self.hold -= 1;
+        } else {
+            // Held out: the peak steps down one quantum per tick, but never
+            // below the displayed level.
+            self.peak = self.peak.saturating_sub(1).max(self.display);
+        }
+    }
+
+    /// Render the 6-cell bar: bright left-anchored eighth-block fill in the
+    /// accent (the chase's lit-LED style), the chase's dim `·` for unlit
+    /// cells, and a dim `▏` peak tick replacing the `·` of the cell holding a
+    /// peak above the bright fill (a peak inside the fill is invisible,
+    /// correctly). Position/length is the signal — the bar passes the
+    /// monochrome test with color removed.
+    fn spans(&self) -> Vec<Span<'static>> {
+        let display = self.display.min(FLOW_QUANTA);
+        let peak = self.peak.min(FLOW_QUANTA);
+        // Cell holding the peak quantum (cell i covers quanta 8i+1..=8i+8).
+        // Marked only above the fill; reduced motion renders no peak at all.
+        let peak_cell = (!self.reduced_motion && peak > display).then(|| (peak - 1) / 8);
+        (0..FLOW_METER_CELLS)
+            .map(|cell| {
+                let eighths = display.saturating_sub(cell * 8).min(8);
+                if eighths > 0 {
+                    Span::styled(
+                        crate::ui::symbols::FLOW_FILL[usize::from(eighths)].to_string(),
+                        prompt_style(),
+                    )
+                } else if peak_cell == Some(cell) {
+                    Span::styled(crate::ui::symbols::FLOW_PEAK.to_string(), dim_style())
+                } else {
+                    Span::styled(crate::ui::symbols::UNLIT.to_string(), dim_style())
+                }
+            })
+            .collect()
+    }
+}
+
 /// Whether the working-indicator animation should be frozen at construction:
 /// the `IRIS_REDUCED_MOTION` env flag only, so a pure UI unit test never depends
 /// on the machine's persisted config. The persisted `tui.reducedMotion`
@@ -638,9 +774,12 @@ pub(super) fn working_indicator_line(
     queued: usize,
     width: usize,
 ) -> Line<'static> {
-    working_indicator_line_with_activity(frame, elapsed, can_interrupt, None, usage, queued, width)
+    working_indicator_line_with_activity(
+        frame, elapsed, can_interrupt, None, usage, queued, None, width,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn working_indicator_line_with_activity(
     frame: &str,
     elapsed: Duration,
@@ -648,6 +787,7 @@ fn working_indicator_line_with_activity(
     activity: Option<&str>,
     usage: Option<&ProviderUsage>,
     queued: usize,
+    flow: Option<&FlowMeter>,
     width: usize,
 ) -> Line<'static> {
     let mut spans = led_frame_spans(frame);
@@ -683,6 +823,15 @@ fn working_indicator_line_with_activity(
             dim_style(),
         ));
     }
+    // The flow meter rides last on the line deliberately (spec §2.1): the
+    // end-of-line truncation below makes it the first thing dropped at narrow
+    // widths — the telemetry counters outrank the meter, with no new
+    // truncation logic. One plain space, not a `┊`: the bar is an instrument
+    // face, not another metadata field.
+    if let Some(flow) = flow {
+        spans.push(Span::raw(" "));
+        spans.extend(flow.spans());
+    }
     let mut line = Line::from(spans);
     truncate_line(&mut line, content_width(width));
     pad_line_left(
@@ -699,6 +848,7 @@ fn working_lines(
     usage: Option<&ProviderUsage>,
     activity: Option<&str>,
     queued: usize,
+    flow: Option<&FlowMeter>,
     width: usize,
 ) -> Vec<Line<'static>> {
     vec![working_indicator_line_with_activity(
@@ -708,6 +858,7 @@ fn working_lines(
         activity,
         usage,
         queued,
+        flow,
         width,
     )]
 }
@@ -798,6 +949,10 @@ pub(crate) struct Screen {
     session_meter: SessionMeter,
     /// Live detent flashes for changed statusline segments / meter LEDs.
     detents: Detents,
+    /// The working indicator's display-stream flow meter. Lives with the
+    /// spinner: reset at turn start, sampled in [`Screen::apply`], advanced on
+    /// the loop tick, rendered only while the spinner runs.
+    flow_meter: FlowMeter,
     /// The start page (IrisMark + launcher), shown before the first session
     /// activity when Iris launched interactively with no task/resume target.
     pub(crate) start_page: Option<StartPage>,
@@ -922,6 +1077,10 @@ impl Screen {
             approval_policy: ApprovalPolicy::OnRequest,
             session_meter: SessionMeter::default(),
             detents: Detents::default(),
+            flow_meter: FlowMeter {
+                reduced_motion: reduced_motion(),
+                ..FlowMeter::default()
+            },
             start_page: None,
             session_menu: None,
             last_session_bar: None,
@@ -1121,6 +1280,7 @@ impl Screen {
     pub(crate) fn set_reduced_motion(&mut self, reduced_motion: bool) {
         self.reduced_motion = reduced_motion;
         self.spinner.reduced_motion = reduced_motion;
+        self.flow_meter.reduced_motion = reduced_motion;
     }
 
     /// Dismiss the start page: entering a session replaces the launcher with
@@ -1374,6 +1534,22 @@ impl Screen {
         }
         if let Some(status) = &mut self.switch_status {
             status.observe(&event);
+        }
+        // Flow-meter sampling tap (spec §2.2): the byte length of every
+        // streaming delta payload as it arrives — assistant text, reasoning
+        // summaries, raw reasoning, freeform tool-input fragments, and live
+        // tool output. These five are the only delta-bearing `UiEvent`
+        // variants; block-level events are not flow. Display-stream inflow
+        // only: never our own commit pacing (`commit_stream_tick` is a display
+        // choice) and never a fabricated tokens/sec (usage arrives once per
+        // provider round, too coarse to be a rate).
+        match &event {
+            UiEvent::AssistantTextDelta(delta)
+            | UiEvent::AssistantReasoningDelta(delta)
+            | UiEvent::AssistantRawReasoningDelta(delta)
+            | UiEvent::ToolInputDelta { delta, .. } => self.flow_meter.observe_bytes(delta.len()),
+            UiEvent::ToolOutputDelta { chunk, .. } => self.flow_meter.observe_bytes(chunk.len()),
+            _ => {}
         }
         // Advance the always-visible work phase from the display-event stream.
         // Approval transitions are owned by `show_approval`/`clear_approval`, so
@@ -1647,6 +1823,9 @@ impl Screen {
         // Pager: a submitted prompt snaps the view back to the live tail.
         self.scroll.follow_latest();
         self.spinner.start();
+        // The flow meter lives with the spinner: a fresh turn starts from a
+        // dark bar, never a stale reading.
+        self.flow_meter.reset();
         self.phase = WorkPhase::Starting;
         self.turn_divider = TurnDivider::default();
         self.awaiting_approval = false;
@@ -1691,6 +1870,13 @@ impl Screen {
         // else; a live flash forces the redraws that let it settle. The
         // settings panel's own detent flash settles through the same grid.
         let settling = self.detents.tick();
+        // The flow meter samples on the same grid: each spinner tick takes the
+        // accumulated inflow as one sample and steps the ballistics. It lives
+        // with the spinner, so an idle screen never ticks it (and the
+        // approval-wait early return above keeps the CPU-idle contract).
+        if self.spinner.active {
+            self.flow_meter.tick();
+        }
         let modal_settling = self.modal.as_mut().is_some_and(|modal| modal.tick());
         // The start page's IrisMark reuses the spinner tick machinery and holds
         // still under reduced motion (StartPage::tick handles both cadence and
@@ -1803,6 +1989,9 @@ impl Screen {
                 self.turn_divider.usage.as_ref(),
                 Some(self.phase.label()),
                 self.queued,
+                // The flow meter renders ONLY on this live line: it vanishes
+                // with the indicator (spinner stop, approval-wait suppression).
+                Some(&self.flow_meter),
                 usize::from(width),
             )
         } else {
@@ -2879,9 +3068,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ApprovalPolicy, CONTEXT_METER_DOTS, Screen, Spinner, SwitchCacheStatus, SwitchStatus,
-        composer_statusline, context_meter_filled, display_width, line_text, parse_context_window,
+        ApprovalPolicy, CONTEXT_METER_DOTS, FLOW_FULL_SCALE, FLOW_QUANTA, FlowMeter, Screen,
+        Spinner, SwitchCacheStatus, SwitchStatus, composer_statusline, context_meter_filled,
+        dim_style, display_width, flow_level, line_text, parse_context_window, prompt_style,
         session_bar, session_bar_lines, switch_status_line, truncate_cwd_middle,
+        working_indicator_line_with_activity,
     };
     use crate::nexus::ToolCall;
     use crate::ui::UiEvent;
@@ -2975,6 +3166,24 @@ mod tests {
                 cache_creation: None,
             }),
         }
+    }
+
+    /// Smallest byte count the fixed log scale quantizes to `level`, so tests
+    /// drive the meter through its public sampling API instead of hardcoding
+    /// scale-dependent byte counts.
+    fn bytes_for_level(level: u8) -> usize {
+        (0..=FLOW_FULL_SCALE)
+            .find(|&bytes| flow_level(bytes) == level)
+            .expect("level is reachable on the fixed scale")
+    }
+
+    /// The flow meter's rendered 6-cell bar as plain text.
+    fn flow_text(meter: &FlowMeter) -> String {
+        meter
+            .spans()
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     fn statusline_span_style(screen: &Screen, content: &str) -> ratatui::style::Style {
@@ -3118,6 +3327,216 @@ mod tests {
                 .contains(Modifier::BOLD),
             "no new LED, no flash"
         );
+    }
+
+    #[test]
+    fn flow_level_is_monotonic_anchored_at_zero_and_clamped_at_full_scale() {
+        // Zero flows read level 0; full scale (and anything past it) pins 48.
+        assert_eq!(flow_level(0), 0);
+        assert_eq!(flow_level(FLOW_FULL_SCALE), FLOW_QUANTA);
+        assert_eq!(flow_level(FLOW_FULL_SCALE * 10), FLOW_QUANTA);
+
+        // Monotonic in bytes across (and past) the whole scale.
+        let mut prev = 0;
+        for bytes in 0..=(FLOW_FULL_SCALE * 2) {
+            let level = flow_level(bytes);
+            assert!(level >= prev, "monotonic at {bytes}: {level} < {prev}");
+            assert!(level <= FLOW_QUANTA, "clamped at {bytes}");
+            prev = level;
+        }
+
+        // Fixed calibration: pinned log-scale anchors (a pure function of the
+        // byte count — the same inflow always reads the same, no adaptive
+        // rescale exists to drift them).
+        assert_eq!(flow_level(1), 4);
+        assert_eq!(flow_level(64), 24);
+    }
+
+    #[test]
+    fn flow_meter_burst_attacks_instantly_releases_and_holds_peak() {
+        let mut meter = FlowMeter::default();
+        // Instant attack: a full-scale burst reads full on the next tick — a
+        // burst is never under-reported.
+        meter.observe_bytes(FLOW_FULL_SCALE);
+        meter.tick();
+        assert_eq!((meter.display, meter.peak), (FLOW_QUANTA, FLOW_QUANTA));
+
+        // Silence: the display releases 4 quanta/tick (48→44→40→…); the peak
+        // holds 5 ticks, then steps down 1/tick. The display never exceeds
+        // the burst and the peak never drops below the display.
+        let mut trace = Vec::new();
+        for _ in 0..7 {
+            meter.tick();
+            trace.push((meter.display, meter.peak));
+            assert!(meter.display <= FLOW_QUANTA, "never exceeds the burst");
+            assert!(meter.peak >= meter.display, "peak never below display");
+        }
+        assert_eq!(
+            trace,
+            vec![
+                (44, 48),
+                (40, 48),
+                (36, 48),
+                (32, 48),
+                (28, 48),
+                (24, 47),
+                (20, 46),
+            ]
+        );
+    }
+
+    #[test]
+    fn flow_meter_spans_render_fill_partials_peak_tick_and_unlit_cells() {
+        // Level 0 + peak 0: six dim `·` cells — nothing bright when nothing
+        // flows, and the unlit mark is the chase's own.
+        let dark = FlowMeter::default();
+        assert_eq!(flow_text(&dark), "······");
+        assert!(dark.spans().iter().all(|span| span.style == dim_style()));
+
+        // Full scale: six accent `█` cells.
+        let full = FlowMeter {
+            display: FLOW_QUANTA,
+            ..FlowMeter::default()
+        };
+        assert_eq!(flow_text(&full), "██████");
+        assert!(full.spans().iter().all(|span| span.style == prompt_style()));
+
+        // A mid level renders exactly one partial cell: 22 quanta = two full
+        // cells + 6/8 of the third.
+        let mid = FlowMeter {
+            display: 22,
+            ..FlowMeter::default()
+        };
+        assert_eq!(flow_text(&mid), "██▊···");
+
+        // A peak above the fill marks the cell holding its quantum (28 lives
+        // in cell 4) with a dim `▏` replacing that cell's `·`…
+        let peaked = FlowMeter {
+            display: 22,
+            peak: 28,
+            ..FlowMeter::default()
+        };
+        assert_eq!(flow_text(&peaked), "██▊▏··");
+        assert_eq!(peaked.spans()[3].style, dim_style());
+
+        // …while a peak inside the bright fill is invisible, correctly.
+        let buried = FlowMeter {
+            display: 22,
+            peak: 20,
+            ..FlowMeter::default()
+        };
+        assert_eq!(flow_text(&buried), "██▊···");
+    }
+
+    #[test]
+    fn flow_meter_lives_and_dies_with_the_spinner() {
+        let mut screen = Screen::new();
+        assert!(screen.working_lines(80).is_empty(), "no indicator at idle");
+
+        // A streaming turn: the delta tap feeds the sampler, the loop tick
+        // takes the sample, the indicator line carries the bar.
+        screen.start_turn();
+        screen.apply(UiEvent::AssistantTextDelta("x".repeat(FLOW_FULL_SCALE)));
+        screen.tick();
+        let line = line_text(&screen.working_lines(80)[0]);
+        assert!(line.contains("██████"), "{line:?}");
+
+        // Approval-wait hides the whole indicator, meter included — the
+        // existing suppression must not regress.
+        screen.show_approval();
+        assert!(
+            screen.working_lines(80).is_empty(),
+            "hidden while awaiting approval"
+        );
+        screen.clear_approval(true);
+        assert!(!screen.working_lines(80).is_empty());
+
+        // The indicator (and its meter) vanish when the turn ends…
+        screen.end_turn();
+        assert!(screen.working_lines(80).is_empty(), "gone when idle");
+
+        // …and the next turn starts from a dark bar: all meter state reset.
+        screen.start_turn();
+        let line = line_text(&screen.working_lines(80)[0]);
+        assert!(line.contains("······"), "reset bar: {line:?}");
+        assert!(!line.contains('█'), "no stale fill: {line:?}");
+    }
+
+    #[test]
+    fn reduced_motion_flow_meter_reads_the_raw_sample_with_no_peak_tick() {
+        let mut meter = FlowMeter {
+            reduced_motion: true,
+            ..FlowMeter::default()
+        };
+        meter.observe_bytes(FLOW_FULL_SCALE);
+        meter.tick();
+        assert_eq!(meter.display, FLOW_QUANTA);
+
+        // No release ballistics: a silent tick reads the raw zero sample.
+        meter.tick();
+        assert_eq!(meter.display, 0);
+
+        // Telemetry keeps updating — reduced motion removes physics, never
+        // data — and no peak tick is ever rendered after the earlier burst.
+        meter.observe_bytes(bytes_for_level(24));
+        meter.tick();
+        assert_eq!(meter.display, 24);
+        assert_eq!(flow_text(&meter), "███···");
+    }
+
+    #[test]
+    fn narrow_width_drops_the_flow_meter_before_the_counters() {
+        use crate::ui::tui::WORKING_FRAMES;
+        let usage = crate::nexus::ProviderUsage {
+            provider: "openai".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 177_000,
+            output_tokens: 5_700,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 182_700,
+            cache_creation: None,
+        };
+        let flow = FlowMeter {
+            display: FLOW_QUANTA,
+            ..FlowMeter::default()
+        };
+        let line_at = |width: usize| {
+            line_text(&working_indicator_line_with_activity(
+                WORKING_FRAMES[0],
+                Duration::from_secs(87),
+                true,
+                None,
+                Some(&usage),
+                0,
+                Some(&flow),
+                width,
+            ))
+        };
+
+        // The fullest form carries the counters AND the meter…
+        let full = line_at(80);
+        assert!(full.contains("↑177k ↓5.7k"), "{full:?}");
+        assert!(full.contains("██████"), "{full:?}");
+
+        // …and position does the truncation work (spec §2.1): at every width
+        // the meter only ever renders behind intact counters, and some width
+        // keeps the counters while dropping the meter.
+        let mut counters_survive_without_meter = false;
+        for width in 1..=80 {
+            let text = line_at(width);
+            if text.contains('█') {
+                assert!(
+                    text.contains("↑177k ↓5.7k"),
+                    "meter must not outlive the counters at {width}: {text:?}"
+                );
+            }
+            if text.contains("↑177k ↓5.7k") && !text.contains('█') {
+                counters_survive_without_meter = true;
+            }
+        }
+        assert!(counters_survive_without_meter);
     }
 
     #[test]
