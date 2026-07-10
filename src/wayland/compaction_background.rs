@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// Which worker [`CompactionEngine::start_background`] resolved to launch,
+/// decided before any engine state mutates so a session with no usable worker
+/// degrades cleanly.
+enum WorkerSpawn {
+    Native(SummarizerFactory),
+    Portable(SummarizerFactory),
+}
+
 /// Outcome of the provider-native rung of the hard-tier fallback ladder
 /// (subagent -> provider-native -> deterministic excerpts).
 enum NativeFallbackOutcome {
@@ -67,7 +75,7 @@ impl CompactionEngine {
         workspace: &Path,
         obs: &dyn AgentObserver,
         trigger_tier: Option<ContextPressureTier>,
-    ) -> Result<()> {
+    ) -> Result<BackgroundStart> {
         let covered = messages[plan.start..plan.end].to_vec();
         let covered_messages = covered.len();
         let original_tokens = context_tokens(&covered);
@@ -93,49 +101,66 @@ impl CompactionEngine {
         } else {
             None
         };
+        // A portable worker only runs for a model-backed summarizer kind. An
+        // Excerpts kind never spawns a worker even when a factory is installed;
+        // relief comes from the deterministic backstop instead.
+        let portable_factory =
+            if native_factory.is_none() && self.summarizer != SummarizerKind::Excerpts {
+                self.summarizer_factory.clone()
+            } else {
+                None
+            };
+        // `has_model_worker()` trusts the native factory's presence, not its live
+        // capability, so it can race this probe: neither a usable native
+        // capability nor a portable summarizer may exist here. Report "no
+        // worker" so the caller degrades to the deterministic backstop instead
+        // of panicking.
+        let spawn = match (native_factory, portable_factory) {
+            (Some(factory), _) => WorkerSpawn::Native(factory),
+            (None, Some(factory)) => WorkerSpawn::Portable(factory),
+            (None, None) => return Ok(BackgroundStart::NoWorker),
+        };
+        let origin = match &spawn {
+            WorkerSpawn::Native(_) => CompactionOrigin::ProviderNative,
+            WorkerSpawn::Portable(_) => match self.summarizer {
+                SummarizerKind::Subagent => CompactionOrigin::Subagent,
+                SummarizerKind::Provider => CompactionOrigin::Provider,
+                SummarizerKind::Excerpts => CompactionOrigin::Excerpts,
+            },
+        };
         let job_id = format!("compaction_{:08x}", self.next_job_seq);
         self.next_job_seq = self.next_job_seq.saturating_add(1);
         let token = CancellationToken::new();
         let worker_token = token.clone();
         let worker = self.worker.clone();
-        let origin = if native_factory.is_some() {
-            CompactionOrigin::ProviderNative
-        } else {
-            match self.summarizer {
-                SummarizerKind::Subagent => CompactionOrigin::Subagent,
-                SummarizerKind::Provider => CompactionOrigin::Provider,
-                SummarizerKind::Excerpts => CompactionOrigin::Excerpts,
-            }
-        };
         let (tx, receiver) = mpsc::channel();
-        if let Some(factory) = native_factory {
-            thread::Builder::new()
-                .name(format!("iris-{job_id}"))
-                .spawn(move || {
-                    let result = run_provider_native_worker(factory, covered, worker, worker_token);
-                    let _ = tx.send(result);
-                })?;
-        } else {
-            let factory = self
-                .summarizer_factory
-                .as_ref()
-                .expect("caller checks portable or native factory")
-                .clone();
-            let workspace_for_worker = workspace.to_path_buf();
-            let mode = self.summarizer;
-            thread::Builder::new()
-                .name(format!("iris-{job_id}"))
-                .spawn(move || {
-                    let result = run_compaction_worker(
-                        factory,
-                        workspace_for_worker,
-                        covered,
-                        worker,
-                        mode,
-                        worker_token,
-                    );
-                    let _ = tx.send(result);
-                })?;
+        match spawn {
+            WorkerSpawn::Native(factory) => {
+                thread::Builder::new()
+                    .name(format!("iris-{job_id}"))
+                    .spawn(move || {
+                        let result =
+                            run_provider_native_worker(factory, covered, worker, worker_token);
+                        let _ = tx.send(result);
+                    })?;
+            }
+            WorkerSpawn::Portable(factory) => {
+                let workspace_for_worker = workspace.to_path_buf();
+                let mode = self.summarizer;
+                thread::Builder::new()
+                    .name(format!("iris-{job_id}"))
+                    .spawn(move || {
+                        let result = run_compaction_worker(
+                            factory,
+                            workspace_for_worker,
+                            covered,
+                            worker,
+                            mode,
+                            worker_token,
+                        );
+                        let _ = tx.send(result);
+                    })?;
+            }
         }
         let job = BackgroundCompaction {
             job_id,
@@ -161,7 +186,7 @@ impl CompactionEngine {
             )),
         )?;
         self.background = Some(job);
-        Ok(())
+        Ok(BackgroundStart::Started)
     }
 
     pub(super) fn drain_background_at_boundary(
@@ -277,7 +302,7 @@ impl CompactionEngine {
                     CompactionLifecycleState::Cancelled,
                     None,
                     Some(format!(
-                        "subagent summary exceeded the {} ms hard wait; escalating fallback",
+                        "background compaction summary exceeded the {} ms hard wait; escalating fallback",
                         self.hard_wait.as_millis()
                     )),
                 )?;
@@ -410,7 +435,17 @@ impl CompactionEngine {
         // the lossy deterministic-excerpts terminal rung. Blocking is accepted
         // here because this path only runs at hard pressure; the wait is bounded
         // and cancellable through the turn token.
-        if let Some(token) = native {
+        //
+        // Only portable-origin failures (Subagent/Provider) escalate to the
+        // native rung. A job that was ALREADY ProviderNative origin and failed,
+        // timed out, or did not shrink must not fire a second identical
+        // provider-native request; it drops straight to the excerpts rung.
+        if let Some(token) = native
+            && matches!(
+                job.origin,
+                CompactionOrigin::Subagent | CompactionOrigin::Provider
+            )
+        {
             match self.try_provider_native_fallback(job, messages, cx, token)? {
                 NativeFallbackOutcome::Applied(replacement) => return Ok(Some(replacement)),
                 NativeFallbackOutcome::Cancelled => return Ok(None),
