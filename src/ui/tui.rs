@@ -4362,8 +4362,6 @@ mod tests {
         }));
         screen.apply(UiEvent::SessionStarted);
         screen.show_start_page(0, true);
-        // Settle the power-on lamp test; this test pins the settled page.
-        screen.start_page.as_mut().expect("start page").skip_boot();
 
         let height = 24u16;
         let lines = rendered_lines(&mut screen, 80, height);
