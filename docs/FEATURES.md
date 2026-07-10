@@ -247,7 +247,8 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 
 - **Context token estimates and budget trigger** — session entries persist
   conservative token estimates, reopened sessions report rebuilt context tokens,
-  and `contextTokenBudget` triggers turn-boundary auto-compaction. [Implemented]
+  and `contextTokenBudget` clamps auto-compaction at turn edges and continuing
+  provider-round-trip boundaries. [Implemented]
 - **Token budget planner** — allocates context across system prompt, tools,
   history, files, summaries, and current task. [Planned]
 - **Context ledger** — records why each context item is included and supports
@@ -294,11 +295,13 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   message-id ranges with summary messages during read/resume rebuild. [Implemented]
 - **Auto-compaction** — Mimir resolves the selected model's effective window;
   Wayland combines provider usage with estimates for unseen messages and applies
-  a configurable warn/start/hard ladder at safe turn boundaries. Hard pressure
-  bounds worker wait and falls back to deterministic excerpts. An explicit
-  `contextTokenBudget` clamps the resolved window. Tool-call/result pairs remain
-  indivisible. Mid-turn governance and branch-aware compaction are planned.
-  (ADR-0054) [Partial]
+  a configurable warn/start/hard ladder before, during, and after turns. Between
+  provider round trips, Nexus consults a provider-neutral governor only after
+  complete tool-call/result groups and before steering injection. Ready workers
+  apply without waiting; hard pressure bounds worker wait and falls back to
+  deterministic excerpts. An explicit `contextTokenBudget` clamps the resolved
+  window. Active worker ranges freeze overlapping folds. Branch-aware
+  compaction remains planned. (ADR-0054, ADR-0055) [Partial]
 - **Background summaries** — the default `compactionSummarizer: subagent` uses
   a read-only worker and falls back through a direct provider request to
   deterministic bounded excerpts. The parent alone validates, persists, and

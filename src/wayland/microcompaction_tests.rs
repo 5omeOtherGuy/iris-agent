@@ -9,17 +9,18 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::Harness;
+use super::{BackgroundCompaction, Harness};
 use crate::config::{CompactionCacheTiming, Settings};
 use crate::nexus::{
-    Agent, AgentEvent, AgentObserver, ChatProvider, FoldTrigger, Message, ProviderStream,
-    SessionSpanReader, ToolCall, Tools,
+    Agent, AgentEvent, AgentObserver, ChatProvider, CompactionOrigin, FoldTrigger, Message,
+    ProviderStream, SessionSpanReader, ToolCall, Tools,
 };
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::{ToolState, built_in_tools, recall};
@@ -208,6 +209,87 @@ fn set_timing(
     policy.cache_timing = timing;
     policy.trigger_tokens = trigger_tokens;
     harness.set_tool_result_compaction(policy);
+}
+
+#[test]
+fn active_background_range_freezes_inside_folds_but_outside_folds_flush() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).unwrap();
+    let mut ids = Vec::new();
+    for (index, body) in ["old one", "old two", "current three"]
+        .into_iter()
+        .enumerate()
+    {
+        let call = format!("c{}", index + 1);
+        for message in [
+            Message::user("read a.rs"),
+            read_call(&call, "a.rs"),
+            ok_read(&call, "a.rs", body),
+            Message::assistant("ok"),
+        ] {
+            ids.push(log.append(&message).unwrap());
+        }
+    }
+    let path = log.path().to_path_buf();
+    let session_id = log.id().to_string();
+    drop(log);
+
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .unwrap();
+    let stored = store.open(&meta).unwrap();
+    let session = SessionLog::resume(&path).unwrap();
+    let agent = Agent::resumed(SilentProvider, built_in_tools(), stored.messages);
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(session),
+        stored.entry_ids,
+        None,
+    );
+    let mut policy = Settings {
+        microcompaction: Some(true),
+        ..Settings::default()
+    }
+    .tool_result_compaction()
+    .unwrap();
+    policy.cache_timing = CompactionCacheTiming::Immediate;
+    policy.semantic_dedupe.protect_recent_tokens = 0;
+    policy.semantic_dedupe.protect_recent_tool_results = 0;
+    policy.semantic_dedupe.retain_per_path = 1;
+    harness.set_tool_result_compaction(policy);
+
+    let (_sender, receiver) = mpsc::channel();
+    harness.compaction.background = Some(BackgroundCompaction {
+        job_id: "compaction_freeze".to_string(),
+        session_id: Some(session_id),
+        from_id: ids[0].clone(),
+        to_id: ids[3].clone(),
+        covered_messages: 4,
+        original_tokens: 10,
+        receiver,
+        token: CancellationToken::new(),
+        origin: CompactionOrigin::Subagent,
+    });
+
+    let pending = harness.pending_folds();
+    assert_eq!(pending.len(), 1, "the c1 result is frozen under the job");
+    assert_eq!(pending[0].tool_call_id, "c2", "outside fold stays eligible");
+    assert_eq!(harness.maybe_microcompact(&NullObserver).unwrap(), 1);
+    assert_eq!(fold_count(&path), 1, "only the outside fold is durable");
+
+    harness.compaction.cancel_background();
+    let released = harness.pending_folds();
+    assert_eq!(released.len(), 1, "the frozen fold releases with the slot");
+    assert_eq!(released[0].tool_call_id, "c1");
+    assert_eq!(harness.maybe_microcompact(&NullObserver).unwrap(), 1);
+    assert_eq!(fold_count(&path), 2);
 }
 
 #[test]

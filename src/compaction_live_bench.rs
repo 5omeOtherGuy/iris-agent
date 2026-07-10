@@ -350,7 +350,8 @@ fn live_loop_enabled(test_name: &str) -> bool {
 
 /// Repeated live auto-compaction protocol. Every row is one scripted session;
 /// errors are printed verbatim and excluded rather than converted into made-up
-/// metrics. G1 remains `baseline-n/a` until slice 3 installs mid-turn governance.
+/// metrics. G1 measures compaction-event-to-next-provider-start gaps inside a
+/// continuing turn, excluding boundaries whose current pressure tier is hard.
 fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     println!(
@@ -370,6 +371,7 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
         match result {
             Ok(row) => {
                 let pass = row.compactions >= 2
+                    && row.g1_non_blocking
                     && row.context_effective
                     && row.needle_answered
                     && row.recall_marker
@@ -379,8 +381,10 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
                     && row.real_read;
                 if !pass {
                     gate_failures.push(format!(
-                        "session {session:02}: compactions={} G2={} G3={}/{}/{} G4={} G5={} read={}",
+                        "session {session:02}: compactions={} G1={:.1}ms/{} G2={} G3={}/{}/{} G4={} G5={} read={}",
                         row.compactions,
+                        row.g1_blocked_ms,
+                        row.g1_non_blocking,
                         row.context_effective,
                         row.needle_answered,
                         row.recall_marker,
@@ -391,9 +395,11 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
                     ));
                 }
                 println!(
-                    "{} | {session:02} | {} | baseline-n/a | {}/{}/{} | {}/{}/{} | {} | {} | {} | {}",
+                    "{} | {session:02} | {} | {:.1}ms/{} | {}/{}/{} | {}/{}/{} | {} | {} | {} | {}",
                     lane.label(),
                     row.compactions,
+                    row.g1_blocked_ms,
+                    row.g1_non_blocking,
                     row.max_context_after_apply,
                     row.start_threshold,
                     row.context_effective,
@@ -409,7 +415,7 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
             Err(error) => {
                 exclusions += 1;
                 println!(
-                    "{} | {session:02} | excluded | baseline-n/a | -/- | -/-/- | - | - | - | {error:#}",
+                    "{} | {session:02} | excluded | -/- | -/- | -/-/- | - | - | - | {error:#}",
                     lane.label()
                 );
             }
@@ -425,6 +431,8 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
 
 struct AutoLiveRow {
     compactions: usize,
+    g1_blocked_ms: f64,
+    g1_non_blocking: bool,
     max_context_after_apply: u64,
     start_threshold: u64,
     context_effective: bool,
@@ -573,6 +581,8 @@ fn run_auto_compaction_live_session(
             .any(|(started, ended)| started <= at && at <= ended)
     });
     let max_context_after_apply = applies.iter().map(|(_, tokens)| *tokens).max().unwrap_or(0);
+    let g1_blocked_ms = max_non_hard_compaction_block_ms(&events, &turn_timeline);
+    let g1_non_blocking = g1_blocked_ms < 200.0;
     let context_effective = !applies.is_empty()
         && applies
             .iter()
@@ -629,6 +639,8 @@ fn run_auto_compaction_live_session(
     });
     Ok(AutoLiveRow {
         compactions: applies.len(),
+        g1_blocked_ms,
+        g1_non_blocking,
         max_context_after_apply,
         start_threshold: AUTO_LIVE_BUDGET * 65 / 100,
         context_effective,
@@ -640,6 +652,103 @@ fn run_auto_compaction_live_session(
         real_read,
         metadata_detail,
     })
+}
+
+fn max_non_hard_compaction_block_ms(
+    events: &[TimedEvent],
+    turn_timeline: &[(Instant, Instant)],
+) -> f64 {
+    let mut pressure = ContextPressureTier::Normal;
+    let mut worst = 0.0f64;
+    for (index, timed) in events.iter().enumerate() {
+        if let AgentEvent::ContextPressure { tier, .. } = &timed.event {
+            pressure = *tier;
+            continue;
+        }
+        let compaction_event = matches!(timed.event, AgentEvent::CompactionApplied { .. })
+            || matches!(timed.event, AgentEvent::CompactionLifecycle { .. });
+        if !compaction_event || pressure == ContextPressureTier::Hard {
+            continue;
+        }
+        let Some((_, turn_end)) = turn_timeline
+            .iter()
+            .find(|(turn_start, turn_end)| *turn_start <= timed.at && timed.at <= *turn_end)
+        else {
+            continue;
+        };
+        let Some(next_request) = events[index + 1..].iter().find(|candidate| {
+            candidate.at <= *turn_end
+                && matches!(candidate.event, AgentEvent::ProviderTurnStarted { .. })
+        }) else {
+            // Post-turn lifecycle events do not block a continuing main loop.
+            continue;
+        };
+        worst = worst.max(next_request.at.duration_since(timed.at).as_secs_f64() * 1_000.0);
+    }
+    worst
+}
+
+#[test]
+fn g1_timing_counts_continuing_non_hard_gaps_and_excludes_hard_tier() {
+    let base = Instant::now();
+    let events = vec![
+        TimedEvent {
+            at: base,
+            event: AgentEvent::ContextPressure {
+                tier: ContextPressureTier::Start,
+                measured: 70,
+                effective_window: 100,
+                source: ContextMeasurementSource::Estimated,
+            },
+        },
+        TimedEvent {
+            at: base + std::time::Duration::from_millis(1),
+            event: AgentEvent::CompactionLifecycle {
+                job_id: "job".to_string(),
+                state: CompactionLifecycleState::Running,
+                covered_messages: 2,
+                original_tokens_estimate: 50,
+                origin: CompactionOrigin::Subagent,
+                worker_usage: None,
+                message: None,
+            },
+        },
+        TimedEvent {
+            at: base + std::time::Duration::from_millis(51),
+            event: AgentEvent::ProviderTurnStarted {
+                turn_id: "turn_1".to_string(),
+            },
+        },
+        TimedEvent {
+            at: base + std::time::Duration::from_millis(60),
+            event: AgentEvent::ContextPressure {
+                tier: ContextPressureTier::Hard,
+                measured: 90,
+                effective_window: 100,
+                source: ContextMeasurementSource::Estimated,
+            },
+        },
+        TimedEvent {
+            at: base + std::time::Duration::from_millis(61),
+            event: AgentEvent::CompactionLifecycle {
+                job_id: "job".to_string(),
+                state: CompactionLifecycleState::Cancelled,
+                covered_messages: 2,
+                original_tokens_estimate: 50,
+                origin: CompactionOrigin::Subagent,
+                worker_usage: None,
+                message: None,
+            },
+        },
+        TimedEvent {
+            at: base + std::time::Duration::from_millis(561),
+            event: AgentEvent::ProviderTurnStarted {
+                turn_id: "turn_2".to_string(),
+            },
+        },
+    ];
+    let timelines = [(base, base + std::time::Duration::from_secs(1))];
+    assert_eq!(max_non_hard_compaction_block_ms(&events, &timelines), 50.0);
 }
 
 #[test]

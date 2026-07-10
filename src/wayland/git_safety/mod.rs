@@ -531,6 +531,25 @@ impl GitSafety {
         max_paths: usize,
     ) -> Option<(Option<String>, Vec<String>)> {
         self.sync_barrier();
+        self.active_task_compaction_state_after_sync(max_paths)
+    }
+
+    /// Compaction carry sampled while the model's turn is still executing.
+    /// Join tool attribution so the carry is current, but do not classify a
+    /// clean tree as externally settled: a model-issued commit is still inside
+    /// Iris until the harness records its execution boundary after the turn.
+    pub(crate) fn active_task_compaction_state_during_iris(
+        &self,
+        max_paths: usize,
+    ) -> Option<(Option<String>, Vec<String>)> {
+        self.join_attribution_scan();
+        self.active_task_compaction_state_after_sync(max_paths)
+    }
+
+    fn active_task_compaction_state_after_sync(
+        &self,
+        max_paths: usize,
+    ) -> Option<(Option<String>, Vec<String>)> {
         let state = self.state.lock().unwrap();
         let task = state.task.as_ref()?;
         if !task.durable {
