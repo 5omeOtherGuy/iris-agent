@@ -3008,9 +3008,9 @@ mod tests {
 
     #[test]
     fn pane_chrome_shows_the_review_posture_while_awaiting_approval() {
-        // Golden frame (review-posture spec §5.7): composer + statusline in the
-        // waiting state — the `▲ REVIEW` swap and the decision-echo placeholder,
-        // all keyed on `awaiting_approval`.
+        // Golden frame (review-posture spec, criterion 7): composer + statusline
+        // in the waiting state — the `▲ REVIEW` swap and the decision-echo
+        // placeholder, all keyed on `awaiting_approval`.
         let mut screen = Screen::new();
         screen.set_footer(
             "sonnet 3.5".to_string(),

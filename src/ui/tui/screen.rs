@@ -1347,19 +1347,30 @@ impl Screen {
     /// approves. A placeholder shows only on an empty buffer, so a queued
     /// steering message is never overwritten; the product prompt returns on any
     /// resolution.
-    fn composer_placeholder(&self) -> String {
+    fn composer_placeholder(&self, width: usize) -> String {
         if !self.awaiting_approval {
             return PLACEHOLDER_PROMPT.to_string();
         }
         let sep = format!(" {} ", crate::ui::symbols::SEP);
         let mut echo = String::from("review waiting");
-        for field in review_footer_extras(
+        for (idx, field) in review_footer_extras(
             self.review_offer.allow_always,
             self.review_offer.allow_project,
             self.review_offer.dirty_gate,
-        ) {
-            echo.push_str(&sep);
-            echo.push_str(&field.plain);
+        )
+        .iter()
+        .enumerate()
+        {
+            let candidate = format!("{echo}{sep}{}", field.plain);
+            // Hints drop WHOLE `┊`-fields at width, never partial: an optional
+            // field (`a …` / `p …`) that would overrun is dropped along with
+            // everything after it. The base affordance (`y approve ┊ n deny`,
+            // the first two fields) is the floor and always included — it can
+            // itself clip only at absurd widths.
+            if idx >= 2 && display_width(&candidate) > width {
+                break;
+            }
+            echo = candidate;
         }
         echo
     }
@@ -2893,8 +2904,10 @@ pub(super) fn render_editor_chrome(
     let mut cursor_cell: Option<(u16, u16)> = None;
     // Repurpose the placeholder as the review decision echo while a gated tool
     // waits (§8.5). A placeholder paints only on an empty buffer, so a queued
-    // steering message is never overwritten.
-    let placeholder = screen.composer_placeholder();
+    // steering message is never overwritten. Fitted to the text measure (minus
+    // the cursor cell the widget paints before it) so the echo drops whole
+    // fields rather than shearing mid-field.
+    let placeholder = screen.composer_placeholder(usize::from(text_area.width).saturating_sub(1));
     screen.editor.set_placeholder_text(placeholder);
     (&screen.editor).render(text_area, &mut buf);
     if screen.composer_focused() {
@@ -3127,7 +3140,7 @@ mod tests {
         let status = composer_statusline(screen, 80)
             .map(|l| line_text(&l))
             .expect("statusline");
-        let placeholder = screen.composer_placeholder();
+        let placeholder = screen.composer_placeholder(200);
         let (top, rule) = composer_frame_styles(screen);
         if active {
             assert!(
@@ -3207,12 +3220,12 @@ mod tests {
         // from the SAME affordance the block footer offers — `a`/`p` appear only
         // when the loop offered them.
         let mut screen = footer_screen("~/repo");
-        assert_eq!(screen.composer_placeholder(), "Give Iris a task...");
+        assert_eq!(screen.composer_placeholder(200), "Give Iris a task...");
 
         // {y, n}: base offer only.
         screen.show_approval(false, false, false);
         assert_eq!(
-            screen.composer_placeholder(),
+            screen.composer_placeholder(200),
             "review waiting \u{250a} y approve \u{250a} n deny"
         );
 
@@ -3220,7 +3233,7 @@ mod tests {
         screen.clear_approval(false);
         screen.show_approval(true, true, false);
         assert_eq!(
-            screen.composer_placeholder(),
+            screen.composer_placeholder(200),
             "review waiting \u{250a} y approve \u{250a} n deny \u{250a} a always \u{250a} p project"
         );
 
@@ -3228,7 +3241,7 @@ mod tests {
         screen.clear_approval(false);
         screen.show_approval(true, false, false);
         assert_eq!(
-            screen.composer_placeholder(),
+            screen.composer_placeholder(200),
             "review waiting \u{250a} y approve \u{250a} n deny \u{250a} a always"
         );
 
@@ -3239,19 +3252,56 @@ mod tests {
         screen.clear_approval(false);
         screen.show_approval(true, true, true);
         assert_eq!(
-            screen.composer_placeholder(),
+            screen.composer_placeholder(200),
             format!(
                 "review waiting \u{250a} y approve \u{250a} n deny \u{250a} a {} \u{250a} p project",
                 crate::tool_display::APPROVAL_ALL_DIRTY_LABEL
             )
         );
         assert!(
-            !screen.composer_placeholder().contains("a always"),
+            !screen.composer_placeholder(200).contains("a always"),
             "the plain `always` label must not appear on a dirty gate"
         );
 
         screen.clear_approval(false);
-        assert_eq!(screen.composer_placeholder(), "Give Iris a task...");
+        assert_eq!(screen.composer_placeholder(200), "Give Iris a task...");
+    }
+
+    #[test]
+    fn review_echo_drops_whole_fields_at_narrow_widths() {
+        // House rule: hints drop WHOLE `┊`-fields at width, never partial. At
+        // width 80 the dirty {y,n,a,p} echo overruns the composer measure, so
+        // trailing fields drop whole (`p project` goes; the long dirty `a`
+        // field stays complete) — never a mid-field shear.
+        let mut screen = footer_screen("~/repo");
+        screen.show_approval(true, true, true);
+        let narrow = super::render_editor_chrome(&mut screen, 80, 12)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dirty_field = format!("a {}", crate::tool_display::APPROVAL_ALL_DIRTY_LABEL);
+        assert!(narrow.contains(&dirty_field), "{narrow:?}");
+        assert!(
+            !narrow.contains("\u{250a} p"),
+            "the overrunning field drops whole, never sheared: {narrow:?}"
+        );
+
+        // A width that fits shows every offered field.
+        let wide = super::render_editor_chrome(&mut screen, 120, 12)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wide.contains(&dirty_field), "{wide:?}");
+        assert!(wide.contains("\u{250a} p project"), "{wide:?}");
+
+        // The floor never drops: even at an absurd width the base affordance
+        // fields are still offered (they may clip, but are never omitted).
+        assert!(
+            screen.composer_placeholder(10).contains("y approve"),
+            "the base affordance is the floor"
+        );
     }
 
     #[test]
