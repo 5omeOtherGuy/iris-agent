@@ -245,7 +245,7 @@ impl OpenAiCompatibleChatProvider {
             };
         }
         let retry_after = retry_after_hint(response.headers());
-        let _ = response.text();
+        let body = response.text().unwrap_or_default();
         if matches!(status.as_u16(), 401 | 403) {
             return Attempt::Fatal(
                 AuthError::for_provider(
@@ -258,7 +258,11 @@ impl OpenAiCompatibleChatProvider {
                 .into(),
             );
         }
-        let error = anyhow!("OpenAI-compatible request failed ({status})");
+        let error = super::classified_http_error(
+            status.as_u16(),
+            &body,
+            format!("OpenAI-compatible request failed ({status})"),
+        );
         match classify_http_status_retryable(status.as_u16()) {
             crate::mimir::providers::transport::HttpClass::Retry => {
                 Attempt::Retry(error, retry_after)

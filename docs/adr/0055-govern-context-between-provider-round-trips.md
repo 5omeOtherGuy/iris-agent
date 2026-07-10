@@ -45,6 +45,23 @@ contracts over one `CompactionEngine`. At a governed boundary the engine:
   used at turn edges;
 - returns the rebuilt context for Nexus to install.
 
+The same governor also exposes one provider-neutral overflow-recovery entry
+point. Nexus invokes it only for a typed context-window failure before any
+assistant output is visible. Mimir owns adapter-specific HTTP classification;
+provider names and wire shapes do not cross the Tier-1 boundary. Wayland
+recovers deterministically in this order: flush eligible folds, apply excerpts
+with the configured recent tail, then retry excerpts with a 1,000-token tail if
+the context is still hard. The parent persists every rewrite before Nexus
+installs it and resends the request.
+
+Nexus permits one recovery and resend per provider round trip. A second
+overflow, an overflow after visible output, or a recovery that cannot produce
+a pair-safe rewrite returns an honest error with the measured context/window
+and the `/compact <focus>`, `/new`, and model-switch options. Successful
+provider completion resets the guard for a later tool round trip. Automatic
+model-backed compaction is capped at two applies per user turn; later pressure
+uses deterministic excerpts.
+
 An active background job freezes folds whose durable ids fall inside its
 covered range. Folds outside the range can flush. Releasing or applying the job
 removes the freeze. This prevents the worker snapshot and fold scheduler from
@@ -81,6 +98,7 @@ rewriting different versions of the same original range.
   plan.
 - Non-hard compaction work is measurable as event-to-next-request latency; the
   live protocol requires it to stay below 200 ms per session.
+- A provider context overflow can rewrite and resend once without leaking
+  provider-specific policy into Nexus or duplicating visible assistant output.
 - The job slot remains process-local and at most one worker runs per session.
-- Reactive provider-overflow recovery and provider-native compaction remain
-  later slices.
+- Provider-native compaction remains a later slice.

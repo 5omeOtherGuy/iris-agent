@@ -586,6 +586,218 @@ fn compaction_entries(path: &Path) -> Vec<serde_json::Value> {
 }
 
 #[test]
+fn reactive_overflow_runs_deterministic_relief_and_returns_a_resend() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let seeded = seed_harness(&root.path, &workspace.path);
+    let SeededHarness {
+        mut harness, path, ..
+    } = seeded;
+    harness.set_compaction_trigger(
+        32_768,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.85,
+            keep_recent_tokens: 1_000,
+            hard_wait_ms: 10,
+            max_consecutive_failures: 3,
+            reactive: true,
+        },
+    );
+    let obs = Recorder::default();
+    let before = super::context_tokens(harness.messages());
+    let messages = harness.messages().to_vec();
+
+    let recovery = harness
+        .compaction
+        .recover_overflow(
+            &messages,
+            ApplyContext {
+                workspace: &workspace.path,
+                output_store: None,
+                task_state: None,
+                observer: &obs,
+            },
+        )
+        .unwrap();
+
+    let crate::nexus::ContextOverflowRecovery::Resend {
+        messages,
+        measured,
+        effective_window,
+    } = recovery
+    else {
+        panic!("reactive overflow should produce one deterministic resend");
+    };
+    assert!(measured < before);
+    assert_eq!(measured, super::context_tokens(&messages));
+    assert_eq!(effective_window, 32_768);
+    assert_eq!(compaction_entries(&path).len(), 1);
+}
+
+#[test]
+fn reactive_off_surfaces_overflow_without_mutating_context() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let seeded = seed_harness(&root.path, &workspace.path);
+    let SeededHarness {
+        mut harness, path, ..
+    } = seeded;
+    harness.set_compaction_trigger(
+        32_768,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.85,
+            keep_recent_tokens: 1_000,
+            hard_wait_ms: 10,
+            max_consecutive_failures: 3,
+            reactive: false,
+        },
+    );
+    let obs = Recorder::default();
+    let messages = harness.messages().to_vec();
+
+    let recovery = harness
+        .compaction
+        .recover_overflow(
+            &messages,
+            ApplyContext {
+                workspace: &workspace.path,
+                output_store: None,
+                task_state: None,
+                observer: &obs,
+            },
+        )
+        .unwrap();
+
+    assert!(matches!(
+        recovery,
+        crate::nexus::ContextOverflowRecovery::Unrecoverable { .. }
+    ));
+    assert!(compaction_entries(&path).is_empty());
+}
+
+#[test]
+fn per_turn_model_compaction_cap_uses_deterministic_relief() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let seeded = seed_harness(&root.path, &workspace.path);
+    let SeededHarness {
+        mut harness,
+        path,
+        prompts,
+        ..
+    } = seeded;
+    harness.set_compaction_trigger(
+        131_072,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.85,
+            keep_recent_tokens: 1_000,
+            hard_wait_ms: 10,
+            max_consecutive_failures: 3,
+            reactive: true,
+        },
+    );
+    let ladder = harness.compaction.ladder.as_mut().unwrap();
+    ladder.warn = 100;
+    ladder.start = 200;
+    ladder.hard = 100_000;
+    ladder.deterministic_only = false;
+    harness.compaction.begin_turn();
+    harness.compaction.model_compactions_this_turn = 2;
+    let obs = Recorder::default();
+
+    block_on(harness.maybe_auto_compact(&obs, &CancellationToken::new(), true)).unwrap();
+
+    assert!(prompts.lock().unwrap().is_empty());
+    let entries = compaction_entries(&path);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["origin"], "excerpts");
+}
+
+#[test]
+fn reactive_overflow_deep_cuts_when_the_retained_tail_stays_hard() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut log = SessionLog::create_in(&root.path, &workspace.path).unwrap();
+    for message in [
+        Message::user(&"old prefix ".repeat(1_000)),
+        Message::assistant("old answer"),
+        Message::user(&"oversized retained tail ".repeat(300)),
+        Message::assistant("tail answer"),
+        Message::user("recent"),
+        Message::assistant("recent answer"),
+    ] {
+        log.append(&message).unwrap();
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .unwrap();
+    let stored = store.open(&meta).unwrap();
+    let log = SessionLog::resume(&path).unwrap();
+    let agent = Agent::resumed(SilentProvider, built_in_tools(), stored.messages);
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        stored.entry_ids,
+        Some(32_768),
+    );
+    harness.set_compaction_trigger(
+        32_768,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.85,
+            keep_recent_tokens: 3_000,
+            hard_wait_ms: 10,
+            max_consecutive_failures: 3,
+            reactive: true,
+        },
+    );
+    harness.compaction.ladder.as_mut().unwrap().hard = 1;
+    let messages = harness.messages().to_vec();
+
+    let recovery = harness
+        .compaction
+        .recover_overflow(
+            &messages,
+            ApplyContext {
+                workspace: &workspace.path,
+                output_store: None,
+                task_state: None,
+                observer: &Recorder::default(),
+            },
+        )
+        .unwrap();
+
+    assert!(matches!(
+        recovery,
+        crate::nexus::ContextOverflowRecovery::Resend { .. }
+    ));
+    assert_eq!(
+        compaction_entries(&path).len(),
+        2,
+        "the second excerpts entry is the 1,000-token deep cut"
+    );
+}
+
+#[test]
 fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
     let root = temp_dir();
     let workspace = temp_dir();
@@ -729,6 +941,7 @@ fn ready_summary_applies_mid_turn_before_queued_steering_is_injected_verbatim() 
             keep_recent_tokens: 1_000,
             hard_wait_ms: 10,
             max_consecutive_failures: 3,
+            reactive: true,
         },
     );
     let ladder = harness.compaction.ladder.as_mut().unwrap();
@@ -1132,6 +1345,7 @@ fn hard_tier_bounds_wait_then_cancels_and_applies_deterministic_fallback() {
             keep_recent_tokens: 20_000,
             hard_wait_ms: 0,
             max_consecutive_failures: 3,
+            reactive: true,
         },
     );
 
@@ -1192,6 +1406,7 @@ fn turn_cancellation_preempts_the_governor_hard_wait_without_applying() {
             keep_recent_tokens: 20_000,
             hard_wait_ms: 5_000,
             max_consecutive_failures: 3,
+            reactive: true,
         },
     );
 
@@ -1251,6 +1466,7 @@ fn v2_off_switch_leaves_automatic_rewrites_disabled() {
             keep_recent_tokens: 20_000,
             hard_wait_ms: 0,
             max_consecutive_failures: 3,
+            reactive: true,
         },
     );
     let obs = Recorder::default();
@@ -1279,6 +1495,7 @@ fn breaker_disables_model_jobs_but_keeps_deterministic_compaction() {
             keep_recent_tokens: 20_000,
             hard_wait_ms: 0,
             max_consecutive_failures: 3,
+            reactive: true,
         },
     );
     let ladder = seeded.harness.compaction.ladder.as_mut().unwrap();

@@ -670,6 +670,8 @@ pub(crate) type ApprovalFuture<'a> = Pin<Box<dyn Future<Output = Result<Approval
 /// only the bounded hard-tier wait may keep this future pending.
 pub(crate) type ContextGovernorFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ContextDirective>> + 'a>>;
+pub(crate) type ContextOverflowFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ContextOverflowRecovery>> + 'a>>;
 
 /// Fire-and-forget observer for semantic events and provider-round-trip commit
 /// boundaries. The default boundary hook is inert; Wayland uses it to persist
@@ -791,11 +793,39 @@ pub(crate) enum ContextDirective {
     Replace { messages: Vec<Message> },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ContextOverflowRecovery {
+    Resend {
+        messages: Vec<Message>,
+        measured: u64,
+        effective_window: u64,
+    },
+    Unrecoverable {
+        measured: u64,
+        effective_window: u64,
+    },
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ReactiveOverflowState {
+    attempted: bool,
+    measurement: Option<(u64, u64)>,
+}
+
 /// Host-supplied context policy consulted only when another provider request
 /// will follow. Object-safe like [`ApprovalGate`]; Nexus knows no budgets,
 /// sessions, summaries, or provider-specific compaction behavior.
 pub(crate) trait ContextGovernor {
     fn at_boundary<'a>(&'a self, cx: BoundaryContext<'a>) -> ContextGovernorFuture<'a>;
+
+    fn on_context_overflow<'a>(&'a self, _cx: BoundaryContext<'a>) -> ContextOverflowFuture<'a> {
+        Box::pin(async {
+            Ok(ContextOverflowRecovery::Unrecoverable {
+                measured: 0,
+                effective_window: 0,
+            })
+        })
+    }
 }
 
 /// Per-turn host hooks that travel together through the loop. Bundling the
@@ -1749,6 +1779,7 @@ impl<P: ChatProvider> Agent<P> {
         // tool calls (or on cancellation). An optional configured soft cap
         // ends the turn gracefully after that many round-trips.
         let mut roundtrip = 0usize;
+        let mut reactive_overflow = ReactiveOverflowState::default();
         loop {
             if let Some(cap) = self.max_tool_roundtrips
                 && roundtrip >= cap
@@ -1793,6 +1824,35 @@ impl<P: ChatProvider> Agent<P> {
 
             let stream_result = match self.stream_turn(obs, token).await {
                 Ok(result) => result,
+                Err(error)
+                    if provider_error_kind(&error)
+                        == Some(ProviderErrorKind::ContextWindowExceeded) =>
+                {
+                    match self
+                        .recover_context_overflow(
+                            governor,
+                            obs,
+                            token,
+                            roundtrip,
+                            &mut reactive_overflow,
+                            &mut unanswered_start,
+                        )
+                        .await
+                    {
+                        Ok(true) => continue,
+                        Ok(false) => return Ok(()),
+                        Err(error) => {
+                            obs.on_event(AgentEvent::ProviderTurnError {
+                                turn_id: provider_turn_id.clone(),
+                                message: format!("{error:#}"),
+                            })?;
+                            if let Some(start) = unanswered_start {
+                                self.messages.truncate(start);
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
                 Err(error) => {
                     obs.on_event(AgentEvent::ProviderTurnError {
                         turn_id: provider_turn_id.clone(),
@@ -1837,6 +1897,42 @@ impl<P: ChatProvider> Agent<P> {
                     saw_delta,
                     saw_reasoning_delta,
                 } => {
+                    if turn.completion_reason == Some(CompletionReason::ContextWindowExceeded) {
+                        let had_visible_content =
+                            turn.text.as_deref().is_some_and(|text| !text.is_empty())
+                                || !turn.reasoning.is_empty()
+                                || !turn.tool_calls.is_empty()
+                                || saw_delta
+                                || saw_reasoning_delta;
+                        let recovery = if had_visible_content {
+                            Err(context_overflow_error(reactive_overflow.measurement))
+                        } else {
+                            self.recover_context_overflow(
+                                governor,
+                                obs,
+                                token,
+                                roundtrip,
+                                &mut reactive_overflow,
+                                &mut unanswered_start,
+                            )
+                            .await
+                        };
+                        match recovery {
+                            Ok(true) => continue,
+                            Ok(false) => return Ok(()),
+                            Err(error) => {
+                                obs.on_event(AgentEvent::ProviderTurnError {
+                                    turn_id: provider_turn_id.clone(),
+                                    message: format!("{error:#}"),
+                                })?;
+                                if let Some(start) = unanswered_start {
+                                    self.messages.truncate(start);
+                                }
+                                return Err(error);
+                            }
+                        }
+                    }
+                    reactive_overflow = ReactiveOverflowState::default();
                     let AssistantTurn {
                         text,
                         reasoning,
@@ -2038,6 +2134,73 @@ impl<P: ChatProvider> Agent<P> {
             }
         }
         Ok(true)
+    }
+
+    async fn recover_context_overflow(
+        &mut self,
+        governor: Option<&dyn ContextGovernor>,
+        obs: &dyn AgentObserver,
+        token: &CancellationToken,
+        round_trip: usize,
+        state: &mut ReactiveOverflowState,
+        unanswered_start: &mut Option<usize>,
+    ) -> Result<bool> {
+        if state.attempted {
+            return Err(context_overflow_error(state.measurement));
+        }
+        let Some(governor) = governor else {
+            return Err(context_overflow_error(None));
+        };
+        let last_usage = self
+            .last_provider_usage
+            .as_ref()
+            .map(|(usage, message_count)| ProviderUsageAnchor {
+                usage,
+                message_count: *message_count,
+            });
+        let cx = BoundaryContext {
+            messages: &self.messages,
+            last_usage,
+            round_trip,
+            turn_continues: true,
+        };
+        let recovery = tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                self.emit_interrupted(obs)?;
+                return Ok(false);
+            }
+            result = governor.on_context_overflow(cx) => result,
+        };
+        match recovery {
+            Ok(ContextOverflowRecovery::Resend {
+                messages,
+                measured,
+                effective_window,
+            }) => {
+                self.replace_messages(messages);
+                if unanswered_start.is_some() {
+                    *unanswered_start = self
+                        .messages
+                        .iter()
+                        .rposition(|message| message.role == Role::User);
+                }
+                state.attempted = true;
+                state.measurement = Some((measured, effective_window));
+                Ok(true)
+            }
+            Ok(ContextOverflowRecovery::Unrecoverable {
+                measured,
+                effective_window,
+            }) => Err(context_overflow_error(Some((measured, effective_window)))),
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "reactive context recovery failed"
+                );
+                Err(context_overflow_error(None))
+            }
+        }
     }
 
     /// Inject the host-queued user messages drained at one injection point
@@ -2991,6 +3154,44 @@ pub(crate) enum CompletionReason {
     Other,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderErrorKind {
+    ContextWindowExceeded,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProviderFailure {
+    kind: ProviderErrorKind,
+    diagnostic: String,
+}
+
+impl ProviderFailure {
+    pub(crate) fn new(kind: ProviderErrorKind, diagnostic: impl Into<String>) -> Self {
+        Self {
+            kind,
+            diagnostic: diagnostic.into(),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> ProviderErrorKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for ProviderFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.diagnostic)
+    }
+}
+
+impl std::error::Error for ProviderFailure {}
+
+pub(crate) fn provider_error_kind(error: &anyhow::Error) -> Option<ProviderErrorKind> {
+    error
+        .downcast_ref::<ProviderFailure>()
+        .map(ProviderFailure::kind)
+}
+
 /// Provider-neutral, user-facing notice for a completion reason the user should
 /// know about. Returns `None` for routine reasons that need no notice. Wording
 /// stays model-agnostic so it is correct for any provider; the runtime never
@@ -3012,6 +3213,17 @@ pub(crate) fn completion_reason_notice(
         }
         CompletionReason::Refusal if !had_visible_content => Some("The model declined to respond."),
         _ => None,
+    }
+}
+
+fn context_overflow_error(measurement: Option<(u64, u64)>) -> anyhow::Error {
+    match measurement {
+        Some((measured, effective_window)) if effective_window > 0 => anyhow::anyhow!(
+            "provider rejected context after bounded reactive recovery: measured ~{measured} tokens against a {effective_window}-token window; try `/compact <focus>`, `/new`, or switch model"
+        ),
+        _ => anyhow::anyhow!(
+            "provider rejected context and deterministic recovery could not make it fit; try `/compact <focus>`, `/new`, or switch model"
+        ),
     }
 }
 

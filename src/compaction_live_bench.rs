@@ -34,6 +34,7 @@ use crate::tools::{ToolState, built_in_tools};
 use crate::wayland::{Harness, SummarizerKind};
 use futures::StreamExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
@@ -67,6 +68,37 @@ struct CapturedUsage {
 struct RecordingProvider<P: ChatProvider> {
     inner: P,
     usages: Arc<Mutex<Vec<CapturedUsage>>>,
+}
+
+struct InducedOverflowProvider {
+    inner: Box<dyn ChatProvider>,
+    inject_next: AtomicBool,
+    forwarded: Arc<AtomicUsize>,
+}
+
+impl ChatProvider for InducedOverflowProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        messages: &'a [Message],
+        tools: &'a Tools,
+        cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        if self.inject_next.swap(false, Ordering::SeqCst) {
+            let turn = AssistantTurn {
+                completion_reason: Some(CompletionReason::ContextWindowExceeded),
+                ..AssistantTurn::default()
+            };
+            return Ok(Box::pin(futures::stream::once(async move {
+                Ok(ProviderEvent::Completed(turn))
+            })));
+        }
+        self.forwarded.fetch_add(1, Ordering::SeqCst);
+        self.inner.respond_stream(messages, tools, cancel)
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
 }
 
 impl<P: ChatProvider> ChatProvider for RecordingProvider<P> {
@@ -493,6 +525,7 @@ fn run_auto_compaction_live_session(
             keep_recent_tokens: 20_000,
             hard_wait_ms: 10_000,
             max_consecutive_failures: 3,
+            reactive: true,
         },
     );
     harness.set_summarizer(SummarizerKind::Subagent);
@@ -710,6 +743,108 @@ fn max_non_hard_compaction_block_ms(
     worst
 }
 
+fn reactive_overflow_live(lane: LiveLoopLane) -> Result<()> {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = TempDir::new("reactive-overflow");
+    let mut log = SessionLog::create_in(&root.path, &workspace)?;
+    for message in auto_live_seed(0xfe, &workspace)? {
+        log.append(&message)?;
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()?
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .ok_or_else(|| anyhow::anyhow!("reactive seed session was not listed"))?;
+    let stored = store.open(&meta)?;
+    let entry_ids = stored.entry_ids.clone();
+    let log = SessionLog::resume(&path)?;
+    let forwarded = Arc::new(AtomicUsize::new(0));
+    let provider = InducedOverflowProvider {
+        inner: lane.build_provider("iris-reactive-overflow-parent")?,
+        inject_next: AtomicBool::new(true),
+        forwarded: forwarded.clone(),
+    };
+    let agent = Agent::resumed(provider, built_in_tools().into_read_only(), stored.messages);
+    let window = 131_072;
+    let mut harness = Harness::resumed(
+        agent,
+        workspace,
+        ToolState::new(),
+        Some(log),
+        entry_ids,
+        Some(window),
+    );
+    harness.set_compaction_trigger(
+        window,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.85,
+            keep_recent_tokens: 1_000,
+            hard_wait_ms: 10_000,
+            max_consecutive_failures: 3,
+            reactive: true,
+        },
+    );
+    harness.set_summarizer(SummarizerKind::Subagent);
+    harness.set_compaction_summarizer_factory(Arc::new(build_live_compaction_worker));
+
+    let observer = LiveLoopObserver::default();
+    block_on(harness.submit_turn(
+        "Use the read tool on Cargo.toml, then reply with one short sentence confirming recovery.",
+        &observer,
+        &ReadOnlyGate,
+        &CancellationToken::new(),
+    ))?;
+
+    let events = observer.events.lock().expect("reactive events lock");
+    let provider_starts = events
+        .iter()
+        .filter(|timed| matches!(timed.event, AgentEvent::ProviderTurnStarted { .. }))
+        .count();
+    let real_read = events.iter().any(
+        |timed| matches!(&timed.event, AgentEvent::ToolResult { call, .. } if call.name == "read"),
+    );
+    let applied = events.iter().any(|timed| {
+        matches!(
+            timed.event,
+            AgentEvent::CompactionApplied {
+                origin: CompactionOrigin::Excerpts,
+                ..
+            }
+        )
+    });
+    drop(events);
+    let resume_exact =
+        context_bytes(harness.messages()) == context_bytes(&store.open(&meta)?.messages);
+    let entries = compaction_json_entries(&path)?;
+    let measured = entries.iter().any(|entry| {
+        entry.get("origin").and_then(serde_json::Value::as_str) == Some("excerpts")
+            && entry
+                .get("workerUsage")
+                .is_some_and(serde_json::Value::is_null)
+    });
+    println!(
+        "REACTIVE LIVE lane={} induced=1 forwarded={} provider_starts={} applied={} resume_exact={} G5={} read={}",
+        lane.label(),
+        forwarded.load(Ordering::SeqCst),
+        provider_starts,
+        applied,
+        resume_exact,
+        measured,
+        real_read
+    );
+    assert!(forwarded.load(Ordering::SeqCst) >= 1);
+    assert!(provider_starts >= 2, "overflow must trigger one resend");
+    assert!(applied && resume_exact && measured && real_read);
+    Ok(())
+}
+
 #[test]
 fn g1_timing_counts_continuing_non_hard_gaps_and_excludes_hard_tier() {
     let base = Instant::now();
@@ -795,6 +930,27 @@ fn auto_compaction_live_loop_codex() {
         return;
     }
     auto_compaction_live_loop(LiveLoopLane::CodexMini, auto_live_session_count());
+}
+
+#[test]
+#[ignore = "live Anthropic API calls; set IRIS_BENCH_LIVE=1 to run"]
+fn auto_compaction_reactive_overflow_anthropic() -> Result<()> {
+    if !live_loop_enabled("auto_compaction_reactive_overflow_anthropic") {
+        return Ok(());
+    }
+    if !claude_code_credentials_available() {
+        anyhow::bail!("no Claude Code credentials discovered");
+    }
+    reactive_overflow_live(LiveLoopLane::AnthropicHaiku)
+}
+
+#[test]
+#[ignore = "live Codex API calls; set IRIS_BENCH_LIVE=1 to run"]
+fn auto_compaction_reactive_overflow_codex() -> Result<()> {
+    if !live_loop_enabled("auto_compaction_reactive_overflow_codex") {
+        return Ok(());
+    }
+    reactive_overflow_live(LiveLoopLane::CodexMini)
 }
 
 #[test]

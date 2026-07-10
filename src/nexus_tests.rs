@@ -937,6 +937,164 @@ struct ReplacingGovernor {
     calls: RefCell<Vec<GovernedBoundary>>,
 }
 
+struct ReactiveGovernor {
+    recoveries: Cell<usize>,
+}
+
+impl ContextGovernor for ReactiveGovernor {
+    fn at_boundary<'a>(&'a self, _cx: BoundaryContext<'a>) -> ContextGovernorFuture<'a> {
+        Box::pin(async { Ok(ContextDirective::Proceed) })
+    }
+
+    fn on_context_overflow<'a>(&'a self, _cx: BoundaryContext<'a>) -> ContextOverflowFuture<'a> {
+        self.recoveries.set(self.recoveries.get() + 1);
+        Box::pin(async {
+            Ok(ContextOverflowRecovery::Resend {
+                messages: vec![
+                    Message::user("[reactively compacted context]"),
+                    Message::assistant("compacted"),
+                ],
+                measured: 9_000,
+                effective_window: 10_000,
+            })
+        })
+    }
+}
+
+fn overflow_turn() -> AssistantTurn {
+    AssistantTurn {
+        completion_reason: Some(CompletionReason::ContextWindowExceeded),
+        ..AssistantTurn::default()
+    }
+}
+
+#[test]
+fn context_overflow_compacts_and_resends_once_without_consuming_a_round_trip() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![
+        Ok(overflow_turn()),
+        Ok(AssistantTurn::text("recovered")),
+    ]);
+    let mut agent = Agent::new(provider, Tools::new(Vec::new()));
+    let state = RefCell::new(ToolState::new());
+    let env = ToolEnv {
+        workspace: &workspace.path,
+        state: &state,
+        output_store: None,
+        session_span: None,
+        output_sink: None,
+        mutation_guard: None,
+    };
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let governor = ReactiveGovernor {
+        recoveries: Cell::new(0),
+    };
+
+    block_on(agent.submit_turn_with_governor(
+        "oversized prompt",
+        TurnContextHooks {
+            observer: &frontend,
+            governor: Some(&governor),
+        },
+        &frontend,
+        &env,
+        &CancellationToken::new(),
+        None,
+    ))?;
+
+    assert_eq!(governor.recoveries.get(), 1);
+    let seen = agent.provider.seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1][0].content, "[reactively compacted context]");
+    assert_eq!(seen[1][1].content, "compacted");
+    Ok(())
+}
+
+#[test]
+fn second_context_overflow_returns_the_honest_bounded_error() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(vec![Ok(overflow_turn()), Ok(overflow_turn())]);
+    let mut agent = Agent::new(provider, Tools::new(Vec::new()));
+    let state = RefCell::new(ToolState::new());
+    let env = ToolEnv {
+        workspace: &workspace.path,
+        state: &state,
+        output_store: None,
+        session_span: None,
+        output_sink: None,
+        mutation_guard: None,
+    };
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let governor = ReactiveGovernor {
+        recoveries: Cell::new(0),
+    };
+
+    let error = block_on(agent.submit_turn_with_governor(
+        "oversized prompt",
+        TurnContextHooks {
+            observer: &frontend,
+            governor: Some(&governor),
+        },
+        &frontend,
+        &env,
+        &CancellationToken::new(),
+        None,
+    ))
+    .unwrap_err()
+    .to_string();
+
+    assert_eq!(governor.recoveries.get(), 1);
+    assert!(error.contains("~9000 tokens"), "{error}");
+    assert!(error.contains("10000-token window"), "{error}");
+    assert!(error.contains("/compact <focus>"), "{error}");
+    assert!(error.contains("/new"), "{error}");
+    assert!(error.contains("switch model"), "{error}");
+    assert_eq!(agent.provider.seen.borrow().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn reactive_resend_guard_resets_after_a_successful_tool_round_trip() -> Result<()> {
+    let workspace = test_workspace()?;
+    fs::write(workspace.path.join("note.txt"), "reactive reset")?;
+    let provider = FakeProvider::new(vec![
+        Ok(overflow_turn()),
+        Ok(single_call_turn("read", json!({ "path": "note.txt" }))),
+        Ok(overflow_turn()),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    let state = RefCell::new(ToolState::new());
+    let env = ToolEnv {
+        workspace: &workspace.path,
+        state: &state,
+        output_store: None,
+        session_span: None,
+        output_sink: None,
+        mutation_guard: None,
+    };
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let governor = ReactiveGovernor {
+        recoveries: Cell::new(0),
+    };
+
+    block_on(agent.submit_turn_with_governor(
+        "read after recovery",
+        TurnContextHooks {
+            observer: &frontend,
+            governor: Some(&governor),
+        },
+        &frontend,
+        &env,
+        &CancellationToken::new(),
+        None,
+    ))?;
+
+    assert_eq!(governor.recoveries.get(), 2);
+    assert_eq!(agent.provider.seen.borrow().len(), 4);
+    Ok(())
+}
+
 impl ContextGovernor for ReplacingGovernor {
     fn at_boundary<'a>(&'a self, cx: BoundaryContext<'a>) -> ContextGovernorFuture<'a> {
         self.calls.borrow_mut().push(GovernedBoundary {
@@ -1779,7 +1937,7 @@ fn provider_completion_event_carries_response_id_and_usage() -> Result<()> {
 }
 
 #[test]
-fn context_window_exceeded_completion_emits_user_notice() -> Result<()> {
+fn context_window_exceeded_after_visible_output_is_not_resent() -> Result<()> {
     let workspace = test_workspace()?;
     let provider = FakeProvider::new(vec![Ok(AssistantTurn {
         text: Some("partial".to_string()),
@@ -1792,15 +1950,13 @@ fn context_window_exceeded_completion_emits_user_notice() -> Result<()> {
     let mut harness = test_harness(provider, &workspace.path, Tools::new(Vec::new()));
     let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
 
-    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+    let error =
+        block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))
+            .unwrap_err()
+            .to_string();
 
-    assert!(
-        frontend.events.borrow().iter().any(|e| matches!(
-            e,
-            AgentEvent::Notice(m) if m.contains("context-window limit")
-        )),
-        "context-window truncation should emit a user notice"
-    );
+    assert!(error.contains("/compact <focus>"), "{error}");
+    assert_eq!(harness.agent.provider.seen.borrow().len(), 1);
     Ok(())
 }
 

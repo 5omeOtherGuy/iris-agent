@@ -6,6 +6,98 @@
 use super::*;
 
 impl CompactionEngine {
+    pub(super) fn recover_overflow(
+        &mut self,
+        messages: &[Message],
+        apply_cx: ApplyContext<'_>,
+    ) -> Result<ContextOverflowRecovery> {
+        let measured_before = measure_context(messages, None, 0).tokens;
+        let effective_window = self
+            .ladder
+            .map(|ladder| ladder.effective_window)
+            .or(self.budget)
+            .unwrap_or(0);
+        if !self.reactive_enabled
+            || !self.trigger_v2
+            || !self.automatic_enabled
+            || self.session.is_none()
+        {
+            return Ok(ContextOverflowRecovery::Unrecoverable {
+                measured: measured_before,
+                effective_window,
+            });
+        }
+        let Some(ladder) = self.ladder else {
+            return Ok(ContextOverflowRecovery::Unrecoverable {
+                measured: measured_before,
+                effective_window,
+            });
+        };
+
+        if let Some(job) = self.background.take() {
+            job.token.cancel();
+            self.emit_lifecycle(
+                apply_cx.observer,
+                &job,
+                CompactionLifecycleState::Cancelled,
+                None,
+                Some(
+                    "background compaction cancelled for reactive deterministic recovery"
+                        .to_string(),
+                ),
+            )?;
+        }
+
+        let mut current = messages.to_vec();
+        let mut changed = false;
+        let plans = self.pending_folds(&current, apply_cx.workspace);
+        if !plans.is_empty() {
+            current = self.flush_folds(
+                &current,
+                &plans,
+                FoldTrigger::CompactionBoundary,
+                apply_cx.observer,
+            )?;
+            changed = true;
+        }
+
+        for (index, keep) in [ladder.keep_recent_tokens, MANUAL_COMPACT_KEEP_TOKENS]
+            .into_iter()
+            .enumerate()
+        {
+            if index > 0
+                && ladder.tier(measure_context(&current, None, 0).tokens)
+                    != ContextPressureTier::Hard
+            {
+                break;
+            }
+            let Some(plan) = self.plan(&current, keep) else {
+                break;
+            };
+            let ContextDirective::Replace { messages } =
+                self.apply_excerpts(&current, plan, apply_cx)?
+            else {
+                break;
+            };
+            current = messages;
+            changed = true;
+        }
+
+        let measured = measure_context(&current, None, 0).tokens;
+        if changed {
+            Ok(ContextOverflowRecovery::Resend {
+                messages: current,
+                measured,
+                effective_window,
+            })
+        } else {
+            Ok(ContextOverflowRecovery::Unrecoverable {
+                measured,
+                effective_window,
+            })
+        }
+    }
+
     /// Derived fold set at the current boundary. While a background job owns a
     /// frozen id range, folds inside that snapshot are withheld so the worker
     /// and parent never race two different rewrites of the same originals.
@@ -190,6 +282,7 @@ impl CompactionEngine {
                 let model_backed = !ladder.deterministic_only
                     && self.summarizer != SummarizerKind::Excerpts
                     && self.summarizer_factory.is_some()
+                    && !self.model_compaction_cap_reached(CompactionOrigin::Subagent)
                     && self.consecutive_failures < self.max_consecutive_failures;
                 if model_backed {
                     self.start_background(&current, plan, workspace, obs)?;

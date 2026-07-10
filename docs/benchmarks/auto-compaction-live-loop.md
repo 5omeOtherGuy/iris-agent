@@ -297,3 +297,86 @@ Codex request failed [status=429 endpoint=/codex/responses model=gpt-5.4-mini er
 Those probes are not averaged into the passing table. After the quota reopened,
 a one-session probe passed with two compactions before the full 10-session
 Codex run above.
+
+## Slice 5 reactive-recovery run — 2026-07-10
+
+Base: `b20cec7` plus the slice 5 worktree. Parent traffic used the two protocol
+lanes. Every model-backed summary used `anthropic/claude-opus-4-6` with medium
+thinking. The new induced variant injects one typed overflow before forwarding
+to the real provider. Recovery itself is deterministic excerpts, so no summary
+worker request is required by that variant.
+
+Regeneration commands:
+
+```sh
+IRIS_BENCH_LIVE=1 cargo test --locked \
+  auto_compaction_reactive_overflow_ -- \
+  --ignored --nocapture --test-threads=1
+
+IRIS_BENCH_LIVE=1 IRIS_AUTO_COMPACTION_SESSIONS=10 \
+  cargo test --locked auto_compaction_live_loop_ -- \
+  --ignored --nocapture --test-threads=1
+```
+
+Induced-overflow evidence:
+
+| lane | injected overflows | real forwarded requests | provider starts | excerpts applied | G4 exact | G5 | real read |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `anthropic/claude-haiku-4-5` | 1 | 2 | 3 | pass | pass | pass | pass |
+| `openai-codex/gpt-5.4-mini` | 1 | 2 | 3 | pass | pass | pass | pass |
+
+Two forwarded requests are expected: the resent request performs the real read,
+then the real provider receives the tool result. The first instrument attempt
+used a 20,000-token retained tail, leaving no pair-safe range in the synthetic
+seed. It was rejected rather than averaged into the passing evidence. Both
+lanes returned:
+
+```text
+provider rejected context after bounded reactive recovery: measured ~21798 tokens against a 131072-token window; try `/compact <focus>`, `/new`, or switch model
+```
+
+The variant now uses the specified 1,000-token deep-cut target and passed on
+both lanes.
+
+Normal live-loop summary:
+
+| lane | scripted sessions | evaluated | compactions | worst G1 | worst post-apply/start | G2 | G3 | G4 | G5 | reads | cache-hit observations | exclusions |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| `anthropic/claude-haiku-4-5` | 10 | 10 | 23 | 3.5 ms | 17,130 / 21,299 (80.4%) | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 10 × 0.000 | 0 |
+| `openai-codex/gpt-5.4-mini` | 10 | 9 | 18 | 22.4 ms | 18,934 / 21,299 (88.9%) | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 | 9 × 0.000 | 1 |
+
+Haiku per-session evidence:
+
+| session | compactions | G1 | maximum post-apply | G2–G5/read | worker cache hit | error |
+|---:|---:|---:|---:|---|---:|---|
+| 00 | 2 | 1.1 ms | 16,952 | pass | 0.000 | — |
+| 01 | 2 | 1.5 ms | 16,894 | pass | 0.000 | — |
+| 02 | 2 | 2.8 ms | 16,857 | pass | 0.000 | — |
+| 03 | 3 | 3.5 ms | 17,130 | pass | 0.000 | — |
+| 04 | 3 | 1.7 ms | 16,938 | pass | 0.000 | — |
+| 05 | 2 | 1.6 ms | 16,958 | pass | 0.000 | — |
+| 06 | 3 | 1.3 ms | 16,927 | pass | 0.000 | — |
+| 07 | 2 | 1.2 ms | 16,855 | pass | 0.000 | — |
+| 08 | 2 | 1.1 ms | 16,909 | pass | 0.000 | — |
+| 09 | 2 | 1.9 ms | 16,905 | pass | 0.000 | — |
+
+Codex per-session evidence:
+
+| session | compactions | G1 | maximum post-apply | G2–G5/read | worker cache hit | error |
+|---:|---:|---:|---:|---|---:|---|
+| 00 | 2 | 2.1 ms | 12,371 | pass | 0.000 | — |
+| 01 | 2 | 2.6 ms | 17,267 | pass | 0.000 | — |
+| 02 | — | — | — | excluded | — | `provider stream produced no events for 90s` |
+| 03 | 2 | 22.4 ms | 14,636 | pass | 0.000 | — |
+| 04 | 2 | 2.7 ms | 16,189 | pass | 0.000 | — |
+| 05 | 2 | 2.3 ms | 18,934 | pass | 0.000 | — |
+| 06 | 2 | 2.1 ms | 16,901 | pass | 0.000 | — |
+| 07 | 2 | 2.2 ms | 17,285 | pass | 0.000 | — |
+| 08 | 2 | 1.4 ms | 17,299 | pass | 0.000 | — |
+| 09 | 2 | 15.4 ms | 15,160 | pass | 0.000 | — |
+
+The normal pair completed in 2,368.77 seconds. Codex session 02 took an
+unusually long provider path before the worker reported the 90-second stream
+idle error above. That latency is external to G1, which measures only
+compaction-event-to-next-request blocking. No evaluated session had a turn,
+tool, persistence, recall, metadata, or resume failure.

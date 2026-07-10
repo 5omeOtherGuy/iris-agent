@@ -18,9 +18,38 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
-use crate::nexus::{Message, Tools};
+use crate::nexus::{Message, ProviderErrorKind, ProviderFailure, Tools};
 
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH: usize = 64;
+
+fn classified_http_error(status: u16, body: &str, diagnostic: String) -> anyhow::Error {
+    if is_context_overflow_response(status, body) {
+        anyhow::Error::new(ProviderFailure::new(
+            ProviderErrorKind::ContextWindowExceeded,
+            diagnostic,
+        ))
+    } else {
+        anyhow::anyhow!(diagnostic)
+    }
+}
+
+fn is_context_overflow_response(status: u16, body: &str) -> bool {
+    if !matches!(status, 400 | 413 | 422) {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "model_context_window_exceeded",
+        "maximum context length",
+        "context window has been exceeded",
+        "prompt is too long",
+        "too many tokens",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle))
+}
 
 fn clamp_openai_prompt_cache_key(key: &str) -> Option<String> {
     let trimmed = key.trim();
@@ -206,6 +235,50 @@ mod tests {
         assert_ne!(
             hash_message(&Message::user("x")),
             hash_message(&Message::assistant("x"))
+        );
+    }
+
+    #[test]
+    fn overflow_classifier_covers_adapter_error_shapes_without_broad_matches() {
+        for (adapter, body) in [
+            (
+                "anthropic",
+                r#"{"error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
+            ),
+            ("codex", r#"{"error":{"code":"context_length_exceeded"}}"#),
+            (
+                "openai-compatible",
+                r#"{"error":{"message":"maximum context length is 8192 tokens"}}"#,
+            ),
+            (
+                "antigravity",
+                r#"{"error":{"message":"too many tokens in request"}}"#,
+            ),
+        ] {
+            assert!(is_context_overflow_response(400, body), "{adapter}");
+        }
+        assert!(!is_context_overflow_response(
+            429,
+            r#"{"error":{"message":"too many tokens"}}"#
+        ));
+        assert!(!is_context_overflow_response(
+            400,
+            r#"{"error":{"message":"context management setting is invalid"}}"#
+        ));
+        let error = classified_http_error(
+            400,
+            r#"{"error":{"code":"context_length_exceeded"}}"#,
+            "safe diagnostic".to_string(),
+        );
+        assert_eq!(
+            crate::nexus::provider_error_kind(&error),
+            Some(ProviderErrorKind::ContextWindowExceeded)
+        );
+        assert_eq!(error.to_string(), "safe diagnostic");
+        let wrapped = error.context("transport wrapper");
+        assert_eq!(
+            crate::nexus::provider_error_kind(&wrapped),
+            Some(ProviderErrorKind::ContextWindowExceeded)
         );
     }
 }

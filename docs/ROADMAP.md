@@ -1458,7 +1458,10 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    folds. Slice 4 makes verbatim transcript input the worker default, adds
    bounded overflow shrink-retry and global-only dedicated worker routing,
    threads cancellation through both worker routes, and unifies manual
-   `/compact [focus]` with the one-slot pipeline.
+   `/compact [focus]` with the one-slot pipeline. Slice 5 adds typed
+   adapter-level overflow classification, one provider-neutral reactive rewrite
+   and resend per round trip, deterministic folds/excerpts/deep-cut recovery,
+   an honest second-overflow error, and a two-model-compaction per-turn cap.
 7. Prebuilt-binary distribution ([#199](https://github.com/5omeOtherGuy/iris-agent/issues/199),
    [#233](https://github.com/5omeOtherGuy/iris-agent/issues/233)) is wired and now
    validated locally ([#252](https://github.com/5omeOtherGuy/iris-agent/issues/252)):
