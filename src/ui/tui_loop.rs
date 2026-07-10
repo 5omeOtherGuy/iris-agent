@@ -2590,6 +2590,14 @@ async fn dispatch_action<P: ChatProvider>(
             let result = picker::apply_action(other, view, harness, sw);
             tui.screen
                 .set_approval_policy(effective_approval_policy(harness));
+            // A faceplate change can cancel the in-flight background compaction
+            // (turning automatic compaction off): reconcile the status chip with
+            // the live harness so it clears at the out-of-turn settings write.
+            tui.screen.set_compaction_running(
+                harness
+                    .context_diagnostics()
+                    .is_some_and(|diag| diag.background_running),
+            );
             let after = sw.selection().clone();
             match result {
                 ActionResult::Close(lines) => {
@@ -5453,6 +5461,14 @@ mod tests {
             default_approval: "auto".to_string(),
             skip_permissions: false,
             context_token_budget: 232_000,
+            compaction_enabled: true,
+            compaction_warn_pct: 60,
+            compaction_start_pct: 72,
+            compaction_hard_pct: 90,
+            compaction_keep_recent_tokens: 8_000,
+            compaction_reactive: true,
+            compaction_worker_input: "transcript".to_string(),
+            resolved_ladder: None,
             compaction_summarizer: "subagent".to_string(),
             microcompaction: true,
             microcompaction_watermark: 32_000,

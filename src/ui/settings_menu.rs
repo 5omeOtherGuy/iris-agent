@@ -28,9 +28,11 @@
 //! and the loop ([`crate::ui::picker::apply_action`]) performs the disk writes
 //! at the safe inter-turn boundary. A change is acknowledged mechanically: the
 //! adjusted element renders bright for two ticks (the §6 detent flash), gated
-//! by reduced motion. Dependent controls (the compaction group's aggressiveness,
-//! cache timing, trigger, retain, and keep-recent knobs) go dark while their
-//! master `compaction` switch is off — inert hardware, still operable.
+//! by reduced motion. Dependent controls go dark while their master switch is
+//! off — inert hardware, still operable: the AUTO COMPACT thresholds, tail,
+//! reactive, summarizer, and worker-input knobs follow `automatic`; the
+//! tool-result aggressiveness, cache timing, fold trigger, retain, and
+//! keep-tool-uses knobs follow `tool result compaction`.
 //!
 //! All writes go to the user-global settings file via `config::save_*`;
 //! global-vs-project scope governs only load/merge precedence in
@@ -53,9 +55,10 @@ use crate::wayland::trust::ProjectPolicyEdit;
 const REV: &str = env!("CARGO_PKG_VERSION");
 
 /// Label column width: two-cell indent + label, control column after. Wide
-/// enough that the longest label (`aggressiveness`, 14) keeps a real gutter.
-/// Shared with the model picker's reasoning track so the two surfaces sit on
-/// one grid.
+/// enough that most labels keep a real gutter; the one long outlier (`tool
+/// result compaction`, deliberately spelled out to disambiguate it from AUTO
+/// COMPACT) overhangs the column rather than widening the shared grid. Shared
+/// with the model picker's reasoning track so the two surfaces sit on one grid.
 pub(crate) const LABEL_W: usize = 18;
 
 /// Detent-flash duration in loop ticks (the §6 two-tick acknowledgment).
@@ -80,7 +83,14 @@ pub(crate) enum Field {
     Theme,
     DefaultApproval,
     ContextTokenBudget,
+    CompactionEnabled,
+    CompactionWarn,
+    CompactionStart,
+    CompactionHard,
+    CompactionKeepRecentTokens,
+    CompactionReactive,
     CompactionSummarizer,
+    CompactionWorkerInput,
     Microcompaction,
     MicrocompactionWatermark,
     CompactionAggressiveness,
@@ -200,10 +210,22 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        title: "AUTO COMPACT",
+        rows: &[
+            RowId::Field(Field::CompactionEnabled),
+            RowId::Field(Field::CompactionWarn),
+            RowId::Field(Field::CompactionStart),
+            RowId::Field(Field::CompactionHard),
+            RowId::Field(Field::CompactionKeepRecentTokens),
+            RowId::Field(Field::CompactionReactive),
+            RowId::Field(Field::CompactionSummarizer),
+            RowId::Field(Field::CompactionWorkerInput),
+        ],
+    },
+    Section {
         title: "MEMORY",
         rows: &[
             RowId::Field(Field::ContextTokenBudget),
-            RowId::Field(Field::CompactionSummarizer),
             RowId::Field(Field::Microcompaction),
             RowId::Field(Field::CompactionAggressiveness),
             RowId::Field(Field::CompactionCacheTiming),
@@ -243,13 +265,27 @@ const BUDGET_LADDER: [u64; 10] = [
 const WATERMARK_LADDER: [u64; 10] = [
     8_000, 12_000, 16_000, 24_000, 32_000, 48_000, 64_000, 96_000, 128_000, 192_000,
 ];
+/// Protected-tail detents for `compaction.keepRecentTokens` (retain tail).
+const TAIL_LADDER: [u64; 10] = [
+    2_000, 4_000, 6_000, 8_000, 12_000, 16_000, 24_000, 32_000, 48_000, 64_000,
+];
+/// Whole-percent detents for the warn/start/hard threshold dials. The printed
+/// value is always the honest percent; the ladder only drives the LED fill and
+/// the neighbouring-detent step.
+const PERCENT_LADDER: [u64; 10] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 99];
 const UNIT_LADDER: [u64; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 /// Hard bounds for typed dial entry, matching the `config::save_*` clamps.
 fn dial_bounds(field: Field) -> (u64, u64) {
     match field {
-        Field::ContextTokenBudget | Field::MicrocompactionWatermark => (1_000, 100_000_000),
+        Field::ContextTokenBudget
+        | Field::MicrocompactionWatermark
+        | Field::CompactionKeepRecentTokens => (1_000, 100_000_000),
         Field::SemanticRetainPerPath | Field::ToolClearingKeepRecent => (1, 1_000),
+        // Thresholds are whole percents; ordering (`warn < start < hard`) is
+        // enforced by the config save, which restores the persisted value on a
+        // rejected combination.
+        Field::CompactionWarn | Field::CompactionStart | Field::CompactionHard => (1, 99),
         Field::ScrollSpeed => (1, 100),
         Field::VerifyMaxAttempts => (1, 10),
         _ => (0, u64::MAX),
@@ -260,6 +296,8 @@ fn ladder(field: Field) -> &'static [u64] {
     match field {
         Field::ContextTokenBudget => &BUDGET_LADDER,
         Field::MicrocompactionWatermark => &WATERMARK_LADDER,
+        Field::CompactionKeepRecentTokens => &TAIL_LADDER,
+        Field::CompactionWarn | Field::CompactionStart | Field::CompactionHard => &PERCENT_LADDER,
         _ => &UNIT_LADDER,
     }
 }
@@ -314,6 +352,24 @@ pub(crate) struct PolicySnapshot {
     pub(crate) sandbox: Option<String>,
 }
 
+/// The auto-compaction ladder resolved against the active model window
+/// (`Harness::context_diagnostics`), for the AUTO COMPACT section's dim
+/// resolved-value line. Reuses the harness's trigger resolution rather than
+/// recomputing the arithmetic on the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedLadder {
+    pub(crate) warn: u64,
+    pub(crate) start: u64,
+    pub(crate) hard: u64,
+    /// The tail size the ladder actually applies after clamping to the model
+    /// window (`keep_recent_tokens.min(window / 4)`).
+    pub(crate) effective_tail: u64,
+    /// The configured tail before that clamp, so the panel can show a
+    /// `configured tail X -> effective tail Y` note when they differ.
+    pub(crate) configured_tail: u64,
+    pub(crate) effective_window: u64,
+}
+
 /// Current persisted values plus the live session state the panel controls
 /// (reasoning levels for the active model, skip-approvals) and the hatch
 /// payloads. Read once by the loop from [`crate::config::Settings`]; pure data,
@@ -341,13 +397,28 @@ pub(crate) struct Snapshot {
     pub(crate) default_approval: String,
     pub(crate) skip_permissions: bool,
     pub(crate) context_token_budget: u64,
+    /// Full-context auto-compaction master switch (`compaction.enabled`).
+    pub(crate) compaction_enabled: bool,
+    /// The warn/start/hard trigger fractions, as whole percents for the dials.
+    pub(crate) compaction_warn_pct: u64,
+    pub(crate) compaction_start_pct: u64,
+    pub(crate) compaction_hard_pct: u64,
+    /// The configured protected-tail size (`compaction.keepRecentTokens`).
+    pub(crate) compaction_keep_recent_tokens: u64,
+    /// Reactive deterministic-recovery toggle (`compaction.reactive`).
+    pub(crate) compaction_reactive: bool,
+    /// Background worker input mode (`compaction.worker.input`).
+    pub(crate) compaction_worker_input: String,
+    /// The ladder resolved against the active model window, for the dim
+    /// resolved-value line. `None` when the harness has no live diagnostics.
+    pub(crate) resolved_ladder: Option<ResolvedLadder>,
     pub(crate) compaction_summarizer: String,
     /// The resolved tool-result-compaction master switch (`toolResultCompaction
     /// .enabled`, or the legacy `microcompaction` alias). Field name kept for the
-    /// MEMORY row's identity; the label reads `compaction`.
+    /// MEMORY row's identity; the label reads `tool result compaction`.
     pub(crate) microcompaction: bool,
     /// The resolved compaction trigger tokens (`toolResultCompaction
-    /// .triggerTokens`, or the legacy watermark). The `trigger at` dial.
+    /// .triggerTokens`, or the legacy watermark). The `fold trigger` dial.
     pub(crate) microcompaction_watermark: u64,
     pub(crate) compaction_aggressiveness: String,
     pub(crate) compaction_cache_timing: String,
@@ -377,7 +448,11 @@ impl Snapshot {
                 &["breakOnly", "cacheAware", "pressureOnly", "immediate"]
             }
             Field::Theme => crate::ui::theme::available(),
-            Field::Microcompaction | Field::ReducedMotion => &["off", "on"],
+            Field::Microcompaction
+            | Field::CompactionEnabled
+            | Field::CompactionReactive
+            | Field::ReducedMotion => &["off", "on"],
+            Field::CompactionWorkerInput => &["transcript", "investigator"],
             _ => &[],
         }
     }
@@ -392,6 +467,9 @@ impl Snapshot {
             Field::CompactionCacheTiming => self.compaction_cache_timing.clone(),
             Field::Theme => self.theme.clone(),
             Field::Microcompaction => on_off(self.microcompaction),
+            Field::CompactionEnabled => on_off(self.compaction_enabled),
+            Field::CompactionReactive => on_off(self.compaction_reactive),
+            Field::CompactionWorkerInput => self.compaction_worker_input.clone(),
             Field::ReducedMotion => on_off(self.reduced_motion),
             _ => String::new(),
         }
@@ -407,6 +485,9 @@ impl Snapshot {
             Field::CompactionCacheTiming => self.compaction_cache_timing = value.to_string(),
             Field::Theme => self.theme = value.to_string(),
             Field::Microcompaction => self.microcompaction = value == "on",
+            Field::CompactionEnabled => self.compaction_enabled = value == "on",
+            Field::CompactionReactive => self.compaction_reactive = value == "on",
+            Field::CompactionWorkerInput => self.compaction_worker_input = value.to_string(),
             Field::ReducedMotion => self.reduced_motion = value == "on",
             _ => {}
         }
@@ -416,6 +497,10 @@ impl Snapshot {
         match field {
             Field::ContextTokenBudget => self.context_token_budget,
             Field::MicrocompactionWatermark => self.microcompaction_watermark,
+            Field::CompactionWarn => self.compaction_warn_pct,
+            Field::CompactionStart => self.compaction_start_pct,
+            Field::CompactionHard => self.compaction_hard_pct,
+            Field::CompactionKeepRecentTokens => self.compaction_keep_recent_tokens,
             Field::SemanticRetainPerPath => self.semantic_retain_per_path,
             Field::ToolClearingKeepRecent => self.tool_clearing_keep_recent,
             Field::ScrollSpeed => u64::from(self.scroll_speed),
@@ -428,6 +513,10 @@ impl Snapshot {
         match field {
             Field::ContextTokenBudget => self.context_token_budget = value,
             Field::MicrocompactionWatermark => self.microcompaction_watermark = value,
+            Field::CompactionWarn => self.compaction_warn_pct = value.clamp(1, 99),
+            Field::CompactionStart => self.compaction_start_pct = value.clamp(1, 99),
+            Field::CompactionHard => self.compaction_hard_pct = value.clamp(1, 99),
+            Field::CompactionKeepRecentTokens => self.compaction_keep_recent_tokens = value.max(1),
             Field::SemanticRetainPerPath => self.semantic_retain_per_path = value.max(1),
             Field::ToolClearingKeepRecent => self.tool_clearing_keep_recent = value.max(1),
             Field::ScrollSpeed => self.scroll_speed = value.min(u64::from(u16::MAX)) as u16,
@@ -478,11 +567,18 @@ fn archetype(row: RowId) -> Archetype {
             | Field::CompactionSummarizer
             | Field::CompactionAggressiveness
             | Field::CompactionCacheTiming
+            | Field::CompactionEnabled
+            | Field::CompactionReactive
+            | Field::CompactionWorkerInput
             | Field::Theme
             | Field::Microcompaction
             | Field::ReducedMotion => Archetype::Switch,
             Field::ContextTokenBudget
             | Field::MicrocompactionWatermark
+            | Field::CompactionWarn
+            | Field::CompactionStart
+            | Field::CompactionHard
+            | Field::CompactionKeepRecentTokens
             | Field::SemanticRetainPerPath
             | Field::ToolClearingKeepRecent
             | Field::ScrollSpeed
@@ -511,14 +607,21 @@ fn label(row: RowId) -> &'static str {
             Field::ReducedMotion => "reduced motion",
             Field::Theme => "theme",
             Field::DefaultApproval => "approvals",
-            Field::ContextTokenBudget => "compact at",
+            Field::ContextTokenBudget => "context cap",
+            Field::CompactionEnabled => "automatic",
+            Field::CompactionWarn => "warn at",
+            Field::CompactionStart => "start at",
+            Field::CompactionHard => "hard at",
+            Field::CompactionKeepRecentTokens => "retain tail",
+            Field::CompactionReactive => "reactive",
             Field::CompactionSummarizer => "summarizer",
-            Field::Microcompaction => "compaction",
+            Field::CompactionWorkerInput => "worker input",
+            Field::Microcompaction => "tool result compaction",
             Field::CompactionAggressiveness => "aggressiveness",
             Field::CompactionCacheTiming => "cache timing",
-            Field::MicrocompactionWatermark => "trigger at",
+            Field::MicrocompactionWatermark => "fold trigger",
             Field::SemanticRetainPerPath => "retain/path",
-            Field::ToolClearingKeepRecent => "keep recent",
+            Field::ToolClearingKeepRecent => "keep tool uses",
             Field::PromptCacheRetention => "prompt cache",
             Field::VerifyCommand => "verify",
             Field::VerifyMaxAttempts => "attempts",
@@ -530,7 +633,10 @@ fn label(row: RowId) -> &'static str {
 /// A dial's unit, printed dim after the honest value. Empty = bare number.
 fn dial_unit(field: Field) -> &'static str {
     match field {
-        Field::ContextTokenBudget | Field::MicrocompactionWatermark => " tokens",
+        Field::ContextTokenBudget
+        | Field::MicrocompactionWatermark
+        | Field::CompactionKeepRecentTokens => " tokens",
+        Field::CompactionWarn | Field::CompactionStart | Field::CompactionHard => "%",
         Field::ScrollSpeed => " lines",
         _ => "",
     }
@@ -1491,7 +1597,46 @@ impl SettingsPanel {
                     }
                 }
             }
+            for line in self.section_footnotes(section.title) {
+                emit(DisplayRow::ReadOnly(line));
+            }
         }
+    }
+
+    /// Dim silkscreen lines printed under a section. AUTO COMPACT shows the
+    /// ladder resolved against the active model window — reusing the harness
+    /// trigger resolution (`/context` diagnostics), never recomputing it here —
+    /// so configured fractions/tail read next to their effective token values.
+    fn section_footnotes(&self, title: &str) -> Vec<Line<'static>> {
+        if title != "AUTO COMPACT" {
+            return Vec::new();
+        }
+        let Some(ladder) = self.snap.resolved_ladder else {
+            return Vec::new();
+        };
+        let mut lines = vec![Line::from(Span::styled(
+            format!(
+                "  active model: warn {} / start {} / hard {} / tail {}",
+                compact_value(ladder.warn),
+                compact_value(ladder.start),
+                compact_value(ladder.hard),
+                compact_value(ladder.effective_tail),
+            ),
+            dim(),
+        ))];
+        // The tail is clamped to a quarter of the model window; when a small
+        // window shrinks it, show the configured -> effective adjustment.
+        if ladder.effective_tail != ladder.configured_tail {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  configured tail {} \u{2192} effective tail {}",
+                    compact_value(ladder.configured_tail),
+                    compact_value(ladder.effective_tail),
+                ),
+                dim(),
+            )));
+        }
+        lines
     }
 
     /// The dim filter-echo line printed directly under the scope port header
@@ -1658,6 +1803,32 @@ impl SettingsPanel {
         }
     }
 
+    /// Whether a row's control is inert (dark but operable) because its master
+    /// switch is off. The AUTO COMPACT knobs follow `automatic`
+    /// (`compaction.enabled`); the tool-result knobs follow `tool result
+    /// compaction` (`toolResultCompaction.enabled`).
+    fn is_inert(&self, row: RowId) -> bool {
+        match row {
+            RowId::Field(
+                Field::CompactionWarn
+                | Field::CompactionStart
+                | Field::CompactionHard
+                | Field::CompactionKeepRecentTokens
+                | Field::CompactionReactive
+                | Field::CompactionSummarizer
+                | Field::CompactionWorkerInput,
+            ) => !self.snap.compaction_enabled,
+            RowId::Field(
+                Field::CompactionAggressiveness
+                | Field::CompactionCacheTiming
+                | Field::MicrocompactionWatermark
+                | Field::SemanticRetainPerPath
+                | Field::ToolClearingKeepRecent,
+            ) => !self.snap.microcompaction,
+            _ => false,
+        }
+    }
+
     fn top_line(&self, row: RowId, selected: bool, avail: usize) -> Line<'static> {
         let flashing = self
             .flash
@@ -1670,20 +1841,17 @@ impl SettingsPanel {
         } else {
             Style::default()
         };
-        // The compaction group's knobs are inert hardware while their master
-        // `compaction` switch is off — still operable, just dark.
-        let inert = matches!(
-            row,
-            RowId::Field(
-                Field::CompactionAggressiveness
-                    | Field::CompactionCacheTiming
-                    | Field::MicrocompactionWatermark
-                    | Field::SemanticRetainPerPath
-                    | Field::ToolClearingKeepRecent
-            )
-        ) && !self.snap.microcompaction;
+        // The compaction groups' knobs are inert hardware while their master
+        // switch is off — still operable, just dark. The AUTO COMPACT dials/
+        // switches follow `automatic`; the tool-result knobs follow `tool result
+        // compaction`.
+        let inert = self.is_inert(row);
+        // Pad to the shared label column, but always leave at least one space
+        // so an over-long label (`tool result compaction`) never abuts its
+        // control; shorter labels are unchanged (name + spaces to `LABEL_W`).
+        let pad = LABEL_W.saturating_sub(name.chars().count()).max(1);
         spans.push(Span::styled(
-            format!("  {name:<width$}", width = LABEL_W),
+            format!("  {name}{}", " ".repeat(pad)),
             if inert {
                 label_style.patch(dim())
             } else {
@@ -2357,7 +2525,10 @@ fn push_dial(
 /// but persist `false`/`true`.
 fn save_token(field: Field, value: &str) -> String {
     match field {
-        Field::Microcompaction | Field::ReducedMotion => (value == "on").to_string(),
+        Field::Microcompaction
+        | Field::CompactionEnabled
+        | Field::CompactionReactive
+        | Field::ReducedMotion => (value == "on").to_string(),
         _ => value.to_string(),
     }
 }
@@ -2460,6 +2631,21 @@ mod tests {
             default_approval: "strict".to_string(),
             skip_permissions: false,
             context_token_budget: 232_000,
+            compaction_enabled: true,
+            compaction_warn_pct: 60,
+            compaction_start_pct: 72,
+            compaction_hard_pct: 90,
+            compaction_keep_recent_tokens: 8_000,
+            compaction_reactive: true,
+            compaction_worker_input: "transcript".to_string(),
+            resolved_ladder: Some(ResolvedLadder {
+                warn: 139_200,
+                start: 167_040,
+                hard: 208_800,
+                effective_tail: 8_000,
+                configured_tail: 8_000,
+                effective_window: 232_000,
+            }),
             compaction_summarizer: "subagent".to_string(),
             microcompaction: false,
             microcompaction_watermark: 32_000,
@@ -2512,7 +2698,15 @@ mod tests {
     fn faceplate_lists_every_section_and_prunes_the_service_hatch() {
         let lines = panel().render_budgeted(80, 60);
         let rendered = text(&lines);
-        for section in ["ENGINE", "SAFETY", "MEMORY", "CHECKS", "PANEL", "GIT"] {
+        for section in [
+            "ENGINE",
+            "SAFETY",
+            "AUTO COMPACT",
+            "MEMORY",
+            "CHECKS",
+            "PANEL",
+            "GIT",
+        ] {
             assert!(rendered.contains(section), "{section} missing:\n{rendered}");
         }
         assert!(!rendered.to_lowercase().contains("bash tool"));
@@ -2520,6 +2714,90 @@ mod tests {
         assert!(!rendered.to_lowercase().contains("roundtrips"));
         assert!(rendered.contains("SETTINGS"));
         assert!(rendered.contains(&format!("iris {REV}")));
+    }
+
+    #[test]
+    fn auto_compact_section_prints_the_new_rows_and_renamed_tool_result_labels() {
+        let rendered = text(&panel().render_budgeted(120, 80));
+        // The AUTO COMPACT rows.
+        assert!(rendered.contains("automatic"), "{rendered}");
+        assert!(rendered.contains("warn at"), "{rendered}");
+        assert!(rendered.contains("start at"), "{rendered}");
+        assert!(rendered.contains("hard at"), "{rendered}");
+        assert!(rendered.contains("retain tail"), "{rendered}");
+        assert!(rendered.contains("reactive"), "{rendered}");
+        assert!(rendered.contains("worker input"), "{rendered}");
+        // Percent dials print the honest percent + `%` unit.
+        assert!(rendered.contains("60%"), "{rendered}");
+        assert!(rendered.contains("72%"), "{rendered}");
+        assert!(rendered.contains("90%"), "{rendered}");
+        // The renamed context-cap row and tool-result labels.
+        assert!(rendered.contains("context cap"), "{rendered}");
+        assert!(rendered.contains("tool result compaction"), "{rendered}");
+        assert!(rendered.contains("fold trigger"), "{rendered}");
+        assert!(rendered.contains("keep tool uses"), "{rendered}");
+        // The stale labels are gone.
+        assert!(!rendered.contains("compact at"), "{rendered}");
+        assert!(!rendered.contains("trigger at"), "{rendered}");
+        assert!(!rendered.contains("keep recent"), "{rendered}");
+    }
+
+    #[test]
+    fn resolved_ladder_line_prints_effective_tokens_and_tail_adjustment() {
+        // A large window: tail is unclamped, so no configured->effective note.
+        let rendered = text(&panel().render_budgeted(120, 80));
+        assert!(
+            rendered.contains("active model: warn 139k / start 167k / hard 208k / tail 8k"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("configured tail"), "{rendered}");
+
+        // A small window clamps the tail to a quarter of the window: the panel
+        // shows the configured -> effective adjustment.
+        let mut snap = snapshot();
+        snap.resolved_ladder = Some(ResolvedLadder {
+            warn: 9_600,
+            start: 11_520,
+            hard: 14_400,
+            effective_tail: 4_000,
+            configured_tail: 8_000,
+            effective_window: 16_000,
+        });
+        let rendered = text(&SettingsPanel::new(snap).render_budgeted(120, 80));
+        assert!(
+            rendered.contains("configured tail 8k \u{2192} effective tail 4k"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn auto_compact_knobs_go_dark_while_automatic_is_off() {
+        let mut snap = snapshot();
+        snap.compaction_enabled = false;
+        let panel = SettingsPanel::new(snap);
+        // The dependent knobs are inert; the master switch never is.
+        assert!(panel.is_inert(RowId::Field(Field::CompactionWarn)));
+        assert!(panel.is_inert(RowId::Field(Field::CompactionKeepRecentTokens)));
+        assert!(panel.is_inert(RowId::Field(Field::CompactionReactive)));
+        assert!(panel.is_inert(RowId::Field(Field::CompactionSummarizer)));
+        assert!(panel.is_inert(RowId::Field(Field::CompactionWorkerInput)));
+        assert!(!panel.is_inert(RowId::Field(Field::CompactionEnabled)));
+    }
+
+    #[test]
+    fn percent_dial_clicks_one_detent_and_emits_the_percent_value() {
+        let mut panel = panel();
+        select_top(&mut panel, RowId::Field(Field::CompactionWarn));
+        // warn starts at 60%; one click right lands on the next percent detent.
+        let outcome = panel.handle_key(ModalKey::Right);
+        assert_eq!(panel.snap.compaction_warn_pct, 70);
+        match outcome {
+            ModalOutcome::Emit(ModalAction::SaveSetting { field, value }) => {
+                assert_eq!(field, Field::CompactionWarn);
+                assert_eq!(value.as_deref(), Some("70"));
+            }
+            other => panic!("expected a save emit, got {other:?}"),
+        }
     }
 
     #[test]

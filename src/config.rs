@@ -852,7 +852,7 @@ pub(crate) fn save_tool_result_compaction_enabled(enabled: bool) -> Result<()> {
     update_global_nested(
         &["toolResultCompaction"],
         &[("enabled", Value::Bool(enabled))],
-        true,
+        SaveValidation::ToolResultCompaction,
     )
 }
 
@@ -861,7 +861,7 @@ pub(crate) fn save_tool_result_compaction_aggressiveness(value: &str) -> Result<
     update_global_nested(
         &["toolResultCompaction"],
         &[("aggressiveness", Value::String(value.to_string()))],
-        true,
+        SaveValidation::ToolResultCompaction,
     )
 }
 
@@ -870,7 +870,7 @@ pub(crate) fn save_tool_result_compaction_cache_timing(value: &str) -> Result<()
     update_global_nested(
         &["toolResultCompaction"],
         &[("cacheTiming", Value::String(value.to_string()))],
-        true,
+        SaveValidation::ToolResultCompaction,
     )
 }
 
@@ -879,7 +879,7 @@ pub(crate) fn save_tool_result_compaction_trigger_tokens(tokens: u64) -> Result<
     update_global_nested(
         &["toolResultCompaction"],
         &[("triggerTokens", Value::from(tokens))],
-        true,
+        SaveValidation::ToolResultCompaction,
     )
 }
 
@@ -887,7 +887,7 @@ pub(crate) fn save_tool_result_compaction_retain_per_path(retain: u64) -> Result
     update_global_nested(
         &["toolResultCompaction", "semanticDedupe"],
         &[("retainPerPath", Value::from(retain.max(1)))],
-        true,
+        SaveValidation::ToolResultCompaction,
     )
 }
 
@@ -895,7 +895,77 @@ pub(crate) fn save_tool_result_compaction_keep_recent_tool_uses(keep: u64) -> Re
     update_global_nested(
         &["toolResultCompaction", "toolClearing"],
         &[("keepRecentToolUses", Value::from(keep.max(1)))],
-        true,
+        SaveValidation::ToolResultCompaction,
+    )
+}
+
+/// Persist the full-context auto-compaction master switch under `compaction`.
+/// Unknown sibling keys (routing, breaker, experimental) survive the write.
+pub(crate) fn save_compaction_enabled(enabled: bool) -> Result<()> {
+    update_global_nested(
+        &["compaction"],
+        &[("enabled", Value::Bool(enabled))],
+        SaveValidation::CompactionTrigger,
+    )
+}
+
+/// Persist the reactive deterministic-recovery toggle under `compaction`.
+pub(crate) fn save_compaction_reactive(enabled: bool) -> Result<()> {
+    update_global_nested(
+        &["compaction"],
+        &[("reactive", Value::Bool(enabled))],
+        SaveValidation::CompactionTrigger,
+    )
+}
+
+/// Persist the protected-tail size under `compaction.keepRecentTokens`, clamped
+/// to the same positive token range as the other budget dials.
+pub(crate) fn save_compaction_keep_recent_tokens(tokens: u64) -> Result<()> {
+    let tokens = tokens.clamp(MIN_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET);
+    update_global_nested(
+        &["compaction"],
+        &[("keepRecentTokens", Value::from(tokens))],
+        SaveValidation::CompactionTrigger,
+    )
+}
+
+/// Persist one auto-compaction threshold fraction under `compaction.thresholds`.
+/// The `CompactionTrigger` re-check rejects any write that would make the merged
+/// ladder unordered (`0 < warn < start < hard < 1`) before it reaches disk.
+fn save_compaction_threshold(key: &'static str, fraction: f64) -> Result<()> {
+    let number = serde_json::Number::from_f64(fraction)
+        .context("compaction threshold must be a finite fraction")?;
+    update_global_nested(
+        &["compaction", "thresholds"],
+        &[(key, Value::Number(number))],
+        SaveValidation::CompactionTrigger,
+    )
+}
+
+pub(crate) fn save_compaction_threshold_warn(fraction: f64) -> Result<()> {
+    save_compaction_threshold("warn", fraction)
+}
+
+pub(crate) fn save_compaction_threshold_start(fraction: f64) -> Result<()> {
+    save_compaction_threshold("start", fraction)
+}
+
+pub(crate) fn save_compaction_threshold_hard(fraction: f64) -> Result<()> {
+    save_compaction_threshold("hard", fraction)
+}
+
+/// Persist the background worker's input mode under `compaction.worker.input`.
+/// An unrecognized value falls back to `transcript` (the built-in default), the
+/// same way the load-time accessor degrades.
+pub(crate) fn save_compaction_worker_input(input: &str) -> Result<()> {
+    let input = match input {
+        "transcript" | "investigator" => input,
+        _ => "transcript",
+    };
+    update_global_nested(
+        &["compaction", "worker"],
+        &[("input", Value::String(input.to_string()))],
+        SaveValidation::None,
     )
 }
 
@@ -1028,10 +1098,25 @@ fn update_global_block(block: &str, updates: &[(&str, Value)]) -> Result<()> {
     write_object_atomically(&path, &object)
 }
 
+/// Which policy invariant a nested settings write must re-check against the
+/// merged on-disk object before it is allowed to reach disk. Keeps invalid
+/// combinations (an incompatible tool-result policy, an unordered auto-compaction
+/// ladder) out of both the file and the live harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveValidation {
+    /// No cross-field re-check (the value is already bounded at the boundary).
+    None,
+    /// Re-parse and re-resolve the structured tool-result-compaction policy.
+    ToolResultCompaction,
+    /// Re-validate the auto-compaction trigger ladder (`0 < warn < start < hard
+    /// < 1`, positive tail).
+    CompactionTrigger,
+}
+
 fn update_global_nested(
     blocks: &[&str],
     updates: &[(&str, Value)],
-    validate_compaction: bool,
+    validation: SaveValidation,
 ) -> Result<()> {
     let path = global_path()
         .context("cannot resolve the global settings path (set HOME or IRIS_CONFIG_PATH)")?;
@@ -1055,12 +1140,22 @@ fn update_global_nested(
             current.insert((*key).to_string(), value.clone());
         }
     }
-    if validate_compaction {
-        let settings: Settings = serde_json::from_value(Value::Object(object.clone()))
-            .context("updated settings are invalid")?;
-        let policy = settings.tool_result_compaction()?;
-        if policy.enabled {
-            crate::mimir::selection::ModelSelection::resolve(&settings)?;
+    match validation {
+        SaveValidation::None => {}
+        SaveValidation::ToolResultCompaction => {
+            let settings: Settings = serde_json::from_value(Value::Object(object.clone()))
+                .context("updated settings are invalid")?;
+            let policy = settings.tool_result_compaction()?;
+            if policy.enabled {
+                crate::mimir::selection::ModelSelection::resolve(&settings)?;
+            }
+        }
+        SaveValidation::CompactionTrigger => {
+            let settings: Settings = serde_json::from_value(Value::Object(object.clone()))
+                .context("updated settings are invalid")?;
+            // Rejects an unordered/degenerate ladder before it can reach disk or
+            // the harness, so a bad threshold never persists.
+            settings.compaction_trigger()?;
         }
     }
     write_object_atomically(&path, &object)
@@ -1503,6 +1598,105 @@ mod tests {
         assert_eq!(policy["toolClearing"]["futureClearing"], 4);
         let loaded = Settings::load_from(Some(&path), &dir.path.join("none.json")).unwrap();
         assert!(loaded.tool_result_compaction().unwrap().enabled);
+    }
+
+    #[test]
+    fn auto_compaction_save_helpers_preserve_unknown_nested_keys() {
+        let dir = temp_dir();
+        let path = dir.path.join("settings.json");
+        // A hand-authored file carrying keys this feature deliberately does not
+        // expose (worker.model, hardWaitMs) plus a future sibling.
+        fs::write(
+            &path,
+            r#"{"futureTop":9,"compaction":{"futurePolicy":7,"hardWaitMs":5000,"worker":{"model":"anthropic/claude-opus-4-6","futureWorker":3},"thresholds":{"futureThreshold":1}}}"#,
+        )
+        .unwrap();
+        let _guard = ConfigPathGuard::set(&path);
+
+        save_compaction_enabled(true).unwrap();
+        save_compaction_threshold_warn(0.20).unwrap();
+        save_compaction_threshold_start(0.30).unwrap();
+        save_compaction_threshold_hard(0.40).unwrap();
+        save_compaction_keep_recent_tokens(6_000).unwrap();
+        save_compaction_reactive(false).unwrap();
+        save_compaction_worker_input("investigator").unwrap();
+
+        let object = read_object(&path).unwrap();
+        assert_eq!(object["futureTop"], 9);
+        let compaction = &object["compaction"];
+        // Unknown siblings and the service-hatch-only keys survive untouched.
+        assert_eq!(compaction["futurePolicy"], 7);
+        assert_eq!(compaction["hardWaitMs"], 5000);
+        assert_eq!(compaction["worker"]["model"], "anthropic/claude-opus-4-6");
+        assert_eq!(compaction["worker"]["futureWorker"], 3);
+        assert_eq!(compaction["thresholds"]["futureThreshold"], 1);
+        // The persisted new values.
+        assert_eq!(compaction["enabled"], true);
+        assert_eq!(compaction["thresholds"]["warn"], 0.20);
+        assert_eq!(compaction["thresholds"]["start"], 0.30);
+        assert_eq!(compaction["thresholds"]["hard"], 0.40);
+        assert_eq!(compaction["keepRecentTokens"], 6_000);
+        assert_eq!(compaction["reactive"], false);
+        assert_eq!(compaction["worker"]["input"], "investigator");
+
+        let trigger = Settings::load_from(Some(&path), &dir.path.join("none.json"))
+            .unwrap()
+            .compaction_trigger()
+            .unwrap();
+        assert!(trigger.enabled);
+        assert_eq!(trigger.warn, 0.20);
+        assert_eq!(trigger.keep_recent_tokens, 6_000);
+        assert!(!trigger.reactive);
+    }
+
+    #[test]
+    fn unordered_thresholds_are_rejected_and_never_reach_disk() {
+        let dir = temp_dir();
+        let path = dir.path.join("settings.json");
+        // A valid starting ladder (defaults: warn .60 / start .72 / hard .90).
+        fs::write(&path, r#"{"compaction":{"thresholds":{"warn":0.6}}}"#).unwrap();
+        let _guard = ConfigPathGuard::set(&path);
+
+        // warn must stay below start (.72): 0.80 is unordered and must fail.
+        let error = save_compaction_threshold_warn(0.80).unwrap_err();
+        assert!(format!("{error:#}").contains("warn < start"), "{error:#}");
+        // The rejected write never persisted: the file still holds warn 0.6.
+        let object = read_object(&path).unwrap();
+        assert_eq!(object["compaction"]["thresholds"]["warn"], 0.6);
+
+        // An ordered move is accepted.
+        save_compaction_threshold_warn(0.50).unwrap();
+        assert_eq!(
+            read_object(&path).unwrap()["compaction"]["thresholds"]["warn"],
+            0.5
+        );
+    }
+
+    #[test]
+    fn a_project_may_tune_the_auto_compaction_ladder_over_global() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(
+            &global,
+            r#"{"compaction":{"enabled":true,"thresholds":{"warn":0.5,"start":0.6,"hard":0.7},"keepRecentTokens":4000}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            r#"{"compaction":{"thresholds":{"warn":0.55},"keepRecentTokens":9000,"worker":{"input":"investigator"}}}"#,
+        )
+        .unwrap();
+        let merged = Settings::load_from(Some(&global), &project).unwrap();
+        let trigger = merged.compaction_trigger().unwrap();
+        assert_eq!(trigger.warn, 0.55, "project warn wins");
+        assert_eq!(trigger.start, 0.6, "global start survives");
+        assert_eq!(trigger.keep_recent_tokens, 9000, "project tail wins");
+        let worker = merged.compaction_worker_config().unwrap();
+        assert!(matches!(
+            worker.input,
+            crate::wayland::CompactionWorkerInput::Investigator
+        ));
     }
 
     #[test]

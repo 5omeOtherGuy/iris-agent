@@ -105,7 +105,11 @@ Implemented today:
   of rendering lossy text.
 - Runtime `/model` and `/reasoning` switching at safe turn boundaries, with TUI
   provider/model/effort pickers, scoped model cycling, `/settings`, `/login`,
-  and `/logout`.
+  and `/logout`. The `/settings` faceplate exposes the auto-compaction policy
+  (AUTO COMPACT: automatic, warn/start/hard percentage thresholds, retain tail,
+  reactive, summarizer, worker input) separately from tool-result compaction,
+  with a dim resolved-ladder line, live application at the next boundary, and
+  background-job cancellation when automatic compaction is turned off.
 - Default-short provider-native prompt-cache settings and diagnostics: OpenAI
   prompt-cache keys/24h retention, Anthropic `cache_control`, provider
   usage/cache metadata, and cache-break warnings only when the stable prefix

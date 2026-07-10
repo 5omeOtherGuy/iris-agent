@@ -180,6 +180,59 @@ fn resume(
     harness
 }
 
+#[test]
+fn disabling_auto_compaction_cancels_the_background_job_and_clears_diagnostics() {
+    // The `/settings` live-apply path: an in-flight background job plus a
+    // disabled trigger must cancel the job so the status chip clears (the loop
+    // reconciles the chip from `background_running`).
+    let (root, workspace, path) = seed_session();
+    let mut harness = resume(&root.path, &workspace.path, &path, Some(200_000), false);
+
+    // Enabled trigger: diagnostics report the resolved ladder + automatic on.
+    let mut trigger = Settings::default().compaction_trigger().unwrap();
+    harness.set_compaction_trigger(200_000, trigger);
+    let diag = harness.context_diagnostics().expect("ladder present");
+    assert!(diag.automatic_enabled);
+    assert_eq!(diag.ladder.effective_window, 200_000);
+
+    // Install a running background job so the chip would be lit.
+    let (_sender, receiver) = mpsc::channel();
+    harness.compaction.background = Some(BackgroundCompaction {
+        job_id: "job".to_string(),
+        session_id: None,
+        from_id: "1".to_string(),
+        to_id: "2".to_string(),
+        covered_messages: 2,
+        original_tokens: 10,
+        receiver,
+        token: CancellationToken::new(),
+        origin: CompactionOrigin::Subagent,
+        trigger_tier: Some(ContextPressureTier::Start),
+        started_at: std::time::Instant::now(),
+        selection_generation: 0,
+    });
+    assert!(
+        harness.context_diagnostics().unwrap().background_running,
+        "job is running"
+    );
+
+    // Disable automatic compaction and cancel the job (the settings apply path).
+    trigger.enabled = false;
+    harness.set_compaction_trigger(200_000, trigger);
+    assert!(harness.cancel_auto_compaction(), "a job was cancelled");
+
+    let diag = harness
+        .context_diagnostics()
+        .expect("ladder still resolves");
+    assert!(!diag.automatic_enabled, "automatic reads off");
+    assert!(
+        !diag.background_running,
+        "the chip clears: no job runs after cancel"
+    );
+    // A no-op cancel (no job) reports nothing to clear.
+    assert!(!harness.cancel_auto_compaction());
+}
+
 /// Count `fold` entries in a transcript.
 fn fold_count(path: &Path) -> usize {
     fold_entries(path).len()
