@@ -1720,9 +1720,9 @@ impl Screen {
     }
 
     /// Pager-mode sticky-prompt disclosure click: the pinned prompt starts on the
-    /// row immediately below the session bar, so a click there toggles the same
-    /// state as Ctrl+O. Other rows fall through to transcript header/link/wheel
-    /// handling.
+    /// row immediately below the session bar, so a click there toggles the band's
+    /// expansion (the same state the `o` key toggles in pager mode). Other rows
+    /// fall through to transcript header/link/wheel handling.
     pub(crate) fn toggle_sticky_prompt_at_screen_row(&mut self, screen_row: u16) -> bool {
         let (width, height) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
         let bar_rows = session_bar_lines(self, width, height).len();
@@ -1735,8 +1735,10 @@ impl Screen {
     /// Render all transcript rows plus any in-flight stream, wrapped to `width`.
     /// Finalized history is intentionally retained here; the terminal surface
     /// owns append/diff/full-replay decisions instead of draining UI state.
-    /// Total visible transcript lines at `width` (pager layout math).
-    pub(super) fn transcript_visible_total(&mut self, width: u16) -> usize {
+    /// Total visible transcript lines at `width` (pager layout math). Building
+    /// this also warms the wrap cache the sticky-prompt anchor reads, so key-
+    /// routing tests in `tui_loop` can pin a prompt; hence `pub(crate)`.
+    pub(crate) fn transcript_visible_total(&mut self, width: u16) -> usize {
         self.transcript.visible_total(width)
     }
 
@@ -3345,7 +3347,7 @@ mod tests {
     }
 
     #[test]
-    fn sticky_prompt_click_row_toggles_like_ctrl_o() {
+    fn sticky_prompt_click_row_toggles_the_band() {
         let mut screen = footer_screen("~/repo (main)");
         screen.pager_active = true;
         screen.commit_user("question that has scrolled away");

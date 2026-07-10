@@ -2938,9 +2938,10 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
                 return IdleKey::Continue;
             }
             KeyCode::Char('o') | KeyCode::Char('O') if ctrl => {
-                if !screen.toggle_sticky_prompt() {
-                    screen.toggle_all_panels();
-                }
+                // ctrl+o has one meaning everywhere: toggle transcript folds. The
+                // pinned prompt band has its own toggle (click, or `o` in pager
+                // mode) so it never pre-empts a reader's collapsed blocks.
+                screen.toggle_all_panels();
                 return IdleKey::Continue;
             }
             KeyCode::Char('g') | KeyCode::Char('G') if ctrl => {
@@ -3192,6 +3193,18 @@ fn scrollback_focus_key(screen: &mut Screen, code: KeyCode, ctrl: bool, alt: boo
             screen.search_step(1);
             true
         }
+        // `o` toggles the pinned prompt band (the job card) -- legal here because
+        // the scrollback list, not the composer, holds focus (the list-state law).
+        // It consumes only when a band is actually pinned; otherwise it types like
+        // any other letter. ctrl+o is unrelated -- it toggles transcript folds.
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            if screen.toggle_sticky_prompt() {
+                true
+            } else {
+                screen.focus_prompt();
+                false
+            }
+        }
         // Typing always returns to the prompt; the key falls through and is
         // handled by the composer (it types). Esc keeps its cancel/clear
         // semantics untouched.
@@ -3355,9 +3368,9 @@ fn handle_running_event(
             let alt = key.modifiers.contains(KeyModifiers::ALT);
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
             if ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
-                if !screen.toggle_sticky_prompt() {
-                    screen.toggle_all_panels();
-                }
+                // ctrl+o always toggles transcript folds; the pinned prompt band
+                // toggles via click or the `o` key, never by pre-empting ctrl+o.
+                screen.toggle_all_panels();
                 return true;
             }
             if ctrl
@@ -4431,6 +4444,103 @@ mod tests {
         ));
         // ctrl+o expanded it.
         assert!(!screen.latest_panel_collapsed());
+    }
+
+    #[test]
+    fn ctrl_o_toggles_folds_not_the_band_when_a_prompt_is_pinned() {
+        // The re-route regression (spec §5.3): with a governing prompt pinned as
+        // the sticky band AND a collapsed block below it, ctrl+o expands the
+        // block (its one meaning everywhere) and leaves the band alone. The old
+        // pre-emption that trapped a reader's folds behind the band is gone.
+        let mut screen = Screen::new();
+        screen.pager_active = true;
+        // A collapsed tool block.
+        screen.apply(UiEvent::ToolResult {
+            call: call(),
+            content: (0..20)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            exit_code: None,
+            duration: None,
+        });
+        assert!(screen.latest_panel_collapsed());
+        // A governing prompt scrolled above a small viewport.
+        screen.commit_user("the governing prompt");
+        for i in 0..40 {
+            screen.apply(UiEvent::Notice(format!("detail {i}")));
+        }
+        let total = screen.transcript_visible_total(80);
+        screen.scroll.sync(total, 5);
+        // Precondition: a band IS a viable toggle target (probe, then restore to
+        // collapsed) -- so the old code path really would have diverged here.
+        assert!(screen.toggle_sticky_prompt(), "a sticky prompt is pinned");
+        assert!(screen.toggle_sticky_prompt());
+        assert!(!screen.sticky_prompt_expanded);
+
+        assert!(matches!(
+            handle_idle_event(
+                &mut screen,
+                key_mod(KeyCode::Char('o'), KeyModifiers::CONTROL)
+            ),
+            IdleKey::Continue
+        ));
+        assert!(
+            !screen.latest_panel_collapsed(),
+            "ctrl+o expanded the collapsed block"
+        );
+        assert!(
+            !screen.sticky_prompt_expanded,
+            "ctrl+o did not touch the pinned band"
+        );
+    }
+
+    #[test]
+    fn o_key_toggles_the_pinned_band_only_under_scrollback_focus() {
+        // The band's keyboard toggle (spec §5.2/§5.4): `o` expands/collapses the
+        // pinned prompt, but only while the scrollback list holds focus (the
+        // list-state law). Without that focus it types like any other letter, so
+        // it never collides with composing a message that starts with `o`.
+        let mut screen = Screen::new();
+        screen.pager_active = true;
+        screen.commit_user("the governing prompt");
+        for i in 0..40 {
+            screen.apply(UiEvent::Notice(format!("detail {i}")));
+        }
+        let total = screen.transcript_visible_total(80);
+        screen.scroll.sync(total, 5);
+
+        // Composer focus: `o` is not consumed (types) and the band is untouched.
+        assert!(!scrollback_focus_key(
+            &mut screen,
+            KeyCode::Char('o'),
+            false,
+            false
+        ));
+        assert!(!screen.sticky_prompt_expanded);
+
+        // Focus the scrollback list, then `o` toggles the band both ways.
+        assert!(scrollback_focus_key(
+            &mut screen,
+            KeyCode::Tab,
+            false,
+            false
+        ));
+        assert!(screen.scrollback_focus);
+        assert!(scrollback_focus_key(
+            &mut screen,
+            KeyCode::Char('o'),
+            false,
+            false
+        ));
+        assert!(screen.sticky_prompt_expanded);
+        assert!(scrollback_focus_key(
+            &mut screen,
+            KeyCode::Char('o'),
+            false,
+            false
+        ));
+        assert!(!screen.sticky_prompt_expanded);
     }
 
     #[test]

@@ -731,33 +731,43 @@ Height caps at 16 rows or ⅓ of the pane.
 - These are **disclosures, not sidebars**: invariant #1 stands — nothing
   persistent, nothing beside the transcript.
 
-#### 9.1.2 Pinned prompt band (the governing prompt)
+#### 9.1.2 The job card (the pinned governing prompt)
 
 When the newest user prompt has scrolled above the viewport, its text is pinned
-as a quiet **band** directly under the session bar, so the reader always knows
-which prompt the visible content answers (grok `sticky_headers`). It reads as an
-extension of the top chrome — **not** a card floating in the transcript.
+as a quiet **band** directly under the session bar — the machine's **job card**,
+the governing instruction for everything on screen below it, so the reader always
+knows which prompt the visible content answers (grok `sticky_headers`). Pager
+mode only; there is no inline-mode band. It reads as an extension of the top
+chrome — **not** a card floating in the transcript.
 
 ```
 ~/iris-agent ┊ git main                      CTX 94k/300k ●●●○○○○○○○
 ────────────────────────────────────────────────────────────────────  ← session bar hairline
 
-  › the prompt the visible answer belongs to, dimmed…
+  ▸ › Overhaul the settings menu. First, prune the settings and…   +4
 ────────────────────────────────────────────────────────────────────  ← band hairline (SAME rule)
 ```
 
 - **Same columns as the transcript.** The `›` marker sits on the user column
   (col 4) and the body hangs at col 6 — a prompt looks identical whether pinned
   or scrolled into view (§7.1). Continuation lines hang unmarked at col 6.
-- **Dim throughout.** The band is a pinned *reference*, not the live turn: the
-  whole prompt is `dim`, the differentiator from the ink transcript below. The
-  marker keeps its `›`+bold glyph; only the tone changes. Not orange, no fill.
+- **Ink text in muted chrome.** The prompt's text renders in body ink
+  (`panel_style`) — the one piece of legible content in the top chrome, readable
+  at a glance. The chrome around it stays muted: the `▸`/`▾` disclosure and the
+  `›` marker are muted **bold**, the closing rule is muted. Not orange, no fill;
+  the surrounding tones still read the band as chrome, not the live turn.
+- **Honest when collapsed.** Collapsed, the band is one row; when wrapped rows
+  are hidden it ends in a right-aligned dim `+N` (the house `+N more` idiom,
+  shortened — the band has no room for prose). No marker when nothing is hidden.
+- **Toggle.** A click on the band row, or the key `o` while the scrollback list
+  holds focus in pager mode (the list-state law, §9.1.1), expands it to the full
+  wrapped prompt and collapses it again. **ctrl+o never routes here** — that is
+  fold-toggling's one meaning everywhere (§8.1). Expansion resets to collapsed on
+  each new user message.
 - **Closed by the session bar's own hairline.** The band's bottom rule is the
   **same** inset dim `─` the session bar draws (col 2 → width−2), byte-for-byte —
   never the composer's full-width border weight. Two matching hairlines bracket
   the band as one top-chrome region.
-- **Capped.** A long prompt is truncated to three physical lines with a trailing
-  `…`; the full text is one scroll away. The band never grows to eat the view.
 - Yields the top row to an interactive overlay (a selection or search match
   revealed exactly at the viewport top keeps its highlight).
 
