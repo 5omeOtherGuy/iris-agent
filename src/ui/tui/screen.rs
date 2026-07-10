@@ -189,10 +189,13 @@ const FLASH_TICKS: u8 = 2;
 /// control clicked into a new position. When a statusline segment changes
 /// (model, effort, approval policy) or the context meter lights a new LED,
 /// the changed element alone renders bright for [`FLASH_TICKS`] loop ticks,
-/// then settles back; quantized, like every Iris motion. Starts **disarmed**
-/// so startup initialization (footer, policy, a restored meter) can never
-/// flash — the loop arms it right before the first frame. Reduced motion
-/// never flashes (triggers are no-ops).
+/// then settles back; quantized, like every Iris motion. The meter
+/// acknowledges both directions (§6 motion 4): a newly lit LED flashes
+/// bright, and LEDs that go dark (compaction reclaiming capacity) hold a dim
+/// `●` after-image — the **exhale** — for the same [`FLASH_TICKS`] before
+/// settling to `○`. Starts **disarmed** so startup initialization (footer,
+/// policy, a restored meter) can never flash — the loop arms it right before
+/// the first frame. Reduced motion never flashes (triggers are no-ops).
 #[derive(Default)]
 struct Detents {
     armed: bool,
@@ -200,6 +203,13 @@ struct Detents {
     effort: u8,
     policy: u8,
     meter: u8,
+    /// Exhale after-image ticks remaining (context-meter lit count dropped).
+    exhale: u8,
+    /// Lit-LED count immediately before the drop that armed the exhale: while
+    /// `exhale` is live, the dots above the current fill up to this mark
+    /// render the dim `●` after-image. A position, not a countdown — stale
+    /// (and ignored) once `exhale` reaches 0.
+    exhale_top: u8,
 }
 
 impl Detents {
@@ -213,6 +223,7 @@ impl Detents {
             &mut self.effort,
             &mut self.policy,
             &mut self.meter,
+            &mut self.exhale,
         ] {
             if *slot > 0 {
                 *slot -= 1;
@@ -775,7 +786,14 @@ pub(super) fn working_indicator_line(
     width: usize,
 ) -> Line<'static> {
     working_indicator_line_with_activity(
-        frame, elapsed, can_interrupt, None, usage, queued, None, width,
+        frame,
+        elapsed,
+        can_interrupt,
+        None,
+        usage,
+        queued,
+        None,
+        width,
     )
 }
 
@@ -1328,6 +1346,38 @@ impl Screen {
         }
     }
 
+    /// Repaint the context meter's fill to `used` tokens and acknowledge the
+    /// movement (§6 motion 4). A lit-LED count increase flashes the fresh
+    /// edge dot bright (the existing strictly-greater gate); a decrease arms
+    /// the **exhale** — the vacated LEDs hold a dim `●` after-image for
+    /// [`FLASH_TICKS`], the symmetric twin of the flash. When both land in
+    /// the same tick the bright flash wins: news of growth outranks the echo
+    /// of shrinkage, so an increase also cancels any live exhale. Both
+    /// acknowledgments obey the armed gate and reduced motion (which settles
+    /// instantly — the fill itself always repaints: motion is removed, data
+    /// never is).
+    fn update_context_meter(&mut self, used: u64) {
+        let Some(footer) = &mut self.footer else {
+            return;
+        };
+        let cap = footer.context.as_deref().and_then(parse_context_window);
+        let filled = |tokens: u64| cap.map_or(0, |cap| context_meter_filled(tokens, cap));
+        let before = footer.context_used_tokens.map_or(0, filled);
+        let after = filled(used);
+        footer.context_used_tokens = Some(used);
+        if after > before {
+            self.detents.exhale = 0;
+            Self::flash_detent(
+                &mut self.detents.meter,
+                self.detents.armed,
+                self.reduced_motion,
+            );
+        } else if after < before && self.detents.armed && !self.reduced_motion {
+            self.detents.exhale = FLASH_TICKS;
+            self.detents.exhale_top = before as u8;
+        }
+    }
+
     /// Set the effective approval-policy posture shown on the bottom statusline.
     pub(crate) fn set_approval_policy(&mut self, policy: ApprovalPolicy) {
         if self.approval_policy != policy {
@@ -1481,55 +1531,64 @@ impl Screen {
         if let UiEvent::ProviderTurnCompleted {
             usage: Some(usage), ..
         } = &event
-            && let Some(footer) = &mut self.footer
+            && self.footer.is_some()
         {
-            // Detent acknowledgment: when this update lights a NEW meter LED,
-            // the fresh edge dot flashes once — the relay click of another 10%
-            // of the window committed.
-            let cap = footer.context.as_deref().and_then(parse_context_window);
-            let advanced = cap.is_some_and(|cap| {
-                let before = footer
-                    .context_used_tokens
-                    .map_or(0, |used| context_meter_filled(used, cap));
-                context_meter_filled(usage.total_tokens, cap) > before
-            });
             // `total_tokens` (prompt + completion) is the full conversation size
             // after this turn, which matches what the harness measures for
             // auto-compaction (`context_tokens` = sum of all message estimates).
             // `input_tokens` alone would omit the latest response and under-report
             // fullness relative to the compaction trigger, so the meter uses the
-            // total.
-            footer.context_used_tokens = Some(usage.total_tokens);
-            footer.usage = Some(usage.clone());
-            if advanced {
-                Self::flash_detent(
-                    &mut self.detents.meter,
-                    self.detents.armed,
-                    self.reduced_motion,
-                );
+            // total. A newly lit LED flashes, a darkened one exhales — both
+            // acknowledged inside `update_context_meter`.
+            self.update_context_meter(usage.total_tokens);
+            if let Some(footer) = &mut self.footer {
+                footer.usage = Some(usage.clone());
             }
         }
         // Accumulate the session-scoped reduction accounting for `/context`
         // (issue #400): fold batches with their trigger tags, and compaction
-        // before/after estimates, straight from the runtime events.
+        // before/after estimates, straight from the runtime events. The
+        // context meter repaints from the same accounting AT the event —
+        // waiting for the next `ProviderTurnCompleted` would show the reclaim
+        // a full turn late, silently (spec §3). The events carry estimates
+        // only, so the post-reclaim total is an estimate too: an honest
+        // estimate now beats an exact number a turn late, and the next
+        // completed provider turn trues the meter up with measured usage.
         match &event {
             UiEvent::FoldApplied {
                 folds,
                 reclaimed_tokens_estimate,
                 trigger,
-            } => self.context_accounting.fold_batches.push((
-                trigger.code(),
-                *folds,
-                *reclaimed_tokens_estimate,
-            )),
+            } => {
+                self.context_accounting.fold_batches.push((
+                    trigger.code(),
+                    *folds,
+                    *reclaimed_tokens_estimate,
+                ));
+                // Post-reclaim estimate: the folded results' mass leaves the
+                // conversation. No meter reading yet (`None`) means nothing
+                // to lower — the meter never fabricates a baseline.
+                if let Some(used) = self.footer.as_ref().and_then(|f| f.context_used_tokens) {
+                    self.update_context_meter(used.saturating_sub(*reclaimed_tokens_estimate));
+                }
+            }
             UiEvent::CompactionApplied {
                 original_tokens_estimate,
                 summary_tokens_estimate,
                 ..
-            } => self
-                .context_accounting
-                .compactions
-                .push((*original_tokens_estimate, *summary_tokens_estimate)),
+            } => {
+                self.context_accounting
+                    .compactions
+                    .push((*original_tokens_estimate, *summary_tokens_estimate));
+                // Post-reclaim estimate: the covered span's mass is replaced
+                // by its summary's mass.
+                if let Some(used) = self.footer.as_ref().and_then(|f| f.context_used_tokens) {
+                    self.update_context_meter(
+                        used.saturating_sub(*original_tokens_estimate)
+                            .saturating_add(*summary_tokens_estimate),
+                    );
+                }
+            }
             _ => {}
         }
         if let Some(status) = &mut self.switch_status {
@@ -2234,11 +2293,20 @@ fn meter_used_style() -> Style {
 /// edge dot at the current usage boundary, and dim empty dots for the remainder.
 /// While the edge LED's detent flash is live (`flash`), the freshly lit dot
 /// renders bold — one quantized blink acknowledging the newly committed 10%.
-fn context_meter_spans(filled: u64, flash: bool) -> Vec<Span<'static>> {
+/// While an exhale is live (`exhale_top` above the fill), the LEDs that just
+/// went dark — above `filled`, up to the pre-drop lit count — render the lit
+/// glyph at its muted fill luminance (`●`, an after-image) before settling to
+/// `○`: reclaimed capacity is acknowledged, not silent (§6 motion 4). The
+/// glyph carries the state, never color alone.
+fn context_meter_spans(filled: u64, flash: bool, exhale_top: u64) -> Vec<Span<'static>> {
     (1..=CONTEXT_METER_DOTS)
         .map(|dot| {
             if filled == 0 || dot > filled {
-                Span::styled(crate::ui::symbols::EMPTY.to_string(), dim_style())
+                if dot <= exhale_top {
+                    Span::styled(crate::ui::symbols::RUNNING.to_string(), meter_used_style())
+                } else {
+                    Span::styled(crate::ui::symbols::EMPTY.to_string(), dim_style())
+                }
             } else if dot == filled {
                 let style = if flash {
                     prompt_style().add_modifier(Modifier::BOLD)
@@ -2415,7 +2483,16 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
         }
         if with_meter && let Some(filled) = meter_filled {
             spans.push(Span::raw(" "));
-            spans.extend(context_meter_spans(filled, screen.detents.meter > 0));
+            let exhale_top = if screen.detents.exhale > 0 {
+                u64::from(screen.detents.exhale_top)
+            } else {
+                0
+            };
+            spans.extend(context_meter_spans(
+                filled,
+                screen.detents.meter > 0,
+                exhale_top,
+            ));
         }
         spans
     };
@@ -3168,6 +3245,45 @@ mod tests {
         }
     }
 
+    /// A compaction event whose covered span of ~`original` tokens was
+    /// replaced by a ~`summary`-token summary.
+    fn compaction(original: u64, summary: u64) -> UiEvent {
+        UiEvent::CompactionApplied {
+            compaction_id: "c1".to_string(),
+            covered_from: "m1".to_string(),
+            covered_to: "m9".to_string(),
+            covered_messages: 9,
+            original_tokens_estimate: original,
+            summary_tokens_estimate: summary,
+            budget: 4096,
+        }
+    }
+
+    /// The session bar's ten context-meter dots as `(glyph, style)` pairs —
+    /// `●`/`○` appear nowhere else on the bar.
+    fn meter_dots(screen: &Screen) -> Vec<(String, ratatui::style::Style)> {
+        let dots: Vec<_> = session_bar(screen, 100)
+            .expect("bar")
+            .spans
+            .iter()
+            .filter(|span| {
+                let content = span.content.as_ref();
+                content == crate::ui::symbols::RUNNING || content == crate::ui::symbols::EMPTY
+            })
+            .map(|span| (span.content.to_string(), span.style))
+            .collect();
+        assert_eq!(dots.len() as u64, CONTEXT_METER_DOTS, "a full strip");
+        dots
+    }
+
+    /// Count of lit (`●`) dots on the session-bar meter, after-images included.
+    fn lit_dots(screen: &Screen) -> usize {
+        meter_dots(screen)
+            .iter()
+            .filter(|(glyph, _)| glyph == crate::ui::symbols::RUNNING)
+            .count()
+    }
+
     /// Smallest byte count the fixed log scale quantizes to `level`, so tests
     /// drive the meter through its public sampling API instead of hardcoding
     /// scale-dependent byte counts.
@@ -3327,6 +3443,114 @@ mod tests {
                 .contains(Modifier::BOLD),
             "no new LED, no flash"
         );
+    }
+
+    #[test]
+    fn compaction_exhale_holds_a_dim_after_image_for_two_ticks_then_settles() {
+        use ratatui::style::Modifier;
+        let mut screen = footer_screen("~/repo");
+        screen.arm_detents();
+        // 210k of 300k lights 7 LEDs; settle the light-up flash first.
+        screen.apply(provider_turn(210_000));
+        screen.tick();
+        screen.tick();
+        assert_eq!(lit_dots(&screen), 7);
+
+        // Compaction replaces ~100k with a ~10k summary: the meter repaints
+        // AT the event (never a turn late) and the three vacated LEDs hold a
+        // dim `●` after-image over the settled `○` tail.
+        screen.apply(compaction(100_000, 10_000));
+        let bar = bar_text(&screen, 100);
+        assert!(bar.contains("CTX 120k"), "event-time repaint: {bar:?}");
+        let dots = meter_dots(&screen);
+        assert_eq!(lit_dots(&screen), 7, "4 lit + 3 after-images");
+        assert_eq!(
+            dots[3].1,
+            prompt_style(),
+            "the new edge dot is plain orange — a shrink never flashes bright"
+        );
+        assert!(!dots[3].1.add_modifier.contains(Modifier::BOLD));
+        for (glyph, style) in &dots[4..7] {
+            assert_eq!(glyph, crate::ui::symbols::RUNNING, "after-image glyph");
+            assert_eq!(*style, super::meter_used_style(), "muted luminance");
+        }
+
+        // Exactly two ticks of after-image, then the vacated LEDs settle to ○.
+        screen.tick();
+        assert_eq!(lit_dots(&screen), 7, "still exhaling after one tick");
+        screen.tick();
+        assert_eq!(lit_dots(&screen), 4, "settled");
+        assert_eq!(meter_dots(&screen)[4].0, crate::ui::symbols::EMPTY);
+    }
+
+    #[test]
+    fn fold_reclaim_exhales_at_the_fold_event() {
+        let mut screen = footer_screen("~/repo");
+        screen.arm_detents();
+        screen.apply(provider_turn(210_000));
+        screen.tick();
+        screen.tick();
+
+        // A microcompaction fold batch reclaims ~90k: same event-time meter
+        // repaint, same exhale, no waiting for the next provider turn.
+        screen.apply(UiEvent::FoldApplied {
+            folds: 2,
+            reclaimed_tokens_estimate: 90_000,
+            trigger: crate::nexus::FoldTrigger::CompactionBoundary,
+        });
+        let bar = bar_text(&screen, 100);
+        assert!(bar.contains("CTX 120k"), "event-time repaint: {bar:?}");
+        assert_eq!(lit_dots(&screen), 7, "4 lit + 3 after-images");
+        screen.tick();
+        screen.tick();
+        assert_eq!(lit_dots(&screen), 4, "settled");
+    }
+
+    #[test]
+    fn simultaneous_shrink_and_growth_favors_the_bright_flash() {
+        use ratatui::style::Modifier;
+        let mut screen = footer_screen("~/repo");
+        screen.arm_detents();
+        screen.apply(provider_turn(120_000)); // 4 LEDs
+        screen.tick();
+        screen.tick();
+
+        // A drop to 2 LEDs arms the exhale; growth back to 3 in the same tick
+        // window wins: the fresh edge flashes bright and the after-image is
+        // cancelled — news of growth outranks the echo of shrinkage.
+        screen.apply(compaction(70_000, 10_000)); // 120k → 60k: 2 LEDs
+        assert_eq!(lit_dots(&screen), 4, "2 lit + 2 after-images");
+        screen.apply(provider_turn(90_000)); // back up to 3 LEDs
+        let dots = meter_dots(&screen);
+        assert_eq!(lit_dots(&screen), 3, "no after-image survives growth");
+        assert!(
+            dots[2].1.add_modifier.contains(Modifier::BOLD),
+            "the newly lit edge flashes"
+        );
+    }
+
+    #[test]
+    fn exhale_stays_dark_before_the_loop_arms_the_detents() {
+        let mut screen = footer_screen("~/repo");
+        // No arm_detents(): startup/restore traffic must never animate.
+        screen.apply(provider_turn(210_000));
+        screen.apply(compaction(100_000, 10_000));
+        // The fill still repaints at the event — only the motion is withheld.
+        assert!(bar_text(&screen, 100).contains("CTX 120k"));
+        assert_eq!(lit_dots(&screen), 4, "no after-image while disarmed");
+    }
+
+    #[test]
+    fn reduced_motion_exhale_settles_instantly() {
+        let mut screen = footer_screen("~/repo");
+        screen.set_reduced_motion(true);
+        screen.arm_detents();
+        screen.apply(provider_turn(210_000));
+        screen.apply(compaction(100_000, 10_000));
+        // Reduced motion removes the after-image, never the data: the meter
+        // still repaints to the post-reclaim total at the event.
+        assert!(bar_text(&screen, 100).contains("CTX 120k"));
+        assert_eq!(lit_dots(&screen), 4, "settles instantly");
     }
 
     #[test]
