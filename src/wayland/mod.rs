@@ -46,9 +46,9 @@ use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalGate, BoundaryContext, ChatProvider,
     CompactionLifecycleState, CompactionOrigin, ContextDirective, ContextGovernor,
     ContextGovernorFuture, ContextMeasurementSource, ContextOverflowFuture,
-    ContextOverflowRecovery, ContextPressureTier, FoldTrigger, Message, ProviderEvent,
-    ProviderUsage, Role, SessionSpanReader, SteeringSource, ToolEnv, Tools, TurnContextHooks,
-    TurnInput, VerificationOutcome, VerifyRun,
+    ContextOverflowRecovery, ContextPressureTier, FoldTrigger, Message,
+    ProviderCompactionCapability, ProviderEvent, ProviderUsage, Role, SessionSpanReader,
+    SteeringSource, ToolEnv, Tools, TurnContextHooks, TurnInput, VerificationOutcome, VerifyRun,
 };
 use crate::session::{
     CompactionTaskState, SessionLog, estimate_tokens, message_token_estimate, preview_line,
@@ -465,6 +465,14 @@ impl<P: ChatProvider> Harness<P> {
         self.compaction.summarizer_factory = Some(factory);
     }
 
+    pub(crate) fn set_provider_native(&mut self, enabled: bool) {
+        self.compaction.provider_native = enabled;
+    }
+
+    pub(crate) fn set_provider_compaction_factory(&mut self, factory: SummarizerFactory) {
+        self.compaction.provider_compaction_factory = Some(factory);
+    }
+
     pub(crate) fn set_compaction_worker(&mut self, worker: CompactionWorkerConfig) {
         self.compaction.worker = worker;
     }
@@ -521,6 +529,17 @@ impl<P: ChatProvider> Harness<P> {
         model: &str,
         reasoning: Option<&str>,
     ) {
+        if self
+            .compaction
+            .last_selection
+            .as_ref()
+            .is_some_and(|current| {
+                current.0 != provider || current.1 != model || current.2.as_deref() != reasoning
+            })
+        {
+            self.compaction.selection_generation =
+                self.compaction.selection_generation.saturating_add(1);
+        }
         self.compaction.last_selection = Some((
             provider.to_string(),
             model.to_string(),
@@ -1168,9 +1187,7 @@ impl<P: ChatProvider> Harness<P> {
         }
         if result.is_ok()
             && !token.is_cancelled()
-            && (self.compaction.trigger_v2
-                || (self.compaction.summarizer != SummarizerKind::Excerpts
-                    && self.compaction.summarizer_factory.is_some()))
+            && (self.compaction.trigger_v2 || self.compaction.has_model_worker())
         {
             // Safe turn boundary after the result/output is presented: apply any
             // ready background summary and, if the completed turn crossed the
@@ -1663,8 +1680,7 @@ impl<P: ChatProvider> Harness<P> {
                     return Ok(());
                 };
                 let model_backed = !ladder.deterministic_only
-                    && self.compaction.summarizer != SummarizerKind::Excerpts
-                    && self.compaction.summarizer_factory.is_some()
+                    && self.compaction.has_model_worker()
                     && !self
                         .compaction
                         .model_compaction_cap_reached(CompactionOrigin::Subagent)
@@ -1738,8 +1754,7 @@ impl<P: ChatProvider> Harness<P> {
         };
         if allow_background_start
             && self.compaction.background.is_none()
-            && self.compaction.summarizer != SummarizerKind::Excerpts
-            && self.compaction.summarizer_factory.is_some()
+            && self.compaction.has_model_worker()
         {
             self.start_background_compaction(&messages, plan, obs)?;
             return Ok(());
@@ -1916,8 +1931,7 @@ impl<P: ChatProvider> Harness<P> {
                     .to_string(),
             ));
         };
-        let model_backed = self.compaction.summarizer != SummarizerKind::Excerpts
-            && self.compaction.summarizer_factory.is_some();
+        let model_backed = self.compaction.has_model_worker();
         if model_backed {
             if self.compaction.background.is_none() {
                 let original_instructions = self.compaction.worker.instructions.clone();
@@ -2169,6 +2183,11 @@ impl<P: ChatProvider> Harness<P> {
         if self.session_id().map(str::to_string) != job.session_id {
             return None;
         }
+        if job.origin == CompactionOrigin::ProviderNative
+            && job.selection_generation != self.compaction.selection_generation
+        {
+            return None;
+        }
         let messages = self.agent.messages();
         let start = self
             .compaction
@@ -2206,58 +2225,13 @@ impl<P: ChatProvider> Harness<P> {
         plan: CompactionPlan,
         obs: &dyn AgentObserver,
     ) -> Result<()> {
-        let factory = self
-            .compaction
-            .summarizer_factory
-            .as_ref()
-            .expect("caller checks factory")
-            .clone();
-        let covered = messages[plan.start..plan.end].to_vec();
-        let covered_messages = covered.len();
-        let original_tokens = context_tokens(&covered);
-        let job_id = format!("compaction_{:08x}", self.compaction.next_job_seq);
-        self.compaction.next_job_seq = self.compaction.next_job_seq.saturating_add(1);
-        let token = CancellationToken::new();
-        let worker_token = token.clone();
-        let workspace = self.workspace.clone();
-        let mode = self.compaction.summarizer;
-        let worker = self.compaction.worker.clone();
-        let origin = match mode {
-            SummarizerKind::Subagent => CompactionOrigin::Subagent,
-            SummarizerKind::Provider => CompactionOrigin::Provider,
-            SummarizerKind::Excerpts => CompactionOrigin::Excerpts,
-        };
-        let (tx, receiver) = mpsc::channel();
-        thread::Builder::new()
-            .name(format!("iris-{job_id}"))
-            .spawn(move || {
-                let result =
-                    run_compaction_worker(factory, workspace, covered, worker, mode, worker_token);
-                let _ = tx.send(result);
-            })?;
-        let job = BackgroundCompaction {
-            job_id,
-            session_id: self.session_id().map(str::to_string),
-            from_id: plan.from_id,
-            to_id: plan.to_id,
-            covered_messages,
-            original_tokens,
-            receiver,
-            token,
-            origin,
-            trigger_tier: Some(ContextPressureTier::Start),
-            started_at: std::time::Instant::now(),
-        };
-        self.emit_compaction_lifecycle(
+        self.compaction.start_background(
+            messages,
+            plan,
+            &self.workspace,
             obs,
-            &job,
-            CompactionLifecycleState::Running,
-            Some(format!(
-                "background compaction running for {covered_messages} message(s), ~{original_tokens} tokens"
-            )),
-        )?;
-        self.compaction.background = Some(job);
-        Ok(())
+            Some(ContextPressureTier::Start),
+        )
     }
 
     /// Shared foreground compaction core: produce the summary for a chosen range,
@@ -2358,6 +2332,7 @@ impl<P: ChatProvider> Harness<P> {
                                     origin: CompactionOrigin::Subagent,
                                     worker_usage,
                                     instructions: None,
+                                    provider_blocks: Vec::new(),
                                 });
                             }
                             tracing::warn!(
@@ -2415,6 +2390,7 @@ impl<P: ChatProvider> Harness<P> {
                             origin: CompactionOrigin::Provider,
                             worker_usage,
                             instructions: None,
+                            provider_blocks: Vec::new(),
                         });
                     }
                     tracing::warn!(

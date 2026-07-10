@@ -745,6 +745,7 @@ mod tests {
             provider_turn_id: None,
             redacted: false,
             origin: None,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -758,6 +759,7 @@ mod tests {
             provider_turn_id: None,
             redacted: false,
             origin: None,
+            provider_blocks: Vec::new(),
         }
     }
 

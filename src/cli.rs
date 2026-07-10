@@ -1008,6 +1008,7 @@ pub(crate) fn compaction_panel_parts(
         "  recall handle      {}",
         entry.recall_handle.as_deref().unwrap_or("unavailable")
     ));
+    lines.push(format!("  provider blocks    {}", entry.provider_blocks));
     match &entry.worker_usage {
         Some(usage) => {
             let cache = usage

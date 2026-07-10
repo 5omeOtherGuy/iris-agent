@@ -109,6 +109,21 @@ global/user-only.
 - Provider usage metadata may be incomplete or absent; UI and benchmarks must
   treat missing usage as unknown, not zero savings.
 
+## Addendum (2026-07-10, provider compaction blocks)
+
+ADR-0056 supplies the missing durable representation. Compaction entries may
+now persist an adapter-owned `providerBlocks` envelope beside a mandatory,
+self-sufficient text summary. `compaction.providerNative=auto` is global-only,
+default-off, and capability-gated. Mimir replays a block only on the same
+adapter and exact model; every other selection uses the text summary.
+
+The earlier blanket rejection of Anthropic compact is therefore lifted for the
+normalized provider-native route. The legacy `anthropicContextManagement`
+compact field remains rejected so two settings cannot control the same reducer.
+Clear-tool-use/local-fold disjointness is unchanged. OpenAI's v2 trigger shape
+remains probe-only because its opaque response does not provide the portable
+text required by ADR-0056.
+
 ## Addendum (2026-07-05, issue #400; superseded 2026-07-09)
 
 `anthropicContextManagement.clearToolUses` and local microcompaction

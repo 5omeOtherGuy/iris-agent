@@ -90,6 +90,7 @@ pub(super) struct CompactionSummary {
     pub(super) origin: CompactionOrigin,
     pub(super) worker_usage: Option<ProviderUsage>,
     pub(super) instructions: Option<String>,
+    pub(super) provider_blocks: Vec<Value>,
 }
 
 impl CompactionSummary {
@@ -99,6 +100,7 @@ impl CompactionSummary {
             origin: CompactionOrigin::Excerpts,
             worker_usage: None,
             instructions: None,
+            provider_blocks: Vec::new(),
         }
     }
 }
@@ -120,6 +122,7 @@ pub(super) struct BackgroundCompaction {
     pub(super) origin: CompactionOrigin,
     pub(super) trigger_tier: Option<ContextPressureTier>,
     pub(super) started_at: std::time::Instant,
+    pub(super) selection_generation: u64,
 }
 
 pub(super) enum BackgroundSummaryResult {
@@ -155,6 +158,9 @@ pub(super) struct CompactionEngine {
     pub(super) summarizer: SummarizerKind,
     pub(super) worker: CompactionWorkerConfig,
     pub(super) summarizer_factory: Option<SummarizerFactory>,
+    pub(super) provider_native: bool,
+    pub(super) provider_compaction_factory: Option<SummarizerFactory>,
+    pub(super) selection_generation: u64,
     pub(super) background: Option<BackgroundCompaction>,
     pub(super) next_job_seq: u64,
     pub(super) tool_result_policy: ToolResultCompactionPolicy,
@@ -210,6 +216,9 @@ impl CompactionEngine {
             summarizer: SummarizerKind::default(),
             worker: CompactionWorkerConfig::default(),
             summarizer_factory: None,
+            provider_native: false,
+            provider_compaction_factory: None,
+            selection_generation: 0,
             background: None,
             next_job_seq: 0,
             tool_result_policy: crate::config::Settings::default()
@@ -250,9 +259,16 @@ impl CompactionEngine {
         self.in_turn
             && matches!(
                 origin,
-                CompactionOrigin::Subagent | CompactionOrigin::Provider
+                CompactionOrigin::Subagent
+                    | CompactionOrigin::Provider
+                    | CompactionOrigin::ProviderNative
             )
             && self.model_compactions_this_turn >= 2
+    }
+
+    pub(super) fn has_model_worker(&self) -> bool {
+        (self.provider_native && self.provider_compaction_factory.is_some())
+            || (self.summarizer != SummarizerKind::Excerpts && self.summarizer_factory.is_some())
     }
 
     /// Append every message not yet durable and capture its assigned entry id.
@@ -326,7 +342,7 @@ impl CompactionEngine {
             .session
             .as_mut()
             .expect("compaction callers check the session first");
-        let compaction_id = log.append_compaction_with_metadata(
+        let compaction_id = log.append_compaction_with_provider_metadata(
             &plan.from_id,
             &plan.to_id,
             &summary.text,
@@ -336,6 +352,7 @@ impl CompactionEngine {
             summary.origin,
             summary.worker_usage.as_ref(),
             summary.instructions.as_deref(),
+            &summary.provider_blocks,
         )?;
         let generation = log.compaction_generation();
         tracing::info!(
@@ -357,7 +374,8 @@ impl CompactionEngine {
             new_messages.push(message.clone());
             new_entry_ids.push(id.clone());
         }
-        new_messages.push(Message::user(&body));
+        new_messages
+            .push(Message::user(&body).with_provider_blocks(summary.provider_blocks.clone()));
         new_entry_ids.push(None);
         for (offset, message) in messages[plan.end..].iter().enumerate() {
             new_messages.push(message.clone());
@@ -393,7 +411,9 @@ impl CompactionEngine {
         if self.in_turn
             && matches!(
                 summary.origin,
-                CompactionOrigin::Subagent | CompactionOrigin::Provider
+                CompactionOrigin::Subagent
+                    | CompactionOrigin::Provider
+                    | CompactionOrigin::ProviderNative
             )
         {
             self.model_compactions_this_turn = self.model_compactions_this_turn.saturating_add(1);
@@ -518,9 +538,59 @@ pub(super) fn run_compaction_worker(
                 worker_usage,
                 instructions: (!config.instructions.is_empty())
                     .then(|| config.instructions.clone()),
+                provider_blocks: Vec::new(),
             })
         }
         Ok(_) => BackgroundSummaryResult::Failed("summarizer returned empty text".to_string()),
+        Err(error) => BackgroundSummaryResult::Failed(format!("{error:#}")),
+    }
+}
+
+pub(super) fn run_provider_native_worker(
+    factory: SummarizerFactory,
+    covered: Vec<Message>,
+    config: CompactionWorkerConfig,
+    token: CancellationToken,
+) -> BackgroundSummaryResult {
+    if token.is_cancelled() {
+        return BackgroundSummaryResult::Cancelled;
+    }
+    let covered_messages = covered.len();
+    // Some adapters use reqwest's blocking client for this dedicated worker.
+    // Polling that future inside Tokio makes reqwest drop its internal runtime
+    // from an async context and panic. The worker already owns an OS thread, so
+    // a runtime-free executor is the correct boundary for this provider seam.
+    let output = factory().and_then(|provider| {
+        futures::executor::block_on(provider.compact_context(
+            &covered,
+            &config.instructions,
+            &token,
+        ))
+    });
+    if token.is_cancelled() {
+        return BackgroundSummaryResult::Cancelled;
+    }
+    match output {
+        Ok(output) if !output.summary.trim().is_empty() && output.provider_blocks.len() == 1 => {
+            BackgroundSummaryResult::Summary(CompactionSummary {
+                text: format!(
+                    "[compacted summary of {covered_messages} earlier message(s)]\n{}",
+                    output.summary.trim()
+                ),
+                origin: CompactionOrigin::ProviderNative,
+                worker_usage: output.usage,
+                instructions: (!config.instructions.is_empty())
+                    .then(|| config.instructions.clone()),
+                provider_blocks: output.provider_blocks,
+            })
+        }
+        Ok(output) if output.summary.trim().is_empty() => BackgroundSummaryResult::Failed(
+            "provider-native compaction returned empty portable text".to_string(),
+        ),
+        Ok(output) => BackgroundSummaryResult::Failed(format!(
+            "provider-native compaction returned {} opaque blocks; expected exactly one",
+            output.provider_blocks.len()
+        )),
         Err(error) => BackgroundSummaryResult::Failed(format!("{error:#}")),
     }
 }

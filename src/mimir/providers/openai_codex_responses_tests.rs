@@ -525,6 +525,7 @@ fn builds_codex_request_from_tool_messages() {
                 provider_turn_id: None,
                 redacted: false,
                 origin: None,
+                provider_blocks: Vec::new(),
             },
             Message {
                 role: Role::Tool,
@@ -535,6 +536,7 @@ fn builds_codex_request_from_tool_messages() {
                 provider_turn_id: None,
                 redacted: false,
                 origin: None,
+                provider_blocks: Vec::new(),
             },
         ],
         &crate::tools::built_in_tools(),
@@ -555,6 +557,81 @@ fn builds_codex_request_from_tool_messages() {
             .unwrap()
             .contains("file text")
     );
+}
+
+#[test]
+fn remote_v2_compaction_probe_is_flag_gated_and_uses_a_trigger_item() {
+    assert!(!openai_native_probe_enabled(None));
+    assert!(openai_native_probe_enabled(Some("1")));
+    assert!(openai_native_probe_enabled(Some("true")));
+    assert!(!openai_native_probe_enabled(Some("0")));
+
+    let request = build_codex_native_compaction_probe_request(
+        "gpt-5.4-mini",
+        "IRIS PROMPT",
+        &[Message::user("old context")],
+        PromptCacheRetention::Short,
+    );
+    let input = request["input"].as_array().unwrap();
+    assert_eq!(
+        input.last().unwrap(),
+        &json!({ "type": "compaction_trigger" })
+    );
+    assert!(request["tools"].as_array().unwrap().is_empty());
+
+    let response = json!({
+        "output": [{ "type": "compaction", "encrypted_content": "opaque" }]
+    });
+    assert_eq!(
+        extract_codex_compaction_block(&response, "gpt-5.4-mini"),
+        Some(json!({
+            "adapter": "openai-codex-responses",
+            "model": "gpt-5.4-mini",
+            "block": { "type": "compaction", "encrypted_content": "opaque" }
+        }))
+    );
+}
+
+#[test]
+fn remote_v2_compaction_probe_captures_one_deduplicated_stream_item() {
+    let stream = concat!(
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}]}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let block = parse_codex_compaction_probe_reader(
+        std::io::Cursor::new(stream),
+        "gpt-5.4-mini",
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(block["adapter"], "openai-codex-responses");
+    assert_eq!(block["model"], "gpt-5.4-mini");
+    assert_eq!(block["block"]["encrypted_content"], "opaque");
+}
+
+#[test]
+fn cross_provider_request_uses_portable_summary_and_ignores_anthropic_block() {
+    let message =
+        Message::user("portable cross-provider summary").with_provider_blocks(vec![json!({
+            "adapter": "anthropic-messages",
+            "model": "claude-opus-4-6",
+            "block": { "type": "compaction", "content": "opaque-anthropic-summary" }
+        })]);
+    let request = build_codex_request(
+        "gpt-5.4-mini",
+        "IRIS PROMPT",
+        &[message],
+        &Tools::new(Vec::new()),
+        None,
+        None,
+        None,
+        PromptCacheRetention::Short,
+    );
+    let encoded = serde_json::to_string(&request).unwrap();
+    assert!(encoded.contains("portable cross-provider summary"));
+    assert!(!encoded.contains("opaque-anthropic-summary"));
+    assert!(!encoded.contains("providerBlocks"));
 }
 
 #[test]

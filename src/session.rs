@@ -72,6 +72,7 @@ pub(crate) struct CompactionInspection {
     pub(crate) worker_usage: Option<crate::nexus::ProviderUsage>,
     pub(crate) instructions: Option<String>,
     pub(crate) recall_handle: Option<String>,
+    pub(crate) provider_blocks: usize,
 }
 
 /// Current transcript format version. v2 adds per-entry `id` + `parentId` to the
@@ -242,6 +243,7 @@ impl SessionLog {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_compaction_with_metadata(
         &mut self,
@@ -254,6 +256,34 @@ impl SessionLog {
         origin: crate::nexus::CompactionOrigin,
         worker_usage: Option<&crate::nexus::ProviderUsage>,
         instructions: Option<&str>,
+    ) -> Result<String> {
+        self.append_compaction_with_provider_metadata(
+            covered_from,
+            covered_to,
+            summary,
+            carry_paths,
+            task_state,
+            token_estimate,
+            origin,
+            worker_usage,
+            instructions,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_compaction_with_provider_metadata(
+        &mut self,
+        covered_from: &str,
+        covered_to: &str,
+        summary: &str,
+        carry_paths: &[String],
+        task_state: Option<&CompactionTaskState>,
+        token_estimate: Option<u64>,
+        origin: crate::nexus::CompactionOrigin,
+        worker_usage: Option<&crate::nexus::ProviderUsage>,
+        instructions: Option<&str>,
+        provider_blocks: &[Value],
     ) -> Result<String> {
         let id = self.next_id();
         // Generation ordinal (ADR-0047): 1-based count of compactions in this
@@ -288,6 +318,9 @@ impl SessionLog {
         // compaction and older readers are unaffected.
         if !carry_paths.is_empty() {
             entry["carryPaths"] = json!(carry_paths);
+        }
+        if !provider_blocks.is_empty() {
+            entry["providerBlocks"] = json!(provider_blocks);
         }
         if let Some(task_state) = task_state.filter(|state| !state.is_empty()) {
             entry["taskState"] = json!({
@@ -1390,6 +1423,7 @@ pub(crate) fn read_compaction_inspections(path: &Path) -> Result<Vec<CompactionI
                 carry_paths: compaction.carry_paths,
                 worker_usage: compaction.worker_usage,
                 instructions: compaction.instructions,
+                provider_blocks: compaction.provider_blocks.len(),
             }
         })
         .collect())
@@ -1512,6 +1546,9 @@ struct Compaction {
     origin: String,
     worker_usage: Option<crate::nexus::ProviderUsage>,
     instructions: Option<String>,
+    /// Provider-owned envelopes replayed only by the matching adapter/model.
+    /// Empty for every legacy and locally summarized entry.
+    provider_blocks: Vec<Value>,
 }
 
 /// Parse a `compaction` entry's rebuild fields. `None` (skipped as malformed)
@@ -1555,6 +1592,11 @@ fn parse_compaction(value: &Value) -> Option<Compaction> {
             .get("instructions")
             .and_then(Value::as_str)
             .map(String::from),
+        provider_blocks: value
+            .get("providerBlocks")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
     })
 }
 
@@ -1655,7 +1697,7 @@ fn rebuild_with_compactions(
     let mut covered = vec![false; entries.len()];
     // Summary (and its token estimate) to emit at the position of each range's
     // first covered message.
-    let mut summary_at: Vec<Option<(String, u64)>> = vec![None; entries.len()];
+    let mut summary_at: Vec<Option<(String, u64, Vec<Value>)>> = vec![None; entries.len()];
     for compaction in compactions {
         let from = lookup_covered(&index_of, &compaction.covered_from, path)?;
         let to = lookup_covered(&index_of, &compaction.covered_to, path)?;
@@ -1691,7 +1733,7 @@ fn rebuild_with_compactions(
         let summary_tokens = compaction
             .token_estimate
             .unwrap_or_else(|| estimate_tokens(&body));
-        summary_at[from] = Some((body, summary_tokens));
+        summary_at[from] = Some((body, summary_tokens, compaction.provider_blocks));
     }
 
     // Folds apply AFTER compaction coverage (ADR-0048 precedence): a fold whose
@@ -1732,13 +1774,13 @@ fn rebuild_with_compactions(
     let mut entry_ids: Vec<Option<String>> = Vec::new();
     let mut context_tokens = 0u64;
     for (i, entry) in entries.into_iter().enumerate() {
-        if let Some((summary, summary_tokens)) = summary_at[i].take() {
+        if let Some((summary, summary_tokens, provider_blocks)) = summary_at[i].take() {
             // The summary stands in for the covered turns as a single user-role
             // message; providers accept it verbatim and resume continues from
             // it. The role/text choice lives only here, so swapping in a
             // provider/local summarizer later changes how the text is produced,
             // not how storage or rebuild work.
-            messages.push(Message::user(&summary));
+            messages.push(Message::user(&summary).with_provider_blocks(provider_blocks));
             entry_ids.push(None);
             // saturating: see the empty-compactions path above.
             context_tokens = context_tokens.saturating_add(summary_tokens);
@@ -1821,6 +1863,7 @@ fn parse_message(inner: &Value) -> Option<Message> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         origin: inner.get("origin").and_then(parse_origin),
+        provider_blocks: Vec::new(),
     })
 }
 
@@ -3235,6 +3278,42 @@ mod tests {
         assert_eq!(entry["workerUsage"]["cacheReadInputTokens"], 80);
         assert_eq!(entry["workerUsage"]["cacheWriteInputTokens"], 20);
         assert_eq!(entry["workerUsage"]["totalTokens"], 150);
+    }
+
+    #[test]
+    fn provider_compaction_blocks_round_trip_and_rebuild_with_portable_text() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let from = log.append(&Message::user("alpha")).unwrap();
+        let to = log.append(&Message::assistant("beta")).unwrap();
+        let blocks = vec![serde_json::json!({
+            "adapter": "anthropic-messages",
+            "model": "claude-opus-4-6",
+            "block": { "type": "compaction", "content": "portable summary" }
+        })];
+
+        log.append_compaction_with_provider_metadata(
+            &from,
+            &to,
+            "portable summary",
+            &[],
+            None,
+            Some(4),
+            CompactionOrigin::ProviderNative,
+            None,
+            None,
+            &blocks,
+        )
+        .unwrap();
+
+        let entry = lines(log.path()).pop().unwrap();
+        assert_eq!(entry["origin"], "providerNative");
+        assert_eq!(entry["providerBlocks"], serde_json::json!(blocks));
+
+        let rebuilt = read_messages(log.path()).unwrap();
+        assert_eq!(rebuilt.messages.len(), 1);
+        assert_eq!(rebuilt.messages[0].content, "portable summary");
+        assert_eq!(rebuilt.messages[0].provider_blocks, blocks);
     }
 
     #[test]

@@ -122,10 +122,20 @@
   `cache_control` markers with optional 1h TTL. Iris records provider usage/cache
   metadata and warns only on proven stable-prefix breaks, not ordinary cold
   caches. [Partial]
+- **Provider-native compaction opt-in** — global-only
+  `compaction.providerNative` accepts `off` (default) or capability-gated
+  `auto`. Entries persist a portable summary plus one adapter-owned opaque
+  block; only the same adapter and exact model replay the block. Anthropic's
+  compact beta is implemented above its 50k trigger floor. The Haiku 4.5 live
+  lane currently rejects the request, so automatic mode remains default-off.
+  OpenAI's v2 trigger probe succeeds on the Codex mini subscription lane but is
+  not enabled until it can satisfy the portable-text invariant. (ADR-0056)
+  [Partial]
 - **Anthropic context-management opt-in** — global-only
   `anthropicContextManagement` supports the public clear-tool-use and
-  clear-thinking edits; provider-side compact is rejected until Iris can persist
-  and replay compaction blocks safely. [Partial]
+  clear-thinking edits. The normalized compact route is
+  `compaction.providerNative`; the legacy duplicate setting remains rejected.
+  [Partial]
 - **Recoverable tool-result compaction** — default-off
   `toolResultCompaction` composes retain-N stale-read dedupe with local
   age/count clearing. Shared count/token guards protect the recent working set;
@@ -316,6 +326,13 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   `worker.model` routes the worker through Mimir. The parent alone validates,
   persists, and applies. Entries record origin, instructions, and reported
   worker token/cache usage. (ADR-0041) [Implemented]
+- **Provider-native summary worker** — when explicitly enabled and capability
+  is reported, the provider replaces the background summary worker without
+  replacing the parent-owned apply path. Portable text, opaque block, origin,
+  and usage persist together; selection changes discard native jobs. Anthropic
+  is implemented but the required Haiku 4.5 live probe is currently rejected by
+  the provider. The OpenAI v2 probe succeeds but returns opaque state only.
+  (ADR-0056) [Partial]
 - **Manual `/compact [focus]`** — uses the same one-slot worker pipeline at the
   inter-turn boundary. It attaches to an existing job, supports a bounded focus
   instruction, keeps a small recent tail, and works without a budget.

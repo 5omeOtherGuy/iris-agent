@@ -669,10 +669,31 @@ pub(crate) enum ProviderEvent {
     Completed(AssistantTurn),
 }
 
+/// Provider-native compaction support for the current selection and planned
+/// input. Mimir decides this from adapter/model capability; upper tiers never
+/// inspect provider ids or wire fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderCompactionCapability {
+    None,
+    OpaqueBlocks,
+}
+
+/// Successful provider-native reduction. `provider_blocks` are opaque adapter
+/// envelopes: Nexus and Wayland persist and replay them without interpretation.
+/// `summary` is always self-sufficient so another adapter can ignore the blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderCompactionOutput {
+    pub(crate) summary: String,
+    pub(crate) provider_blocks: Vec<Value>,
+    pub(crate) usage: Option<ProviderUsage>,
+}
+
 /// A `!Send` boxed stream of provider events tied to the borrow of the provider
 /// and its inputs. Boxed (not `impl Stream`) so the loop code is uniform and the
 /// real provider can back it with a channel fed by a blocking task.
 pub(crate) type ProviderStream<'a> = Pin<Box<dyn Stream<Item = Result<ProviderEvent>> + 'a>>;
+pub(crate) type ProviderCompactionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProviderCompactionOutput>> + 'a>>;
 
 /// A `!Send` boxed tool-execution future, so `Box<dyn Tool>` stays object-safe
 /// while `execute` is async.
@@ -1314,6 +1335,25 @@ pub(crate) trait ChatProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
     }
+
+    /// Whether this selection can produce a portable text summary plus opaque
+    /// replay block for the planned input size. The input estimate lets Mimir
+    /// enforce provider-native trigger floors without leaking them upward.
+    fn compaction_capability(&self, _input_tokens: u64) -> ProviderCompactionCapability {
+        ProviderCompactionCapability::None
+    }
+
+    /// Run one provider-native compaction request. Called only after capability
+    /// selection and off the parent loop; the default is a typed unsupported
+    /// error so adapters opt in explicitly.
+    fn compact_context<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _instructions: &'a str,
+        _cancel: &'a CancellationToken,
+    ) -> ProviderCompactionFuture<'a> {
+        Box::pin(async { bail!("provider-native compaction is not supported") })
+    }
 }
 
 /// Forward the contract through a boxed provider so the front-end can select
@@ -1331,6 +1371,19 @@ impl ChatProvider for Box<dyn ChatProvider> {
 
     fn capabilities(&self) -> ProviderCapabilities {
         (**self).capabilities()
+    }
+
+    fn compaction_capability(&self, input_tokens: u64) -> ProviderCompactionCapability {
+        (**self).compaction_capability(input_tokens)
+    }
+
+    fn compact_context<'a>(
+        &'a self,
+        messages: &'a [Message],
+        instructions: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> ProviderCompactionFuture<'a> {
+        (**self).compact_context(messages, instructions, cancel)
     }
 }
 
@@ -3334,6 +3387,11 @@ pub(crate) struct Message {
     pub(crate) provider_turn_id: Option<String>,
     pub(crate) redacted: bool,
     pub(crate) origin: Option<ModelOrigin>,
+    /// Opaque provider-owned compaction envelopes attached only to synthetic
+    /// summary messages. Adapters replay matching envelopes; every other lane
+    /// ignores them and consumes `content` as the portable summary.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) provider_blocks: Vec<Value>,
 }
 
 /// One visible user prompt plus optional hidden provider-context messages.
@@ -3395,6 +3453,7 @@ impl Message {
             provider_turn_id: None,
             redacted: block.redacted,
             origin: Some(block.origin),
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -3410,6 +3469,7 @@ impl Message {
             provider_turn_id: None,
             redacted: false,
             origin: None,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -3423,6 +3483,7 @@ impl Message {
             provider_turn_id: None,
             redacted: false,
             origin: None,
+            provider_blocks: Vec::new(),
         }
     }
 
@@ -3436,7 +3497,13 @@ impl Message {
             provider_turn_id: None,
             redacted: false,
             origin: None,
+            provider_blocks: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_provider_blocks(mut self, provider_blocks: Vec<Value>) -> Self {
+        self.provider_blocks = provider_blocks;
+        self
     }
 
     pub(crate) fn with_provider_turn_id(mut self, provider_turn_id: &str) -> Self {

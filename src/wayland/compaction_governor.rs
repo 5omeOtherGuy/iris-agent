@@ -308,8 +308,7 @@ impl CompactionEngine {
                     });
                 };
                 let model_backed = !ladder.deterministic_only
-                    && self.summarizer != SummarizerKind::Excerpts
-                    && self.summarizer_factory.is_some()
+                    && self.has_model_worker()
                     && !self.model_compaction_cap_reached(CompactionOrigin::Subagent)
                     && self.consecutive_failures < self.max_consecutive_failures;
                 if model_backed {

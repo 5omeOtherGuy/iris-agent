@@ -278,6 +278,7 @@ fn active_background_range_freezes_inside_folds_but_outside_folds_flush() {
         origin: CompactionOrigin::Subagent,
         trigger_tier: Some(ContextPressureTier::Start),
         started_at: std::time::Instant::now(),
+        selection_generation: 0,
     });
 
     let (frozen, _frozen_tokens) = harness.frozen_fold_stats();

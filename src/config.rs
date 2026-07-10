@@ -220,6 +220,13 @@ pub(crate) struct CompactionTriggerConfig {
     pub(crate) reactive: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ProviderNativeMode {
+    #[default]
+    Off,
+    Auto,
+}
+
 fn merge_compaction(
     global: Option<CompactionSettings>,
     project: Option<CompactionSettings>,
@@ -644,6 +651,19 @@ impl Settings {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
+    }
+
+    pub(crate) fn compaction_provider_native(&self) -> Result<ProviderNativeMode> {
+        match self
+            .compaction
+            .as_ref()
+            .and_then(|value| value.provider_native.as_deref())
+            .map(str::trim)
+        {
+            None | Some("off") => Ok(ProviderNativeMode::Off),
+            Some("auto") => Ok(ProviderNativeMode::Auto),
+            Some(_) => bail!("compaction.providerNative must be off|auto"),
+        }
     }
 
     /// Whether opt-in microcompaction is enabled (ADR-0048, #378). Default off
@@ -1653,6 +1673,10 @@ mod tests {
             "project config cannot redirect worker traffic"
         );
         assert_eq!(block.provider_native.as_deref(), Some("auto"));
+        assert_eq!(
+            merged.compaction_provider_native().unwrap(),
+            ProviderNativeMode::Auto
+        );
 
         let worker = merged.compaction_worker_config().unwrap();
         assert_eq!(
@@ -1678,6 +1702,21 @@ mod tests {
         };
         assert!(invalid.compaction_trigger().is_err());
 
+        let invalid_native = Settings {
+            compaction: Some(CompactionSettings {
+                provider_native: Some("always".to_string()),
+                ..CompactionSettings::default()
+            }),
+            ..Settings::default()
+        };
+        assert!(
+            invalid_native
+                .compaction_provider_native()
+                .unwrap_err()
+                .to_string()
+                .contains("off|auto")
+        );
+
         let unbounded_wait = Settings {
             compaction: Some(CompactionSettings {
                 hard_wait_ms: Some(120_001),
@@ -1687,6 +1726,25 @@ mod tests {
         };
         let error = unbounded_wait.compaction_trigger().unwrap_err().to_string();
         assert!(error.contains("at most 120000"), "{error}");
+    }
+
+    #[test]
+    fn provider_native_defaults_off_and_is_global_only() {
+        assert_eq!(
+            Settings::default().compaction_provider_native().unwrap(),
+            ProviderNativeMode::Off
+        );
+
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(&global, r#"{ "compaction": { "providerNative": "auto" } }"#).unwrap();
+        fs::write(&project, r#"{ "compaction": { "providerNative": "off" } }"#).unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        assert_eq!(
+            settings.compaction_provider_native().unwrap(),
+            ProviderNativeMode::Auto
+        );
     }
 
     #[test]

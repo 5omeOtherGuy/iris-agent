@@ -134,6 +134,48 @@ impl OpenAiCodexResponsesProvider {
             ws_state: Arc::new(tokio::sync::Mutex::new(CodexWsState::default())),
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn probe_v2_compaction(
+        &self,
+        messages: &[Message],
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        if !openai_native_probe_enabled(
+            std::env::var("IRIS_OPENAI_NATIVE_COMPACTION_PROBE")
+                .ok()
+                .as_deref(),
+        ) {
+            bail!("OpenAI native compaction probe is disabled");
+        }
+        let request = build_codex_native_compaction_probe_request(
+            &self.model,
+            &self.system_prompt,
+            messages,
+            self.cache_retention,
+        );
+        let token = self.tokens.access_token(&self.client)?;
+        let response = self
+            .client
+            .post(resolve_codex_url(&self.base_url)?)
+            .headers(codex_headers(&token)?)
+            .json(&request)
+            .send()
+            .context("failed to send Codex native compaction probe")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            let error_type = extract_error_field(&body, "type")
+                .or_else(|| extract_error_field(&body, "code"))
+                .unwrap_or_else(|| "unknown_error".to_string());
+            bail!(
+                "Codex native compaction probe failed [status={} endpoint=/codex/responses model={} error_type={error_type}]",
+                status.as_u16(),
+                self.model
+            );
+        }
+        parse_codex_compaction_probe_reader(BufReader::new(response), &self.model, cancel)
+    }
 }
 
 impl ChatProvider for OpenAiCodexResponsesProvider {
@@ -667,6 +709,90 @@ fn build_codex_request(
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
     body
+}
+
+#[cfg(test)]
+fn openai_native_probe_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value.trim(), "1" | "true" | "on"))
+}
+
+#[cfg(test)]
+fn build_codex_native_compaction_probe_request(
+    model: &str,
+    instructions: &str,
+    messages: &[Message],
+    cache_retention: PromptCacheRetention,
+) -> Value {
+    let mut body = build_codex_request(
+        model,
+        instructions,
+        messages,
+        &Tools::new(Vec::new()),
+        None,
+        None,
+        None,
+        cache_retention,
+    );
+    body["input"]
+        .as_array_mut()
+        .expect("request input is an array")
+        .push(json!({ "type": "compaction_trigger" }));
+    body
+}
+
+#[cfg(test)]
+fn extract_codex_compaction_block(response: &Value, model: &str) -> Option<Value> {
+    let item = response
+        .get("output")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))?;
+    let encrypted = item.get("encrypted_content").and_then(Value::as_str)?;
+    Some(json!({
+        "adapter": API_ID,
+        "model": model,
+        "block": { "type": "compaction", "encrypted_content": encrypted }
+    }))
+}
+
+#[cfg(test)]
+fn parse_codex_compaction_probe_reader(
+    reader: impl BufRead,
+    model: &str,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    let mut blocks = Vec::new();
+    for_each_sse_event(reader, cancel, |data| {
+        if data.is_empty() || data == "[DONE]" {
+            return Ok(());
+        }
+        let event: Value = serde_json::from_str(data)
+            .map_err(|_| anyhow!("Codex native compaction probe returned invalid SSE JSON"))?;
+        if event.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+            && let Some(item) = event.get("item")
+            && let Some(block) =
+                extract_codex_compaction_block(&json!({ "output": [item.clone()] }), model)
+            && !blocks.contains(&block)
+        {
+            blocks.push(block);
+        }
+        if matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("response.completed" | "response.done")
+        ) && let Some(response) = event.get("response")
+            && let Some(block) = extract_codex_compaction_block(response, model)
+            && !blocks.contains(&block)
+        {
+            blocks.push(block);
+        }
+        Ok(())
+    })?;
+    match blocks.len() {
+        1 => Ok(blocks.pop().expect("one checked block")),
+        count => bail!(
+            "Codex native compaction probe returned {count} opaque blocks; expected exactly one"
+        ),
+    }
 }
 
 /// Map a normalized reasoning level to the Codex Responses `reasoning` object,

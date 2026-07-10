@@ -21,6 +21,8 @@ this file keeps implementation issues and decisions that span slices.
   passed.
 - Slice 5: typed overflow classification, bounded reactive resend, deterministic
   recovery ladder, and induced-overflow live coverage merged in PR #530.
+- Slice 6: durable compaction inspection, lifecycle/chip states, and the live TUI
+  milestone merged in PR #534.
 
 ## Slice 5 — reactive recovery
 
@@ -72,7 +74,7 @@ session was the run's sole exclusion.
 
 ## Slice 6 — inspectability
 
-Status: implementation and live TUI milestone complete; awaiting merge.
+Status: merged in PR #534.
 
 Decision: `/compaction [n]` treats `n` as the durable 1-based generation
 ordinal; omission selects the latest. The viewer derives covered message count
@@ -114,3 +116,68 @@ Notable repository event: PRs #522 and #529 landed during slice 5's live run.
 Slice 5 rebased cleanly. The primary checkout remains intentionally dirty with
 unrelated operator changes, so primary sync refuses; each later slice continues
 from fetched `origin/main` in its own worktree.
+
+## Slice 7 — provider-native route
+
+Status: implementation complete; verification in progress.
+
+Decision: provider blocks are additive continuity hints, never the portable
+truth. Every native entry persists self-sufficient text, one opaque adapter
+envelope, usage, and `providerNative` origin. Rebuild is byte-identical before
+translation. Only Mimir decides whether the envelope matches the exact adapter
+and model; a selection change discards an in-flight native job.
+
+Decision: `compaction.providerNative=auto` is global-only and default-off. The
+legacy Anthropic compact field stays rejected so one reducer has one control.
+Anthropic capability is not advertised below the public 50,000-token trigger
+floor. A rejected model is cached for the process and later jobs use the
+portable ladder.
+
+Issue: the first real Anthropic probe panicked before the request completed:
+`Cannot drop a runtime in a context where blocking is not allowed. This happens
+when a runtime is dropped from within an asynchronous context.` The dedicated
+native worker polled a blocking adapter inside a Tokio runtime. A regression
+test now requires the provider future to run without a Tokio handle, and the
+worker uses the runtime-free futures executor on its already dedicated OS
+thread.
+
+Live capability result: the corrected request reached Anthropic, but
+`anthropic/claude-haiku-4-5` rejected compact. The lifecycle error was recorded
+verbatim:
+`background compaction failed; using deterministic fallback: Anthropic native
+compaction request failed (status=400, error_type=invalid_request_error)`.
+The same session applied excerpts, retained the needle, and rebuilt exactly.
+This agrees with the public compact documentation's current supported-model
+list, which does not include Haiku 4.5. The route remains implemented and
+probe-gated but does not clear the slice's native-live exit criterion on this
+lane; no success is fabricated.
+
+Decision: the OpenAI v2 `compaction_trigger` shape is pinned by deterministic
+request/response tests and an independently double-gated real probe. The live
+`openai-codex/gpt-5.4-mini` subscription backend accepted it and returned
+exactly one encrypted compaction block. The block does not include portable
+text, so the adapter still does not advertise capability. Accepting it directly
+would violate the cross-provider resume invariant; a future route must
+synthesize and measure text before it can produce a durable entry.
+
+Measurement follow-up: the native test's first run is excluded because of the
+runtime panic, and the corrected run is an explicit provider capability failure,
+not a passing native row. The ordinary two-lane LVP remains the behavioral gate
+for the portable path in this slice.
+
+Ordinary-LVP issue: the first slice 7 Codex attempt returned
+`Codex request failed [status=429 endpoint=/codex/responses model=gpt-5.4-mini
+error_type=usage_limit_reached]` for sessions 00 and 01. Two exclusions already
+made the run ineligible, so the remaining eight redundant calls were cancelled.
+This aborted attempt is recorded separately and will be regenerated after the
+quota reopens; it contributes no metrics.
+
+A one-session Codex retry after the deterministic gate returned the same
+`usage_limit_reached` error before any evaluated session. It contributes no
+metrics; the quota condition remains external and verbatim-recorded.
+
+Portable-path Haiku result: 10/10 sessions passed with 22 real compactions and
+no exclusions. Worst non-hard blocking was 16.2 ms; worst post-apply context was
+17,103/21,299. G2–G5 and the real-read check passed in every session. Three
+summary workers reported a 0.999 cache-read/input ratio and seven reported
+0.000. Every worker was `anthropic/claude-opus-4-6` at medium thinking.
