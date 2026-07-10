@@ -580,7 +580,7 @@ fn openai_reasoning_effort(level: ReasoningEffort) -> Option<&'static str> {
         ReasoningEffort::Off => None,
         ReasoningEffort::Minimal | ReasoningEffort::Low => Some("low"),
         ReasoningEffort::Medium => Some("medium"),
-        ReasoningEffort::High | ReasoningEffort::XHigh => Some("high"),
+        ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => Some("high"),
     }
 }
 

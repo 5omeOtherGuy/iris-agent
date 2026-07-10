@@ -1400,6 +1400,7 @@ fn manual_budget(level: ReasoningEffort) -> u32 {
         ReasoningEffort::Medium => 10240,
         ReasoningEffort::High => 20480,
         ReasoningEffort::XHigh => 32768,
+        ReasoningEffort::Max => 32768,
     }
 }
 
@@ -1415,6 +1416,7 @@ fn adaptive_effort(level: ReasoningEffort) -> &'static str {
         ReasoningEffort::Medium => "high",
         ReasoningEffort::High => "xhigh",
         ReasoningEffort::XHigh => "max",
+        ReasoningEffort::Max => "max",
     }
 }
 

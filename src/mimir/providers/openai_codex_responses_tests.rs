@@ -912,6 +912,22 @@ fn reasoning_level_adds_effort_and_off_omits() {
         json!({ "effort": "xhigh", "summary": "auto" })
     );
 
+    let max = build_codex_request(
+        "gpt-5.6-sol",
+        &instructions,
+        &messages,
+        &tools,
+        Some(ReasoningEffort::Max),
+        Some("session-1"),
+        None,
+        PromptCacheRetention::Short,
+    );
+    assert_eq!(
+        max["reasoning"],
+        json!({ "effort": "max", "summary": "auto" }),
+        "GPT-5.6 native max must reach the Codex Responses request unchanged"
+    );
+
     // Off has no disable field on gpt-5.5, so it omits reasoning entirely.
     let off = build_codex_request(
         "gpt-test",
