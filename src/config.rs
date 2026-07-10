@@ -348,8 +348,8 @@ pub(crate) const DEFAULT_COMPACTION_WARN: f64 = 0.60;
 pub(crate) const DEFAULT_COMPACTION_START: f64 = 0.72;
 pub(crate) const DEFAULT_COMPACTION_HARD: f64 = 0.90;
 pub(crate) const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 8_000;
-const DEFAULT_COMPACTION_HARD_WAIT_MS: u64 = 10_000;
-const MAX_COMPACTION_HARD_WAIT_MS: u64 = 120_000;
+const DEFAULT_COMPACTION_HARD_WAIT_MS: u64 = 120_000;
+const MAX_COMPACTION_HARD_WAIT_MS: u64 = 300_000;
 const DEFAULT_COMPACTION_MAX_FAILURES: u32 = 3;
 /// Default independent microcompaction flush threshold. This matches the old
 /// default `contextTokenBudget / 2` behavior without coupling future budget edits
@@ -932,6 +932,22 @@ pub(crate) fn save_compaction_keep_recent_tokens(cwd: &Path, tokens: u64) -> Res
     update_global_nested(
         &["compaction"],
         &[("keepRecentTokens", Value::from(tokens))],
+        SaveValidation::CompactionTrigger {
+            project: Some(&project),
+        },
+    )
+}
+
+/// Persist the hard-tier bounded wait under `compaction.hardWaitMs`, clamped to
+/// [`MAX_COMPACTION_HARD_WAIT_MS`] at the boundary so a hand-typed dial value can
+/// never request a wait longer than the harness accepts. The `CompactionTrigger`
+/// re-check folds in any project override before the write reaches disk.
+pub(crate) fn save_compaction_hard_wait(cwd: &Path, ms: u64) -> Result<()> {
+    let ms = ms.min(MAX_COMPACTION_HARD_WAIT_MS);
+    let project = project_path(cwd);
+    update_global_nested(
+        &["compaction"],
+        &[("hardWaitMs", Value::from(ms))],
         SaveValidation::CompactionTrigger {
             project: Some(&project),
         },
@@ -1687,8 +1703,9 @@ mod tests {
     fn auto_compaction_save_helpers_preserve_unknown_nested_keys() {
         let dir = temp_dir();
         let path = dir.path.join("settings.json");
-        // A hand-authored file carrying keys this feature deliberately does not
-        // expose (worker.model, hardWaitMs) plus a future sibling.
+        // A hand-authored file carrying a service-hatch-only key this section
+        // does not surface (worker.model), a pre-existing hardWaitMs the called
+        // helpers must leave untouched, plus future siblings.
         fs::write(
             &path,
             r#"{"futureTop":9,"compaction":{"futurePolicy":7,"hardWaitMs":5000,"worker":{"model":"anthropic/claude-opus-4-6","futureWorker":3},"thresholds":{"futureThreshold":1}}}"#,
@@ -1730,6 +1747,36 @@ mod tests {
         assert_eq!(trigger.warn, 0.20);
         assert_eq!(trigger.keep_recent_tokens, 6_000);
         assert!(!trigger.reactive);
+    }
+
+    #[test]
+    fn save_compaction_hard_wait_persists_and_clamps_to_the_max() {
+        let dir = temp_dir();
+        let path = dir.path.join("settings.json");
+        let _guard = ConfigPathGuard::set(&path);
+
+        // An in-range write round-trips exactly through the loader.
+        save_compaction_hard_wait(&dir.path, 90_000).unwrap();
+        assert_eq!(
+            read_object(&path).unwrap()["compaction"]["hardWaitMs"],
+            90_000
+        );
+        assert_eq!(
+            Settings::load_from(Some(&path), &dir.path.join("none.json"))
+                .unwrap()
+                .compaction_trigger()
+                .unwrap()
+                .hard_wait_ms,
+            90_000
+        );
+
+        // A value past the 300000 ms cap is clamped at the boundary so it can
+        // never reach disk (or the CompactionTrigger re-check) out of range.
+        save_compaction_hard_wait(&dir.path, 10_000_000).unwrap();
+        assert_eq!(
+            read_object(&path).unwrap()["compaction"]["hardWaitMs"],
+            MAX_COMPACTION_HARD_WAIT_MS
+        );
     }
 
     #[test]
@@ -1972,7 +2019,7 @@ mod tests {
             (0.60, 0.72, 0.90)
         );
         assert_eq!(defaults.keep_recent_tokens, 8_000);
-        assert_eq!(defaults.hard_wait_ms, 10_000);
+        assert_eq!(defaults.hard_wait_ms, 120_000);
         assert_eq!(defaults.max_consecutive_failures, 3);
         assert!(defaults.reactive);
 
@@ -2081,15 +2128,26 @@ mod tests {
                 .contains("off|auto")
         );
 
+        // The new cap is 300000 ms (5 min); one past it is rejected, exactly at
+        // it is accepted.
         let unbounded_wait = Settings {
             compaction: Some(CompactionSettings {
-                hard_wait_ms: Some(120_001),
+                hard_wait_ms: Some(300_001),
                 ..CompactionSettings::default()
             }),
             ..Settings::default()
         };
         let error = unbounded_wait.compaction_trigger().unwrap_err().to_string();
-        assert!(error.contains("at most 120000"), "{error}");
+        assert!(error.contains("at most 300000"), "{error}");
+
+        let at_cap = Settings {
+            compaction: Some(CompactionSettings {
+                hard_wait_ms: Some(300_000),
+                ..CompactionSettings::default()
+            }),
+            ..Settings::default()
+        };
+        assert_eq!(at_cap.compaction_trigger().unwrap().hard_wait_ms, 300_000);
     }
 
     #[test]

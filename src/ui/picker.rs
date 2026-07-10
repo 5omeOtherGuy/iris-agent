@@ -484,6 +484,7 @@ fn settings_snapshot<P: ChatProvider>(
         compaction_start_pct: (trigger.start * 100.0).round() as u64,
         compaction_hard_pct: (trigger.hard * 100.0).round() as u64,
         compaction_keep_recent_tokens: trigger.keep_recent_tokens,
+        compaction_hard_wait_ms: trigger.hard_wait_ms,
         compaction_reactive: trigger.reactive,
         compaction_worker_input: worker_input,
         resolved_ladder,
@@ -636,6 +637,9 @@ fn save_setting_field(
         Field::CompactionKeepRecentTokens => {
             config::save_compaction_keep_recent_tokens(workspace, value.unwrap_or("0").parse()?)
         }
+        Field::CompactionHardWait => {
+            config::save_compaction_hard_wait(workspace, value.unwrap_or("0").parse()?)
+        }
         // The percent dials persist as fractions; the config save rejects any
         // combination that would leave the merged global+project ladder
         // unordered.
@@ -685,10 +689,11 @@ fn save_setting_field(
 }
 
 /// Whether a saved field feeds the full-context auto-compaction trigger ladder
-/// (master switch, thresholds, tail, or the legacy context cap that clamps the
-/// window), so its live application re-resolves the ladder against the current
-/// model and installs it on the harness. Includes `context cap`
-/// (`contextTokenBudget`), which the menu previously failed to mirror live.
+/// (master switch, thresholds, tail, hard-tier bounded wait, or the legacy
+/// context cap that clamps the window), so its live application re-resolves the
+/// ladder against the current model and installs it on the harness. Includes
+/// `context cap` (`contextTokenBudget`), which the menu previously failed to
+/// mirror live.
 fn is_auto_compaction_trigger_field(field: settings_menu::Field) -> bool {
     use settings_menu::Field;
     matches!(
@@ -698,6 +703,7 @@ fn is_auto_compaction_trigger_field(field: settings_menu::Field) -> bool {
             | Field::CompactionStart
             | Field::CompactionHard
             | Field::CompactionKeepRecentTokens
+            | Field::CompactionHardWait
             | Field::CompactionReactive
             | Field::ContextTokenBudget
     )
@@ -1198,6 +1204,7 @@ mod tests {
             Field::CompactionStart,
             Field::CompactionHard,
             Field::CompactionKeepRecentTokens,
+            Field::CompactionHardWait,
             Field::CompactionReactive,
         ] {
             assert!(is_auto_compaction_trigger_field(field), "{field:?}");
