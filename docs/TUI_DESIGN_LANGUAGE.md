@@ -890,7 +890,10 @@ Never invent a fifth:
   child (its true verbs). The **model row is a rotary–port hybrid**: `←`/`→`
   cycles the scoped models exactly like Ctrl+P (the row rebuilds on the new
   engine and flashes), `↵` expands the hatch; its footer names both verbs
-  (`←→ cycle · ↵ open`). Inside the model hatch the panel's own `reasoning` row
+  (`←→ cycle · ↵ open`). The collapsed value prints the **active session
+  engine** (not the persisted default); a session-only `s` pick that diverges
+  from the default carries a quiet `· session` tag so the row never lies about
+  what is running. Inside the model hatch the panel's own `reasoning` row
   IS the effort track — arrowing over candidates re-renders it with that model's
   levels, target clamped, and there is no duplicated second track.
   **Dialog-guard exception:** three genuine interrupts (the large-context switch

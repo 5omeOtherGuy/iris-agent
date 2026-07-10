@@ -1601,11 +1601,17 @@ impl SettingsPanel {
     ) {
         match row {
             RowId::Model => {
-                let (provider, model) = self
-                    .snap
-                    .default_model
-                    .split_once('/')
-                    .unwrap_or(("", self.snap.default_model.as_str()));
+                // The collapsed value prints the ACTIVE session engine, not the
+                // persisted default — honest after an `s` session-only pick
+                // (§10.1). When they agree (the common case; ←/→ cycling persists
+                // on every click) it reads exactly as before; when they diverge
+                // the active model carries a quiet dim `· session` tag.
+                let (qualified, session_only) =
+                    match self.snap.catalog.iter().find(|m| m.is_current) {
+                        Some(model) => (model.qualified.as_str(), !model.is_default),
+                        None => (self.snap.default_model.as_str(), false),
+                    };
+                let (provider, model) = qualified.split_once('/').unwrap_or(("", qualified));
                 spans.push(self.port_marker(row));
                 spans.push(Span::raw(model.to_string()));
                 if !provider.is_empty() {
@@ -1613,6 +1619,9 @@ impl SettingsPanel {
                         format!(" {} {provider}", crate::ui::symbols::SEP),
                         dim(),
                     ));
+                }
+                if session_only {
+                    spans.push(Span::styled(" \u{00b7} session".to_string(), dim()));
                 }
             }
             RowId::Scope => {
@@ -2497,6 +2506,49 @@ mod tests {
         );
         assert!(panel.footer().contains("\u{2190}\u{2192} cycle"));
         assert!(panel.footer().contains("\u{21b5} open"));
+    }
+
+    #[test]
+    fn the_collapsed_model_row_prints_the_active_engine_and_tags_a_session_pick() {
+        // Common case: the active session model IS the persisted default, so the
+        // row reads exactly as before — no `· session` tag.
+        let panel = panel();
+        let rendered = text(&panel.render_budgeted(120, 80));
+        let model_line = rendered
+            .lines()
+            .find(|line| line.contains("gpt-5.5"))
+            .expect("model row");
+        assert!(model_line.contains("openai-codex"), "{model_line}");
+        assert!(
+            !model_line.contains("session"),
+            "no tag when active == default: {model_line}"
+        );
+
+        // Session-only pick: the active engine diverges from the persisted
+        // default, so the active model + provider print with a quiet `· session`.
+        let mut snap = snapshot();
+        snap.catalog = vec![
+            model_choice(ProviderId::OpenAiCodex, "gpt-5.5", false, true),
+            model_choice(ProviderId::Anthropic, "claude-sonnet-4-6", true, false),
+        ];
+        let panel = SettingsPanel::new(snap);
+        let rendered = text(&panel.render_budgeted(120, 80));
+        let model_line = rendered
+            .lines()
+            .find(|line| line.contains("claude-sonnet-4-6"))
+            .expect("model row");
+        assert!(
+            model_line.contains("anthropic"),
+            "active provider: {model_line}"
+        );
+        assert!(
+            model_line.contains("\u{00b7} session"),
+            "session tag: {model_line}"
+        );
+        assert!(
+            !model_line.contains("gpt-5.5"),
+            "prints the active engine, not the persisted default: {model_line}"
+        );
     }
 
     // --- criterion 1: expand each port in place ---
