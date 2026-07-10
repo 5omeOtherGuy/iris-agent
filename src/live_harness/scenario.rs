@@ -107,20 +107,26 @@ pub(crate) struct AggressiveFill {
 /// Large, stable repository files the live turn reads one at a time. Each is
 /// well over a thousand tokens even after the read tool's caps, so a live read
 /// adds real mid-turn mass exactly as the scripted bodies model it in-gate.
-pub(crate) const S1_LIVE_READ_TARGETS: [&str; 4] = [
+pub(crate) const S1_LIVE_READ_TARGETS: [&str; 6] = [
     "src/nexus.rs",
     "src/session.rs",
     "src/config.rs",
     "src/cli.rs",
+    "src/lib.rs",
+    "src/mimir/providers/anthropic_messages.rs",
 ];
 
 impl AggressiveFill {
-    /// The default pilot cell: seed below start, four mid-turn round-trips that
-    /// cross start then hard before the last one, so a continuing hard-tier
-    /// boundary lets #552 current-turn coverage fire.
+    /// The default pilot cell: seed below start, six mid-turn round-trips that
+    /// cross start then hard well before the last one, so a continuing
+    /// hard-tier boundary lets #552 current-turn coverage fire. Six (not four)
+    /// because pilot-a run 2 showed live provider-anchored measurement runs
+    /// ~15% below the estimator arithmetic: with four reads the live run
+    /// topped out between start and hard and compaction became a start-tier
+    /// background race (1 of 2 runs lost it).
     pub(crate) fn pilot() -> Self {
         Self {
-            round_trips: 4,
+            round_trips: 6,
             seed_repeat: 900,
             result_repeat: 320,
             budget: 32_768,
@@ -475,6 +481,22 @@ mod tests {
             k_hard < s1.round_trips as u64,
             "hard must be crossed before the final round-trip so a continuing \
              hard-tier boundary remains (k_hard={k_hard}, round_trips={})",
+            s1.round_trips
+        );
+
+        // Live divergence margin: pilot-a run 2 measured provider-anchored
+        // context ~15% below this estimator arithmetic, which left the live
+        // run short of hard and compaction hostage to the start-tier race.
+        // Require hard crossed before the final round-trip even if the
+        // provider counts 20% fewer tokens than the estimator.
+        let discounted = |k: u64| (cumulative(k) as f64 * 0.80) as u64;
+        let k_hard_discounted = (1..=s1.round_trips as u64)
+            .find(|k| discounted(*k) >= s1.hard_threshold())
+            .expect("must cross hard within planned round-trips at a 20% provider discount");
+        assert!(
+            k_hard_discounted < s1.round_trips as u64,
+            "hard must be crossed pre-final even at a 20% provider discount \
+             (k={k_hard_discounted}, round_trips={})",
             s1.round_trips
         );
     }
