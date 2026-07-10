@@ -611,6 +611,12 @@ duplicated in a second block.
   place** (the diff IS the review surface), then `RUNNING → DONE`, or `DENIED`.
 - **`DENIED`** (red, no elapsed) is terminal: the tool never ran, so the block
   is the honest record of what was proposed and declined.
+- While the decision is pending, the **bottom statusline** and the **composer
+  frame + placeholder** take the REVIEW posture (§9.2/§9.3): the same
+  symbol+label and the same offered affordance (`y approve ┊ n deny ┊ …`),
+  echoed at the composer — the eye's resting place — so the decision is never
+  lost off-screen. Those cues carry no new state; they key on the same
+  `awaiting_approval` flag and revert with the block.
 
 ### 8.6 Diff rendering (`DiffBlock`) — shared by EDIT & the in-block review
 Columns: **line number** (right-aligned, muted, non-selectable) · **marker**
@@ -746,6 +752,12 @@ transcript) is the full `border-frame` hairline; the rule between the input
 and the statusline is a lighter internal hairline (the same soft weight panels
 use internally). There is no other chrome option.
 
+The frame is also the machine's **bezel lamp**: both weights render in their
+`border`/dim tones at rest and take the **orange accent** while a review waits
+(§8.5) — reinforcement for the `▲ REVIEW` readout, never the sole signal (the
+text carries state; the monochrome test still passes). The empty-buffer
+placeholder likewise becomes a dim decision echo for the duration (§8.5).
+
 ### 9.3 Bottom statusline (the composer's last row)
 `◉ MODE ─ MODEL EFFORT ─ <policy-symbol> <policy>`. The `◉` is orange; `MODE`
 bold uppercase; ` ─ ` dim separators; model name is an **underlined button**
@@ -758,9 +770,21 @@ state symbol + label, never color alone:
 | on-request | `▲` orange + dim label |
 | read-only | `■` red + dim label |
 | off (approvals disabled) | `○` dim + dim label |
+| **REVIEW posture** (`awaiting_approval`) | leading segment is `▲ REVIEW` (orange symbol, bold label); every other segment dims |
 
 **Narrow widths, drop in order:** policy → effort → minimum `◉ CODE ─ MODEL`.
 cwd/branch/context NEVER appear here — they live on the session bar.
+
+**The REVIEW posture (§8.5).** While a gated tool awaits the user's decision
+(`awaiting_approval`), the leading segment swaps `◉ MODE` for `▲ REVIEW`
+(`symbols::REVIEW`, orange, bold label — the same symbol+label the gated
+block's footer shows, echoed at the eye's resting place) and **every other
+segment dims**: the model button drops its underline (it is not clickable while
+the composer is frozen), and effort and the policy symbol lose their tone, so
+the line has one lit subject. `▲ REVIEW` inherits `◉ MODE`'s never-dropped
+slot, so the narrow-width minimum becomes `▲ REVIEW ─ MODEL`. The swap is a
+static state readout — ticks stay stopped during the wait (no flash) — and it
+reverts to the exact prior rendering on approve/deny/cancel.
 
 ### 9.4 Input row
 A single editable row directly beneath the top edge, growing **1 → 8 rows** as

@@ -3007,6 +3007,37 @@ mod tests {
     }
 
     #[test]
+    fn pane_chrome_shows_the_review_posture_while_awaiting_approval() {
+        // Golden frame (review-posture spec, criterion 7): composer + statusline
+        // in the waiting state — the `▲ REVIEW` swap and the decision-echo
+        // placeholder, all keyed on `awaiting_approval`.
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "sonnet 3.5".to_string(),
+            Some("high".to_string()),
+            "~/workspace/user-auth".to_string(),
+        );
+        screen.show_approval(true, true, false);
+        let rendered = rendered_text(&mut screen, 100, 12);
+
+        // The leading segment swaps to `▲ REVIEW`; the policy segment still
+        // reads `▲ on-request` (now dimmed) and `◉ CODE` is gone.
+        assert!(
+            rendered.contains("▲ REVIEW ─ SONNET 3.5 HIGH ─ ▲ on-request"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("◉ CODE"), "{rendered}");
+
+        // The empty composer echoes the offered decision set as a dim
+        // placeholder, in place of the product prompt.
+        assert!(
+            rendered.contains("review waiting ┊ y approve ┊ n deny ┊ a always ┊ p project"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Give Iris a task..."), "{rendered}");
+    }
+
+    #[test]
     fn keyboard_enhancement_pushed_only_when_supported() -> io::Result<()> {
         // Unsupported terminal: never push (safe fallback to plain key events).
         let mut out: Vec<u8> = Vec::new();
