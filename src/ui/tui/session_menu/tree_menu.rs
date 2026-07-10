@@ -552,10 +552,22 @@ impl TreeMenu {
         git: Option<&GitStatus>,
     ) -> (Vec<Span<'static>>, Option<Span<'static>>) {
         let mut state: Vec<Span<'static>> = Vec::new();
+        // An ancestor-of-cwd dir (`cwd_rel` = None: the cwd is inside it, not
+        // the other way round) degrades to count-only: the status sets are
+        // cwd-scoped, so a rollup there would report only the cwd's slice of a
+        // larger subtree — a partial `±N` presented as the dir's state would
+        // lie.
         if let Some(status) = git
             && let Some(cwd_rel) = self.cwd_rel(rel)
         {
-            let prefix = format!("{cwd_rel}/");
+            // Empty `cwd_rel` = this row IS the session cwd itself (seen from
+            // a root above it): every cwd-relative status path lies beneath
+            // it, so the prefix matches all.
+            let prefix = if cwd_rel.is_empty() {
+                String::new()
+            } else {
+                format!("{cwd_rel}/")
+            };
             let under = |paths: &[String]| paths.iter().filter(|p| p.starts_with(&prefix)).count();
             let user = under(&status.user_paths);
             let iris = under(&status.iris_paths);
@@ -898,6 +910,44 @@ mod tests {
         assert!(
             text.contains("other/"),
             "out-of-cwd row still renders: {text}"
+        );
+    }
+
+    #[test]
+    fn cwd_row_rolls_up_fully_when_rerooted_above() {
+        // Re-rooted above the cwd, the cwd's own COLLAPSED dir row has
+        // `cwd_rel == ""` — the rollup must match ALL cwd-relative status
+        // paths (every dirty file is by definition beneath the cwd), not a
+        // bogus `/`-prefix that matches none.
+        let t = TreeMenu {
+            root: PathBuf::from("/"),
+            cwd: PathBuf::from("/repo"),
+            files: Some(vec![
+                "repo/src/a.rs".to_string(),
+                "repo/src/b.rs".to_string(),
+                "repo/src/c.rs".to_string(),
+                "other/README.md".to_string(),
+            ]),
+            children: RefCell::new(BTreeMap::new()),
+            expanded: BTreeSet::new(),
+            selected: 0,
+            mode: Mode::Browse,
+        };
+        // `repo/` stays collapsed; status paths are cwd-relative.
+        let status = GitStatus {
+            user_paths: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            iris_paths: vec!["src/c.rs".to_string()],
+            ..GitStatus::default()
+        };
+        let lines = t.render_lines(60, 20, false, Some(&status), &[]);
+        let repo = row_text(&lines, "repo/");
+        assert!(repo.contains("±2 ◇1 · 3 files"), "{repo:?}");
+        // An out-of-cwd dir keeps the count-only degrade.
+        let other = row_text(&lines, "other/");
+        assert!(other.contains("1 file"), "{other:?}");
+        assert!(
+            !other.contains('±') && !other.contains('◇'),
+            "no state on out-of-cwd dir: {other:?}"
         );
     }
 
