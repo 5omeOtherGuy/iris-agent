@@ -30,22 +30,22 @@ auto-approves EVERY gated tool call at the top of the approval decision path,
 before any floor, grant, or preset is consulted, and emits a distinct audit
 event. The mode is guarded by hard constraints:
 
-1. **Activation is operator-controlled.** The CLI flag is the startup path: it
-   is stripped in `main.rs` (positional-agnostic, like `--no-alt-screen`) and
-   threaded to `Agent::with_skip_permissions` as an explicit runtime parameter.
-   The in-session settings action may toggle the same runtime state. Resuming a
-   session restores the last `dangerousMode` state from Iris's session
-   transcript, so the operator's prior choice follows that session. `Settings`
-   has no field for it, so a global/project config file, the per-cwd trust store
-   (ADR-0027), an env var, or any repo-committed state cannot enable it. A
-   malicious repository has no path to granting itself approval (upholds
-   ADR-0032's repository-control floor for activation).
+1. **Activation is operator-controlled.** The CLI flag is the explicit startup
+   path. `/approval dangerously-skip-permissions` and the settings menu select the
+   same runtime mode at an inter-turn boundary. The selected permission mode is
+   stored in global-only `defaultApproval`; project settings are ignored for this
+   key, and the per-cwd trust store (ADR-0027), env vars, and repo-committed state
+   cannot enable it. A malicious repository has no path to granting itself
+   approval (upholds ADR-0032's repository-control floor for activation).
 
-2. **Session-scoped persistence only.** In skip mode Nexus never writes to
-   `session_allowed` or the project `PolicyStoreSink`. The only persisted state
-   is the append-only `dangerousMode` transcript marker for that session. A
-   resumed session may rehydrate its last marker; a fresh session starts with the
-   mode off, and turning the mode off appends an explicit disabled marker.
+2. **Default plus transcript persistence.** `defaultApproval` stores the last
+   selected permission mode (`strict`, `auto`, `never`, or
+   `dangerously-skip-permissions`) for new processes and `/new`. A session
+   transcript may also carry `dangerousMode` markers; on resume, the last marker
+   overrides the global default for that session. Missing markers inherit the
+   global default; turning the mode off appends an explicit disabled marker. In
+   skip mode Nexus never writes to `session_allowed` or the project
+   `PolicyStoreSink`.
 
 3. **Auditable, never silent.** Each bypass is emitted as
    `AgentEvent::ToolAutoApprovedDangerous`, distinct from the ordinary
@@ -66,28 +66,28 @@ floor/grant/preset logic below is untouched.
 
 ## Alternatives Considered
 
-### Activate from a config file / trust-store flag
-- **Pros**: Set once, no per-invocation flag.
+### Activate from project config / trust-store flag
+- **Pros**: Set once per repository.
 - **Cons**: A repo-committed or persisted value could grant a cloned repository
   approval-gate bypass — exactly the repository-control floor ADR-0032 forbids.
-- **Why not**: Rejected. Activation must stay outside config/trust stores and any
-  repository-controlled state. Session-transcript rehydration is allowed only for
-  the same Iris session.
+- **Why not**: Rejected. Activation may persist only in the user-global
+  `defaultApproval` setting or in the same session's transcript markers; project
+  config and trust stores cannot enable it.
 
 ### Add a `full-access` approval preset
-- **Pros**: Reuses the ADR-0032 preset axis and `/approval` control.
-- **Cons**: Presets are runtime-switchable (session/global settings), which
-  reopens the config-activation hole; and a preset that silently overrides
-  floors blurs the auto/never model.
-- **Why not**: This is a deliberate floor exception, not a preset. Keep it a
-  separate, explicit operator action with session-scoped persistence.
+- **Pros**: Reuses the ADR-0032 preset axis.
+- **Cons**: A preset that silently overrides floors blurs the auto/never model.
+- **Why not**: This is a deliberate floor exception, not a normal preset. It is
+  surfaced as an exclusive permission mode: selecting `strict`, `auto`, or
+  `never` clears skip-permissions; selecting `dangerously-skip-permissions`
+  enables it.
 
 ## Consequences
 
 - Operators get a true no-prompt mode for sandboxed/CI use.
-- The bypass is explicit, loud, audited per-call, and persists only as
-  same-session transcript state — the residual risk is bounded to the session the
-  operator opted into.
+- The bypass is explicit, loud, audited per-call, and persisted only in
+  user-global defaults plus same-session transcript state — project files still
+  cannot opt a repository into it.
 - Non-approval safety (paths, read-before-mutate, mutation guard) still applies,
   so skip mode is not "disable all safety".
 - Risk: a user runs it outside a sandbox. Mitigated by the flag name, the help

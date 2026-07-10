@@ -73,11 +73,10 @@ fn dispatch() -> Result<()> {
     if args.len() != before {
         ui::screen_mode::set_no_alt_screen_cli();
     }
-    // `--dangerously-skip-permissions` (ADR-0049) is positional-agnostic and
-    // CLI-ONLY: strip it here so every session entry point honors it, and pass
-    // the resulting bool explicitly down to Nexus. It is deliberately not read
-    // from any config file, project file, trust store, or env var, so a
-    // repository can never grant itself approval.
+    // `--dangerously-skip-permissions` (ADR-0049) is positional-agnostic: strip
+    // it here so every session entry point can opt into the dangerous permission
+    // mode. Session startup persists that operator choice as the global default;
+    // project config, trust stores, and env vars still cannot enable it.
     let before = args.len();
     args.retain(|arg| arg != "--dangerously-skip-permissions");
     let skip_permissions = args.len() != before;
@@ -361,13 +360,97 @@ fn print_session_list(sessions: &[session::ResumableSession], now_ms: u128) {
     println!("Resume one with: iris resume <session-id>");
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PermissionDefaults {
+    approval_mode: nexus::ApprovalMode,
+    skip_permissions: bool,
+}
+
+impl Default for PermissionDefaults {
+    fn default() -> Self {
+        Self {
+            approval_mode: nexus::ApprovalMode::Strict,
+            skip_permissions: false,
+        }
+    }
+}
+
+fn permission_defaults_from_mode(mode: nexus::PermissionMode) -> PermissionDefaults {
+    match mode {
+        nexus::PermissionMode::Approval(mode) => PermissionDefaults {
+            approval_mode: mode,
+            skip_permissions: false,
+        },
+        nexus::PermissionMode::DangerousSkipPermissions => PermissionDefaults {
+            approval_mode: nexus::ApprovalMode::Strict,
+            skip_permissions: true,
+        },
+    }
+}
+
+fn permission_defaults_from_setting(setting: Option<&str>) -> PermissionDefaults {
+    permission_defaults_from_mode(nexus::PermissionMode::from_startup_setting(setting))
+}
+
+fn startup_permission_defaults(
+    setting: Option<&str>,
+    cli_skip_permissions: bool,
+) -> PermissionDefaults {
+    if cli_skip_permissions {
+        permission_defaults_from_mode(nexus::PermissionMode::DangerousSkipPermissions)
+    } else {
+        permission_defaults_from_setting(setting)
+    }
+}
+
+fn permission_defaults_for_cwd(cwd: &Path) -> PermissionDefaults {
+    config::Settings::load(cwd)
+        .map(|settings| permission_defaults_from_setting(settings.default_approval.as_deref()))
+        .unwrap_or_default()
+}
+
+fn permission_token(skip_permissions: bool, approval_mode: nexus::ApprovalMode) -> &'static str {
+    if skip_permissions {
+        nexus::DANGEROUS_SKIP_PERMISSIONS_TOKEN
+    } else {
+        approval_mode.as_token()
+    }
+}
+
+fn persist_default_permission(token: &str) {
+    if let Err(error) = config::save_default_approval(token) {
+        tracing::warn!(error = %format!("{error:#}"), "failed to save default approval mode");
+    }
+}
+
+fn persist_cli_skip_permissions(cli_skip_permissions: bool) {
+    if cli_skip_permissions
+        && let Err(error) = config::save_default_approval(nexus::DANGEROUS_SKIP_PERMISSIONS_TOKEN)
+    {
+        eprintln!("warning: could not save default approval mode: {error:#}");
+    }
+}
+
+fn persist_session_permission_override(
+    persisted_skip_permissions: Option<bool>,
+    effective_skip_permissions: bool,
+    approval_mode: nexus::ApprovalMode,
+) {
+    if persisted_skip_permissions.is_some() {
+        persist_default_permission(permission_token(effective_skip_permissions, approval_mode));
+    }
+}
+
 fn run_agent_inner(
     force_plain: bool,
     startup_modal: Option<ui::modal::Modal>,
-    skip_permissions: bool,
+    cli_skip_permissions: bool,
 ) -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
+    let permission_defaults =
+        startup_permission_defaults(settings.default_approval.as_deref(), cli_skip_permissions);
+    persist_cli_skip_permissions(cli_skip_permissions);
     // Harness-owned assembly: the fragment/slot baukasten composes the prompt
     // from the in-binary shipped fragments plus dynamic context (project docs,
     // date, cwd) and the live tool registry (ADR-0026). Fresh and resume call
@@ -385,7 +468,7 @@ fn run_agent_inner(
     let agent = Agent::new(provider, tools)
         .with_max_tool_roundtrips(settings.max_tool_roundtrips())
         .with_project_policy(project_policy(&cwd), project_policy_sink(&cwd))
-        .with_skip_permissions(skip_permissions);
+        .with_skip_permissions(permission_defaults.skip_permissions);
     // Transcript persistence is best-effort: if the log cannot be opened (e.g.
     // no writable session dir), warn and continue in-memory rather than fail.
     let mut session = match session::SessionLog::create_with_id(&cwd, &session_id) {
@@ -400,7 +483,7 @@ fn run_agent_inner(
     };
     // ADR-0049: loud one-time warning + a transcript audit record so a resumed
     // or audited session shows the mode was active.
-    announce_skip_permissions(skip_permissions, session.as_mut());
+    announce_skip_permissions(permission_defaults.skip_permissions, session.as_mut());
     // Resume foundation: surface prior persisted sessions for this workspace.
     // The /resume UI is a later milestone; this only proves the store reads
     // back and signals that persistence is durable and resumable.
@@ -409,9 +492,12 @@ fn run_agent_inner(
     // persistence, and the auto-compaction policy, wrapping the bare in-memory
     // agent. When the context token total exceeds the budget at a turn
     // boundary, the harness compacts before the provider request.
-    let budget = Some(settings.context_token_budget());
+    let (effective_window, compaction_trigger) =
+        resolved_compaction_trigger(&settings, &selection)?;
+    let budget = Some(effective_window);
     let mut harness =
         wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
+    harness.set_compaction_trigger(effective_window, compaction_trigger);
     // Post-change verification (issue #265): engaged only when a `verify` block
     // is present; the command runs under the unchanged approval gate.
     harness.set_verification(settings.verification());
@@ -422,9 +508,7 @@ fn run_agent_inner(
         system_prompt.clone(),
         background_session_id.clone(),
     );
-    // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
-    harness.set_microcompaction(settings.microcompaction());
-    harness.set_microcompaction_watermark(settings.microcompaction_watermark());
+    harness.set_tool_result_compaction(selection.tool_result_compaction.clone());
     let _ = harness.set_task_workflow_enabled(settings.tasks());
     // Prompt-cache profile + selection identity for the fold scheduler
     // (issue #400): resolved here so wayland consumes only profile fields.
@@ -436,12 +520,10 @@ fn run_agent_inner(
             .reasoning
             .map(mimir::selection::ReasoningEffort::as_str),
     );
-    // Startup approval posture (ADR-0032): apply the GLOBAL-ONLY `defaultApproval`
-    // preference; absent/invalid leaves the built-in default (`strict`). The live
-    // `/approval` command stays session-only and is unaffected.
-    harness.set_approval_mode(nexus::ApprovalMode::from_startup_setting(
-        settings.default_approval.as_deref(),
-    ));
+    // Startup permission mode: apply the GLOBAL-ONLY `defaultApproval`
+    // preference. A dangerous default enables skip-permissions; normal modes use
+    // Nexus's approval preset and clear skip.
+    harness.set_approval_mode(permission_defaults.approval_mode);
     // Tier-3 mode-switch state: `/model` `/reasoning` rebuild a provider from the
     // same system prompt via `build_provider` and install it at a turn boundary.
     // The session id lives in a shared cell so an in-session `/resume` `/new`
@@ -458,6 +540,7 @@ fn run_agent_inner(
         settings.enabled_models.clone(),
     );
     switch_state.set_background_selection_cell(background_selection.clone());
+    switch_state.set_compaction_settings(settings.clone());
     let mut switch = Some(switch_state);
     let swap_cwd = cwd.clone();
     let swap = move |source: &cli::SessionSource| {
@@ -465,7 +548,7 @@ fn run_agent_inner(
             &swap_cwd,
             &session_cell,
             &background_session_id,
-            skip_permissions,
+            permission_defaults_for_cwd(&swap_cwd),
             source,
         )
     };
@@ -496,7 +579,7 @@ fn load_session_source(
     cwd: &Path,
     cell: &Rc<RefCell<String>>,
     background_cell: &Arc<Mutex<String>>,
-    cli_skip_permissions: bool,
+    permission_defaults: PermissionDefaults,
     source: &cli::SessionSource,
 ) -> Result<cli::LoadedSource> {
     match source {
@@ -509,7 +592,7 @@ fn load_session_source(
                     None
                 }
             };
-            record_skip_permissions(cli_skip_permissions, session_log.as_mut());
+            record_skip_permissions(permission_defaults.skip_permissions, session_log.as_mut());
             Ok(cli::LoadedSource {
                 session_id: cli::SessionIdGuard::swap_with_background(
                     cell.clone(),
@@ -520,7 +603,8 @@ fn load_session_source(
                 messages: Vec::new(),
                 entry_ids: Vec::new(),
                 resumed: 0,
-                skip_permissions: cli_skip_permissions,
+                approval_mode: permission_defaults.approval_mode,
+                skip_permissions: permission_defaults.skip_permissions,
             })
         }
         cli::SessionSource::Resume(id) => {
@@ -531,8 +615,16 @@ fn load_session_source(
             let stored = store.open(&meta)?;
             let resumed = stored.messages.len();
             let entry_ids = stored.entry_ids;
-            let skip_permissions =
-                session_skip_permissions(cli_skip_permissions, stored.dangerous_skip_permissions);
+            let skip_permissions = session_skip_permissions(
+                false,
+                permission_defaults.skip_permissions,
+                stored.dangerous_skip_permissions,
+            );
+            persist_session_permission_override(
+                stored.dangerous_skip_permissions,
+                skip_permissions,
+                permission_defaults.approval_mode,
+            );
             let mut session_log = match session::SessionLog::resume(&meta.path) {
                 Ok(log) => Some(log),
                 Err(error) => {
@@ -551,6 +643,7 @@ fn load_session_source(
                 messages: stored.messages,
                 entry_ids,
                 resumed,
+                approval_mode: permission_defaults.approval_mode,
                 skip_permissions,
             })
         }
@@ -566,6 +659,9 @@ fn load_session_source(
 fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<()> {
     let cwd = env::current_dir()?;
     let settings = config::Settings::load(&cwd)?;
+    let permission_defaults =
+        startup_permission_defaults(settings.default_approval.as_deref(), skip_permissions);
+    persist_cli_skip_permissions(skip_permissions);
     let tools = tools::built_in_tools_for(settings.bash_tool_mode());
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
@@ -579,7 +675,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     let agent = Agent::new(provider, tools)
         .with_max_tool_roundtrips(settings.max_tool_roundtrips())
         .with_project_policy(project_policy(&cwd), None)
-        .with_skip_permissions(skip_permissions);
+        .with_skip_permissions(permission_defaults.skip_permissions);
     // Persist the print run's transcript like a normal run; best-effort.
     let mut session = match session::SessionLog::create_with_id(&cwd, &session_id) {
         Ok(log) => {
@@ -591,10 +687,13 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
             None
         }
     };
-    announce_skip_permissions(skip_permissions, session.as_mut());
-    let budget = Some(settings.context_token_budget());
+    announce_skip_permissions(permission_defaults.skip_permissions, session.as_mut());
+    let (effective_window, compaction_trigger) =
+        resolved_compaction_trigger(&settings, &selection)?;
+    let budget = Some(effective_window);
     let mut harness =
         wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
+    harness.set_compaction_trigger(effective_window, compaction_trigger);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
     install_compaction_summarizer_factory(
@@ -603,9 +702,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
         system_prompt.clone(),
         background_session_id.clone(),
     );
-    // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
-    harness.set_microcompaction(settings.microcompaction());
-    harness.set_microcompaction_watermark(settings.microcompaction_watermark());
+    harness.set_tool_result_compaction(selection.tool_result_compaction.clone());
     let _ = harness.set_task_workflow_enabled(settings.tasks());
     // Prompt-cache profile + selection identity for the fold scheduler
     // (issue #400): resolved here so wayland consumes only profile fields.
@@ -617,6 +714,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
             .reasoning
             .map(mimir::selection::ReasoningEffort::as_str),
     );
+    harness.set_approval_mode(permission_defaults.approval_mode);
 
     // Merge piped stdin (when not a TTY) into the prompt before the turn.
     let piped = print::read_piped_stdin()?;
@@ -634,11 +732,15 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     Ok(())
 }
 
-/// Whether the current session should run with `--dangerously-skip-permissions`.
-/// The explicit CLI flag applies to every session entry point in this process,
-/// while a resumed transcript can also carry a prior enabled state.
-fn session_skip_permissions(cli_skip_permissions: bool, persisted_skip_permissions: bool) -> bool {
-    cli_skip_permissions || persisted_skip_permissions
+/// Whether the current session should run with dangerous skip-permissions.
+/// Explicit CLI input wins for the initial entry point; otherwise a transcript
+/// marker overrides the global default, and absence inherits the default.
+fn session_skip_permissions(
+    cli_skip_permissions: bool,
+    default_skip_permissions: bool,
+    persisted_skip_permissions: Option<bool>,
+) -> bool {
+    cli_skip_permissions || persisted_skip_permissions.unwrap_or(default_skip_permissions)
 }
 
 /// Best-effort transcript audit for skip-permissions mode. Used both at process
@@ -701,12 +803,33 @@ fn install_compaction_summarizer_factory(
     }));
 }
 
+fn resolved_compaction_trigger(
+    settings: &config::Settings,
+    selection: &mimir::selection::ModelSelection,
+) -> Result<(u64, config::CompactionTriggerConfig)> {
+    let trigger = settings.compaction_trigger()?;
+    let resolved =
+        mimir::model_catalog::effective_context_window(selection, config::DEFAULT_SUMMARY_RESERVE)
+            .map(|window| window.effective);
+    let effective_window = match (settings.context_token_budget, resolved) {
+        (Some(legacy), Some(model)) => legacy.min(model),
+        (Some(legacy), None) => legacy,
+        (None, Some(model)) => model,
+        (None, None) => settings.context_token_budget(),
+    };
+    Ok((effective_window, trigger))
+}
+
 /// Resume an existing session by id: load its transcript from the store,
 /// reconstruct the provider-visible messages, seed the agent with them, and
 /// continue appending future turns to the same log. Errors clearly when the id
 /// is unknown or the session cannot be read.
-fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> Result<()> {
+fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool) -> Result<()> {
     let cwd = env::current_dir()?;
+    let settings = config::Settings::load(&cwd)?;
+    let permission_defaults =
+        permission_defaults_from_setting(settings.default_approval.as_deref());
+    persist_cli_skip_permissions(cli_skip_permissions);
     let store = session::SessionStore::open_default()?;
     let meta = store.find(session_id)?.ok_or_else(|| {
         errors::UsageError::new(format!(
@@ -724,17 +847,26 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
     // stable across resume. The harness compares it against the budget at the
     // next turn boundary.
     let context_tokens = stored.context_tokens;
-    let skip_permissions =
-        session_skip_permissions(skip_permissions, stored.dangerous_skip_permissions);
+    let skip_permissions = session_skip_permissions(
+        cli_skip_permissions,
+        permission_defaults.skip_permissions,
+        stored.dangerous_skip_permissions,
+    );
+    persist_session_permission_override(
+        stored.dangerous_skip_permissions,
+        skip_permissions,
+        permission_defaults.approval_mode,
+    );
 
-    let settings = config::Settings::load(&cwd)?;
-    let budget = Some(settings.context_token_budget());
     // Resume assembles instructions through the same harness-owned baukasten as
     // a fresh session, so a resumed turn gets identical fragment/context output.
     let tools = tools::built_in_tools_for(settings.bash_tool_mode());
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
+    let (effective_window, compaction_trigger) =
+        resolved_compaction_trigger(&settings, &selection)?;
+    let budget = Some(effective_window);
     let session_id = meta.id.clone();
     let background_selection = Arc::new(Mutex::new(selection.clone()));
     let background_session_id = Arc::new(Mutex::new(session_id.clone()));
@@ -765,6 +897,7 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
         entry_ids,
         budget,
     );
+    harness.set_compaction_trigger(effective_window, compaction_trigger);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
     install_compaction_summarizer_factory(
@@ -773,9 +906,7 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
         system_prompt.clone(),
         background_session_id.clone(),
     );
-    // Opt-in microcompaction (ADR-0048, #378): fold spent tool results when on.
-    harness.set_microcompaction(settings.microcompaction());
-    harness.set_microcompaction_watermark(settings.microcompaction_watermark());
+    harness.set_tool_result_compaction(selection.tool_result_compaction.clone());
     let _ = harness.set_task_workflow_enabled(settings.tasks());
     // Prompt-cache profile + selection identity for the fold scheduler
     // (issue #400): resolved here so wayland consumes only profile fields.
@@ -787,11 +918,9 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
             .reasoning
             .map(mimir::selection::ReasoningEffort::as_str),
     );
-    // Startup approval posture (ADR-0032): apply the GLOBAL-ONLY `defaultApproval`
-    // preference; absent/invalid leaves the built-in default (`strict`).
-    harness.set_approval_mode(nexus::ApprovalMode::from_startup_setting(
-        settings.default_approval.as_deref(),
-    ));
+    // Startup permission mode: apply the GLOBAL-ONLY `defaultApproval` normal
+    // preset; dangerous state is carried by `skip_permissions` above.
+    harness.set_approval_mode(permission_defaults.approval_mode);
     let session_cell = Rc::new(RefCell::new(session_id.clone()));
     let build_cell = session_cell.clone();
     let build = move |selection: &mimir::selection::ModelSelection, prompt: &str| {
@@ -804,6 +933,7 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
         settings.enabled_models.clone(),
     );
     switch_state.set_background_selection_cell(background_selection.clone());
+    switch_state.set_compaction_settings(settings.clone());
     let mut switch = Some(switch_state);
     let swap_cwd = cwd.clone();
     let swap = move |source: &cli::SessionSource| {
@@ -811,7 +941,7 @@ fn resume_agent(session_id: &str, force_plain: bool, skip_permissions: bool) -> 
             &swap_cwd,
             &session_cell,
             &background_session_id,
-            skip_permissions,
+            permission_defaults_for_cwd(&swap_cwd),
             source,
         )
     };
@@ -895,6 +1025,7 @@ fn build_provider(
                 session_id,
                 selection.cache_retention,
                 selection.retry_policy,
+                selection.codex_transport,
             )?,
         ),
         ProviderId::OpenAi => {
@@ -1203,8 +1334,9 @@ fn print_help() {
     eprintln!(
         "                                   approval prompt, INCLUDING destructive commands."
     );
-    eprintln!("                                   Bypasses the safety floors; follows resumed");
-    eprintln!("                                   sessions. Use only in a sandbox you trust.");
+    eprintln!("                                   Bypasses the safety floors and saves this");
+    eprintln!("                                   permission mode as the global default.");
+    eprintln!("                                   Use only in a sandbox you trust.");
     eprintln!();
     eprintln!("Display (flag / env var):");
     eprintln!("  --plain, IRIS_PLAIN=1, NO_COLOR   Plain, ANSI-free text UI");
@@ -1292,10 +1424,23 @@ mod tests {
     }
 
     #[test]
-    fn session_skip_permissions_honors_cli_flag_or_persisted_state() {
-        assert!(!session_skip_permissions(false, false));
-        assert!(session_skip_permissions(true, false));
-        assert!(session_skip_permissions(false, true));
+    fn session_skip_permissions_honors_cli_marker_then_default() {
+        assert!(!session_skip_permissions(false, false, None));
+        assert!(session_skip_permissions(true, false, Some(false)));
+        assert!(session_skip_permissions(false, false, Some(true)));
+        assert!(!session_skip_permissions(false, true, Some(false)));
+        assert!(session_skip_permissions(false, true, None));
+    }
+
+    #[test]
+    fn permission_defaults_accept_dangerous_global_mode() {
+        let defaults = permission_defaults_from_setting(Some("dangerously-skip-permissions"));
+        assert!(defaults.skip_permissions);
+        assert_eq!(defaults.approval_mode, nexus::ApprovalMode::Strict);
+
+        let defaults = permission_defaults_from_setting(Some("auto"));
+        assert!(!defaults.skip_permissions);
+        assert_eq!(defaults.approval_mode, nexus::ApprovalMode::Auto);
     }
 
     #[test]
@@ -1310,9 +1455,18 @@ mod tests {
     }
 
     #[test]
-    fn load_session_source_fresh_inherits_cli_skip_permissions() {
+    fn load_session_source_fresh_inherits_dangerous_default() {
         let dir = TempDir::new();
         let _guard = SessionDirGuard::set(&dir.path);
+        let config_path = dir.path.join("settings.json");
+        fs::write(
+            &config_path,
+            r#"{ "defaultApproval": "dangerously-skip-permissions" }"#,
+        )
+        .unwrap();
+        let settings: config::Settings =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let defaults = permission_defaults_from_setting(settings.default_approval.as_deref());
         let cell = Rc::new(RefCell::new("current".to_string()));
         let background = Arc::new(Mutex::new("current".to_string()));
 
@@ -1320,12 +1474,13 @@ mod tests {
             Path::new("/w"),
             &cell,
             &background,
-            true,
+            defaults,
             &cli::SessionSource::Fresh,
         )
         .unwrap();
 
         assert!(loaded.skip_permissions);
+        assert_eq!(loaded.approval_mode, nexus::ApprovalMode::Strict);
         assert!(
             fs::read_to_string(session_file(&dir.path))
                 .unwrap()
@@ -1334,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn load_session_source_resume_combines_cli_and_persisted_skip_permissions() {
+    fn load_session_source_resume_inherits_default_when_no_marker() {
         let dir = TempDir::new();
         let _guard = SessionDirGuard::set(&dir.path);
         let cwd = Path::new("/w");
@@ -1349,17 +1504,19 @@ mod tests {
             cwd,
             &cell,
             &background,
-            true,
+            PermissionDefaults {
+                approval_mode: nexus::ApprovalMode::Auto,
+                skip_permissions: true,
+            },
             &cli::SessionSource::Resume(id),
         )
         .unwrap();
 
-        assert!(loaded.skip_permissions);
         assert!(
-            fs::read_to_string(session_file(&dir.path))
-                .unwrap()
-                .contains("\"type\":\"dangerousMode\""),
+            loaded.skip_permissions,
+            "unmarked sessions inherit the default"
         );
+        assert_eq!(loaded.approval_mode, nexus::ApprovalMode::Auto);
     }
 
     #[test]

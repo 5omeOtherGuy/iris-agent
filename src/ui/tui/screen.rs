@@ -12,7 +12,7 @@ use ratatui_textarea::{TextArea, WrapMode};
 use crate::git::status::{GitStatus, JjStatus, VcsStatus};
 #[cfg(test)]
 use crate::mimir::model_catalog;
-use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
+use crate::nexus::{ApprovalDecision, ContextPressureTier, ProviderUsage, ToolCall};
 use crate::ui::UiEvent;
 use crate::ui::modal::Modal;
 use crate::ui::slash::Palette;
@@ -515,6 +515,7 @@ struct Footer {
     /// drop to empty at every turn start) and is cleared only when the model or
     /// context window changes.
     context_used_tokens: Option<u64>,
+    context_pressure: ContextPressureTier,
 }
 
 /// Predicted prompt-cache posture for a just-applied model/reasoning switch.
@@ -1628,6 +1629,12 @@ impl Screen {
                 footer.usage = Some(usage.clone());
             }
         }
+        if let UiEvent::ContextPressure { tier, measured, .. } = &event
+            && let Some(footer) = &mut self.footer
+        {
+            footer.context_used_tokens = Some(*measured);
+            footer.context_pressure = *tier;
+        }
         // Accumulate the session-scoped reduction accounting for `/context`
         // (issue #400): fold batches with their trigger tags, and compaction
         // before/after estimates, straight from the runtime events. The
@@ -1642,6 +1649,7 @@ impl Screen {
                 folds,
                 reclaimed_tokens_estimate,
                 trigger,
+                ..
             } => {
                 self.context_accounting.fold_batches.push((
                     trigger.code(),
@@ -1947,6 +1955,7 @@ impl Screen {
             vcs,
             usage,
             context_used_tokens,
+            context_pressure: ContextPressureTier::Normal,
         });
     }
 
@@ -2611,8 +2620,16 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
     // The context readout, fullest form first: used/cap + meter, then used/cap,
     // then used alone, then nothing.
     let ctx_spans = |with_cap: bool, with_meter: bool| -> Vec<Span<'static>> {
+        let pressure = !matches!(footer.context_pressure, ContextPressureTier::Normal);
         let mut spans = vec![
-            Span::styled("CTX ".to_string(), dim_style()),
+            Span::styled(
+                if pressure { "CTX! " } else { "CTX " }.to_string(),
+                if pressure {
+                    border_style()
+                } else {
+                    dim_style()
+                },
+            ),
             Span::styled(used_text.clone(), Style::default()),
         ];
         if with_cap && let Some(cap) = cap.as_deref() {
@@ -3307,7 +3324,7 @@ mod tests {
         session_bar, session_bar_lines, switch_status_line, truncate_cwd_middle,
         working_indicator_line_with_activity,
     };
-    use crate::nexus::ToolCall;
+    use crate::nexus::{ContextPressureTier, ToolCall};
     use crate::ui::UiEvent;
     use crate::ui::tui::WORKING_FRAMES;
 
@@ -3901,6 +3918,8 @@ mod tests {
         // repaint, same exhale, no waiting for the next provider turn.
         screen.apply(UiEvent::FoldApplied {
             folds: 2,
+            semantic_dedupe_folds: 2,
+            tool_clearing_folds: 0,
             reclaimed_tokens_estimate: 90_000,
             trigger: crate::nexus::FoldTrigger::CompactionBoundary,
         });
@@ -3927,6 +3946,8 @@ mod tests {
         screen.apply(compaction(60_000, 0)); // 210k → 150k: 5 LEDs
         screen.apply(UiEvent::FoldApplied {
             folds: 1,
+            semantic_dedupe_folds: 1,
+            tool_clearing_folds: 0,
             reclaimed_tokens_estimate: 90_000,
             trigger: crate::nexus::FoldTrigger::CompactionBoundary,
         }); // 150k → 60k: 2 LEDs
@@ -4262,6 +4283,28 @@ mod tests {
         // Mode/model/policy never appear on the session bar.
         assert!(!bar.contains("CODE"), "{bar:?}");
         assert!(!bar.contains("GPT"), "{bar:?}");
+    }
+
+    #[test]
+    fn session_bar_marks_context_pressure_until_it_returns_to_normal() {
+        let mut screen = footer_screen("~/repo");
+        screen.apply(UiEvent::ContextPressure {
+            tier: ContextPressureTier::Warn,
+            measured: 90_000,
+            effective_window: 120_000,
+            source: crate::nexus::ContextMeasurementSource::Estimated,
+        });
+        assert!(bar_text(&screen, 80).contains("CTX! 90k"));
+
+        screen.apply(UiEvent::ContextPressure {
+            tier: ContextPressureTier::Normal,
+            measured: 20_000,
+            effective_window: 120_000,
+            source: crate::nexus::ContextMeasurementSource::Estimated,
+        });
+        let bar = bar_text(&screen, 80);
+        assert!(bar.contains("CTX 20k"), "{bar:?}");
+        assert!(!bar.contains("CTX!"), "{bar:?}");
     }
 
     #[test]
@@ -4864,6 +4907,8 @@ mod tests {
 
         screen.apply(UiEvent::FoldApplied {
             folds: 2,
+            semantic_dedupe_folds: 2,
+            tool_clearing_folds: 0,
             reclaimed_tokens_estimate: 8_000,
             trigger: crate::nexus::FoldTrigger::SelectionSwitch,
         });

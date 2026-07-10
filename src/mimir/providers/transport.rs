@@ -96,7 +96,7 @@ pub(crate) fn shared_client() -> Client {
 /// Provider-internal seam for incremental assistant text. The streamed SSE
 /// parser pushes deltas here; the live provider forwards them onto the
 /// [`ProviderStream`] channel, while tests use a recording/no-op sink.
-pub(super) trait TurnSink {
+pub(super) trait TurnSink: Send {
     /// Forward provider activity that does not yet have user-visible text. Used
     /// to keep idle detection from timing out live streams that are currently
     /// sending buffered reasoning/tool-call-input frames.
@@ -204,6 +204,34 @@ pub(super) fn spawn_stream(
         };
         let _ = tx.unbounded_send(terminal);
     });
+    stream_with_idle_guard(rx, stream_cancel)
+}
+
+pub(super) fn spawn_async_stream<F, Fut>(
+    run: F,
+    cancel: CancellationToken,
+) -> ProviderStream<'static>
+where
+    F: FnOnce(ChannelSink, CancellationToken) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<AssistantTurn>> + Send + 'static,
+{
+    let (tx, rx) = mpsc::unbounded::<Result<ProviderEvent>>();
+    let stream_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let sink = ChannelSink { tx: tx.clone() };
+        let terminal = match run(sink, cancel).await {
+            Ok(turn) => Ok(ProviderEvent::Completed(turn)),
+            Err(error) => Err(error),
+        };
+        let _ = tx.unbounded_send(terminal);
+    });
+    stream_with_idle_guard(rx, stream_cancel)
+}
+
+fn stream_with_idle_guard(
+    rx: mpsc::UnboundedReceiver<Result<ProviderEvent>>,
+    stream_cancel: CancellationToken,
+) -> ProviderStream<'static> {
     Box::pin(futures::stream::unfold(
         (rx, stream_cancel),
         |(mut rx, cancel)| async move {

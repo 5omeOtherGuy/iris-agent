@@ -143,6 +143,12 @@ pub(crate) trait Ui {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UiEvent {
     SessionStarted,
+    ContextPressure {
+        tier: crate::nexus::ContextPressureTier,
+        measured: u64,
+        effective_window: u64,
+        source: crate::nexus::ContextMeasurementSource,
+    },
     ProviderTurnStarted {
         turn_id: String,
     },
@@ -191,6 +197,8 @@ pub(crate) enum UiEvent {
     /// and estimates only, tagged with the trigger class that released it.
     FoldApplied {
         folds: usize,
+        semantic_dedupe_folds: usize,
+        tool_clearing_folds: usize,
         reclaimed_tokens_estimate: u64,
         trigger: crate::nexus::FoldTrigger,
     },
@@ -301,6 +309,17 @@ impl UiEvent {
     /// both the blocking text bridge and the async loop bridge agree.
     pub(crate) fn from_agent_event(event: AgentEvent) -> Self {
         match event {
+            AgentEvent::ContextPressure {
+                tier,
+                measured,
+                effective_window,
+                source,
+            } => UiEvent::ContextPressure {
+                tier,
+                measured,
+                effective_window,
+                source,
+            },
             AgentEvent::ProviderTurnStarted { turn_id } => UiEvent::ProviderTurnStarted { turn_id },
             AgentEvent::ProviderTurnCompleted {
                 turn_id,
@@ -351,6 +370,7 @@ impl UiEvent {
                 covered_messages,
                 original_tokens_estimate,
                 summary_tokens_estimate,
+                context_tokens_after_apply: _,
                 budget,
                 // Generation ordinal (ADR-0047) is instrumentation for the
                 // event/benchmark, not a display field; the UI does not surface
@@ -359,6 +379,8 @@ impl UiEvent {
                 // Carry count (ADR-0044) is event/benchmark instrumentation, not
                 // a display field; drop it in the display mapping too.
                 carried_paths: _,
+                origin: _,
+                worker_usage: _,
             } => UiEvent::CompactionApplied {
                 compaction_id,
                 covered_from,
@@ -373,6 +395,8 @@ impl UiEvent {
                 state,
                 covered_messages,
                 original_tokens_estimate,
+                origin: _,
+                worker_usage: _,
                 message,
             } => UiEvent::CompactionLifecycle {
                 job_id,
@@ -383,10 +407,14 @@ impl UiEvent {
             },
             AgentEvent::FoldApplied {
                 folds,
+                semantic_dedupe_folds,
+                tool_clearing_folds,
                 reclaimed_tokens_estimate,
                 trigger,
             } => UiEvent::FoldApplied {
                 folds,
+                semantic_dedupe_folds,
+                tool_clearing_folds,
                 reclaimed_tokens_estimate,
                 trigger,
             },

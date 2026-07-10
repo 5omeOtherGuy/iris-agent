@@ -117,8 +117,13 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/skills",
+        description: "Browse and mention an installed skill",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/approval",
-        description: "Set the approval preset [strict|auto|never]",
+        description: "Set approval [strict|auto|never|dangerously-skip-permissions]",
         action: SlashAction::Submit,
     },
     SlashCommand {
@@ -328,6 +333,16 @@ mod tests {
         // keeps `/tasks` first for users heading to the modal.
         let task_matches: Vec<&str> = matches("/task").iter().map(|c| c.name).collect();
         assert_eq!(task_matches, vec!["/tasks", "/task"]);
+    }
+
+    #[test]
+    fn skills_command_is_registered_and_submits() {
+        let command = COMMANDS
+            .iter()
+            .find(|command| command.name == "/skills")
+            .expect("/skills must be registered");
+        assert_eq!(command.action, SlashAction::Submit);
+        assert_eq!(matches("/ski")[0].name, "/skills");
     }
 
     #[test]

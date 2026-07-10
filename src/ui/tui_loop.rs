@@ -38,8 +38,8 @@ use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::model_catalog;
 use crate::mimir::selection::ModelSelection;
 use crate::nexus::{
-    AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, ReviewContext,
-    ToolCall,
+    AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, PermissionMode,
+    ReviewContext, ToolCall,
 };
 use crate::tool_display::approval_dirty_note;
 use crate::ui::UiEvent;
@@ -235,6 +235,8 @@ enum IdleOutcome {
     Exit,
     /// Ctrl+L: open the model picker.
     OpenModelPicker,
+    /// `$`: open the Codex-compatible skill mention picker.
+    OpenSkillPicker,
     /// Ctrl+P (forward) / Shift+Ctrl+P (backward): cycle the model.
     CycleModel(bool),
     /// Shift+Tab: cycle the thinking/effort level.
@@ -263,6 +265,7 @@ enum IdleKey {
     Submit(String),
     Exit,
     OpenModelPicker,
+    OpenSkillPicker,
     CycleModel(bool),
     CycleEffort,
     OpenResumePicker,
@@ -457,6 +460,16 @@ async fn session_loop<P: ChatProvider>(
                     }
                 }
             }
+            IdleOutcome::OpenSkillPicker => {
+                if harness.skills().is_empty() {
+                    apply_notices(tui, vec!["No skills are installed.".to_string()]);
+                } else {
+                    tui.screen
+                        .open_modal(Modal::Skills(crate::ui::modal::SkillPicker::new(
+                            harness.skills(),
+                        )));
+                }
+            }
             IdleOutcome::CycleModel(forward) => {
                 if let Some(sw) = switch.as_mut() {
                     let before = sw.selection().clone();
@@ -640,6 +653,7 @@ fn perform_swap<P: ChatProvider>(
         loaded.entry_ids,
         resumed,
     );
+    harness.set_approval_mode(loaded.approval_mode);
     if harness.skip_permissions() != loaded.skip_permissions {
         harness.set_skip_permissions(loaded.skip_permissions);
     }
@@ -1291,28 +1305,52 @@ fn execute_menu_action<P: ChatProvider>(
 /// free headroom, plus per-batch fold lines tagged with their trigger class.
 /// Everything is an estimate from data that already exists (the harness
 /// message estimates, the budget, the runtime fold/compaction events and the
-/// pending set); nothing is fabricated, and the system+tools row is labeled
-/// as outside the budget estimate (the budget covers conversation messages).
+/// pending set); nothing is fabricated. System+tools are labeled as included
+/// when provider usage anchors the total and display-only for local estimates.
 fn context_breakdown_lines<P: ChatProvider>(
     harness: &crate::wayland::Harness<P>,
     switch: Option<&ModelSwitch<'_, P>>,
     accounting: &super::tui::ContextAccounting,
 ) -> Vec<String> {
     use crate::session::estimate_tokens;
-    let total = harness.context_token_estimate();
+    let local_total = harness.context_token_estimate();
     let mut lines = Vec::new();
-    match harness.context_budget() {
-        Some(budget) => {
+    match harness.context_diagnostics() {
+        Some(diagnostics) => {
+            let total = diagnostics.measured;
+            let budget = diagnostics.ladder.effective_window;
             let pct = (total.saturating_mul(100)).checked_div(budget).unwrap_or(0);
+            let source = match diagnostics.source {
+                crate::nexus::ContextMeasurementSource::ProviderReportedPlusLocal => {
+                    "provider-reported + local"
+                }
+                crate::nexus::ContextMeasurementSource::Estimated => "estimated",
+            };
             lines.push(format!(
-                "context: ~{total} of {budget} tokens ({pct}% of the compaction budget)"
+                "context: ~{total} of {budget} tokens ({pct}% of effective window; {source})"
             ));
             lines.push(format!(
                 "  free headroom      ~{} tokens",
                 budget.saturating_sub(total)
             ));
+            let state = if diagnostics.automatic_enabled {
+                "on"
+            } else {
+                "off"
+            };
+            let job = if diagnostics.background_running {
+                "running"
+            } else {
+                "idle"
+            };
+            lines.push(format!(
+                "  compaction         {state}; warn {} / start {} / hard {}; job {job}",
+                diagnostics.ladder.warn, diagnostics.ladder.start, diagnostics.ladder.hard
+            ));
         }
-        None => lines.push(format!("context: ~{total} tokens (no compaction budget)")),
+        None => lines.push(format!(
+            "context: ~{local_total} tokens (no compaction window)"
+        )),
     }
     // System prompt + tool declarations: sent with every request but not part
     // of the conversation estimate the budget covers.
@@ -1328,8 +1366,19 @@ fn context_breakdown_lines<P: ChatProvider>(
                     .saturating_add(estimate_tokens(&tool.parameters().to_string()))
             })
             .fold(0, u64::saturating_add);
+        let inclusion = harness.context_diagnostics().map_or(
+            "display-only; no window configured",
+            |diagnostics| match diagnostics.source {
+                crate::nexus::ContextMeasurementSource::ProviderReportedPlusLocal => {
+                    "included in provider-reported total"
+                }
+                crate::nexus::ContextMeasurementSource::Estimated => {
+                    "not included in conversation-only estimate"
+                }
+            },
+        );
         lines.push(format!(
-            "  system + tools     ~{} tokens (per request, outside the budget estimate)",
+            "  system + tools     ~{} tokens ({inclusion})",
             system.saturating_add(tools)
         ));
     }
@@ -1349,7 +1398,7 @@ fn context_breakdown_lines<P: ChatProvider>(
         .count();
     lines.push(format!(
         "  raw conversation   ~{} tokens",
-        total.saturating_sub(summarized)
+        local_total.saturating_sub(summarized)
     ));
     let (original_total, summary_total) = accounting
         .compactions
@@ -1447,27 +1496,41 @@ fn route_command<P: ChatProvider>(
             tui.screen.open_modal(picker::open_settings(harness, sw));
             Ok(RouteOutcome::Consumed)
         }
+        "/skills" if rest.is_empty() => {
+            tui.screen.commit_user(prompt);
+            if harness.skills().is_empty() {
+                apply_notices(tui, vec!["No skills are installed.".to_string()]);
+            } else {
+                tui.screen
+                    .open_modal(Modal::Skills(crate::ui::modal::SkillPicker::new(
+                        harness.skills(),
+                    )));
+            }
+            Ok(RouteOutcome::Consumed)
+        }
         "/approval" => {
-            // ADR-0032 session control. Changing the preset at this inter-turn
-            // boundary is safe: the harness forwards it to Nexus, which owns
-            // enforcement. The statusline posture is kept in lockstep so the
-            // label never claims a mode the runtime is not in.
+            // Permission mode (ADR-0032 + ADR-0049). Changing it at this
+            // inter-turn boundary is safe: the harness forwards it to Nexus,
+            // which owns enforcement. The statusline posture is kept in lockstep
+            // so the label never claims a mode the runtime is not in.
             tui.screen.commit_user(prompt);
             let lines = if rest.is_empty() {
                 vec![format!(
-                    "approval mode: {} (use /approval strict|auto|never)",
-                    harness.approval_mode().as_token()
+                    "approval mode: {} (use /approval {})",
+                    crate::cli::current_permission_token(harness),
+                    crate::cli::APPROVAL_USAGE
                 )]
             } else {
-                match crate::nexus::ApprovalMode::parse(rest) {
+                match PermissionMode::parse(rest) {
                     Some(mode) => {
-                        harness.set_approval_mode(mode);
+                        let lines = crate::cli::apply_permission_mode(harness, mode);
                         tui.screen
                             .set_approval_policy(effective_approval_policy(harness));
-                        vec![format!("approval mode set to {}", mode.as_token())]
+                        lines
                     }
                     None => vec![format!(
-                        "unknown approval mode `{rest}` (use strict|auto|never)"
+                        "unknown approval mode `{rest}` (use {})",
+                        crate::cli::APPROVAL_USAGE
                     )],
                 }
             };
@@ -1823,6 +1886,7 @@ async fn idle_phase(
                         IdleKey::Submit(text) => return Ok(IdleOutcome::Submit(text)),
                         IdleKey::Exit => return Ok(IdleOutcome::Exit),
                         IdleKey::OpenModelPicker => return Ok(IdleOutcome::OpenModelPicker),
+                        IdleKey::OpenSkillPicker => return Ok(IdleOutcome::OpenSkillPicker),
                         IdleKey::CycleModel(forward) => return Ok(IdleOutcome::CycleModel(forward)),
                         IdleKey::CycleEffort => return Ok(IdleOutcome::CycleEffort),
                         IdleKey::OpenResumePicker => return Ok(IdleOutcome::OpenResumePicker),
@@ -2460,6 +2524,13 @@ async fn dispatch_action<P: ChatProvider>(
                 _ => tui.screen.close_modal(),
             }
         }
+        ModalAction::InsertSkillMention { name, path } => {
+            tui.screen.close_modal();
+            tui.screen
+                .editor
+                .insert_str(format!("[${name}](skill://{path}) "));
+            tui.screen.sync_palette();
+        }
         // Model / scoped / effort / settings / policy actions.
         other => {
             // Capture the faceplate's view before the action so a snapshot-
@@ -3021,6 +3092,10 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
         KeyCode::Char('@') if !ctrl && !alt && screen.editor_is_empty() => {
             return IdleKey::ToggleTreeMenu(true);
         }
+        // Codex skill-mention idiom: `$` opens the searchable picker instead of
+        // inserting a literal sigil. Selecting a row inserts a path-qualified
+        // mention at the current cursor.
+        KeyCode::Char('$') if !ctrl && !alt => return IdleKey::OpenSkillPicker,
         // Everything else is pure text editing, shared with the running phase so
         // the composer behaves identically whether or not a turn is in flight.
         code => {
@@ -3626,11 +3701,15 @@ mod tests {
         let mut screen = Screen::new();
         screen.apply(crate::ui::UiEvent::FoldApplied {
             folds: 2,
+            semantic_dedupe_folds: 2,
+            tool_clearing_folds: 0,
             reclaimed_tokens_estimate: 900,
             trigger: crate::nexus::FoldTrigger::SelectionSwitch,
         });
         screen.apply(crate::ui::UiEvent::FoldApplied {
             folds: 1,
+            semantic_dedupe_folds: 0,
+            tool_clearing_folds: 1,
             reclaimed_tokens_estimate: 300,
             trigger: crate::nexus::FoldTrigger::Watermark,
         });
@@ -5099,6 +5178,12 @@ mod tests {
     #[test]
     fn idle_chords_open_picker_and_cycle() {
         let mut screen = Screen::new();
+        // `$` opens the skill mention picker and does not enter the editor.
+        assert!(matches!(
+            handle_idle_event(&mut screen, key(KeyCode::Char('$'))),
+            IdleKey::OpenSkillPicker
+        ));
+        assert!(screen.editor_is_empty());
         // Ctrl+L opens the model picker.
         assert!(matches!(
             handle_idle_event(
@@ -5220,7 +5305,15 @@ mod tests {
             base_url: "https://example".to_string(),
             reasoning: None,
             cache_retention: crate::mimir::selection::PromptCacheRetention::Short,
+            codex_transport: crate::mimir::selection::CodexTransport::Auto,
             context_management: crate::mimir::selection::ContextManagement::default(),
+            legacy_context_management: crate::mimir::selection::ContextManagement::default(),
+            tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
+            configured_tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
             retry_policy: crate::mimir::retry::RetryPolicy::default(),
             open_ai_compatible: crate::mimir::selection::OpenAiCompatibleConfig::default(),
         }
@@ -5320,6 +5413,10 @@ mod tests {
             compaction_summarizer: "subagent".to_string(),
             microcompaction: true,
             microcompaction_watermark: 32_000,
+            compaction_aggressiveness: "conservative".to_string(),
+            compaction_cache_timing: "cacheAware".to_string(),
+            semantic_retain_per_path: 1,
+            tool_clearing_keep_recent: 8,
             prompt_cache_retention: "short".to_string(),
             verify_command: None,
             verify_max_attempts: 3,
@@ -5548,6 +5645,79 @@ mod tests {
                 "{resolution}: cursor held on the same candidate"
             );
         }
+    }
+
+    // --- decision #4 / coordinator override: the dangerous skip-approvals bypass
+    // PERSISTS as the default permission mode (#520) and survives a restart. It is
+    // NOT session-only — the faceplate row clicked once must still be dangerous on
+    // the next boot. ---
+    #[test]
+    fn skip_approvals_persists_the_dangerous_default_and_survives_a_restart() {
+        use crate::mimir::test_support::ConfigPathGuard;
+        use crate::nexus::{ApprovalMode, PermissionMode};
+
+        let dir = crate::tools::test_support::temp_dir();
+        let global = dir.path.join("settings.json");
+        let _guard = ConfigPathGuard::set(&global);
+
+        let (mut harness, _hdir) = harness_with_context(400, Some(40_000));
+        harness.set_approval_mode(ApprovalMode::Auto);
+        let build = |_s: &ModelSelection, _p: &str| Ok(NullChat);
+        let mut switch = ModelSwitch::new(null_selection(), "P".to_string(), &build, None);
+        assert!(!harness.skip_permissions(), "starts with the bypass off");
+
+        // Click the faceplate skip-approvals switch ON: applied live AND persisted
+        // through #520's permission-mode default.
+        let _ = picker::apply_action(
+            ModalAction::ToggleSkipPermissions,
+            None,
+            &mut harness,
+            &mut switch,
+        );
+        assert!(
+            harness.skip_permissions(),
+            "the bypass is live this session"
+        );
+
+        // Restart-shaped: a FRESH settings load reads the persisted global token,
+        // and startup resolution re-enables the bypass — proving it is not
+        // session-only but survives across restarts.
+        let reloaded = crate::config::Settings::load(&dir.path).unwrap();
+        assert_eq!(
+            reloaded.default_approval.as_deref(),
+            Some(crate::nexus::DANGEROUS_SKIP_PERMISSIONS_TOKEN),
+            "the dangerous default persisted to global settings"
+        );
+        assert!(
+            matches!(
+                PermissionMode::from_startup_setting(reloaded.default_approval.as_deref()),
+                PermissionMode::DangerousSkipPermissions
+            ),
+            "a fresh boot resolves the persisted token back to the bypass"
+        );
+
+        // Toggling it back OFF restores AND persists the parked approval preset,
+        // so a later restart is no longer dangerous (the persistence is symmetric).
+        let _ = picker::apply_action(
+            ModalAction::ToggleSkipPermissions,
+            None,
+            &mut harness,
+            &mut switch,
+        );
+        assert!(!harness.skip_permissions(), "the bypass is cleared live");
+        let reloaded = crate::config::Settings::load(&dir.path).unwrap();
+        assert_ne!(
+            reloaded.default_approval.as_deref(),
+            Some(crate::nexus::DANGEROUS_SKIP_PERMISSIONS_TOKEN),
+            "clearing the bypass persists a normal default, not the dangerous token"
+        );
+        assert!(
+            !matches!(
+                PermissionMode::from_startup_setting(reloaded.default_approval.as_deref()),
+                PermissionMode::DangerousSkipPermissions
+            ),
+            "a fresh boot no longer resolves to the bypass"
+        );
     }
 
     // --- criterion 17: a resolved login returns expanded, badge/count refreshed ---

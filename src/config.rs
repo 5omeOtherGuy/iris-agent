@@ -18,12 +18,13 @@
 //! older binaries tolerate newer config. A malformed file is a hard error -- a
 //! silently-ignored config is a footgun.
 //!
-//! Live tool/approval policy is not configured here: the session approval mode
-//! (`/approval`) and project permission grants (`/trust`) are session/project
-//! state, not settings keys. The one exception is `defaultApproval`, the
-//! startup approval posture, which is GLOBAL-ONLY (a cloned project must never
-//! be able to weaken it -- see `merged_with`). Cross-session approval-grant
-//! persistence is still tracked separately (roadmap #14).
+//! Live project grants are not configured here: project permission grants (`/trust`)
+//! are HOME-owned state, not repo settings. The one exception is
+//! `defaultApproval`, the global startup permission mode. It may be
+//! `strict|auto|never|dangerously-skip-permissions`, but remains GLOBAL-ONLY (a
+//! cloned project must never be able to weaken it -- see `merged_with`).
+//! Cross-session approval-grant persistence is still tracked separately
+//! (roadmap #14).
 
 use std::env;
 use std::io::Write;
@@ -33,10 +34,17 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+mod tool_result_compaction;
+
+pub(crate) use tool_result_compaction::{
+    CompactionAggressiveness, CompactionCacheTiming, ToolClearingBackend, ToolClearingMode,
+    ToolResultCompactionPolicy, ToolResultCompactionSettings,
+};
+
 /// Settings loaded from the JSON config files. Every field is optional; an
 /// absent field falls back to the next layer (safe project fields -> global ->
 /// built-in default, with env applied above where the provider supports it).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Settings {
     /// Provider id: `openai-codex` (default), `anthropic`, or `antigravity`.
@@ -47,11 +55,9 @@ pub(crate) struct Settings {
     pub(crate) default_model: Option<String>,
     /// Base URL override for the active provider's API endpoint.
     pub(crate) base_url: Option<String>,
-    /// Auto-compaction threshold. The Tier-2 harness reads it to decide when to
-    /// auto-compact: when the rebuilt/current context token total exceeds this,
-    /// the harness compacts at a safe turn boundary. Absent ->
-    /// [`Settings::context_token_budget`] default. Kept on the legacy
-    /// `contextTokenBudget` key for settings-file compatibility.
+    /// Legacy absolute auto-compaction window override. When set, it clamps the
+    /// model-derived effective window; when the model window is unknown it is
+    /// the window. Kept on `contextTokenBudget` for compatibility.
     pub(crate) context_token_budget: Option<u64>,
     /// Microcompaction watermark. When microcompaction is enabled, detected fold
     /// plans flush once provider-visible context reaches this independent token
@@ -96,6 +102,12 @@ pub(crate) struct Settings {
     /// never redirect requests, so a project file may tune it. Gates fold
     /// WRITING only; a persisted fold always rebuilds regardless of this value.
     pub(crate) microcompaction: Option<bool>,
+    /// Structured, opt-in tool-result compaction policy. Local semantic dedupe
+    /// and clearing knobs are project-tunable; provider-native backend controls
+    /// remain global-only in [`Settings::merged_with`]. When absent, the legacy
+    /// `microcompaction` + `microcompactionWatermark` pair resolves to the
+    /// conservative policy unchanged.
+    pub(crate) tool_result_compaction: Option<ToolResultCompactionSettings>,
     /// Opt-in durable task workflow (ADR-0052, issue #444): checkpoint refs,
     /// recovery/adoption, task lifecycle entries, badges, task diffs, and
     /// rollback across restarts. Absent/false -> off; the dirty-tree guard
@@ -125,6 +137,10 @@ pub(crate) struct Settings {
     /// request load and cost, so an untrusted project file must not crank it up
     /// (same reasoning as `prompt_cache_retention`).
     pub(crate) retry: Option<RetrySettings>,
+    /// OpenAI Codex transport mode: `auto` uses OAuth WebSocket by default with
+    /// HTTP/SSE fallback; `sse` forces the legacy HTTP/SSE route. GLOBAL-ONLY:
+    /// it changes secret-bearing provider transport behavior and fallback policy.
+    pub(crate) codex_transport: Option<String>,
     /// Generic OpenAI-compatible model metadata. The provider/model/base-url are
     /// still resolved through the existing top-level defaults; this object holds
     /// capability/display flags for the configured custom endpoint.
@@ -142,13 +158,13 @@ pub(crate) struct Settings {
     /// Terminal-UI behavior (ADR-0029 screen-mode policy). Display-only
     /// preferences: no security-sensitive capability lives here.
     pub(crate) tui: Option<TuiSettings>,
-    /// Startup approval posture (`strict|auto|never`, ADR-0032). Parsed by
-    /// [`crate::nexus::ApprovalMode::parse`] and applied to the harness at
-    /// startup; an absent/invalid value leaves today's default (`strict`).
+    /// Startup permission mode (`strict|auto|never|dangerously-skip-permissions`).
+    /// Normal modes are parsed by [`crate::nexus::ApprovalMode::parse`]; the
+    /// dangerous token is handled by the host as the explicit skip-permissions
+    /// mode. An absent/invalid value leaves today's default (`strict`).
     /// GLOBAL-ONLY: a cloned project must never be able to lower the initial
-    /// posture to `never`, so (like `prompt_cache_retention`) it is taken from
-    /// global config and never from an untrusted project file. The live
-    /// `/approval` command stays session-only and is unaffected.
+    /// posture or enable dangerous skip, so (like `prompt_cache_retention`) it is
+    /// taken from global config and never from an untrusted project file.
     pub(crate) default_approval: Option<String>,
     /// Where the git dropdown's `w` (new worktree) gesture creates worktrees,
     /// relative to the main worktree root when not absolute. Absent ->
@@ -156,6 +172,94 @@ pub(crate) struct Settings {
     /// user-confirmed `git worktree add` (the resolved path is always shown
     /// before create), granting no new capability.
     pub(crate) worktree_root: Option<String>,
+    /// Automatic full-context compaction policy. Project-safe tuning fields
+    /// merge over global settings; routing/native fields remain global-only.
+    pub(crate) compaction: Option<CompactionSettings>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CompactionSettings {
+    pub(crate) enabled: Option<bool>,
+    pub(crate) thresholds: Option<CompactionThresholdSettings>,
+    pub(crate) keep_recent_tokens: Option<u64>,
+    pub(crate) worker: Option<CompactionWorkerSettings>,
+    pub(crate) hard_wait_ms: Option<u64>,
+    pub(crate) max_consecutive_failures: Option<u32>,
+    pub(crate) reactive: Option<bool>,
+    pub(crate) provider_native: Option<String>,
+    pub(crate) instructions: Option<String>,
+    pub(crate) model_tool: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub(crate) struct CompactionThresholdSettings {
+    pub(crate) warn: Option<f64>,
+    pub(crate) start: Option<f64>,
+    pub(crate) hard: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CompactionWorkerSettings {
+    pub(crate) input: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) max_tool_roundtrips: Option<usize>,
+    pub(crate) timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CompactionTriggerConfig {
+    pub(crate) enabled: bool,
+    pub(crate) warn: f64,
+    pub(crate) start: f64,
+    pub(crate) hard: f64,
+    pub(crate) keep_recent_tokens: u64,
+    pub(crate) hard_wait_ms: u64,
+    pub(crate) max_consecutive_failures: u32,
+}
+
+fn merge_compaction(
+    global: Option<CompactionSettings>,
+    project: Option<CompactionSettings>,
+) -> Option<CompactionSettings> {
+    if global.is_none() && project.is_none() {
+        return None;
+    }
+    let global = global.unwrap_or_default();
+    let project = project.unwrap_or_default();
+    let global_thresholds = global.thresholds.unwrap_or_default();
+    let project_thresholds = project.thresholds.unwrap_or_default();
+    let thresholds = CompactionThresholdSettings {
+        warn: project_thresholds.warn.or(global_thresholds.warn),
+        start: project_thresholds.start.or(global_thresholds.start),
+        hard: project_thresholds.hard.or(global_thresholds.hard),
+    };
+    let global_worker = global.worker.unwrap_or_default();
+    let project_worker = project.worker.unwrap_or_default();
+    Some(CompactionSettings {
+        enabled: project.enabled.or(global.enabled),
+        thresholds: Some(thresholds),
+        keep_recent_tokens: project.keep_recent_tokens.or(global.keep_recent_tokens),
+        worker: Some(CompactionWorkerSettings {
+            input: project_worker.input.or(global_worker.input),
+            // Worker model changes provider routing and remains global-only.
+            model: global_worker.model,
+            max_tool_roundtrips: project_worker
+                .max_tool_roundtrips
+                .or(global_worker.max_tool_roundtrips),
+            timeout_ms: project_worker.timeout_ms.or(global_worker.timeout_ms),
+        }),
+        hard_wait_ms: project.hard_wait_ms.or(global.hard_wait_ms),
+        max_consecutive_failures: project
+            .max_consecutive_failures
+            .or(global.max_consecutive_failures),
+        reactive: project.reactive.or(global.reactive),
+        // Provider-native rewrites alter server-side semantics and are global-only.
+        provider_native: global.provider_native,
+        instructions: project.instructions.or(global.instructions),
+        model_tool: project.model_tool.or(global.model_tool),
+    })
 }
 
 /// Terminal-UI settings block (`"tui": { ... }` in settings.json).
@@ -229,10 +333,13 @@ pub(crate) struct RetrySettings {
     pub(crate) max_delay_ms: Option<u64>,
 }
 
-/// Default context token budget when none is configured. A conservative ceiling
-/// that fits common model context windows; it is only surfaced through
-/// [`Settings::context_token_budget`] and triggers nothing yet.
+/// Legacy fallback when neither an explicit budget nor a model window exists.
 const DEFAULT_CONTEXT_TOKEN_BUDGET: u64 = 128_000;
+pub(crate) const DEFAULT_SUMMARY_RESERVE: u64 = 8_192;
+const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 20_000;
+const DEFAULT_COMPACTION_HARD_WAIT_MS: u64 = 10_000;
+const MAX_COMPACTION_HARD_WAIT_MS: u64 = 120_000;
+const DEFAULT_COMPACTION_MAX_FAILURES: u32 = 3;
 /// Default independent microcompaction flush threshold. This matches the old
 /// default `contextTokenBudget / 2` behavior without coupling future budget edits
 /// to microcompaction.
@@ -269,6 +376,11 @@ impl Settings {
     /// base-url control where bearer tokens are sent and must come from global
     /// user config or built-in defaults.
     fn merged_with(self, project: Settings) -> Settings {
+        let tool_result_compaction = tool_result_compaction::merge(
+            self.tool_result_compaction.clone(),
+            project.tool_result_compaction.clone(),
+        );
+        let compaction = merge_compaction(self.compaction.clone(), project.compaction.clone());
         Settings {
             default_provider: self.default_provider,
             default_model: project.default_model.or(self.default_model),
@@ -290,6 +402,7 @@ impl Settings {
             // trades in-context detail for recoverable detail, never redirects a
             // request), so a project may tune it; project value wins, else global.
             microcompaction: project.microcompaction.or(self.microcompaction),
+            tool_result_compaction,
             // Durable task workflow is opt-in product surface, not the safety
             // floor. Project config may enable it for a repo; absent defaults
             // off via the accessor.
@@ -315,6 +428,9 @@ impl Settings {
             // Retry tuning affects provider load/cost, so keep it global-only
             // like prompt cache retention; never taken from project config.
             retry: self.retry,
+            // Codex transport affects secret-bearing provider transport and
+            // fallback behavior, so it is global-only like provider/base-url.
+            codex_transport: self.codex_transport,
             // Custom endpoint capability flags are global-only alongside the
             // base URL, so a cloned project cannot change how a secret-bearing
             // endpoint is called.
@@ -328,12 +444,13 @@ impl Settings {
             // redirect, so a project may set it; project value wins, else
             // global.
             tui: project.tui.or(self.tui),
-            // Startup approval posture gates whether tools auto-run without a
-            // prompt, so (like prompt_cache_retention) it is GLOBAL-ONLY: a
-            // cloned project must never lower the initial posture to `never`.
+            // Startup permission mode gates whether tools auto-run without a
+            // prompt and may enable dangerous skip, so it is GLOBAL-ONLY: a
+            // cloned project must never lower the initial posture.
             default_approval: self.default_approval,
             // A local worktree location preference; project value wins.
             worktree_root: project.worktree_root.or(self.worktree_root),
+            compaction,
         }
     }
 
@@ -392,12 +509,67 @@ impl Settings {
         self.retry.clone().unwrap_or_default()
     }
 
-    /// Configured context token budget, or the built-in default when unset. The
-    /// harness compares the current context token total against this and
-    /// auto-compacts when it is exceeded.
+    /// Explicit legacy window override, or the unknown-model fallback when
+    /// unset. Production model-aware resolution preserves raw `None` separately.
     pub(crate) fn context_token_budget(&self) -> u64 {
         self.context_token_budget
             .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET)
+    }
+
+    /// Validated trigger-ladder tuning. The legacy absolute budget is checked
+    /// here because `enabled=false`, not a zero budget, is the off switch.
+    pub(crate) fn compaction_trigger(&self) -> Result<CompactionTriggerConfig> {
+        if let Some(budget) = self.context_token_budget
+            && budget < DEFAULT_SUMMARY_RESERVE
+        {
+            bail!(
+                "contextTokenBudget must be at least {DEFAULT_SUMMARY_RESERVE}; use compaction.enabled=false to disable automatic compaction"
+            );
+        }
+        let compaction = self.compaction.as_ref();
+        let thresholds = compaction.and_then(|value| value.thresholds.as_ref());
+        let warn = thresholds.and_then(|value| value.warn).unwrap_or(0.55);
+        let start = thresholds.and_then(|value| value.start).unwrap_or(0.65);
+        let hard = thresholds.and_then(|value| value.hard).unwrap_or(0.85);
+        if !(warn.is_finite()
+            && start.is_finite()
+            && hard.is_finite()
+            && 0.0 < warn
+            && warn < start
+            && start < hard
+            && hard < 1.0)
+        {
+            bail!("compaction thresholds must satisfy 0 < warn < start < hard < 1");
+        }
+        let keep_recent_tokens = compaction
+            .and_then(|value| value.keep_recent_tokens)
+            .unwrap_or(DEFAULT_COMPACTION_KEEP_RECENT_TOKENS);
+        if keep_recent_tokens == 0 {
+            bail!("compaction.keepRecentTokens must be greater than zero");
+        }
+        let max_consecutive_failures = compaction
+            .and_then(|value| value.max_consecutive_failures)
+            .unwrap_or(DEFAULT_COMPACTION_MAX_FAILURES);
+        if max_consecutive_failures == 0 {
+            bail!("compaction.maxConsecutiveFailures must be greater than zero");
+        }
+        let hard_wait_ms = compaction
+            .and_then(|value| value.hard_wait_ms)
+            .unwrap_or(DEFAULT_COMPACTION_HARD_WAIT_MS);
+        if hard_wait_ms > MAX_COMPACTION_HARD_WAIT_MS {
+            bail!(
+                "compaction.hardWaitMs must be at most {MAX_COMPACTION_HARD_WAIT_MS} milliseconds"
+            );
+        }
+        Ok(CompactionTriggerConfig {
+            enabled: compaction.and_then(|value| value.enabled).unwrap_or(true),
+            warn,
+            start,
+            hard,
+            keep_recent_tokens,
+            hard_wait_ms,
+            max_consecutive_failures,
+        })
     }
 
     /// Configured independent microcompaction watermark, or the built-in default
@@ -432,6 +604,18 @@ impl Settings {
     /// a `/settings` toggle takes effect at the next turn boundary.
     pub(crate) fn microcompaction(&self) -> bool {
         self.microcompaction.unwrap_or(false)
+    }
+
+    /// Resolve the structured policy, or the legacy conservative alias when no
+    /// structured block exists. This is the single validation boundary shared
+    /// by Wayland and Mimir; malformed enum/count/tool-list values fail before
+    /// a provider is built or a fold is planned.
+    pub(crate) fn tool_result_compaction(&self) -> Result<ToolResultCompactionPolicy> {
+        tool_result_compaction::resolve(
+            self.tool_result_compaction.as_ref(),
+            self.microcompaction(),
+            self.microcompaction_watermark(),
+        )
     }
 
     /// Whether the durable task workflow is enabled. Default off; the dirty-tree
@@ -495,10 +679,11 @@ pub(crate) fn save_enabled_models(ids: Option<&[String]>) -> Result<()> {
     update_global(&[("enabledModels", value)])
 }
 
-/// Persist the startup approval posture (`strict|auto|never`) in the global
-/// settings file. GLOBAL-ONLY (like [`save_prompt_cache_retention`]): a cloned
-/// project must never redirect the initial posture, so this always writes the
-/// user-global file.
+/// Persist the startup permission mode
+/// (`strict|auto|never|dangerously-skip-permissions`) in the global settings
+/// file. GLOBAL-ONLY (like [`save_prompt_cache_retention`]): a cloned project
+/// must never redirect the initial posture, so this always writes the user-global
+/// file.
 pub(crate) fn save_default_approval(mode: &str) -> Result<()> {
     update_global(&[("defaultApproval", Value::String(mode.to_string()))])
 }
@@ -520,15 +705,21 @@ pub(crate) fn save_compaction_summarizer(mode: &str) -> Result<()> {
     update_global(&[("compactionSummarizer", Value::String(mode.to_string()))])
 }
 
-/// Persist the context token budget in the global settings file, clamped to a
-/// sane positive range so a hand-typed value cannot store a degenerate budget.
+/// Persist the legacy context window override. Values below the summary reserve
+/// are rejected; disabling automatic compaction is an explicit boolean policy.
 pub(crate) fn save_context_token_budget(budget: u64) -> Result<()> {
-    let budget = budget.clamp(MIN_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET);
+    if budget < DEFAULT_SUMMARY_RESERVE {
+        bail!(
+            "contextTokenBudget must be at least {DEFAULT_SUMMARY_RESERVE}; use compaction.enabled=false to disable automatic compaction"
+        );
+    }
+    let budget = budget.min(MAX_CONTEXT_TOKEN_BUDGET);
     update_global(&[("contextTokenBudget", Value::from(budget))])
 }
 
 /// Persist the microcompaction watermark in the global settings file, clamped to
 /// the same sane positive token range as the auto-compaction threshold.
+#[cfg(test)]
 pub(crate) fn save_microcompaction_watermark(watermark: u64) -> Result<()> {
     let watermark = watermark.clamp(MIN_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET);
     update_global(&[("microcompactionWatermark", Value::from(watermark))])
@@ -538,33 +729,87 @@ pub(crate) fn save_microcompaction_watermark(watermark: u64) -> Result<()> {
 /// (ADR-0048, #378). A boolean, so no clamping is needed; the `/settings` toggle
 /// and config parsing both validate at the boundary.
 ///
-/// Enabling is rejected while `anthropicContextManagement.clearToolUses` is
-/// configured (issue #400, ADR-0022 addendum): server-side tool-result
-/// clearing and local microcompaction are mutually exclusive (the server
-/// drops content Iris still models as present). The raw-key check mirrors
-/// `ContextManagement::validate_compatible_with_microcompaction`, which
-/// enforces the same rule over the MERGED settings at selection load;
-/// `anthropicContextManagement` is global-only, so the global file is the
-/// complete truth for the key this save guards against.
+/// Enabling is rejected when legacy Anthropic clearing overlaps the legacy
+/// semantic candidate set (`read`, `ls`). Excluding both tools proves the
+/// reducers disjoint and is accepted. Typed selection validation applies the
+/// same rule to the merged structured policy.
+#[cfg(test)]
 pub(crate) fn save_microcompaction(enabled: bool) -> Result<()> {
     if enabled {
         let path = global_path()
             .context("cannot resolve the global settings path (set HOME or IRIS_CONFIG_PATH)")?;
         let object = read_object(&path)?;
-        let clears_tool_uses = object
+        let clear_tool_uses = object
             .get("anthropicContextManagement")
-            .and_then(|value| value.get("clearToolUses"))
-            .is_some();
-        if clears_tool_uses {
+            .and_then(|value| value.get("clearToolUses"));
+        let excludes_local_c = clear_tool_uses
+            .and_then(|value| value.get("excludeTools"))
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                ["read", "ls"]
+                    .iter()
+                    .all(|required| tools.iter().any(|tool| tool.as_str() == Some(required)))
+            });
+        if clear_tool_uses.is_some() && !excludes_local_c {
             anyhow::bail!(
                 "anthropicContextManagement.clearToolUses and microcompaction cannot be enabled \
-                 together: the server drops tool results Iris still models as present, so \
-                 context accounting and fold plans diverge. Disable one of them \
-                 (clearThinking remains compatible with microcompaction)."
+                 together for overlapping tools; exclude both read and ls from clearToolUses, \
+                 or disable one reducer (clearThinking remains compatible)."
             );
         }
     }
     update_global(&[("microcompaction", Value::Bool(enabled))])
+}
+
+pub(crate) fn save_tool_result_compaction_enabled(enabled: bool) -> Result<()> {
+    update_global_nested(
+        &["toolResultCompaction"],
+        &[("enabled", Value::Bool(enabled))],
+        true,
+    )
+}
+
+pub(crate) fn save_tool_result_compaction_aggressiveness(value: &str) -> Result<()> {
+    let value = CompactionAggressiveness::parse(Some(value))?.as_str();
+    update_global_nested(
+        &["toolResultCompaction"],
+        &[("aggressiveness", Value::String(value.to_string()))],
+        true,
+    )
+}
+
+pub(crate) fn save_tool_result_compaction_cache_timing(value: &str) -> Result<()> {
+    let value = CompactionCacheTiming::parse(Some(value))?.as_str();
+    update_global_nested(
+        &["toolResultCompaction"],
+        &[("cacheTiming", Value::String(value.to_string()))],
+        true,
+    )
+}
+
+pub(crate) fn save_tool_result_compaction_trigger_tokens(tokens: u64) -> Result<()> {
+    let tokens = tokens.clamp(MIN_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET);
+    update_global_nested(
+        &["toolResultCompaction"],
+        &[("triggerTokens", Value::from(tokens))],
+        true,
+    )
+}
+
+pub(crate) fn save_tool_result_compaction_retain_per_path(retain: u64) -> Result<()> {
+    update_global_nested(
+        &["toolResultCompaction", "semanticDedupe"],
+        &[("retainPerPath", Value::from(retain.max(1)))],
+        true,
+    )
+}
+
+pub(crate) fn save_tool_result_compaction_keep_recent_tool_uses(keep: u64) -> Result<()> {
+    update_global_nested(
+        &["toolResultCompaction", "toolClearing"],
+        &[("keepRecentToolUses", Value::from(keep.max(1)))],
+        true,
+    )
 }
 
 /// Persist the durable task workflow toggle in the project settings file for
@@ -692,6 +937,44 @@ fn update_global_block(block: &str, updates: &[(&str, Value)]) -> Result<()> {
         object.remove(block);
     } else {
         object.insert(block.to_string(), Value::Object(nested));
+    }
+    write_object_atomically(&path, &object)
+}
+
+fn update_global_nested(
+    blocks: &[&str],
+    updates: &[(&str, Value)],
+    validate_compaction: bool,
+) -> Result<()> {
+    let path = global_path()
+        .context("cannot resolve the global settings path (set HOME or IRIS_CONFIG_PATH)")?;
+    let mut object = read_object(&path)?;
+    let mut current = &mut object;
+    for block in blocks {
+        let value = current
+            .entry((*block).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !value.is_object() {
+            *value = Value::Object(Map::new());
+        }
+        current = value
+            .as_object_mut()
+            .expect("value replaced with an object above");
+    }
+    for (key, value) in updates {
+        if value.is_null() {
+            current.remove(*key);
+        } else {
+            current.insert((*key).to_string(), value.clone());
+        }
+    }
+    if validate_compaction {
+        let settings: Settings = serde_json::from_value(Value::Object(object.clone()))
+            .context("updated settings are invalid")?;
+        let policy = settings.tool_result_compaction()?;
+        if policy.enabled {
+            crate::mimir::selection::ModelSelection::resolve(&settings)?;
+        }
     }
     write_object_atomically(&path, &object)
 }
@@ -960,6 +1243,182 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_compaction_defaults_off_and_legacy_alias_is_conservative() {
+        let defaulted = Settings::default().tool_result_compaction().unwrap();
+        assert!(!defaulted.enabled);
+        assert_eq!(
+            defaulted.aggressiveness,
+            CompactionAggressiveness::Conservative
+        );
+        assert_eq!(defaulted.cache_timing, CompactionCacheTiming::CacheAware);
+        assert_eq!(defaulted.trigger_tokens, 64_000);
+        assert!(defaulted.semantic_dedupe.enabled);
+        assert_eq!(defaulted.semantic_dedupe.retain_per_path, 1);
+        assert!(!defaulted.tool_clearing.enabled);
+        assert!(defaulted.legacy_alias);
+
+        let legacy = Settings {
+            microcompaction: Some(true),
+            microcompaction_watermark: Some(17_000),
+            ..Settings::default()
+        }
+        .tool_result_compaction()
+        .unwrap();
+        assert!(legacy.enabled);
+        assert_eq!(legacy.trigger_tokens, 17_000);
+        assert!(legacy.semantic_dedupe.enabled);
+        assert!(!legacy.tool_clearing.enabled);
+    }
+
+    #[test]
+    fn structured_compaction_parses_presets_and_explicit_overrides() {
+        let raw = serde_json::json!({
+            "toolResultCompaction": {
+                "enabled": true,
+                "aggressiveness": "aggressive",
+                "cacheTiming": "immediate",
+                "triggerTokens": 12000,
+                "semanticDedupe": {
+                    "retainPerPath": 3,
+                    "protectRecentToolResults": 7,
+                    "protectRecentTokens": 900
+                },
+                "toolClearing": {
+                    "backend": "local",
+                    "mode": "selected",
+                    "keepRecentToolUses": 5,
+                    "clearAtLeastTokens": 200,
+                    "eligibleTools": ["bash", "grep", "bash"],
+                    "excludedTools": ["edit"],
+                    "includeFailures": true
+                }
+            }
+        });
+        let settings: Settings = serde_json::from_value(raw).unwrap();
+        let policy = settings.tool_result_compaction().unwrap();
+        assert!(policy.enabled);
+        assert_eq!(policy.cache_timing, CompactionCacheTiming::Immediate);
+        assert_eq!(policy.semantic_dedupe.retain_per_path, 3);
+        assert_eq!(policy.semantic_dedupe.protect_recent_tool_results, 7);
+        assert!(policy.tool_clearing.enabled, "aggressive preset enables B");
+        assert_eq!(policy.tool_clearing.mode, ToolClearingMode::Selected);
+        assert_eq!(policy.tool_clearing.eligible_tools, vec!["bash", "grep"]);
+        assert!(policy.tool_clearing.include_failures);
+        assert!(!policy.legacy_alias);
+    }
+
+    #[test]
+    fn structured_compaction_rejects_degenerate_counts_and_empty_names() {
+        for (raw, needle) in [
+            (
+                serde_json::json!({"toolResultCompaction":{"enabled":true,"triggerTokens":0}}),
+                "triggerTokens",
+            ),
+            (
+                serde_json::json!({"toolResultCompaction":{"enabled":true,"semanticDedupe":{"retainPerPath":0}}}),
+                "retainPerPath",
+            ),
+            (
+                serde_json::json!({"toolResultCompaction":{"enabled":true,"semanticDedupe":{"protectRecentToolResults":0,"protectRecentTokens":0}}}),
+                "recent working set",
+            ),
+            (
+                serde_json::json!({"toolResultCompaction":{"enabled":true,"aggressiveness":"custom","toolClearing":{"enabled":true,"mode":"selected","eligibleTools":[]}}}),
+                "eligibleTools",
+            ),
+            (
+                serde_json::json!({"toolResultCompaction":{"enabled":true,"aggressiveness":"custom","toolClearing":{"enabled":true,"mode":"selected","eligibleTools":["  "]}}}),
+                "empty tool name",
+            ),
+        ] {
+            let settings: Settings = serde_json::from_value(raw).unwrap();
+            let error = format!("{:#}", settings.tool_result_compaction().unwrap_err());
+            assert!(
+                error.contains(needle),
+                "{error:?} did not contain {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_merge_tunes_local_policy_but_cannot_select_or_rewrite_native() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(
+            &global,
+            r#"{"toolResultCompaction":{"enabled":true,"toolClearing":{"enabled":true,"backend":"anthropicNative","keepRecentToolUses":4,"excludedTools":["read","ls"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            r#"{"toolResultCompaction":{"enabled":false,"cacheTiming":"pressureOnly","semanticDedupe":{"retainPerPath":2},"toolClearing":{"backend":"local","keepRecentToolUses":99}}}"#,
+        )
+        .unwrap();
+        let merged = Settings::load_from(Some(&global), &project).unwrap();
+        let policy = merged.tool_result_compaction().unwrap();
+        assert!(
+            policy.enabled,
+            "project cannot disable global native config"
+        );
+        assert_eq!(policy.cache_timing, CompactionCacheTiming::PressureOnly);
+        assert_eq!(policy.semantic_dedupe.retain_per_path, 2);
+        assert_eq!(
+            policy.tool_clearing.backend,
+            ToolClearingBackend::AnthropicNative
+        );
+        assert_eq!(policy.tool_clearing.keep_recent_tool_uses, 4);
+
+        fs::write(&global, "{}").unwrap();
+        fs::write(
+            &project,
+            r#"{"toolResultCompaction":{"enabled":true,"toolClearing":{"enabled":true,"backend":"auto"}}}"#,
+        )
+        .unwrap();
+        let merged = Settings::load_from(Some(&global), &project).unwrap();
+        let policy = merged.tool_result_compaction().unwrap();
+        assert!(policy.enabled);
+        assert!(
+            !policy.tool_clearing.enabled,
+            "project native block ignored"
+        );
+        assert_eq!(policy.tool_clearing.backend, ToolClearingBackend::Local);
+    }
+
+    #[test]
+    fn structured_compaction_save_helpers_preserve_unknown_nested_keys() {
+        let dir = temp_dir();
+        let path = dir.path.join("settings.json");
+        fs::write(
+            &path,
+            r#"{"futureTop":9,"toolResultCompaction":{"futurePolicy":7,"semanticDedupe":{"futureSemantic":3},"toolClearing":{"futureClearing":4}}}"#,
+        )
+        .unwrap();
+        let _guard = ConfigPathGuard::set(&path);
+
+        save_tool_result_compaction_aggressiveness("balanced").unwrap();
+        save_tool_result_compaction_cache_timing("pressureOnly").unwrap();
+        save_tool_result_compaction_trigger_tokens(12_000).unwrap();
+        save_tool_result_compaction_retain_per_path(3).unwrap();
+        save_tool_result_compaction_keep_recent_tool_uses(6).unwrap();
+        save_tool_result_compaction_enabled(true).unwrap();
+
+        let object = read_object(&path).unwrap();
+        assert_eq!(object["futureTop"], 9);
+        let policy = &object["toolResultCompaction"];
+        assert_eq!(policy["futurePolicy"], 7);
+        assert_eq!(policy["aggressiveness"], "balanced");
+        assert_eq!(policy["cacheTiming"], "pressureOnly");
+        assert_eq!(policy["triggerTokens"], 12_000);
+        assert_eq!(policy["semanticDedupe"]["retainPerPath"], 3);
+        assert_eq!(policy["semanticDedupe"]["futureSemantic"], 3);
+        assert_eq!(policy["toolClearing"]["keepRecentToolUses"], 6);
+        assert_eq!(policy["toolClearing"]["futureClearing"], 4);
+        let loaded = Settings::load_from(Some(&path), &dir.path.join("none.json")).unwrap();
+        assert!(loaded.tool_result_compaction().unwrap().enabled);
+    }
+
+    #[test]
     fn task_workflow_defaults_off_and_a_project_may_opt_in() {
         assert!(!Settings::default().tasks());
 
@@ -1070,6 +1529,95 @@ mod tests {
         let configured = Settings::load_from(None, &project).unwrap();
         assert_eq!(configured.context_token_budget, Some(64_000));
         assert_eq!(configured.context_token_budget(), 64_000);
+    }
+
+    #[test]
+    fn compaction_trigger_defaults_and_validates_legacy_off_switch() {
+        let defaults = Settings::default().compaction_trigger().unwrap();
+        assert!(defaults.enabled);
+        assert_eq!(
+            (defaults.warn, defaults.start, defaults.hard),
+            (0.55, 0.65, 0.85)
+        );
+        assert_eq!(defaults.keep_recent_tokens, 20_000);
+        assert_eq!(defaults.hard_wait_ms, 10_000);
+        assert_eq!(defaults.max_consecutive_failures, 3);
+
+        let too_small = Settings {
+            context_token_budget: Some(8_191),
+            ..Settings::default()
+        };
+        let error = too_small.compaction_trigger().unwrap_err().to_string();
+        assert!(error.contains("compaction.enabled=false"), "{error}");
+    }
+
+    #[test]
+    fn compaction_thresholds_must_be_ordered_and_project_knobs_merge() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(
+            &global,
+            r#"{
+              "compaction": {
+                "thresholds": { "warn": 0.50, "start": 0.60, "hard": 0.80 },
+                "worker": { "model": "anthropic/claude-haiku-4-5", "timeoutMs": 90000 },
+                "providerNative": "auto"
+              }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            r#"{
+              "compaction": {
+                "enabled": false,
+                "thresholds": { "start": 0.62 },
+                "keepRecentTokens": 12000,
+                "worker": { "model": "evil/redirect", "timeoutMs": 1000 },
+                "providerNative": "off"
+              }
+            }"#,
+        )
+        .unwrap();
+        let merged = Settings::load_from(Some(&global), &project).unwrap();
+        let trigger = merged.compaction_trigger().unwrap();
+        assert_eq!(
+            (trigger.warn, trigger.start, trigger.hard),
+            (0.50, 0.62, 0.80)
+        );
+        assert!(!trigger.enabled);
+        assert_eq!(trigger.keep_recent_tokens, 12_000);
+        let block = merged.compaction.unwrap();
+        assert_eq!(
+            block.worker.unwrap().model.as_deref(),
+            Some("anthropic/claude-haiku-4-5"),
+            "project config cannot redirect worker traffic"
+        );
+        assert_eq!(block.provider_native.as_deref(), Some("auto"));
+
+        let invalid = Settings {
+            compaction: Some(CompactionSettings {
+                thresholds: Some(CompactionThresholdSettings {
+                    warn: Some(0.7),
+                    start: Some(0.6),
+                    hard: Some(0.8),
+                }),
+                ..CompactionSettings::default()
+            }),
+            ..Settings::default()
+        };
+        assert!(invalid.compaction_trigger().is_err());
+
+        let unbounded_wait = Settings {
+            compaction: Some(CompactionSettings {
+                hard_wait_ms: Some(120_001),
+                ..CompactionSettings::default()
+            }),
+            ..Settings::default()
+        };
+        let error = unbounded_wait.compaction_trigger().unwrap_err().to_string();
+        assert!(error.contains("at most 120000"), "{error}");
     }
 
     #[test]
@@ -1334,22 +1882,32 @@ mod tests {
     }
 
     #[test]
-    fn config_cannot_activate_dangerously_skip_permissions() {
-        // ADR-0049 activation isolation: the skip-permissions mode is not configurable.
-        // Settings has no field for it, so a malicious global OR project config
-        // carrying `dangerouslySkipPermissions: true` is inert -- serde ignores
-        // the unknown key and the loaded Settings is byte-equal to the default.
-        // There is intentionally no accessor or field a config could populate.
+    fn dangerous_default_approval_is_global_only() {
         let dir = temp_dir();
         let global = dir.path.join("global.json");
         let project = dir.path.join("project.json");
-        std::fs::write(&global, r#"{ "dangerouslySkipPermissions": true }"#).unwrap();
-        std::fs::write(&project, r#"{ "dangerouslySkipPermissions": true }"#).unwrap();
+        std::fs::write(
+            &global,
+            r#"{ "defaultApproval": "dangerously-skip-permissions", "dangerouslySkipPermissions": true }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"{ "defaultApproval": "dangerously-skip-permissions", "dangerouslySkipPermissions": true }"#,
+        )
+        .unwrap();
         let settings = Settings::load_from(Some(&global), &project).unwrap();
         assert_eq!(
-            settings,
-            Settings::default(),
-            "an unknown skip-permissions key must not populate any setting"
+            settings.default_approval.as_deref(),
+            Some("dangerously-skip-permissions"),
+            "the global defaultApproval token may select dangerous mode"
+        );
+
+        let absent_global =
+            Settings::load_from(Some(&dir.path.join("none.json")), &project).unwrap();
+        assert_eq!(
+            absent_global.default_approval, None,
+            "a project file still cannot enable dangerous mode"
         );
     }
 
@@ -1386,8 +1944,12 @@ mod tests {
         let global = dir.path.join("global.json");
         let project = dir.path.join("project.json");
         fs::write(&global, r#"{ "defaultApproval": "strict" }"#).unwrap();
-        // A cloned project must never lower the posture to `never`.
-        fs::write(&project, r#"{ "defaultApproval": "never" }"#).unwrap();
+        // A cloned project must never lower the posture or enable dangerous skip.
+        fs::write(
+            &project,
+            r#"{ "defaultApproval": "dangerously-skip-permissions" }"#,
+        )
+        .unwrap();
         let settings = Settings::load_from(Some(&global), &project).unwrap();
         assert_eq!(settings.default_approval.as_deref(), Some("strict"));
         // Absent global -> None (today's default applies at startup).
@@ -1424,10 +1986,8 @@ mod tests {
 
     #[test]
     fn save_microcompaction_rejects_enabling_beside_clear_tool_uses() {
-        // Mutual exclusion at the /settings save boundary (issue #400,
-        // ADR-0022 addendum): enabling microcompaction while the global file
-        // configures anthropicContextManagement.clearToolUses is rejected;
-        // disabling stays allowed, and clearThinking does not block.
+        // Overlap rejection at the /settings save boundary: legacy
+        // microcompaction targets read/ls, so native clearing must exclude both.
         let dir = temp_dir();
         let path = dir.path.join("settings.json");
         fs::write(
@@ -1445,6 +2005,13 @@ mod tests {
         );
         // Disabling is always allowed (it resolves the conflict).
         save_microcompaction(false).unwrap();
+
+        fs::write(
+            &path,
+            r#"{ "anthropicContextManagement": { "clearToolUses": { "excludeTools": ["read", "ls"] } } }"#,
+        )
+        .unwrap();
+        save_microcompaction(true).unwrap();
 
         // clearThinking alone does not block enabling.
         fs::write(
@@ -1471,8 +2038,9 @@ mod tests {
         // Top-level scalar saves.
         save_default_approval("auto").unwrap();
         save_prompt_cache_retention("long").unwrap();
-        // Clamp: below/above the sane range is pulled into it.
-        save_context_token_budget(1).unwrap();
+        let error = save_context_token_budget(1).unwrap_err().to_string();
+        assert!(error.contains("compaction.enabled=false"), "{error}");
+        save_context_token_budget(DEFAULT_SUMMARY_RESERVE).unwrap();
         save_microcompaction_watermark(999_999_999).unwrap();
         save_worktree_root(Some("  ../trees  ")).unwrap();
         // Nested block saves preserve sibling + unknown nested keys.
@@ -1488,7 +2056,10 @@ mod tests {
             object.get("defaultApproval"),
             Some(&Value::String("auto".into()))
         );
-        assert_eq!(object.get("contextTokenBudget"), Some(&Value::from(1_000)));
+        assert_eq!(
+            object.get("contextTokenBudget"),
+            Some(&Value::from(DEFAULT_SUMMARY_RESERVE))
+        );
         assert_eq!(
             object.get("microcompactionWatermark"),
             Some(&Value::from(100_000_000))

@@ -12,7 +12,9 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 use crate::mimir::model_capabilities;
 use crate::mimir::selection::{self, ModelSelection, ProviderId, ReasoningEffort};
-use crate::nexus::{AgentObserver, ApprovalGate, ChatProvider, Message, Role};
+use crate::nexus::{
+    AgentObserver, ApprovalGate, ApprovalMode, ChatProvider, Message, PermissionMode, Role,
+};
 use crate::session::{self, SessionLog, SessionStore};
 use crate::ui::tui::TuiUi;
 use crate::ui::{Ui, UiBridge, UiEvent, slash};
@@ -35,6 +37,7 @@ pub(crate) struct ModelSwitch<'a, P> {
     /// factory. Text/TUI model switches update it at the same boundary as the
     /// foreground provider swap; tests and generic harnesses leave it unset.
     background_selection: Option<Arc<Mutex<ModelSelection>>>,
+    compaction_settings: Option<config::Settings>,
     /// Ordered `provider/model` ids that scope Ctrl+P cycling, or `None` to cycle
     /// every authenticated model. Seeded from `settings.enabled_models` and edited
     /// by `/scoped-models`; only the picker's Ctrl+S persists it back to settings.
@@ -53,12 +56,17 @@ impl<'a, P> ModelSwitch<'a, P> {
             system_prompt,
             build,
             background_selection: None,
+            compaction_settings: None,
             scoped,
         }
     }
 
     pub(crate) fn set_background_selection_cell(&mut self, cell: Arc<Mutex<ModelSelection>>) {
         self.background_selection = Some(cell);
+    }
+
+    pub(crate) fn set_compaction_settings(&mut self, settings: config::Settings) {
+        self.compaction_settings = Some(settings);
     }
 
     /// The active resolved selection (provider/model/base-url/reasoning).
@@ -183,7 +191,10 @@ pub(crate) struct LoadedSource {
     /// compactable (#375).
     pub(crate) entry_ids: Vec<Option<String>>,
     pub(crate) resumed: usize,
-    /// Persisted dangerous skip-permissions state for the target session.
+    /// Normal approval preset to install for this target session. Dangerous skip
+    /// is carried separately so it remains an exclusive mode.
+    pub(crate) approval_mode: ApprovalMode,
+    /// Persisted/default dangerous skip-permissions state for the target session.
     pub(crate) skip_permissions: bool,
 }
 
@@ -192,6 +203,52 @@ pub(crate) struct LoadedSource {
 /// provider builder reads, so it can generate/select the id, open or create the
 /// log, and load messages; the loop only asks for the swap.
 pub(crate) type SessionLoader<'a> = dyn Fn(&SessionSource) -> Result<LoadedSource> + 'a;
+
+pub(crate) const APPROVAL_USAGE: &str = "strict|auto|never|dangerously-skip-permissions";
+
+/// The operator-visible permission mode: dangerous skip is exclusive and hides
+/// the normal approval preset while active.
+pub(crate) fn current_permission_token<P: ChatProvider>(harness: &Harness<P>) -> &'static str {
+    if harness.skip_permissions() {
+        crate::nexus::DANGEROUS_SKIP_PERMISSIONS_TOKEN
+    } else {
+        harness.approval_mode().as_token()
+    }
+}
+
+/// Apply a permission mode to the live harness without writing settings. Normal
+/// modes always clear dangerous skip; dangerous mode enables it and leaves the
+/// normal preset parked until a normal mode is selected.
+pub(crate) fn set_permission_mode<P: ChatProvider>(harness: &mut Harness<P>, mode: PermissionMode) {
+    match mode {
+        PermissionMode::Approval(mode) => {
+            harness.set_approval_mode(mode);
+            if harness.skip_permissions() {
+                harness.set_skip_permissions(false);
+            }
+        }
+        PermissionMode::DangerousSkipPermissions => {
+            if !harness.skip_permissions() {
+                harness.set_skip_permissions(true);
+            }
+        }
+    }
+}
+
+/// Apply a permission mode and persist it as the global default. Persistence
+/// errors are surfaced as notice lines but never block the live mode switch.
+pub(crate) fn apply_permission_mode<P: ChatProvider>(
+    harness: &mut Harness<P>,
+    mode: PermissionMode,
+) -> Vec<String> {
+    set_permission_mode(harness, mode);
+    let token = current_permission_token(harness);
+    let mut lines = vec![format!("approval mode set to {token}")];
+    if let Err(error) = config::save_default_approval(token) {
+        lines.push(format!("(default not saved: {error:#})"));
+    }
+    lines
+}
 
 /// Startup-only TUI state: an optional modal to show before the first input
 /// event, whether the home/start page should render, and the session id when
@@ -532,7 +589,11 @@ pub(crate) fn candidate_for(
         base_url,
         reasoning,
         cache_retention: current.cache_retention,
+        codex_transport: current.codex_transport,
         context_management: current.context_management.clone(),
+        legacy_context_management: current.legacy_context_management.clone(),
+        tool_result_compaction: current.tool_result_compaction.clone(),
+        configured_tool_result_compaction: current.configured_tool_result_compaction.clone(),
         // A runtime model switch keeps the configured retry policy and custom
         // endpoint metadata.
         retry_policy: current.retry_policy,
@@ -619,10 +680,13 @@ pub(crate) fn switch_context_advisory_for<P>(
 /// the audit event. Any failure (unsupported reasoning, build/auth error) leaves
 /// the active selection and provider untouched.
 pub(crate) fn apply_selection<P: ChatProvider>(
-    candidate: ModelSelection,
+    mut candidate: ModelSelection,
     harness: &mut Harness<P>,
     switch: &mut ModelSwitch<'_, P>,
 ) -> Vec<String> {
+    if let Err(error) = candidate.resolve_context_management_for_provider() {
+        return vec![format!("{error:#}")];
+    }
     if let Err(error) = model_capabilities::validate(&candidate) {
         return vec![format!("{error:#}")];
     }
@@ -632,10 +696,16 @@ pub(crate) fn apply_selection<P: ChatProvider>(
     };
     let scope = switch_scope(&switch.selection, &candidate);
     harness.replace_provider(provider);
+    if let Some(settings) = switch.compaction_settings.as_ref()
+        && let Ok((window, trigger)) = crate::resolved_compaction_trigger(settings, &candidate)
+    {
+        harness.set_compaction_trigger(window, trigger);
+    }
     // Install the new lane's cache profile for the fold scheduler (issue
     // #400) before recording the switch, so the A2/A3 break is scheduled
     // against the profile of the lane the next request actually uses.
     harness.set_cache_profile(crate::mimir::selection::cache_profile(&candidate));
+    harness.set_tool_result_compaction(candidate.tool_result_compaction.clone());
     let reasoning = candidate.reasoning.map(ReasoningEffort::as_str);
     if let Err(error) =
         harness.record_selection_event(candidate.provider.as_str(), &candidate.model, reasoning)
@@ -665,6 +735,27 @@ pub(crate) fn apply_selection<P: ChatProvider>(
     let mut lines = vec![confirm];
     lines.extend(advisory);
     lines
+}
+
+/// Apply a saved compaction policy to the active session. Rebuilds the provider
+/// because an Anthropic-native backend changes request JSON; local-only edits
+/// use the same path so selection state cannot drift and revert on `/model`.
+pub(crate) fn apply_tool_result_compaction<P: ChatProvider>(
+    policy: crate::config::ToolResultCompactionPolicy,
+    harness: &mut Harness<P>,
+    switch: &mut ModelSwitch<'_, P>,
+) -> Result<()> {
+    let mut candidate = switch.selection.clone();
+    candidate.configured_tool_result_compaction = policy;
+    candidate.resolve_context_management_for_provider()?;
+    let provider = (switch.build)(&candidate, &switch.system_prompt)?;
+    harness.replace_provider(provider);
+    harness.set_tool_result_compaction(candidate.tool_result_compaction.clone());
+    if let Some(cell) = &switch.background_selection {
+        *cell.lock().unwrap_or_else(|poison| poison.into_inner()) = candidate.clone();
+    }
+    switch.selection = candidate;
+    Ok(())
 }
 
 /// Slash commands that require the interactive TUI (pickers/modals, or --
@@ -1140,26 +1231,28 @@ fn run_session_inner<P: ChatProvider>(
             }
             continue;
         }
-        // Approval preset (ADR-0032). A real session control, meaningful in the
-        // non-TTY path too (e.g. `never` for a read-only/non-interactive
-        // posture), handled at this safe boundary and never sent to the model.
+        // Permission mode (ADR-0032 + ADR-0049). A real session control,
+        // meaningful in the non-TTY path too (e.g. `never` for read-only runs or
+        // dangerous skip in a sandbox), handled at this safe boundary and never
+        // sent to the model.
         if prompt == "/approval" || prompt.starts_with("/approval ") {
             let rest = prompt["/approval".len()..].trim();
-            let line = if rest.is_empty() {
-                format!(
-                    "approval mode: {} (use /approval strict|auto|never)",
-                    harness.approval_mode().as_token()
-                )
+            let lines = if rest.is_empty() {
+                vec![format!(
+                    "approval mode: {} (use /approval {APPROVAL_USAGE})",
+                    current_permission_token(harness)
+                )]
             } else {
-                match crate::nexus::ApprovalMode::parse(rest) {
-                    Some(mode) => {
-                        harness.set_approval_mode(mode);
-                        format!("approval mode set to {}", mode.as_token())
-                    }
-                    None => format!("unknown approval mode `{rest}` (use strict|auto|never)"),
+                match PermissionMode::parse(rest) {
+                    Some(mode) => apply_permission_mode(harness, mode),
+                    None => vec![format!(
+                        "unknown approval mode `{rest}` (use {APPROVAL_USAGE})"
+                    )],
                 }
             };
-            ui.emit(UiEvent::Notice(line))?;
+            for line in lines {
+                ui.emit(UiEvent::Notice(line))?;
+            }
             continue;
         }
         if prompt == "/tasks" || prompt.starts_with("/tasks ") {
@@ -1240,7 +1333,7 @@ fn watch_for_interrupt(token: &CancellationToken, done: &AtomicBool) {
 mod tests {
     use super::*;
     use anyhow::{Result, anyhow};
-    use std::cell::RefCell;
+    use std::{cell::RefCell, env};
 
     use crate::mimir::test_support::ConfigPathGuard;
     use crate::nexus::{Agent, AssistantTurn, Message, ProviderEvent, ProviderStream, Tools};
@@ -1304,9 +1397,42 @@ mod tests {
             base_url: "https://example".to_string(),
             reasoning: None,
             cache_retention: selection::PromptCacheRetention::Short,
+            codex_transport: selection::CodexTransport::Auto,
             context_management: selection::ContextManagement::default(),
+            legacy_context_management: selection::ContextManagement::default(),
+            tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
+            configured_tool_result_compaction: crate::config::Settings::default()
+                .tool_result_compaction()
+                .unwrap(),
             retry_policy: crate::mimir::retry::RetryPolicy::default(),
             open_ai_compatible: selection::OpenAiCompatibleConfig::default(),
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let prev = env::var(key).ok();
+            // SAFETY: callers hold ConfigPathGuard, which serializes test env
+            // mutation through the shared mimir env lock. This guard is declared
+            // after ConfigPathGuard so it restores before that lock is released.
+            unsafe { env::remove_var(key) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(prev) => unsafe { env::set_var(self.key, prev) },
+                None => unsafe { env::remove_var(self.key) },
+            }
         }
     }
 
@@ -1914,6 +2040,54 @@ mod tests {
         assert!(
             saved.contains("defaultReasoning") && saved.contains("high"),
             "the clamped level must be persisted as defaultReasoning: {saved}"
+        );
+    }
+
+    #[test]
+    fn reasoning_command_persisted_anthropic_adaptive_level_survives_restart() {
+        // Root-cause regression for the #514/#512 interaction: Anthropic
+        // adaptive display labels are shifted relative to Iris's stored tokens.
+        // `/reasoning high` installs internal `Medium` and writes `"medium"`;
+        // startup must read that as the stored token `Medium`, not as the
+        // provider-native label `medium` (which would lower it to `Low`).
+        let (mut harness, dir) = fake_harness();
+        let path = dir.path.join("settings.json");
+        let _config = ConfigPathGuard::set(&path);
+        let _model_env = EnvVarGuard::unset("IRIS_MODEL");
+        config::save_default_model("anthropic", "claude-sonnet-5").unwrap();
+        let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
+        let mut switch = Some(ModelSwitch::new(
+            selection(ProviderId::Anthropic, "claude-sonnet-5"),
+            "PROMPT".to_string(),
+            &build,
+            None,
+        ));
+
+        let lines =
+            handle_model_command("/reasoning high", &mut harness, &mut switch).expect("handled");
+        assert!(
+            lines.iter().any(|line| line.contains("reasoning: high")),
+            "interactive confirmation must stay provider-native: {lines:?}"
+        );
+        let saved = std::fs::read_to_string(&path).expect("settings file written");
+        assert!(
+            saved.contains(r#""defaultReasoning": "medium""#),
+            "Iris stores the normalized token for Anthropic adaptive high: {saved}"
+        );
+
+        let reloaded = config::Settings::load(&dir.path).unwrap();
+        let resolved = ModelSelection::resolve(&reloaded).unwrap();
+        assert_eq!(resolved.provider, ProviderId::Anthropic);
+        assert_eq!(resolved.model, "claude-sonnet-5");
+        assert_eq!(resolved.reasoning, Some(ReasoningEffort::Medium));
+        assert_eq!(
+            model_capabilities::display_level(
+                resolved.provider,
+                &resolved.model,
+                resolved.reasoning.unwrap()
+            ),
+            "high",
+            "restart must display the same provider-native effort the user selected"
         );
     }
 

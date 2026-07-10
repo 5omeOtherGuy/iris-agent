@@ -1,15 +1,32 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Issue 472 implementation notes</title></head>
+<head><meta charset="utf-8"><title>Codex WebSocket implementation notes</title></head>
 <body>
-<h1>Issue 472 implementation notes</h1>
+<h1>Codex WebSocket implementation notes</h1>
 <ul>
-  <li>Implementation is in worktree <code>../iris-issue-472</code> on branch <code>issue-472-bg-compaction</code>.</li>
-  <li>Wayland now schedules automatic provider/subagent compaction as a background read-only summarizer when Tier 3 installs a worker provider factory. Harnesses without that factory keep the legacy foreground provider/excerpts path.</li>
-  <li>The worker returns text only. The parent harness revalidates the planned durable entry-id range, derives carry/task state, registers recall, enforces shrink, appends the compaction entry, rebuilds live context, and emits the applied event.</li>
-  <li>Stale worker results are discarded after parent revalidation. Worker errors fall back to deterministic excerpts only if the original durable range is still valid.</li>
-  <li>The <code>subagent</code> summarizer setting uses the existing Wayland subagent backend with read-only tools and a bounded tool-roundtrip/output budget.</li>
-  <li>Lifecycle events are metadata only: job id, state, covered message count, token estimate, and a short status message. Summary text and covered transcript content are not sent through lifecycle events.</li>
+<li>Live OpenAI WebSocket Mode guide was reachable during implementation; the implemented protocol uses <code>response.create</code>, omits HTTP/SSE transport fields, keeps <code>store:false</code>, treats <code>previous_response_not_found</code> and <code>websocket_connection_limit_reached</code> specially, and preserves one in-flight response per socket.</li>
+<li>Dependency choice: <code>tokio-tungstenite</code> with rustls webpki roots matches the existing reqwest rustls posture; Tokio gained only <code>net</code> and <code>sync</code> for WebSocket I/O and reusable socket state.</li>
+<li>Setting choice: global-only <code>codexTransport</code> accepts <code>auto</code> (default WebSocket with SSE fallback) or <code>sse</code> (force legacy HTTP/SSE). Project settings cannot override it because it changes secret-bearing provider transport behavior.</li>
+<li>The WebSocket URL is derived from the resolved Codex HTTP endpoint by normalizing to <code>/codex/responses</code> and changing <code>https</code>/<code>http</code> to <code>wss</code>/<code>ws</code>; it never targets the public API-key endpoint.</li>
+<li>Continuation state is memory-only per provider instance. A next WebSocket request is reduced to suffix input only when non-input request shape is unchanged and the new full input starts with prior full input plus normalized prior assistant output items; uncertainty clears continuation and sends full context.</li>
+<li>Fallback is allowed only before visible text, reasoning summary, or tool-input deltas are emitted. After visible output, WebSocket failures surface a sanitized fatal error to avoid duplicate visible replay.</li>
+<li>Cancellation abandons the active socket, clears continuation, and returns promptly; the implementation reuses sockets only while under a 55-minute age cap and 5-minute idle TTL.</li>
+<li>Deferred: public API-key Responses WebSocket, generate:false warmup, server-side compaction/replay, debug stats/UI controls, benchmarking, and async conversion of SSE fallback remain outside this OAuth Codex transport task.</li>
+</ul>
+<h1>Configurable tool-result compaction</h1>
+<ul>
+  <li>The structured setting resolves presets as defaults, then applies explicit nested overrides. <code>conservative</code> preserves legacy superseded-read folding; <code>balanced</code> also clears older replayable local results; <code>aggressive</code> also clears older locally recoverable results; <code>custom</code> enables only reducers selected in nested settings.</li>
+  <li>Where the task did not prescribe nested defaults, presets protect 2,000 recent tokens; balanced/aggressive also protect four recent results. Local clearing keeps eight eligible uses (four for aggressive), requires 1,000 reclaimable tokens, and excludes <code>edit</code>, <code>write</code>, <code>recall</code>, and <code>read_output</code> unless explicitly overridden.</li>
+  <li>Shared recency guards apply before semantic dedupe and local clearing. <code>excludedTools</code> wins over mode and eligibility. Local clearing treats a missing or non-true result envelope as a failure and keeps it unless <code>includeFailures</code> is explicit.</li>
+  <li>Project settings may override local policy and scheduling. A project cannot select <code>anthropicNative</code> or <code>auto</code>, or alter a global native policy; those provider-side request controls remain global-only.</li>
+  <li>Anthropic public documentation was checked on 2026-07-09. It documents <code>exclude_tools</code> and <code>clear_tool_inputs</code> for <code>clear_tool_uses_20250919</code>; Iris maps both. Native clearing keeps tool inputs by default so local transcript recovery retains the original call and result.</li>
+  <li>Native and local reducers may coexist only when their candidate tool sets are provably disjoint. Semantic dedupe has candidates <code>read</code> and <code>ls</code>; native clearing must exclude both when semantic dedupe remains enabled.</li>
+  <li>Anthropic exposes no success/failure selector for native clearing. Explicit <code>anthropicNative</code> therefore requires <code>includeFailures=true</code>; <code>auto</code> falls back to local clearing when that consent or reducer disjointness is absent.</li>
+  <li>Native inclusion modes are translated to <code>exclude_tools</code> over Iris's current built-in tool surface. Provider telemetry for exact cleared call ids is deferred because the response reports aggregate counts/tokens, not the cleared ids.</li>
+  <li>Tool-call-id recovery scans the existing session JSONL. No new blob store or folded-body copy is added; normal tool-output offload still handles an oversized recall response.</li>
+  <li><code>/settings</code> edits enabled, aggressiveness, cache timing, trigger tokens, semantic retain-per-path, and clearing keep-recent counts. Tool-name arrays, mode, backend, failure inclusion, and native input clearing remain settings-file-only because the current menu has no safe list editor.</li>
+  <li>The repository's named <code>documentation-codemap-specialist</code> skill was unavailable in this environment. Affected codemap rows were updated manually; no generated codemap tooling was available to run.</li>
+  <li>No new ADR was added. These decisions directly extend ADR-0048's durable fold/recovery model, ADR-0051's flush scheduler, and ADR-0022's provider-native boundary; their dated addenda are the authoritative record.</li>
 </ul>
 </body>
 </html>

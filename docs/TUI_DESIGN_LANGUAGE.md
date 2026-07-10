@@ -943,11 +943,18 @@ ENGINE
 
 MEMORY
   compact at        ●●●●●●○○○○  232k tokens
-  microcompaction   ○ off  ◉ on
-  watermark         ●●●●●○○○○○  32k tokens
+  compaction        ○ off  ◉ on
+  aggressiveness    ◉ conservative  ○ balanced  ○ aggressive  ○ custom
+  trigger at        ●●●●●○○○○○  32k tokens
 
 ↑↓ select · ←→ set · esc close
 ```
+
+The `compaction` switch is the master for the tool-result compaction group
+(#518): its `aggressiveness`/`cache timing` switches and `trigger at` /
+`retain/path` / `keep recent` dials all persist through the structured
+`toolResultCompaction` policy and dim to inert hardware while `compaction` is
+off.
 
 Pressing `↵` on a `▸` port **expands it in place** — the marker flips to `▾`
 and the surface's rows print indented directly beneath, inside the same panel.
@@ -981,7 +988,9 @@ Never invent a fifth:
   orange wherever it sits (selection color, not state color); the one guarded
   switch (`skip approvals`) paints its handle **danger red in the on
   position** and carries a permanent dim caution silkscreen
-  (`dangerous ┊ session only`). When the labeled track does not fit the
+  (`dangerous ┊ saved default`) — the bypass persists as the default
+  permission mode (#520), so it is honestly tagged `saved default`, not
+  `session only`. When the labeled track does not fit the
   width, the row degrades to its **rotary form** — position dots + the
   selected value (`○○◉○○  medium`) — width alone decides, per row.
 - **dial** — a numeric on a **10-detent ladder** rendered as the house 10-dot
@@ -1024,7 +1033,8 @@ element renders bright for two ticks — the §6 detent flash, on the same tick
 grid as the statusline detents, settled instantly under reduced motion. The
 theme row is a **live rotary**: each click re-skins the whole pane before
 your eyes. A **dependent control dims to inert hardware** while its master is
-off (the watermark under `microcompaction ○ off`) but stays operable. The
+off (the compaction group's `trigger at` / `aggressiveness` knobs under
+`compaction ○ off`) but stays operable. The
 footer prints only the selected row's true verbs (`←→ set` · `←→ adjust · ↵
 type` · `↵ edit` · `↵ open` — keymap honesty per archetype).
 

@@ -91,16 +91,16 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 
 | Owns | Today's file(s) |
 |---|---|
-| Harness wrapping the bare agent: owns the execution env + session, injects `ToolEnv`, persists the transcript post-turn | `wayland/mod.rs` (`Harness`) |
+| Harness wrapping the bare agent: owns the execution env + session, injects `ToolEnv`, persists complete round trips plus the final/error backstop | `wayland/mod.rs` (`Harness`) |
 | Session transcript persistence/read store | `session.rs` |
 | Settings / configuration loading, including global-only provider/base-url/scoped-model/cache/context-management controls and project-safe model/reasoning/context-budget overrides | `config.rs` |
 | Workspace path safety (the FS/Shell sandbox surface) | `tools/path.rs`, `tools/bash/sandbox.rs` |
 | Tool execution state (observed files, bash sessions) | `tools/observe.rs`, `tools/bash/session.rs` (`ToolState`) |
 | Host capabilities, if a plugin system is ever added (`host_read`, `host_ls`, later `host_*_plan`) | _exploratory (issue #18)_ |
 | Oversized tool-output handle storage | `handles.rs`, `wayland/mod.rs` |
-| Context compaction | `wayland/mod.rs`, `session.rs` |
+| Context compaction engine, mid-turn governor, background lifecycle, hybrid measurement, and trigger ladder | `wayland/compaction.rs`, `wayland/compaction_governor.rs`, `wayland/compaction_background.rs`, `wayland/trigger.rs`, `wayland/mod.rs`, `session.rs` |
 | System-prompt / project-instruction assembly (fragments + generated tool blocks + project docs + runtime context) | `wayland/system_prompt/` |
-| Skills | _planned_ |
+| Skills: bounded repo/user/system/admin discovery, Codex metadata/config compatibility, metadata budgeting, contextual injection, confined resource reads, refresh-at-turn-boundary | `wayland/skills/`, `wayland/mod.rs`, `tools/read.rs` |
 
 Depends on Tier 1 only. The `Harness` is the analogue of pi's `AgentHarness`
 (`agent-harness.ts`): it owns `env`/`session`, passes `env` into the run, and
@@ -164,10 +164,11 @@ owns the instance). The cuts that reached this split:
    `Agent` holds no `workspace`, `ToolState`, `SessionLog`, or `SessionStore`. The Tier-2
    `Harness` (`wayland/mod.rs`) wraps the agent, owns the workspace + `ToolState`
    (injected per turn as `ToolEnv`) and the optional `SessionLog`, and persists
-   the transcript by diffing `agent.messages()` after each turn. The read-side
-   `SessionStore` lists/opens persisted transcripts for `resume <id>` and
-   compaction-aware context rebuild, still outside the core loop -- mirroring
-   pi's `AgentHarness` owning `ExecutionEnv`
+   complete provider round trips through an inert-by-default Nexus observer
+   boundary, with a final/error diff after each turn as the backstop. The
+   read-side `SessionStore` lists/opens persisted transcripts for `resume <id>`
+   and compaction-aware context rebuild, still outside the core loop --
+   mirroring pi's `AgentHarness` owning `ExecutionEnv`
    + session and appending messages itself, never in Nexus.
 
 ## Tools across the tiers

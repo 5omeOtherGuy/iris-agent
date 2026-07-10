@@ -61,9 +61,10 @@
   `SessionLog` appends v2 transcript entries with stable ids, `parentId`, and
   token estimates, plus compaction and model-selection audit entries;
   `SessionStore` lists/finds/opens sessions, rebuilds context through
-  compaction summaries, and `iris resume <id>` continues the same log.
-  Branching/rollback and an in-session resume picker are planned later.
-  [Partial]
+  compaction summaries, and `iris resume <id>` continues the same log. Complete
+  provider round trips flush before the next provider request; a final/error
+  turn-boundary flush remains the backstop. Branching/rollback and an
+  in-session resume picker are planned later. [Partial]
 
 ## Providers and auth
 
@@ -103,14 +104,16 @@
 - **Provider configuration** — `defaultProvider`, `defaultModel`, and `baseUrl`
   settings; supported provider ids are `openai-codex`, `anthropic`, and
   `antigravity`. Project-local settings may override only `defaultModel`,
-  `defaultReasoning`, `contextTokenBudget`, and `compactionSummarizer`; global
-  settings own provider, base-url, and model-cycle scope so a cloned repo
-  cannot redirect bearer tokens or silently change which provider a session
-  cycles to.
+  `defaultReasoning`, `contextTokenBudget`, `compactionSummarizer`, and the
+  project-safe fields of `compaction`; global settings own provider, base-url,
+  model-cycle scope, compaction worker model, and provider-native mode so a
+  cloned repo cannot redirect bearer tokens or silently change which provider
+  a session cycles to.
   OpenAI Codex additionally supports `IRIS_MODEL` and `IRIS_CODEX_BASE_URL` env
-  overrides. `contextTokenBudget` configures the auto-compaction threshold,
+  overrides. `contextTokenBudget` clamps the model-aware compaction window,
   `compactionSummarizer` picks who writes compaction summaries
-  (`provider`/`excerpts`), `defaultReasoning` sets startup thinking/effort, and
+  (`subagent`/`provider`/`excerpts`), `defaultReasoning` sets startup
+  thinking/effort, and
   `enabledModels` scopes Ctrl+P model cycling from global/user config only.
   [Partial]
 - **Provider-native prompt cache controls** — global-only `promptCacheRetention`
@@ -123,6 +126,20 @@
   `anthropicContextManagement` supports the public clear-tool-use and
   clear-thinking edits; provider-side compact is rejected until Iris can persist
   and replay compaction blocks safely. [Partial]
+- **Recoverable tool-result compaction** — default-off
+  `toolResultCompaction` composes retain-N stale-read dedupe with local
+  age/count clearing. Shared count/token guards protect the recent working set;
+  durable fold entries preserve provider tool-pair invariants; originals remain
+  recoverable from session JSONL with `recall(tool_call_id="...")`. Four cache
+  timing policies choose explicit breaks, inferred-cold windows, pressure, or
+  immediate safe boundaries. The legacy `microcompaction` setting resolves to
+  the ADR-0048 conservative `toolResultCompaction` policy and retains its
+  independent 64,000-token watermark. [Implemented]
+- **Anthropic-native tool clearing** — explicit `anthropicNative` or `auto`
+  backends map the public `clear_tool_uses_20250919` trigger, keep, minimum,
+  excluded-tool, and tool-input controls. Provider selection rejects overlapping
+  local/native tool sets; `auto` falls back to local when native clearing is
+  unsupported or cannot honor the configured safety policy. [Implemented]
 - **Runtime model and reasoning switching** — `/model`, `/reasoning`, TUI
   provider/model/effort pickers, Ctrl+P/Shift+Ctrl+P model cycling,
   Shift+Tab effort cycling, `/settings`, `/scoped-models`, and session-local or
@@ -230,7 +247,8 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 
 - **Context token estimates and budget trigger** — session entries persist
   conservative token estimates, reopened sessions report rebuilt context tokens,
-  and `contextTokenBudget` triggers turn-boundary auto-compaction. [Implemented]
+  and `contextTokenBudget` clamps auto-compaction at turn edges and continuing
+  provider-round-trip boundaries. [Implemented]
 - **Token budget planner** — allocates context across system prompt, tools,
   history, files, summaries, and current task. [Planned]
 - **Context ledger** — records why each context item is included and supports
@@ -275,17 +293,22 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 
 - **Durable compaction entries** — JSONL `compaction` entries replace covered
   message-id ranges with summary messages during read/resume rebuild. [Implemented]
-- **Auto-compaction** — when context estimates exceed `contextTokenBudget`, the
-  Wayland harness compacts at safe turn boundaries, retaining recent context and
-  preserving tool-call/result pairs. Branch-aware compaction is planned later.
-  [Implemented]
-- **Provider-backed summaries** — the default `compactionSummarizer: provider`
-  asks the active model for a structured handoff summary (goal, state, key
-  facts, next steps), reusing the cached context prefix and normal tool
-  declarations; failures, empty answers, or non-shrinking summaries fall back
-  to the deterministic bounded excerpts (`compactionSummarizer: excerpts` keeps
-  the deterministic stand-in only). Cancellation skips compaction for the turn.
-  (ADR-0041) [Implemented]
+- **Auto-compaction** — Mimir resolves the selected model's effective window;
+  Wayland combines provider usage with estimates for unseen messages and applies
+  a configurable warn/start/hard ladder before, during, and after turns. Between
+  provider round trips, Nexus consults a provider-neutral governor only after
+  complete tool-call/result groups and before steering injection. Ready workers
+  apply without waiting; hard pressure bounds worker wait and falls back to
+  deterministic excerpts. An explicit `contextTokenBudget` clamps the resolved
+  window. Active worker ranges freeze overlapping folds. Branch-aware
+  compaction remains planned. (ADR-0054, ADR-0055) [Partial]
+- **Background summaries** — the default `compactionSummarizer: subagent` uses
+  a read-only worker and falls back through a direct provider request to
+  deterministic bounded excerpts. The parent alone validates, persists, and
+  applies the summary. Compaction entries and events record the provider-neutral
+  origin plus reported worker token/cache usage. `provider` skips the read-only
+  worker; `excerpts` makes the deterministic floor explicit. Cancellation skips
+  compaction for the turn. (ADR-0041) [Implemented]
 - **Manual `/compact`** — compacts on demand at the inter-turn boundary in the
   TUI (turn-style spinner, Ctrl-C cancel) and the text path, keeping a small
   recent tail and reporting the token shrink; works without a budget.
@@ -308,6 +331,36 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 - **Named slots and selector schema** — replace numeric slots with named slots
   and drive prompt/tool inclusion from resolved provider/model/thinking/mode.
   [Planned]
+
+## Skills
+
+- **Codex-compatible filesystem format** — recursively load `SKILL.md` files
+  with validated YAML `name`/`description` metadata, frontmatter short
+  descriptions, and optional `agents/openai.yaml` interface, dependency, and
+  policy metadata. [Implemented]
+- **Repo, user, system, and admin discovery** — scan `.agents/skills` from
+  repository root to cwd, legacy `<repo>/.codex/skills`, `~/.agents/skills`,
+  existing `$CODEX_HOME/skills` plus its bundled `.system` root,
+  `~/.iris/skills`, and administrator roots. Canonical-path dedupe, bounded
+  depth/count, symlinked directories, and non-fatal load errors match Codex's
+  local loader behavior. [Implemented]
+- **Codex config compatibility** — honor `skills.include_instructions` and
+  ordered name/path `skills.config` enable rules from Codex's config. Optional
+  malformed metadata fails open. [Implemented]
+- **Progressive disclosure** — expose name, description, and source path under
+  a 2% context budget; load the full `SKILL.md` only after selection. Catalog
+  changes inject at turn boundaries without rewriting the system prompt.
+  [Implemented]
+- **Explicit and implicit invocation** — unique `$skill-name` and
+  path-qualified picker mentions inject the selected body; the model can select
+  implicitly from descriptions unless `allow_implicit_invocation` is false.
+  [Implemented]
+- **TUI discovery** — `$` and `/skills` open a searchable selector; selecting a
+  duplicate name inserts its exact `skill://` path. Interface display names and
+  short descriptions appear when present. [Implemented]
+- **Confined resource reads** — a loaded skill extends `read` with its own
+  canonical directory only. References work under workspace confinement;
+  sibling paths and out-of-workspace mutation remain denied. [Implemented]
 
 ## Modes
 

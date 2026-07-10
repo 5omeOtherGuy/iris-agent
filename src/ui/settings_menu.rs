@@ -28,8 +28,9 @@
 //! and the loop ([`crate::ui::picker::apply_action`]) performs the disk writes
 //! at the safe inter-turn boundary. A change is acknowledged mechanically: the
 //! adjusted element renders bright for two ticks (the §6 detent flash), gated
-//! by reduced motion. A dependent control (the microcompaction watermark) goes
-//! dark while its master switch is off — inert hardware, still operable.
+//! by reduced motion. Dependent controls (the compaction group's aggressiveness,
+//! cache timing, trigger, retain, and keep-recent knobs) go dark while their
+//! master `compaction` switch is off — inert hardware, still operable.
 //!
 //! All writes go to the user-global settings file via `config::save_*`;
 //! global-vs-project scope governs only load/merge precedence in
@@ -52,7 +53,7 @@ use crate::wayland::trust::ProjectPolicyEdit;
 const REV: &str = env!("CARGO_PKG_VERSION");
 
 /// Label column width: two-cell indent + label, control column after. Wide
-/// enough that the longest label (`microcompaction`, 15) keeps a real gutter.
+/// enough that the longest label (`aggressiveness`, 14) keeps a real gutter.
 /// Shared with the model picker's reasoning track so the two surfaces sit on
 /// one grid.
 pub(crate) const LABEL_W: usize = 18;
@@ -82,6 +83,10 @@ pub(crate) enum Field {
     CompactionSummarizer,
     Microcompaction,
     MicrocompactionWatermark,
+    CompactionAggressiveness,
+    CompactionCacheTiming,
+    SemanticRetainPerPath,
+    ToolClearingKeepRecent,
     PromptCacheRetention,
     VerifyCommand,
     VerifyMaxAttempts,
@@ -200,7 +205,11 @@ const SECTIONS: &[Section] = &[
             RowId::Field(Field::ContextTokenBudget),
             RowId::Field(Field::CompactionSummarizer),
             RowId::Field(Field::Microcompaction),
+            RowId::Field(Field::CompactionAggressiveness),
+            RowId::Field(Field::CompactionCacheTiming),
             RowId::Field(Field::MicrocompactionWatermark),
+            RowId::Field(Field::SemanticRetainPerPath),
+            RowId::Field(Field::ToolClearingKeepRecent),
             RowId::Field(Field::PromptCacheRetention),
         ],
     },
@@ -240,6 +249,7 @@ const UNIT_LADDER: [u64; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 fn dial_bounds(field: Field) -> (u64, u64) {
     match field {
         Field::ContextTokenBudget | Field::MicrocompactionWatermark => (1_000, 100_000_000),
+        Field::SemanticRetainPerPath | Field::ToolClearingKeepRecent => (1, 1_000),
         Field::ScrollSpeed => (1, 100),
         Field::VerifyMaxAttempts => (1, 10),
         _ => (0, u64::MAX),
@@ -332,8 +342,17 @@ pub(crate) struct Snapshot {
     pub(crate) skip_permissions: bool,
     pub(crate) context_token_budget: u64,
     pub(crate) compaction_summarizer: String,
+    /// The resolved tool-result-compaction master switch (`toolResultCompaction
+    /// .enabled`, or the legacy `microcompaction` alias). Field name kept for the
+    /// MEMORY row's identity; the label reads `compaction`.
     pub(crate) microcompaction: bool,
+    /// The resolved compaction trigger tokens (`toolResultCompaction
+    /// .triggerTokens`, or the legacy watermark). The `trigger at` dial.
     pub(crate) microcompaction_watermark: u64,
+    pub(crate) compaction_aggressiveness: String,
+    pub(crate) compaction_cache_timing: String,
+    pub(crate) semantic_retain_per_path: u64,
+    pub(crate) tool_clearing_keep_recent: u64,
     pub(crate) prompt_cache_retention: String,
     pub(crate) verify_command: Option<String>,
     pub(crate) verify_max_attempts: u32,
@@ -351,6 +370,12 @@ impl Snapshot {
             Field::DefaultApproval => &["strict", "auto", "never"],
             Field::PromptCacheRetention => &["none", "short", "long"],
             Field::CompactionSummarizer => &["excerpts", "provider", "subagent"],
+            Field::CompactionAggressiveness => {
+                &["conservative", "balanced", "aggressive", "custom"]
+            }
+            Field::CompactionCacheTiming => {
+                &["breakOnly", "cacheAware", "pressureOnly", "immediate"]
+            }
             Field::Theme => crate::ui::theme::available(),
             Field::Microcompaction | Field::ReducedMotion => &["off", "on"],
             _ => &[],
@@ -363,6 +388,8 @@ impl Snapshot {
             Field::DefaultApproval => self.default_approval.clone(),
             Field::PromptCacheRetention => self.prompt_cache_retention.clone(),
             Field::CompactionSummarizer => self.compaction_summarizer.clone(),
+            Field::CompactionAggressiveness => self.compaction_aggressiveness.clone(),
+            Field::CompactionCacheTiming => self.compaction_cache_timing.clone(),
             Field::Theme => self.theme.clone(),
             Field::Microcompaction => on_off(self.microcompaction),
             Field::ReducedMotion => on_off(self.reduced_motion),
@@ -376,6 +403,8 @@ impl Snapshot {
             Field::DefaultApproval => self.default_approval = value.to_string(),
             Field::PromptCacheRetention => self.prompt_cache_retention = value.to_string(),
             Field::CompactionSummarizer => self.compaction_summarizer = value.to_string(),
+            Field::CompactionAggressiveness => self.compaction_aggressiveness = value.to_string(),
+            Field::CompactionCacheTiming => self.compaction_cache_timing = value.to_string(),
             Field::Theme => self.theme = value.to_string(),
             Field::Microcompaction => self.microcompaction = value == "on",
             Field::ReducedMotion => self.reduced_motion = value == "on",
@@ -387,6 +416,8 @@ impl Snapshot {
         match field {
             Field::ContextTokenBudget => self.context_token_budget,
             Field::MicrocompactionWatermark => self.microcompaction_watermark,
+            Field::SemanticRetainPerPath => self.semantic_retain_per_path,
+            Field::ToolClearingKeepRecent => self.tool_clearing_keep_recent,
             Field::ScrollSpeed => u64::from(self.scroll_speed),
             Field::VerifyMaxAttempts => u64::from(self.verify_max_attempts),
             _ => 0,
@@ -397,6 +428,8 @@ impl Snapshot {
         match field {
             Field::ContextTokenBudget => self.context_token_budget = value,
             Field::MicrocompactionWatermark => self.microcompaction_watermark = value,
+            Field::SemanticRetainPerPath => self.semantic_retain_per_path = value.max(1),
+            Field::ToolClearingKeepRecent => self.tool_clearing_keep_recent = value.max(1),
             Field::ScrollSpeed => self.scroll_speed = value.min(u64::from(u16::MAX)) as u16,
             Field::VerifyMaxAttempts => self.verify_max_attempts = value.min(10) as u32,
             _ => {}
@@ -443,11 +476,15 @@ fn archetype(row: RowId) -> Archetype {
             | Field::DefaultApproval
             | Field::PromptCacheRetention
             | Field::CompactionSummarizer
+            | Field::CompactionAggressiveness
+            | Field::CompactionCacheTiming
             | Field::Theme
             | Field::Microcompaction
             | Field::ReducedMotion => Archetype::Switch,
             Field::ContextTokenBudget
             | Field::MicrocompactionWatermark
+            | Field::SemanticRetainPerPath
+            | Field::ToolClearingKeepRecent
             | Field::ScrollSpeed
             | Field::VerifyMaxAttempts => Archetype::Dial,
             Field::VerifyCommand | Field::WorktreeRoot => Archetype::Register,
@@ -476,8 +513,12 @@ fn label(row: RowId) -> &'static str {
             Field::DefaultApproval => "approvals",
             Field::ContextTokenBudget => "compact at",
             Field::CompactionSummarizer => "summarizer",
-            Field::Microcompaction => "microcompaction",
-            Field::MicrocompactionWatermark => "watermark",
+            Field::Microcompaction => "compaction",
+            Field::CompactionAggressiveness => "aggressiveness",
+            Field::CompactionCacheTiming => "cache timing",
+            Field::MicrocompactionWatermark => "trigger at",
+            Field::SemanticRetainPerPath => "retain/path",
+            Field::ToolClearingKeepRecent => "keep recent",
             Field::PromptCacheRetention => "prompt cache",
             Field::VerifyCommand => "verify",
             Field::VerifyMaxAttempts => "attempts",
@@ -1629,9 +1670,18 @@ impl SettingsPanel {
         } else {
             Style::default()
         };
-        // The watermark is inert hardware while its master switch is off.
-        let inert =
-            row == RowId::Field(Field::MicrocompactionWatermark) && !self.snap.microcompaction;
+        // The compaction group's knobs are inert hardware while their master
+        // `compaction` switch is off — still operable, just dark.
+        let inert = matches!(
+            row,
+            RowId::Field(
+                Field::CompactionAggressiveness
+                    | Field::CompactionCacheTiming
+                    | Field::MicrocompactionWatermark
+                    | Field::SemanticRetainPerPath
+                    | Field::ToolClearingKeepRecent
+            )
+        ) && !self.snap.microcompaction;
         spans.push(Span::styled(
             format!("  {name:<width$}", width = LABEL_W),
             if inert {
@@ -1757,12 +1807,14 @@ impl SettingsPanel {
                 ));
                 // Caution silkscreen: printed after the guard switch,
                 // `┊`-joined metadata (never key-hint `·`). At a narrow width
-                // it drops whole fields — ` ┊ session only` first, then
-                // `dangerous` — never truncating mid-word (a clipped `sessi`
-                // reads as a dead control, the footer drop-rule honesty).
+                // it drops whole fields — ` ┊ saved default` first, then
+                // `dangerous` — never truncating mid-word (a clipped `defau`
+                // reads as a dead control, the footer drop-rule honesty). The
+                // bypass persists via #520's permission-mode default, so the
+                // qualifier reads `saved default`, not `session only`.
                 let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
                 let caution_avail = avail.saturating_sub(used);
-                let full = format!("  dangerous {} session only", crate::ui::symbols::SEP);
+                let full = format!("  dangerous {} saved default", crate::ui::symbols::SEP);
                 let short = "  dangerous";
                 if full.chars().count() <= caution_avail {
                     spans.push(Span::styled(full, dim()));
@@ -2411,6 +2463,10 @@ mod tests {
             compaction_summarizer: "subagent".to_string(),
             microcompaction: false,
             microcompaction_watermark: 32_000,
+            compaction_aggressiveness: "conservative".to_string(),
+            compaction_cache_timing: "cacheAware".to_string(),
+            semantic_retain_per_path: 1,
+            tool_clearing_keep_recent: 8,
             prompt_cache_retention: "short".to_string(),
             verify_command: None,
             verify_max_attempts: 3,
@@ -3793,17 +3849,17 @@ mod tests {
         // Wide: the whole caution prints.
         let wide = text(&[panel.control_line(&row, false, 80)]);
         assert!(
-            wide.contains("dangerous") && wide.contains("session only"),
+            wide.contains("dangerous") && wide.contains("saved default"),
             "{wide}"
         );
-        // Mid: ` ┊ session only` drops first, whole.
+        // Mid: ` ┊ saved default` drops first, whole.
         let mid = text(&[panel.control_line(&row, false, 46)]);
         assert!(mid.contains("dangerous"), "{mid}");
-        assert!(!mid.contains("session"), "{mid}");
-        // Narrow (the offending ~40 cols): `dangerous` drops too — never `sessi`.
+        assert!(!mid.contains("saved"), "{mid}");
+        // Narrow (the offending ~40 cols): `dangerous` drops too — never `danger`.
         let narrow = text(&[panel.control_line(&row, false, 40)]);
         assert!(!narrow.contains("dangerous"), "{narrow}");
-        assert!(!narrow.contains("sessi"), "{narrow}");
+        assert!(!narrow.contains("danger"), "{narrow}");
         // Whole-field honesty: the row always fits the width it was given, so
         // the overlay's hard truncation never gets to clip a word.
         for avail in [40usize, 42, 46, 57, 80] {

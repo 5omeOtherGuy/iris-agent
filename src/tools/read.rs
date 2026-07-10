@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::ObservedFiles;
-use super::path::resolve_existing;
+use super::path::resolve_existing_in_roots;
 use super::skim::skim_mask;
 use super::text::{
     READ_TOOL_MAX_BYTES, render_line_window, render_line_window_masked, validate_offset_limit,
@@ -33,13 +33,15 @@ pub(super) fn execute(
     root: &Path,
     args: &Value,
     observed: &mut ObservedFiles,
+    skill_read_roots: &[std::path::PathBuf],
 ) -> Result<super::ToolOutput> {
     let input: ReadInput =
         serde_json::from_value(args.clone()).context("read tool arguments must include path")?;
     // Record the read target for the compaction carry (ADR-0044): a successful
     // read's workspace-relative path rides the result metadata so the carry
     // derives from successful results, not raw tool-call arguments.
-    Ok(read(root, &input, observed)?.with_workspace_target(root, &input.path))
+    Ok(read_with_roots(root, &input, observed, skill_read_roots)?
+        .with_workspace_target(root, &input.path))
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,12 +55,22 @@ struct ReadInput {
     skim: bool,
 }
 
+#[cfg(test)]
 fn read(root: &Path, input: &ReadInput, observed: &mut ObservedFiles) -> Result<super::ToolOutput> {
+    read_with_roots(root, input, observed, &[])
+}
+
+fn read_with_roots(
+    root: &Path,
+    input: &ReadInput,
+    observed: &mut ObservedFiles,
+    skill_read_roots: &[std::path::PathBuf],
+) -> Result<super::ToolOutput> {
     // Reject bad window args before any filesystem work, matching `read`'s
     // original pre-I/O validation order (the shared windower re-checks anyway).
     validate_offset_limit(input.offset, input.limit)?;
 
-    let resolved = resolve_existing(root, &input.path)?;
+    let resolved = resolve_existing_in_roots(root, &input.path, skill_read_roots)?;
     let metadata =
         fs::metadata(&resolved).with_context(|| format!("failed to stat {}", input.path))?;
     if !metadata.is_file() {
@@ -264,6 +276,48 @@ mod tests {
     }
 
     #[test]
+    fn read_allows_host_discovered_skill_resource_but_not_its_sibling() {
+        let workspace = temp_dir();
+        let skill = temp_dir();
+        let skill_root = skill.path.join("skill");
+        fs::create_dir_all(&skill_root).unwrap();
+        let reference = skill_root.join("reference.md");
+        let sibling = skill.path.join("secret.txt");
+        fs::write(&reference, "skill reference").unwrap();
+        fs::write(&sibling, "outside").unwrap();
+        let root = root_of(&workspace);
+
+        let output = read_with_roots(
+            &root,
+            &ReadInput {
+                path: reference.display().to_string(),
+                offset: None,
+                limit: None,
+                skim: false,
+            },
+            &mut ObservedFiles::new(),
+            &[skill_root.canonicalize().unwrap()],
+        )
+        .unwrap();
+        assert!(output.content.contains("skill reference"));
+
+        let error = read_with_roots(
+            &root,
+            &ReadInput {
+                path: sibling.display().to_string(),
+                offset: None,
+                limit: None,
+                skim: false,
+            },
+            &mut ObservedFiles::new(),
+            &[skill_root.canonicalize().unwrap()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("escapes workspace"), "{error}");
+    }
+
+    #[test]
     fn read_rejects_invalid_utf8_instead_of_lossy_rendering() {
         let dir = temp_dir();
         fs::write(dir.path.join("binary.dat"), [b'a', 0xFF, b'b']).unwrap();
@@ -291,7 +345,7 @@ mod tests {
         observed: &mut ObservedFiles,
     ) -> super::super::ToolOutput {
         let root = root_of(dir);
-        execute(&root, &args, observed).unwrap()
+        execute(&root, &args, observed, &[]).unwrap()
     }
 
     #[test]
