@@ -715,7 +715,11 @@ fn run_auto_compaction_live_session(
     let gate = ReadOnlyGate;
     let token = CancellationToken::new();
     let mut turn_timeline = Vec::new();
-    for turn in 0..10 {
+    // Keep supplying real pair-closed read boundaries until two applies land.
+    // A fixed turn count alone is insufficient when the second Opus worker is
+    // still running: parent lanes grow at different rates and worker latency is
+    // independent of parent latency. The cap keeps a broken trigger bounded.
+    for turn in 0..14 {
         let prompt = format!(
             "Use the read tool on Cargo.toml, then reply in at most two short sentences. Turn {turn}. {}",
             "Keep this filler distinct so the real provider context grows toward the next compaction boundary. "
@@ -734,11 +738,18 @@ fn run_auto_compaction_live_session(
         if applied >= 2 {
             break;
         }
+        if harness
+            .context_diagnostics()
+            .is_some_and(|diagnostics| diagnostics.background_running)
+        {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
     }
 
     // A second job may start at the final filler's post-turn boundary. Give the
-    // fixed Opus worker time to finish before the needle probe supplies the next
-    // safe apply boundary; the user's turn is not blocked by this worker wait.
+    // fixed Opus worker one bounded final interval before the needle probe
+    // supplies the next safe apply boundary; the user's turn is not blocked by
+    // this worker wait.
     let applied_before_probe = observer
         .events
         .lock()
@@ -751,7 +762,7 @@ fn run_auto_compaction_live_session(
             .context_diagnostics()
             .is_some_and(|diagnostics| diagnostics.background_running)
     {
-        std::thread::sleep(std::time::Duration::from_secs(30));
+        std::thread::sleep(std::time::Duration::from_secs(60));
     }
 
     let probe = format!(

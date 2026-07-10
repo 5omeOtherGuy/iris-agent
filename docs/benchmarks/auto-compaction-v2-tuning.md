@@ -136,6 +136,11 @@ at 0.000; the committed Anthropic write-side probe measured 1,758/1,761 input
 tokens written after compaction. Codex write accounting remains unavailable by
 provider contract.
 
+After quota recovery, one Codex instrument smoke forced two compactions and
+reported a 0.999 worker cache-hit rate. Parent derived fresh input increased
+from 5,249 to 22,158 tokens across paired applies (4.221×). The row is labeled
+derived because Codex still does not report writes.
+
 ## Provider-native arm
 
 The live native arm is capability-gated, so failed capability is reported
