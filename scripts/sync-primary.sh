@@ -10,7 +10,8 @@
 #   - Refuses to run from inside a worktree that is NOT the primary checkout
 #     (primary = the directory containing `.git/` as a real dir, not a
 #     `.git` file pointing at a worktree gitdir).
-#   - Refuses if the working tree is dirty (any tracked/untracked changes).
+#   - Repairs one known launcher accident: an unstaged ELF binary overwriting
+#     `scripts/iris-dev.sh`. All other dirty state is refused.
 #   - Refuses if local `main` has diverged from `origin/main` (would need
 #     a non-fast-forward merge; that is a human decision, not automation's).
 #   - Fetches `origin --prune`.
@@ -70,9 +71,26 @@ if [ ! -d "$REPO_TOP/.git" ]; then
   exit 12
 fi
 
-# Refuse on dirty tree. We will not stash for the user; that is an explicit
-# human choice. The whole point is to never silently mutate the primary.
-if [ -n "$(git status --porcelain=v1 2>/dev/null)" ]; then
+# A launcher installed through a symlink can follow that link and replace the
+# tracked script with the Iris ELF binary. This exact state is unambiguous and
+# safe to repair from HEAD. Do not broaden this exception: text edits, staged
+# changes, and any additional dirty path remain user-owned state.
+DIRTY=$(git status --porcelain=v1 2>/dev/null)
+if [ "$DIRTY" = " M scripts/iris-dev.sh" ] && [ -f scripts/iris-dev.sh ]; then
+  MAGIC=$(LC_ALL=C od -An -tx1 -N4 scripts/iris-dev.sh 2>/dev/null | tr -d ' \n')
+  if [ "$MAGIC" = "7f454c46" ]; then
+    warn "repairing scripts/iris-dev.sh after an ELF binary overwrite"
+    if ! git restore --source=HEAD --worktree -- scripts/iris-dev.sh; then
+      warn "failed to restore scripts/iris-dev.sh"
+      exit 20
+    fi
+    DIRTY=$(git status --porcelain=v1 2>/dev/null)
+  fi
+fi
+
+# Refuse on every other dirty tree. We will not stash for the user; that is an
+# explicit human choice. The whole point is to never silently mutate primary.
+if [ -n "$DIRTY" ]; then
   warn "working tree is dirty; refusing to fast-forward"
   warn "resolve uncommitted changes in $REPO_TOP first, then re-run"
   exit 10
