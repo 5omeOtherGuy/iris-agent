@@ -26,6 +26,8 @@ this file keeps implementation issues and decisions that span slices.
 - Slice 7: portable provider-block persistence, Anthropic compact adapter, and
   probe-gated OpenAI v2 capability merged in PR #537.
 - Slice 8: default-off model-requested compaction tool merged in PR #538.
+- Slice 9: benchmark extensions and evidence-tuned trigger defaults merged in
+  PR #539.
 
 ## Slice 5 — reactive recovery
 
@@ -220,7 +222,7 @@ path.
 
 ## Slice 9 — benchmark extension and default tuning
 
-Status: implementation and verification in progress.
+Status: merged in PR #539; final protocol closeout remains in progress.
 
 Issue: live tables showed post-apply context near 17k after triggering near
 20k, which looked like the summary worker removed little. The first hypothesis
@@ -284,3 +286,18 @@ returned verbatim:
 `Codex request failed [status=429 endpoint=/codex/responses model=gpt-5.4-mini
 error_type=usage_limit_reached]`. It is not counted as a pass. The final two
 full protocol pairs remain open until the external quota allows evaluated rows.
+
+Follow-up issue after merge: the Codex quota reopened and the first evaluated
+smoke applied once, passed every individual gate, but failed the protocol's
+two-compaction minimum. The second Opus job was still active when the
+instrument's fixed 30-second wait ended. This was an instrument timing
+assumption, not a compaction failure: the apply was 29,484 -> 14,553 (50.6%
+total reduction), G1 was 0.9 ms, and recall, carry, metadata, read, and exact
+resume all passed.
+
+Decision: keep sending bounded real-read, pair-closed boundaries while a job is
+active, up to 14 filler turns, with five-second yields; allow one final bounded
+60-second interval before the needle probe. The next Codex smoke forced two
+compactions and passed: G1 29.6 ms, worst post/start 11,394/23,592, shallowest
+26,263 -> 11,394 (56.6% total, 96.9% covered), worker hit 0.999, derived fresh
+parent input 5,249 -> 22,158 (4.221×), and all G2–G5/read checks.

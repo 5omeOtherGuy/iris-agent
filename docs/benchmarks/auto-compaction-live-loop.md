@@ -559,3 +559,24 @@ non-null usage object with no positive input count; no hit rate is inferred.
 Every entry still passed G5 and identified the required Opus worker. The
 parent-write ratio is cache cost after a prefix rewrite, not context
 reclamation.
+
+Codex availability later recovered. The first evaluated smoke exposed an
+instrument-boundary timing issue: one compaction landed and passed every
+individual gate, but the second Opus worker was still running after the fixed
+30-second final wait. The row was rejected by the two-compaction minimum:
+
+| compactions | G1 | maximum post/start | before -> after | covered / total | G2–G5/read | result |
+|---:|---:|---:|---:|---:|---|---|
+| 1 | 0.9 ms | 14,553/23,592 | 29,484 -> 14,553 | 97.3% / 50.6% | pass | rejected: fewer than two applies |
+
+The instrument now supplies bounded additional real-read boundaries while a
+job is active instead of assuming provider-independent worker latency. The
+next smoke passed:
+
+| compactions | G1 | maximum post/start | shallowest before -> after | covered / total | G2–G5/read | worker hit | parent derived fresh, pre -> post |
+|---:|---:|---:|---:|---:|---|---:|---:|
+| 2 | 29.6 ms | 11,394/23,592 | 26,263 -> 11,394 | 96.9% / 56.6% | pass | 0.999 | 5,249 -> 22,158 (4.221×) |
+
+The Codex parent column is derived fresh input (`input - cache_read`), not a
+reported cache write. This one-session availability row validates the repaired
+instrument but is not one of the required final 10-session runs.
