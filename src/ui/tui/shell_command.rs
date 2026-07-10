@@ -38,6 +38,30 @@ pub(super) struct Payload {
     pub(super) closing: String,
 }
 
+/// Format a recognized heredoc payload for display without changing the command
+/// that is executed. Ruff gives Python payloads the same stable layout users see
+/// in editors; unsupported, invalid, or incomplete input remains verbatim.
+pub(super) fn format_payload(body: &[String], lang: &str) -> Vec<String> {
+    if lang != "python" {
+        return body.to_vec();
+    }
+
+    let source = body.join("\n");
+    ruff_python_formatter::format_module_source(
+        &source,
+        ruff_python_formatter::PyFormatOptions::default(),
+    )
+    .map(|printed| {
+        printed
+            .as_code()
+            .trim_end_matches('\n')
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_else(|_| body.to_vec())
+}
+
 /// Build the structured command display from a raw `bash` command string.
 pub(super) fn build(command: &str) -> ShellCommand {
     if let Some(hd) = find_heredoc(command) {
@@ -284,6 +308,35 @@ fn infer_language(opener_segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn python_payload_is_formatted_for_display() {
+        let body = vec![
+            "from pathlib import Path".to_string(),
+            "p=Path('src/ui/tui/startup.rs')".to_string(),
+            "s=p.read_text()".to_string(),
+            "s=s.replace('old','new')".to_string(),
+        ];
+
+        assert_eq!(
+            format_payload(&body, "python"),
+            vec![
+                "from pathlib import Path",
+                "",
+                "p = Path(\"src/ui/tui/startup.rs\")",
+                "s = p.read_text()",
+                "s = s.replace(\"old\", \"new\")",
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_python_and_other_languages_remain_verbatim() {
+        let invalid = vec!["if (".to_string()];
+        assert_eq!(format_payload(&invalid, "python"), invalid);
+        let javascript = vec!["const x=1".to_string()];
+        assert_eq!(format_payload(&javascript, "javascript"), javascript);
+    }
 
     #[test]
     fn single_command_is_one_prompt_row() {

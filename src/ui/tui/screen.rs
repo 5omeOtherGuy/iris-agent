@@ -3493,14 +3493,13 @@ mod tests {
         let mut screen = footer_screen("~/repo (main)");
         screen.pager_active = true;
         screen.commit_user("question that has scrolled away");
-        for i in 0..20 {
+        // Use a fixed viewport and enough history to guarantee that the prompt
+        // has scrolled past it. Reading the host terminal made this test depend
+        // on the pane height (and fail in tall terminals and CI harnesses).
+        for i in 0..60 {
             screen.apply(UiEvent::Notice(format!("detail {i}")));
         }
-        let (width, height) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
-        let _ = super::super::pager::compose_frame(
-            &mut screen,
-            ratatui::layout::Size::new(width, height),
-        );
+        let _ = super::super::pager::compose_frame(&mut screen, ratatui::layout::Size::new(80, 24));
         assert!(screen.scroll.top() > 0, "prompt must be pinned");
 
         let sticky_row = screen

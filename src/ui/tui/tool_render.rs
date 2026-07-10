@@ -678,7 +678,10 @@ impl PanelBody {
             self.line("", panel_style());
             self.line(&format!("  payload  {}", payload.lang), dim_style());
             self.payload_rule();
-            self.payload_body(&payload.body, &payload.lang);
+            self.payload_body(
+                &shell_command::format_payload(&payload.body, &payload.lang),
+                &payload.lang,
+            );
             self.payload_line(&payload.closing);
         }
         for cont in &cmd.trailing {

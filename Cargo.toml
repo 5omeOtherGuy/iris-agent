@@ -61,6 +61,10 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # `html`, `plist-load`, or `yaml-load`: scopes are mapped to the Iris palette in
 # `src/ui/highlight.rs`, so no stock theme/plist machinery is pulled in.
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
+# Python heredoc display formatting. Ruff is the established Rust-native Python
+# formatter; using its library keeps rendering deterministic and avoids spawning
+# an optional host binary. Invalid/incomplete payloads fall back verbatim.
+ruff_python_formatter = "0.0.4"
 # Multiline editor widget (undo/redo, kill-ring/yank, word-nav) over the same
 # ratatui buffer. default-features off drops its crossterm/termion/termwiz input
 # backends and the regex search feature: Iris drives edits from its own keymap
