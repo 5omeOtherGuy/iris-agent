@@ -47,7 +47,7 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 
-use crate::nexus::MutationGuard;
+use crate::nexus::{GuardViolation, MutationGuard};
 
 use baseline::Baseline;
 use checkpoint::{CheckpointChain, Mode as FileMode};
@@ -1343,7 +1343,7 @@ impl MutationGuard for GitSafety {
         }
     }
 
-    fn after_exec(&self, approved: &[PathBuf], expected_after: Option<&str>) -> Vec<PathBuf> {
+    fn after_exec(&self, approved: &[PathBuf], expected_after: Option<&str>) -> GuardViolation {
         let mut violations = Vec::new();
         let mut scan_input = None;
         {
@@ -1363,11 +1363,11 @@ impl MutationGuard for GitSafety {
                         "linked worktree disappeared during cleanup with no Iris ledger; dropping guard without restoring orphaned files"
                     );
                     state.task = None;
-                    return Vec::new();
+                    return GuardViolation::clean();
                 }
             }
             let Some(task) = state.task.as_mut() else {
-                return Vec::new();
+                return GuardViolation::clean();
             };
             if task.degraded {
                 // Degraded (non-git / jj): no gating or violation detection, but
@@ -1375,25 +1375,50 @@ impl MutationGuard for GitSafety {
                 // targets so a rollback can undo Iris's own work (reduced
                 // guarantees, ADR-0028 Alternative 3).
                 self.checkpoint_degraded(task, approved);
-                return Vec::new();
+                return GuardViolation::clean();
             }
             if task.jj_external_op {
                 task.jj_external_op = false;
-                return approved
-                    .iter()
-                    .map(|path| self.normalize(path))
-                    .chain(std::iter::once(self.workspace.clone()))
-                    .collect();
+                // Resync to the current operation so this halt fires exactly
+                // once: without it every later call in the task re-trips the
+                // stale comparison and poisons the whole session (issue #560).
+                match jj::current_operation_id(&self.workspace) {
+                    Ok(op) => task.jj_last_op = Some(op),
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "jj operation resync failed after external operation")
+                    }
+                }
+                return GuardViolation {
+                    paths: approved.iter().map(|path| self.normalize(path)).collect(),
+                    reason: Some(
+                        "the working copy changed via a jj operation outside Iris; this call was halted (the next call proceeds from the new state)"
+                            .to_string(),
+                    ),
+                };
             }
-            if matches!(self.mode, Mode::Jj(_))
-                && let Err(error) = jj::snapshot(&self.workspace)
-            {
-                tracing::warn!(error = %format!("{error:#}"), "jj post-mutation snapshot failed");
-                return approved
-                    .iter()
-                    .map(|path| self.normalize(path))
-                    .chain(std::iter::once(self.workspace.clone()))
-                    .collect();
+            if matches!(self.mode, Mode::Jj(_)) {
+                match jj::snapshot(&self.workspace) {
+                    // The snapshot itself appends to the jj op log whenever the
+                    // working copy changed, so record the resulting operation as
+                    // ours unconditionally -- comparing the next call against a
+                    // pre-snapshot id would flag our own snapshot as external
+                    // (issue #560).
+                    Ok(_) => match jj::current_operation_id(&self.workspace) {
+                        Ok(op) => task.jj_last_op = Some(op),
+                        Err(error) => {
+                            tracing::warn!(error = %format!("{error:#}"), "jj operation update failed")
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "jj post-mutation snapshot failed");
+                        return GuardViolation {
+                            paths: approved.iter().map(|path| self.normalize(path)).collect(),
+                            reason: Some(format!(
+                                "could not verify the working copy after this call (jj status failed: {error:#})"
+                            )),
+                        };
+                    }
+                }
             }
             let approved_set: BTreeSet<PathBuf> =
                 approved.iter().map(|path| self.normalize(path)).collect();
@@ -1486,14 +1511,6 @@ impl MutationGuard for GitSafety {
                         store.checkpoint(label);
                     }
                 }
-                if matches!(self.mode, Mode::Jj(_)) {
-                    match jj::current_operation_id(&self.workspace) {
-                        Ok(op) => task.jj_last_op = Some(op),
-                        Err(error) => {
-                            tracing::warn!(error = %format!("{error:#}"), "jj operation update failed")
-                        }
-                    }
-                }
                 self.persist_task(task);
             }
             // Async attribution only for the non-targeted (bash-like) path: a
@@ -1515,7 +1532,10 @@ impl MutationGuard for GitSafety {
             });
             *self.scan.lock().unwrap() = Some(handle);
         }
-        violations
+        GuardViolation {
+            paths: violations,
+            reason: None,
+        }
     }
 
     fn restore(&self, paths: &[PathBuf]) -> Result<()> {

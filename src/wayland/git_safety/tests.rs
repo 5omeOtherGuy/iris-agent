@@ -275,7 +275,7 @@ fn durable_removed_linked_worktree_with_unreviewed_iris_changes_is_restored() {
 
     guard.before_exec(&[]);
     run_git(&primary, &["worktree", "remove", "--force", linked_arg]);
-    let violations = guard.after_exec(&[], None);
+    let violations = guard.after_exec(&[], None).paths;
 
     assert!(
         violations
@@ -457,7 +457,7 @@ fn bash_violation_detected_and_restored() {
     fs::write(&dirty, "clobbered\n").unwrap();
     fs::write(&untracked, "clobbered\n").unwrap();
 
-    let mut violations = guard.after_exec(&[], None);
+    let mut violations = guard.after_exec(&[], None).paths;
     violations.sort();
     assert_eq!(violations.len(), 2, "both protected files flagged");
 
@@ -540,7 +540,7 @@ fn unapproved_dirty_bash_path_still_violates_and_restores() {
     fs::write(&approved, "approved bash change\n").unwrap();
     fs::write(&unapproved, "unapproved bash change\n").unwrap();
 
-    let violations = guard.after_exec(&[], None);
+    let violations = guard.after_exec(&[], None).paths;
     assert_eq!(violations, vec![unapproved.clone()]);
     assert_eq!(
         guard.ledger_len(),
@@ -713,13 +713,65 @@ fn jj_external_operation_after_task_is_a_violation() {
     run_jj(&repo.path, &["describe", "-m", "external operation"]);
     guard.before_exec(std::slice::from_ref(&target));
     fs::write(&target, "second iris\n").unwrap();
-    let violations = guard.after_exec(
+    let violation = guard.after_exec(
         std::slice::from_ref(&target),
         Some(&crate::tools::content_hash(b"second iris\n")),
     );
     assert!(
-        !violations.is_empty(),
+        !violation.is_empty(),
         "external jj operation must not silently advance the task baseline"
+    );
+    assert!(
+        violation
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("jj operation outside Iris")),
+        "external-op halt names its cause, not a fake file list: {violation:?}"
+    );
+
+    // The halt fires exactly once: the guard resyncs to the new operation, so
+    // the next call proceeds instead of re-tripping forever (issue #560).
+    guard.before_exec(std::slice::from_ref(&target));
+    fs::write(&target, "third iris\n").unwrap();
+    let violation = guard.after_exec(
+        std::slice::from_ref(&target),
+        Some(&crate::tools::content_hash(b"third iris\n")),
+    );
+    assert!(
+        violation.is_empty(),
+        "an external-op halt must not poison later calls: {violation:?}"
+    );
+}
+
+// Issue #560: the guard's own post-call `jj status` appends to the op log
+// whenever the command changed the working copy. That operation is the guard's
+// own, not external -- the next call must not be halted by it (the reported
+// bug poisoned every subsequent tool call for the rest of the task).
+#[test]
+fn jj_own_snapshot_operation_is_not_flagged_external() {
+    let Some(repo) = init_jj_repo() else {
+        return;
+    };
+    let guard = guard(&repo.path);
+    guard.note_mutation();
+
+    // Bash-like call (no static targets) writes a brand-new, unprotected file,
+    // e.g. a generator script producing derived output.
+    guard.before_exec(&[]);
+    fs::write(repo.path.join("generated.txt"), "derived\n").unwrap();
+    let violation = guard.after_exec(&[], None);
+    assert!(
+        violation.is_empty(),
+        "a new unprotected file is not a violation: {violation:?}"
+    );
+
+    // Second benign command: must run clean instead of tripping on the op the
+    // guard's own snapshot created above.
+    guard.before_exec(&[]);
+    let violation = guard.after_exec(&[], None);
+    assert!(
+        violation.is_empty(),
+        "guard's own snapshot op was flagged as external: {violation:?}"
     );
 }
 
@@ -859,7 +911,7 @@ fn workflow_off_still_detects_and_restores_dirty_violations() {
 
     guard.before_exec(&[]);
     fs::write(&dirty, "clobbered\n").unwrap();
-    let violations = guard.after_exec(&[], None);
+    let violations = guard.after_exec(&[], None).paths;
     assert_eq!(violations, vec![dirty.clone()]);
     guard.restore(&violations).unwrap();
     assert_eq!(fs::read_to_string(&dirty).unwrap(), "user work\n");
@@ -883,10 +935,12 @@ fn approved_target_unconfirmed_change_stays_protected() {
     // concurrent external change lands different bytes on disk before the check.
     guard.before_exec(&[]);
     fs::write(&target, "user raced\n").unwrap();
-    let violations = guard.after_exec(
-        std::slice::from_ref(&target),
-        Some(&crate::tools::content_hash(b"iris edit\n")),
-    );
+    let violations = guard
+        .after_exec(
+            std::slice::from_ref(&target),
+            Some(&crate::tools::content_hash(b"iris edit\n")),
+        )
+        .paths;
 
     assert_eq!(
         violations.len(),
@@ -919,7 +973,7 @@ fn approved_change_without_confirmation_stays_protected() {
     guard.before_exec(&[]);
     fs::write(&target, "partial\n").unwrap();
     // `None` expected-after models a failed/cancelled or non-reporting tool.
-    let violations = guard.after_exec(std::slice::from_ref(&target), None);
+    let violations = guard.after_exec(std::slice::from_ref(&target), None).paths;
     assert_eq!(violations.len(), 1, "an unconfirmed change is a violation");
     assert_eq!(guard.ledger_len(), 0, "not attributed to Iris");
 }
@@ -954,7 +1008,7 @@ fn non_utf8_filename_is_protected_and_restorable() {
     // A bash-like out-of-band overwrite is detected and restored to exact bytes.
     guard.before_exec(&[]);
     fs::write(&path, "clobbered\n").unwrap();
-    let violations = guard.after_exec(&[], None);
+    let violations = guard.after_exec(&[], None).paths;
     assert_eq!(violations.len(), 1, "the out-of-band change is flagged");
     guard.restore(&violations).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"user bytes\n");
