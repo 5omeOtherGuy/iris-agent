@@ -823,7 +823,7 @@ SETTINGS                                                    iris 0.1.0
 ENGINE
   model             ▸ gpt-5.5 ┊ openai-codex
   reasoning         ○ off  ○ minimal  ○ low  ◉ medium  ○ high  ○ xhigh
-  model scope       ▸ all models
+  model scope       ▸ all enabled
   providers         ▸ 3 connected
 
 MEMORY
@@ -846,7 +846,7 @@ ENGINE
     ○ claude-sonnet-5                  anthropic
     ○ gemini-3-pro                     google
   reasoning         ○ off  ○ minimal  ○ low  ◉ medium  ○ high  ○ xhigh
-  model scope       ▸ all models
+  model scope       ▸ all enabled
 
 ←→ reasoning · ↵ set default · s session · esc collapse
 ```
@@ -916,7 +916,9 @@ type` · `↵ edit` · `↵ open` — keymap honesty per archetype).
 **Height honesty.** On a tall pane the whole faceplate prints at once. On a
 short one the panel windows itself under the pinned session bar and above the
 protected composer, scrolling with the house `(n/N)` position row — never
-clipped, never painted under other chrome.
+clipped, never painted under other chrome. The design floor is a 12-row
+terminal: panels window all the way down to it; below that floor the footer
+may clip.
 
 **Pruning.** The faceplate is curated; the service hatch is `settings.json`.
 Niche flags (bash tool mode, tool round-trip caps, retry tuning, custom

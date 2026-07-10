@@ -2107,7 +2107,7 @@ async fn run_modal_phase<P: ChatProvider>(
     // (a login can grow the catalog) and reopen the faceplate expanded, cursor
     // intact, BEFORE the next draw so the dock never collapses for a frame
     // (§2.5, the invariant that killed the jank in fa93453).
-    let mut settings_return: Option<crate::ui::settings_menu::PanelView> = None;
+    let mut settings_stash: Option<crate::ui::settings_menu::PanelView> = None;
     while tui.screen.focus() == FocusTarget::Modal {
         tokio::select! {
             maybe = input_rx.recv() => {
@@ -2150,7 +2150,7 @@ async fn run_modal_phase<P: ChatProvider>(
                 if let (Some(view), ModalOutcome::Emit(action)) = (&from_settings_view, &outcome)
                     && leaves_faceplate_for_guard(action)
                 {
-                    settings_return = Some(view.clone());
+                    settings_stash = Some(view.clone());
                 }
                 let requested = apply_modal_outcome(
                     outcome,
@@ -2174,7 +2174,7 @@ async fn run_modal_phase<P: ChatProvider>(
                 // and reopen the panel expanded BEFORE drawing, so the dock never
                 // collapses for a frame on the way back.
                 if tui.screen.focus() != FocusTarget::Modal
-                    && let Some(view) = settings_return.take()
+                    && let Some(view) = settings_stash.take()
                     && let Some(sw) = switch.as_mut()
                 {
                     tui.screen
@@ -2182,7 +2182,7 @@ async fn run_modal_phase<P: ChatProvider>(
                 }
                 // Once the panel itself is in front again, nothing is pending.
                 if matches!(tui.screen.modal, Some(Modal::Settings(_))) {
-                    settings_return = None;
+                    settings_stash = None;
                 }
                 // The picker may have switched model/effort; refresh the
                 // footer before drawing so it never shows a stale model.
