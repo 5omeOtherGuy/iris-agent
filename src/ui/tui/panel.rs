@@ -17,7 +17,7 @@ use super::{
     BOX_X_PADDING, PANEL_BODY_INDENT, PANEL_FOOTER_INDENT, diff_add_bg, diff_del_bg, dim_style,
     err_style, ok_style, panel_style, prompt_style,
 };
-use crate::ui::{is_diff_file_header, symbols};
+use crate::ui::{highlight, is_diff_file_header, symbols};
 
 fn panel_outer_padding(width: usize) -> usize {
     if width <= BOX_X_PADDING.saturating_mul(2).saturating_add(1) {
@@ -401,8 +401,79 @@ pub(super) struct PanelHeaderSpec<'a> {
 /// Render a single-target EDIT diff: hunk anchors, one line-number lane, a
 /// marker lane, then code. The EDIT header already owns the path, so raw file
 /// headers stay suppressed.
-pub(super) fn diff_table_rows(diff: &str) -> Vec<TranscriptRow> {
-    diff_table_rows_inner(diff, false)
+pub(super) fn diff_table_rows(diff: &str, path: Option<&str>) -> Vec<TranscriptRow> {
+    let mut rows = diff_table_rows_inner(diff, false);
+    let syntax = path
+        .and_then(|path| std::path::Path::new(path).extension())
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| highlight::is_known_syntax(extension));
+    if let Some(syntax) = syntax {
+        syntax_highlight_diff_rows(&mut rows, syntax);
+    }
+    rows
+}
+
+/// Apply source-language highlighting to the code lane of an already parsed
+/// diff table. Diff gutters and row backgrounds retain their semantic add/remove
+/// colors; only source tokens take syntax colors.
+fn syntax_highlight_diff_rows(rows: &mut [TranscriptRow], syntax: &str) {
+    const GUTTER_BYTES: usize = 9;
+    for row in rows {
+        let bytes = row.text.as_bytes();
+        if bytes.len() < GUTTER_BYTES || !matches!(bytes.get(6), Some(b'+' | b'-' | b' ')) {
+            continue;
+        }
+        let code = &row.text[GUTTER_BYTES..];
+        let Some(mut highlighted) = highlight::highlight(code, Some(syntax))
+            .and_then(|mut lines| (!lines.is_empty()).then(|| lines.remove(0)))
+        else {
+            continue;
+        };
+        let changed = match &row.chrome {
+            Some(ChromeRow::Body { line, .. }) => line
+                .spans
+                .iter()
+                .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+                .map(|span| span.content.to_string())
+                .filter(|token| !token.trim().is_empty())
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        for token in changed {
+            emphasize_highlighted_token(&mut highlighted.spans, &token);
+        }
+        highlighted.spans.insert(
+            0,
+            Span::styled(row.text[..GUTTER_BYTES].to_string(), row.style),
+        );
+        if let Some(ChromeRow::Body { line, .. }) = &mut row.chrome {
+            *line = highlighted;
+        }
+    }
+}
+
+fn emphasize_highlighted_token(spans: &mut Vec<Span<'static>>, token: &str) {
+    let mut out = Vec::new();
+    for span in spans.drain(..) {
+        let content = span.content.as_ref();
+        let mut start = 0;
+        for (offset, matched) in content.match_indices(token) {
+            if offset > start {
+                out.push(Span::styled(content[start..offset].to_string(), span.style));
+            }
+            out.push(Span::styled(
+                matched.to_string(),
+                span.style.add_modifier(Modifier::REVERSED),
+            ));
+            start = offset + matched.len();
+        }
+        if start < content.len() {
+            out.push(Span::styled(content[start..].to_string(), span.style));
+        } else if start == 0 {
+            out.push(span);
+        }
+    }
+    *spans = out;
 }
 
 /// Render a task-level, potentially multi-file diff. Each file gains a clear
@@ -879,10 +950,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn edit_diff_highlights_source_tokens_without_recoloring_the_gutter() {
+        let diff = "--- a/demo.py\n+++ b/demo.py\n@@ -1 +1 @@\n-old=True\n+new=False\n";
+        let rows = diff_table_rows(diff, Some("demo.py"));
+        let added = rows
+            .iter()
+            .find(|row| row.text.contains("new=False"))
+            .unwrap();
+        let ChromeRow::Body { line, bg } = added.chrome.as_ref().unwrap() else {
+            panic!("expected diff body row");
+        };
+
+        assert_eq!(line.spans[0].style.fg, Some(crate::ui::palette::green()));
+        assert_eq!(*bg, Some(diff_add_bg()));
+        assert!(
+            line.spans
+                .iter()
+                .skip(1)
+                .any(|span| span.style.fg != line.spans[0].style.fg),
+            "source tokens should use syntax colors: {:?}",
+            line.spans
+        );
+    }
+
+    #[test]
     fn diff_rows_count_removed_content_that_looks_like_file_header() {
         let diff = "--- a/query.sql\n+++ b/query.sql\n@@ -1,2 +1 @@\n--- comment\n keep\n";
 
-        let rows = diff_table_rows(diff);
+        let rows = diff_table_rows(diff, Some("query.sql"));
         let rendered = rows
             .iter()
             .map(|row| row.text.as_str())

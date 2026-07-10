@@ -1706,7 +1706,8 @@ impl Transcript {
         let renderer = tool_render::resolve(call);
         let meta = renderer.header_meta(call);
         let plain = renderer.plain_meta(call);
-        let diff_rows = diff_table_rows(diff);
+        let path = call.arguments.get("path").and_then(|value| value.as_str());
+        let diff_rows = diff_table_rows(diff, path);
         // A diff is consequential evidence, not routine output. Keep it open
         // through preview, execution, and every settled outcome. The rebuild
         // path still reapplies an explicit user fold.
