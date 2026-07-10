@@ -13,6 +13,7 @@ pub(crate) mod git_safety;
 pub(crate) mod skills;
 pub(crate) mod subagents;
 pub(crate) mod system_prompt;
+mod trigger;
 pub(crate) mod trust;
 
 #[cfg(test)]
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread;
 
 use anyhow::Result;
@@ -34,13 +35,16 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use crate::config::{CompactionCacheTiming, ToolResultCompactionPolicy, VerificationConfig};
+use crate::config::{
+    CompactionCacheTiming, CompactionTriggerConfig, ToolResultCompactionPolicy, VerificationConfig,
+};
 use crate::handles::HandleStore;
 use crate::nexus::ToolOutputStore;
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, CompactionLifecycleState,
-    CompactionOrigin, FoldTrigger, Message, ProviderEvent, ProviderUsage, Role, SessionSpanReader,
-    SteeringSource, ToolEnv, Tools, TurnInput, VerificationOutcome, VerifyRun,
+    CompactionOrigin, ContextMeasurementSource, ContextPressureTier, FoldTrigger, Message,
+    ProviderEvent, ProviderUsage, Role, SessionSpanReader, SteeringSource, ToolEnv, Tools,
+    TurnInput, VerificationOutcome, VerifyRun,
 };
 use crate::session::{
     CompactionTaskState, SessionLog, estimate_tokens, message_token_estimate, preview_line,
@@ -51,6 +55,7 @@ use crate::tools::ToolState;
 use crate::tools::recall;
 pub(crate) use compaction::SummarizerKind;
 use compaction::*;
+use trigger::*;
 
 /// Read-only [`SessionSpanReader`] over a SINGLE session transcript, for the
 /// `recall` tool's standalone entry-id span (ADR-0046 / issue #373). Holds only
@@ -137,6 +142,15 @@ pub(crate) struct CacheProfile {
     /// Minimum cacheable prefix in tokens; below it nothing is cached, so
     /// every flush is free (trigger class A5).
     pub(crate) min_cacheable_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContextDiagnostics {
+    pub(crate) measured: u64,
+    pub(crate) source: ContextMeasurementSource,
+    pub(crate) ladder: TriggerLadder,
+    pub(crate) automatic_enabled: bool,
+    pub(crate) background_running: bool,
 }
 
 impl Default for CacheProfile {
@@ -299,6 +313,30 @@ impl<P: ChatProvider> Harness<P> {
     /// never issue surprise provider calls.
     pub(crate) fn set_summarizer(&mut self, summarizer: SummarizerKind) {
         self.compaction.summarizer = summarizer;
+    }
+
+    pub(crate) fn set_compaction_trigger(
+        &mut self,
+        effective_window: u64,
+        config: CompactionTriggerConfig,
+    ) {
+        self.compaction.budget = Some(effective_window);
+        self.compaction.automatic_enabled = config.enabled;
+        self.compaction.trigger_v2 = true;
+        self.compaction.pressure = PressureTracker::default();
+        self.compaction.tiny_notice_emitted = false;
+        self.compaction.ladder = Some(TriggerLadder::resolve(
+            effective_window,
+            TriggerThresholds {
+                warn: config.warn,
+                start: config.start,
+                hard: config.hard,
+            },
+            DEFAULT_SUMMARY_RESERVE,
+            config.keep_recent_tokens,
+        ));
+        self.compaction.hard_wait = std::time::Duration::from_millis(config.hard_wait_ms);
+        self.compaction.max_consecutive_failures = config.max_consecutive_failures;
     }
 
     /// Install the provider builder used by background compaction workers
@@ -762,6 +800,25 @@ impl<P: ChatProvider> Harness<P> {
         self.compaction.budget
     }
 
+    pub(crate) fn context_diagnostics(&self) -> Option<ContextDiagnostics> {
+        let ladder = self.compaction.ladder?;
+        let anchor =
+            self.agent
+                .last_provider_usage_anchor()
+                .map(|(total_tokens, message_count)| UsageAnchor {
+                    total_tokens,
+                    message_count,
+                });
+        let measured = measure_context(self.agent.messages(), anchor, 0);
+        Some(ContextDiagnostics {
+            measured: measured.tokens,
+            source: measured.source,
+            ladder,
+            automatic_enabled: self.compaction.automatic_enabled,
+            background_running: self.compaction.background.is_some(),
+        })
+    }
+
     /// Record a runtime mode switch as a first-class `modelSelection` entry in
     /// the transcript log. Best-effort (no-op without an attached log), mirroring
     /// message persistence: a switch is still applied even if it cannot be
@@ -845,7 +902,8 @@ impl<P: ChatProvider> Harness<P> {
         // transcript is complete here (every tool call answered), so neither the
         // fold pass nor the covered range splits a pending tool-call/result pair.
         self.maybe_microcompact(obs)?;
-        self.maybe_auto_compact(obs, token, false).await?;
+        self.run_auto_compaction(obs, token, false, estimate_tokens(prompt))
+            .await;
         // Refresh at the safe turn boundary so newly installed or edited skills
         // appear without restarting. Only a changed catalog is appended; this
         // is the narrow contextual-diff behavior Codex uses to preserve cache
@@ -962,15 +1020,16 @@ impl<P: ChatProvider> Harness<P> {
         }
         if result.is_ok()
             && !token.is_cancelled()
-            && self.compaction.summarizer != SummarizerKind::Excerpts
-            && self.compaction.summarizer_factory.is_some()
+            && (self.compaction.trigger_v2
+                || (self.compaction.summarizer != SummarizerKind::Excerpts
+                    && self.compaction.summarizer_factory.is_some()))
         {
             // Safe turn boundary after the result/output is presented: apply any
             // ready background summary and, if the completed turn crossed the
             // threshold, start the next background summarizer without waiting for
             // it (issue #472). Harnesses without a background factory keep the
             // legacy foreground pre-turn compaction path.
-            self.maybe_auto_compact(obs, token, true).await?;
+            self.run_auto_compaction(obs, token, true, 0).await;
         }
         result?;
         if token.is_cancelled() {
@@ -1229,7 +1288,16 @@ impl<P: ChatProvider> Harness<P> {
         pending_break: Option<FoldTrigger>,
         resume_activity_ms: Option<u64>,
     ) -> Option<FoldTrigger> {
-        if let Some(budget) = self.compaction.budget
+        if self.compaction.trigger_v2 {
+            if self.compaction.ladder.is_some_and(|ladder| {
+                matches!(
+                    ladder.tier(total),
+                    ContextPressureTier::Start | ContextPressureTier::Hard
+                )
+            }) {
+                return Some(FoldTrigger::CompactionBoundary);
+            }
+        } else if let Some(budget) = self.compaction.budget
             && total > budget
         {
             return Some(FoldTrigger::CompactionBoundary);
@@ -1398,7 +1466,102 @@ impl<P: ChatProvider> Harness<P> {
     /// No-op when auto-compaction is disabled, no log is attached, the context
     /// is within budget, nothing coverable remains, or the summary request was
     /// cancelled (the turn's own cancellation handling takes over).
+    #[cfg(test)]
     async fn maybe_auto_compact(
+        &mut self,
+        obs: &dyn AgentObserver,
+        token: &CancellationToken,
+        post_turn: bool,
+    ) -> Result<()> {
+        self.maybe_auto_compact_with_pending(obs, token, post_turn, 0)
+            .await
+    }
+
+    async fn maybe_auto_compact_with_pending(
+        &mut self,
+        obs: &dyn AgentObserver,
+        _token: &CancellationToken,
+        _post_turn: bool,
+        pending_tokens: u64,
+    ) -> Result<()> {
+        if !self.compaction.trigger_v2 {
+            return self
+                .maybe_auto_compact_legacy(obs, _token, _post_turn)
+                .await;
+        }
+        self.drain_background_compaction(obs)?;
+        let Some(ladder) = self.compaction.ladder else {
+            return Ok(());
+        };
+        if !self.compaction.automatic_enabled {
+            return Ok(());
+        }
+        // Compaction is a durable read-time view; without a log there is no
+        // place to record it, so skip rather than mutate history in memory.
+        if self.compaction.session.is_none() {
+            return Ok(());
+        }
+        let measurement = self.context_measurement(pending_tokens);
+        if let Some(tier) = self
+            .compaction
+            .pressure
+            .crossing(measurement.tokens, &ladder)
+        {
+            obs.on_event(AgentEvent::ContextPressure {
+                tier,
+                measured: measurement.tokens,
+                effective_window: ladder.effective_window,
+                source: measurement.source,
+            })?;
+        }
+        if ladder.deterministic_only && !self.compaction.tiny_notice_emitted {
+            self.compaction.tiny_notice_emitted = true;
+            obs.on_event(AgentEvent::Notice(format!(
+                "context window {} is too small for background summarization; automatic compaction will use deterministic excerpts.",
+                ladder.effective_window
+            )))?;
+        }
+
+        match ladder.tier(measurement.tokens) {
+            ContextPressureTier::Normal | ContextPressureTier::Warn => Ok(()),
+            ContextPressureTier::Start => {
+                if self.compaction.background.is_some() {
+                    return Ok(());
+                }
+                let messages = self.agent.messages().to_vec();
+                let Some(plan) = self.plan_compaction(&messages, ladder.keep_recent_tokens) else {
+                    return Ok(());
+                };
+                let model_backed = !ladder.deterministic_only
+                    && self.compaction.summarizer != SummarizerKind::Excerpts
+                    && self.compaction.summarizer_factory.is_some()
+                    && self.compaction.consecutive_failures
+                        < self.compaction.max_consecutive_failures;
+                if model_backed {
+                    match self.start_background_compaction(&messages, plan, obs) {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            self.record_compaction_failure();
+                            Err(error)
+                        }
+                    }
+                } else {
+                    self.maybe_emit_breaker_notice(obs)?;
+                    self.apply_excerpts_plan(&messages, plan, obs)
+                }
+            }
+            ContextPressureTier::Hard => {
+                self.resolve_hard_background(obs)?;
+                let current = self.context_measurement(pending_tokens);
+                if ladder.tier(current.tokens) != ContextPressureTier::Hard {
+                    return Ok(());
+                }
+                self.apply_deterministic_ladder(ladder, pending_tokens, obs)
+            }
+        }
+    }
+
+    async fn maybe_auto_compact_legacy(
         &mut self,
         obs: &dyn AgentObserver,
         token: &CancellationToken,
@@ -1408,23 +1571,16 @@ impl<P: ChatProvider> Harness<P> {
         let Some(budget) = self.compaction.budget else {
             return Ok(());
         };
-        // Compaction is a durable read-time view; without a log there is no
-        // place to record it, so skip rather than mutate history in memory.
         if self.compaction.session.is_none() {
             return Ok(());
         }
-
-        // Current provider-visible context total, using the same per-message
-        // convention the store persists and rebuilds with.
         let mut total = context_tokens(self.agent.messages());
         if total <= budget {
             return Ok(());
         }
-
         if self.compaction.background.is_some() && allow_background_start {
             return Ok(());
         }
-
         if !allow_background_start && let Some(job) = self.compaction.background.take() {
             job.token.cancel();
             self.emit_compaction_lifecycle(
@@ -1442,21 +1598,11 @@ impl<P: ChatProvider> Harness<P> {
                 return Ok(());
             }
         }
-
         let messages = self.agent.messages().to_vec();
-        // Keep the recent tail within a low-water target below the budget, not
-        // the full budget: the new summary contributes its own tokens, so a
-        // tail filling the whole budget would push the context back over budget
-        // immediately and cause per-turn compaction thrash. Three-quarters
-        // leaves headroom for the summary and the next prompt.
         let keep_target = budget.saturating_mul(3) / 4;
         let Some(plan) = self.plan_compaction(&messages, keep_target) else {
-            // Nothing coverable (e.g. an all-summary/legacy id-less prefix or a
-            // single oversized message at a tool boundary): a no-op, never
-            // history destruction or a faked token count.
             return Ok(());
         };
-
         if allow_background_start
             && self.compaction.background.is_none()
             && self.compaction.summarizer != SummarizerKind::Excerpts
@@ -1465,13 +1611,131 @@ impl<P: ChatProvider> Harness<P> {
             self.start_background_compaction(&messages, plan, obs)?;
             return Ok(());
         }
-
         let Some(outcome) = self.compact_range(&messages, plan, obs, token).await? else {
             return Ok(());
         };
         obs.on_event(AgentEvent::Notice(format!(
             "compacted {} earlier message(s) to stay within the {budget}-token context budget.",
             outcome.covered
+        )))
+    }
+
+    async fn run_auto_compaction(
+        &mut self,
+        obs: &dyn AgentObserver,
+        token: &CancellationToken,
+        post_turn: bool,
+        pending_tokens: u64,
+    ) {
+        if let Err(error) = self
+            .maybe_auto_compact_with_pending(obs, token, post_turn, pending_tokens)
+            .await
+        {
+            tracing::warn!(error = %format!("{error:#}"), "automatic compaction failed; continuing turn");
+            let _ = obs.on_event(AgentEvent::Notice(format!(
+                "automatic compaction failed; continuing without rewriting context: {error}"
+            )));
+        }
+    }
+
+    fn context_measurement(&self, pending_tokens: u64) -> ContextMeasurement {
+        let anchor =
+            self.agent
+                .last_provider_usage_anchor()
+                .map(|(total_tokens, message_count)| UsageAnchor {
+                    total_tokens,
+                    message_count,
+                });
+        measure_context(self.agent.messages(), anchor, pending_tokens)
+    }
+
+    fn apply_excerpts_plan(
+        &mut self,
+        messages: &[Message],
+        plan: CompactionPlan,
+        obs: &dyn AgentObserver,
+    ) -> Result<()> {
+        let summary = CompactionSummary::excerpts(summarize(&messages[plan.start..plan.end]));
+        let _ = self.apply_compaction_summary(messages, plan, summary, obs)?;
+        Ok(())
+    }
+
+    fn apply_deterministic_ladder(
+        &mut self,
+        ladder: TriggerLadder,
+        pending_tokens: u64,
+        obs: &dyn AgentObserver,
+    ) -> Result<()> {
+        let pending = self.pending_folds();
+        if !pending.is_empty() {
+            self.flush_folds(&pending, FoldTrigger::CompactionBoundary, obs)?;
+        }
+        for keep in [ladder.keep_recent_tokens, MANUAL_COMPACT_KEEP_TOKENS] {
+            if ladder.tier(self.context_measurement(pending_tokens).tokens)
+                != ContextPressureTier::Hard
+            {
+                break;
+            }
+            let messages = self.agent.messages().to_vec();
+            let Some(plan) = self.plan_compaction(&messages, keep) else {
+                break;
+            };
+            self.apply_excerpts_plan(&messages, plan, obs)?;
+        }
+        Ok(())
+    }
+
+    fn resolve_hard_background(&mut self, obs: &dyn AgentObserver) -> Result<()> {
+        let Some(job) = self.compaction.background.take() else {
+            return Ok(());
+        };
+        match job.receiver.recv_timeout(self.compaction.hard_wait) {
+            Ok(result) => self.finish_background_compaction(job, result, obs),
+            Err(RecvTimeoutError::Timeout) => {
+                job.token.cancel();
+                self.record_compaction_failure();
+                self.emit_compaction_lifecycle(
+                    obs,
+                    &job,
+                    CompactionLifecycleState::Cancelled,
+                    Some(format!(
+                        "background compaction exceeded the {} ms hard wait; using deterministic fallback",
+                        self.compaction.hard_wait.as_millis()
+                    )),
+                )?;
+                self.apply_deterministic_fallback_for_job(&job, obs)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.record_compaction_failure();
+                self.emit_compaction_lifecycle(
+                    obs,
+                    &job,
+                    CompactionLifecycleState::Failed,
+                    Some(
+                        "background compaction worker stopped before returning a summary"
+                            .to_string(),
+                    ),
+                )?;
+                self.apply_deterministic_fallback_for_job(&job, obs)
+            }
+        }
+    }
+
+    fn record_compaction_failure(&mut self) {
+        self.compaction.consecutive_failures =
+            self.compaction.consecutive_failures.saturating_add(1);
+    }
+
+    fn maybe_emit_breaker_notice(&mut self, obs: &dyn AgentObserver) -> Result<()> {
+        if self.compaction.consecutive_failures < self.compaction.max_consecutive_failures
+            || self.compaction.breaker_notice_emitted
+        {
+            return Ok(());
+        }
+        self.compaction.breaker_notice_emitted = true;
+        obs.on_event(AgentEvent::Notice(format!(
+            "background compaction disabled after {} consecutive failures; deterministic compaction remains active.",
+            self.compaction.consecutive_failures
         )))
     }
 
@@ -1530,6 +1794,7 @@ impl<P: ChatProvider> Harness<P> {
             Err(TryRecvError::Empty) => Ok(()),
             Err(TryRecvError::Disconnected) => {
                 let job = self.compaction.background.take().expect("checked above");
+                self.record_compaction_failure();
                 self.emit_compaction_lifecycle(
                     obs,
                     &job,
@@ -1568,20 +1833,29 @@ impl<P: ChatProvider> Harness<P> {
                 let messages = self.agent.messages().to_vec();
                 let discarded_usage = summary.worker_usage.clone();
                 match self.apply_compaction_summary(&messages, plan, summary, obs)? {
-                    Some(_) => Ok(()),
-                    None => self.emit_compaction_lifecycle_with_usage(
-                        obs,
-                        &job,
-                        CompactionLifecycleState::Discarded,
-                        discarded_usage,
-                        Some(
-                            "background compaction summary did not shrink; keeping current context"
-                                .to_string(),
-                        ),
-                    ),
+                    Some(_) => {
+                        self.compaction.consecutive_failures = 0;
+                        self.compaction.breaker_notice_emitted = false;
+                        Ok(())
+                    }
+                    None => {
+                        self.record_compaction_failure();
+                        self.emit_compaction_lifecycle_with_usage(
+                            obs,
+                            &job,
+                            CompactionLifecycleState::Discarded,
+                            discarded_usage,
+                            Some(
+                                "background compaction summary did not shrink; using deterministic fallback"
+                                    .to_string(),
+                            ),
+                        )?;
+                        self.apply_deterministic_fallback_for_job(&job, obs)
+                    }
                 }
             }
             BackgroundSummaryResult::Failed(message) => {
+                self.record_compaction_failure();
                 self.emit_compaction_lifecycle(
                     obs,
                     &job,

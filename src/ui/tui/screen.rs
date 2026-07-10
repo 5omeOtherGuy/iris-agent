@@ -12,7 +12,7 @@ use ratatui_textarea::{TextArea, WrapMode};
 use crate::git::status::{GitStatus, JjStatus, VcsStatus};
 #[cfg(test)]
 use crate::mimir::model_catalog;
-use crate::nexus::{ApprovalDecision, ProviderUsage, ToolCall};
+use crate::nexus::{ApprovalDecision, ContextPressureTier, ProviderUsage, ToolCall};
 use crate::ui::UiEvent;
 use crate::ui::modal::Modal;
 use crate::ui::slash::Palette;
@@ -226,6 +226,7 @@ struct Footer {
     /// drop to empty at every turn start) and is cleared only when the model or
     /// context window changes.
     context_used_tokens: Option<u64>,
+    context_pressure: ContextPressureTier,
 }
 
 /// Predicted prompt-cache posture for a just-applied model/reasoning switch.
@@ -1138,6 +1139,12 @@ impl Screen {
             footer.context_used_tokens = Some(usage.total_tokens);
             footer.usage = Some(usage.clone());
         }
+        if let UiEvent::ContextPressure { tier, measured, .. } = &event
+            && let Some(footer) = &mut self.footer
+        {
+            footer.context_used_tokens = Some(*measured);
+            footer.context_pressure = *tier;
+        }
         // Accumulate the session-scoped reduction accounting for `/context`
         // (issue #400): fold batches with their trigger tags, and compaction
         // before/after estimates, straight from the runtime events.
@@ -1396,6 +1403,7 @@ impl Screen {
             vcs,
             usage,
             context_used_tokens,
+            context_pressure: ContextPressureTier::Normal,
         });
     }
 
@@ -1945,8 +1953,16 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
     // The context readout, fullest form first: used/cap + meter, then used/cap,
     // then used alone, then nothing.
     let ctx_spans = |with_cap: bool, with_meter: bool| -> Vec<Span<'static>> {
+        let pressure = !matches!(footer.context_pressure, ContextPressureTier::Normal);
         let mut spans = vec![
-            Span::styled("CTX ".to_string(), dim_style()),
+            Span::styled(
+                if pressure { "CTX! " } else { "CTX " }.to_string(),
+                if pressure {
+                    border_style()
+                } else {
+                    dim_style()
+                },
+            ),
             Span::styled(used_text.clone(), Style::default()),
         ];
         if with_cap && let Some(cap) = cap.as_deref() {
@@ -2590,7 +2606,7 @@ mod tests {
         composer_statusline, context_meter_filled, display_width, line_text, parse_context_window,
         session_bar, session_bar_lines, switch_status_line, truncate_cwd_middle,
     };
-    use crate::nexus::ToolCall;
+    use crate::nexus::{ContextPressureTier, ToolCall};
     use crate::ui::UiEvent;
     use crate::ui::tui::WORKING_FRAMES;
 
@@ -2693,6 +2709,28 @@ mod tests {
         // Mode/model/policy never appear on the session bar.
         assert!(!bar.contains("CODE"), "{bar:?}");
         assert!(!bar.contains("GPT"), "{bar:?}");
+    }
+
+    #[test]
+    fn session_bar_marks_context_pressure_until_it_returns_to_normal() {
+        let mut screen = footer_screen("~/repo");
+        screen.apply(UiEvent::ContextPressure {
+            tier: ContextPressureTier::Warn,
+            measured: 90_000,
+            effective_window: 120_000,
+            source: crate::nexus::ContextMeasurementSource::Estimated,
+        });
+        assert!(bar_text(&screen, 80).contains("CTX! 90k"));
+
+        screen.apply(UiEvent::ContextPressure {
+            tier: ContextPressureTier::Normal,
+            measured: 20_000,
+            effective_window: 120_000,
+            source: crate::nexus::ContextMeasurementSource::Estimated,
+        });
+        let bar = bar_text(&screen, 80);
+        assert!(bar.contains("CTX 20k"), "{bar:?}");
+        assert!(!bar.contains("CTX!"), "{bar:?}");
     }
 
     #[test]

@@ -22,10 +22,13 @@
 //! cache-WRITE mass vs the pre-compaction baseline).
 
 use super::*;
+use crate::config::CompactionTriggerConfig;
 use crate::mimir::auth::anthropic::claude_code_credentials_available;
 use crate::mimir::providers::anthropic_messages::AnthropicProvider;
 use crate::mimir::retry::RetryPolicy;
-use crate::mimir::selection::{CodexTransport, ContextManagement, PromptCacheRetention};
+use crate::mimir::selection::{
+    CodexTransport, ContextManagement, PromptCacheRetention, ReasoningEffort,
+};
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::{ToolState, built_in_tools};
 use crate::wayland::{Harness, SummarizerKind};
@@ -40,6 +43,7 @@ const LIVE_MODEL: &str = "claude-sonnet-4-6";
 /// Minimal system prompt; the provider prepends the required Claude Code
 /// identity block itself.
 const LIVE_SYSTEM_PROMPT: &str = "You are a coding assistant. Keep answers short.";
+const AUTO_LIVE_WORKER_MODEL: &str = "claude-opus-4-6";
 /// Matches the summarizer instruction prefix (`SUMMARY_PROMPT`, private to
 /// `crate::wayland`) so the recording wrapper tags a summarization request.
 const SUMMARY_INSTRUCTION_PREFIX: &str = "Summarize this coding session";
@@ -218,6 +222,18 @@ impl LiveLoopLane {
     }
 }
 
+fn build_live_compaction_worker() -> Result<Box<dyn ChatProvider>> {
+    Ok(Box::new(AnthropicProvider::new(
+        AUTO_LIVE_WORKER_MODEL,
+        "https://api.anthropic.com",
+        Some(ReasoningEffort::Medium),
+        LIVE_SYSTEM_PROMPT,
+        PromptCacheRetention::DEFAULT,
+        ContextManagement::default(),
+        RetryPolicy::default(),
+    )?))
+}
+
 /// A no-op observer: the live harness reads usage from the recording provider,
 /// not from events.
 struct NoopObserver;
@@ -259,7 +275,10 @@ fn live_seed() -> Vec<Message> {
     seed
 }
 
-const AUTO_LIVE_BUDGET: u64 = 8_000;
+// Four summary reserves: the smallest synthetic window that keeps model-backed
+// background work enabled. Parent traffic stays on the two cheap protocol lanes;
+// every summary worker is Opus 4.6 with medium thinking by operator requirement.
+const AUTO_LIVE_BUDGET: u64 = 32_768;
 const AUTO_LIVE_CARRY_HEADER: &str = "[files touched or read in the compacted range]";
 
 fn auto_live_seed(session: usize, workspace: &std::path::Path) -> Result<Vec<Message>> {
@@ -292,7 +311,7 @@ fn auto_live_seed(session: usize, workspace: &std::path::Path) -> Result<Vec<Mes
         seed.push(Message::user(&format!(
             "Seed filler {turn}: {}",
             "Auto-compaction must preserve durable ranges, tool pairs, recall markers, and exact resume reconstruction. "
-                .repeat(18)
+                .repeat(60)
         )));
         seed.push(Message::assistant(
             "Acknowledged. The constraints remain part of the session state.",
@@ -331,8 +350,7 @@ fn live_loop_enabled(test_name: &str) -> bool {
 
 /// Repeated live auto-compaction protocol. Every row is one scripted session;
 /// errors are printed verbatim and excluded rather than converted into made-up
-/// metrics. Slice 0 reports G1 as `baseline-n/a` because no hard tier exists
-/// yet; slice 3 activates the non-blocking assertion.
+/// metrics. G1 remains `baseline-n/a` until slice 3 installs mid-turn governance.
 fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     println!(
@@ -342,36 +360,73 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
         AUTO_LIVE_BUDGET
     );
     println!(
-        "lane | session | compactions | G1 blocked | G2 max-after/under-budget | G3 needle/marker/carry | G4 exact | G5 metadata | real read | error"
+        "lane | session | compactions | G1 blocked | G2 max-after/start/pass | G3 needle/marker/carry | G4 exact | G5 metadata | real read | error"
     );
 
+    let mut exclusions = 0usize;
+    let mut gate_failures = Vec::new();
     for session in 0..session_count {
         let result = run_auto_compaction_live_session(lane, session, &workspace);
         match result {
-            Ok(row) => println!(
-                "{} | {session:02} | {} | baseline-n/a | {}/{} | {}/{}/{} | {} | {} | {} | -",
-                lane.label(),
-                row.compactions,
-                row.max_context_after_apply,
-                row.context_effective,
-                row.needle_answered,
-                row.recall_marker,
-                row.carry_block,
-                row.resume_exact,
-                row.measured_entries,
-                row.real_read,
-            ),
-            Err(error) => println!(
-                "{} | {session:02} | excluded | baseline-n/a | -/- | -/-/- | - | - | - | {error:#}",
-                lane.label()
-            ),
+            Ok(row) => {
+                let pass = row.compactions >= 2
+                    && row.context_effective
+                    && row.needle_answered
+                    && row.recall_marker
+                    && row.carry_block
+                    && row.resume_exact
+                    && row.measured_entries
+                    && row.real_read;
+                if !pass {
+                    gate_failures.push(format!(
+                        "session {session:02}: compactions={} G2={} G3={}/{}/{} G4={} G5={} read={}",
+                        row.compactions,
+                        row.context_effective,
+                        row.needle_answered,
+                        row.recall_marker,
+                        row.carry_block,
+                        row.resume_exact,
+                        row.measured_entries,
+                        row.real_read,
+                    ));
+                }
+                println!(
+                    "{} | {session:02} | {} | baseline-n/a | {}/{}/{} | {}/{}/{} | {} | {} | {} | {}",
+                    lane.label(),
+                    row.compactions,
+                    row.max_context_after_apply,
+                    row.start_threshold,
+                    row.context_effective,
+                    row.needle_answered,
+                    row.recall_marker,
+                    row.carry_block,
+                    row.resume_exact,
+                    row.measured_entries,
+                    row.real_read,
+                    row.metadata_detail.as_deref().unwrap_or("-"),
+                );
+            }
+            Err(error) => {
+                exclusions += 1;
+                println!(
+                    "{} | {session:02} | excluded | baseline-n/a | -/- | -/-/- | - | - | - | {error:#}",
+                    lane.label()
+                );
+            }
         }
     }
+    assert!(
+        exclusions <= 1 && gate_failures.is_empty(),
+        "{} live protocol failed: exclusions={exclusions}; {}",
+        lane.label(),
+        gate_failures.join("; ")
+    );
 }
 
 struct AutoLiveRow {
     compactions: usize,
     max_context_after_apply: u64,
+    start_threshold: u64,
     context_effective: bool,
     needle_answered: bool,
     recall_marker: bool,
@@ -379,6 +434,7 @@ struct AutoLiveRow {
     resume_exact: bool,
     measured_entries: bool,
     real_read: bool,
+    metadata_detail: Option<String>,
 }
 
 fn run_auto_compaction_live_session(
@@ -415,16 +471,20 @@ fn run_auto_compaction_live_session(
         entry_ids,
         Some(AUTO_LIVE_BUDGET),
     );
+    harness.set_compaction_trigger(
+        AUTO_LIVE_BUDGET,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.85,
+            keep_recent_tokens: 20_000,
+            hard_wait_ms: 10_000,
+            max_consecutive_failures: 3,
+        },
+    );
     harness.set_summarizer(SummarizerKind::Subagent);
-    let worker_lane = lane;
-    let worker_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    harness.set_compaction_summarizer_factory(Arc::new(move || {
-        let seq = worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        worker_lane.build_provider(&format!(
-            "iris-auto-loop-{}-{session}-worker-{seq}",
-            worker_lane.label()
-        ))
-    }));
+    harness.set_compaction_summarizer_factory(Arc::new(build_live_compaction_worker));
 
     let observer = LiveLoopObserver::default();
     let gate = ReadOnlyGate;
@@ -434,7 +494,7 @@ fn run_auto_compaction_live_session(
         let prompt = format!(
             "Use the read tool on Cargo.toml, then reply in at most two short sentences. Turn {turn}. {}",
             "Keep this filler distinct so the real provider context grows toward the next compaction boundary. "
-                .repeat(12)
+                .repeat(70)
         );
         let started = Instant::now();
         block_on(harness.submit_turn(&prompt, &observer, &gate, &token))?;
@@ -449,6 +509,24 @@ fn run_auto_compaction_live_session(
         if applied >= 2 {
             break;
         }
+    }
+
+    // A second job may start at the final filler's post-turn boundary. Give the
+    // fixed Opus worker time to finish before the needle probe supplies the next
+    // safe apply boundary; the user's turn is not blocked by this worker wait.
+    let applied_before_probe = observer
+        .events
+        .lock()
+        .expect("live events lock")
+        .iter()
+        .filter(|timed| matches!(timed.event, AgentEvent::CompactionApplied { .. }))
+        .count();
+    if applied_before_probe < 2
+        && harness
+            .context_diagnostics()
+            .is_some_and(|diagnostics| diagnostics.background_running)
+    {
+        std::thread::sleep(std::time::Duration::from_secs(30));
     }
 
     let probe = format!(
@@ -472,13 +550,13 @@ fn run_auto_compaction_live_session(
         .rev()
         .find(|message| message.role == Role::Assistant)
         .is_some_and(|message| message.content.contains("--enable-zeta"));
-    let real_read = live_messages.iter().any(|message| {
-        message.role == Role::Tool
-            && message.tool_name.as_deref() == Some("read")
-            && message.provider_turn_id.is_some()
-    });
-
     let events = observer.events.lock().expect("live events lock");
+    let real_read = events.iter().any(|timed| {
+        matches!(
+            &timed.event,
+            AgentEvent::ToolResult { call, .. } if call.name == "read"
+        )
+    });
     let applies = events
         .iter()
         .filter_map(|timed| match &timed.event {
@@ -498,7 +576,7 @@ fn run_auto_compaction_live_session(
     let context_effective = !applies.is_empty()
         && applies
             .iter()
-            .all(|(_, tokens)| *tokens <= AUTO_LIVE_BUDGET);
+            .all(|(_, tokens)| *tokens <= AUTO_LIVE_BUDGET * 65 / 100);
     drop(events);
 
     let entries = compaction_json_entries(&path)?;
@@ -508,16 +586,51 @@ fn run_auto_compaction_live_session(
                 .get("origin")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            !origin.is_empty()
-                && entry.get("workerUsage").is_some()
-                && (origin == "excerpts"
-                    || entry
-                        .get("workerUsage")
-                        .is_some_and(|usage| !usage.is_null()))
+            let usage = entry.get("workerUsage");
+            match origin {
+                "excerpts" => usage.is_some_and(serde_json::Value::is_null),
+                "subagent" | "provider" => {
+                    usage.is_some_and(|usage| !usage.is_null())
+                        && usage
+                            .and_then(|usage| usage.get("provider"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("anthropic")
+                        && usage
+                            .and_then(|usage| usage.get("model"))
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|model| model.starts_with(AUTO_LIVE_WORKER_MODEL))
+                }
+                _ => false,
+            }
         });
+    let metadata_detail = (!measured_entries).then(|| {
+        entries
+            .iter()
+            .map(|entry| {
+                let usage = entry.get("workerUsage");
+                format!(
+                    "origin={} worker={}/{}",
+                    entry
+                        .get("origin")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("null"),
+                    usage
+                        .and_then(|usage| usage.get("provider"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("null"),
+                    usage
+                        .and_then(|usage| usage.get("model"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("null")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    });
     Ok(AutoLiveRow {
         compactions: applies.len(),
         max_context_after_apply,
+        start_threshold: AUTO_LIVE_BUDGET * 65 / 100,
         context_effective,
         needle_answered,
         recall_marker: context_text.matches("recall(handle=\"").count() >= applies.len(),
@@ -525,6 +638,7 @@ fn run_auto_compaction_live_session(
         resume_exact,
         measured_entries,
         real_read,
+        metadata_detail,
     })
 }
 

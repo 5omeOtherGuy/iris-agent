@@ -5,6 +5,7 @@
 //! preserves the existing turn-boundary algorithms; later trigger/governor
 //! slices extend this owner instead of growing the harness again.
 
+use super::trigger::{DEFAULT_SUMMARY_RESERVE, PressureTracker, TriggerLadder, TriggerThresholds};
 use super::*;
 
 /// Maximum characters in an auto-compaction summary.
@@ -88,6 +89,15 @@ pub(super) struct CompactionEngine {
     pub(super) persisted: usize,
     pub(super) entry_ids: Vec<Option<String>>,
     pub(super) budget: Option<u64>,
+    pub(super) automatic_enabled: bool,
+    pub(super) trigger_v2: bool,
+    pub(super) ladder: Option<TriggerLadder>,
+    pub(super) hard_wait: std::time::Duration,
+    pub(super) max_consecutive_failures: u32,
+    pub(super) consecutive_failures: u32,
+    pub(super) breaker_notice_emitted: bool,
+    pub(super) tiny_notice_emitted: bool,
+    pub(super) pressure: PressureTracker,
     pub(super) summarizer: SummarizerKind,
     pub(super) summarizer_factory: Option<SummarizerFactory>,
     pub(super) background: Option<BackgroundCompaction>,
@@ -109,11 +119,28 @@ impl CompactionEngine {
         let resume_last_activity_ms = session
             .as_ref()
             .and_then(SessionLog::resumed_last_activity_ms);
+        let ladder = budget.map(|window| {
+            TriggerLadder::resolve(
+                window,
+                TriggerThresholds::default(),
+                DEFAULT_SUMMARY_RESERVE,
+                20_000,
+            )
+        });
         Self {
             session,
             persisted,
             entry_ids,
             budget,
+            automatic_enabled: budget.is_some(),
+            trigger_v2: false,
+            ladder,
+            hard_wait: std::time::Duration::from_millis(10_000),
+            max_consecutive_failures: 3,
+            consecutive_failures: 0,
+            breaker_notice_emitted: false,
+            tiny_notice_emitted: false,
+            pressure: PressureTracker::default(),
             summarizer: SummarizerKind::default(),
             summarizer_factory: None,
             background: None,

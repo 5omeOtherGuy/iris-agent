@@ -786,6 +786,7 @@ mod tests {
             tui: None,
             default_approval: None,
             worktree_root: None,
+            compaction: None,
         }
     }
 

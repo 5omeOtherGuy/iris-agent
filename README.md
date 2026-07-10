@@ -208,10 +208,31 @@ file (`~/.iris/settings.json`, or `IRIS_CONFIG_PATH`):
 Supported provider ids are `openai-codex`, `anthropic`, and `antigravity`.
 Recognized settings keys are `defaultProvider`, `defaultModel`, `baseUrl`,
 `contextTokenBudget`, `defaultReasoning`, `promptCacheRetention`,
-`anthropicContextManagement`, `toolResultCompaction`, and `enabledModels`.
+`anthropicContextManagement`, `compaction`, `toolResultCompaction`, and
+`enabledModels`.
 
 If unset, `promptCacheRetention` defaults to `short`; set it to `none` to omit
 provider-native prompt-cache hints.
+
+Automatic compaction uses the selected model's effective context window. An
+explicit `contextTokenBudget` remains an absolute upper bound. Tune or disable
+the trigger ladder with:
+
+```json
+{
+  "compaction": {
+    "enabled": true,
+    "thresholds": { "warn": 0.55, "start": 0.65, "hard": 0.85 },
+    "keepRecentTokens": 20000,
+    "hardWaitMs": 10000,
+    "maxConsecutiveFailures": 3
+  }
+}
+```
+
+`compaction.enabled=false` disables automatic rewrites; manual `/compact` and
+tool-result folds keep their own behavior. A legacy budget below 8,192 tokens is
+invalid because it cannot reserve space for a summary.
 
 Tool-result compaction is opt-in. This example enables stale-read dedupe and
 older replayable-result clearing locally:

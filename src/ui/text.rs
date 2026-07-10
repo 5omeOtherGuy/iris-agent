@@ -391,7 +391,8 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
 
     fn emit(&mut self, event: UiEvent) -> Result<()> {
         match event {
-            UiEvent::ProviderTurnStarted { .. }
+            UiEvent::ContextPressure { .. }
+            | UiEvent::ProviderTurnStarted { .. }
             | UiEvent::ProviderTurnCompleted { .. }
             | UiEvent::ProviderTurnCancelled { .. }
             | UiEvent::ProviderTurnError { .. }

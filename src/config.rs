@@ -44,7 +44,7 @@ pub(crate) use tool_result_compaction::{
 /// Settings loaded from the JSON config files. Every field is optional; an
 /// absent field falls back to the next layer (safe project fields -> global ->
 /// built-in default, with env applied above where the provider supports it).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Settings {
     /// Provider id: `openai-codex` (default), `anthropic`, or `antigravity`.
@@ -55,11 +55,9 @@ pub(crate) struct Settings {
     pub(crate) default_model: Option<String>,
     /// Base URL override for the active provider's API endpoint.
     pub(crate) base_url: Option<String>,
-    /// Auto-compaction threshold. The Tier-2 harness reads it to decide when to
-    /// auto-compact: when the rebuilt/current context token total exceeds this,
-    /// the harness compacts at a safe turn boundary. Absent ->
-    /// [`Settings::context_token_budget`] default. Kept on the legacy
-    /// `contextTokenBudget` key for settings-file compatibility.
+    /// Legacy absolute auto-compaction window override. When set, it clamps the
+    /// model-derived effective window; when the model window is unknown it is
+    /// the window. Kept on `contextTokenBudget` for compatibility.
     pub(crate) context_token_budget: Option<u64>,
     /// Microcompaction watermark. When microcompaction is enabled, detected fold
     /// plans flush once provider-visible context reaches this independent token
@@ -174,6 +172,94 @@ pub(crate) struct Settings {
     /// user-confirmed `git worktree add` (the resolved path is always shown
     /// before create), granting no new capability.
     pub(crate) worktree_root: Option<String>,
+    /// Automatic full-context compaction policy. Project-safe tuning fields
+    /// merge over global settings; routing/native fields remain global-only.
+    pub(crate) compaction: Option<CompactionSettings>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CompactionSettings {
+    pub(crate) enabled: Option<bool>,
+    pub(crate) thresholds: Option<CompactionThresholdSettings>,
+    pub(crate) keep_recent_tokens: Option<u64>,
+    pub(crate) worker: Option<CompactionWorkerSettings>,
+    pub(crate) hard_wait_ms: Option<u64>,
+    pub(crate) max_consecutive_failures: Option<u32>,
+    pub(crate) reactive: Option<bool>,
+    pub(crate) provider_native: Option<String>,
+    pub(crate) instructions: Option<String>,
+    pub(crate) model_tool: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub(crate) struct CompactionThresholdSettings {
+    pub(crate) warn: Option<f64>,
+    pub(crate) start: Option<f64>,
+    pub(crate) hard: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CompactionWorkerSettings {
+    pub(crate) input: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) max_tool_roundtrips: Option<usize>,
+    pub(crate) timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CompactionTriggerConfig {
+    pub(crate) enabled: bool,
+    pub(crate) warn: f64,
+    pub(crate) start: f64,
+    pub(crate) hard: f64,
+    pub(crate) keep_recent_tokens: u64,
+    pub(crate) hard_wait_ms: u64,
+    pub(crate) max_consecutive_failures: u32,
+}
+
+fn merge_compaction(
+    global: Option<CompactionSettings>,
+    project: Option<CompactionSettings>,
+) -> Option<CompactionSettings> {
+    if global.is_none() && project.is_none() {
+        return None;
+    }
+    let global = global.unwrap_or_default();
+    let project = project.unwrap_or_default();
+    let global_thresholds = global.thresholds.unwrap_or_default();
+    let project_thresholds = project.thresholds.unwrap_or_default();
+    let thresholds = CompactionThresholdSettings {
+        warn: project_thresholds.warn.or(global_thresholds.warn),
+        start: project_thresholds.start.or(global_thresholds.start),
+        hard: project_thresholds.hard.or(global_thresholds.hard),
+    };
+    let global_worker = global.worker.unwrap_or_default();
+    let project_worker = project.worker.unwrap_or_default();
+    Some(CompactionSettings {
+        enabled: project.enabled.or(global.enabled),
+        thresholds: Some(thresholds),
+        keep_recent_tokens: project.keep_recent_tokens.or(global.keep_recent_tokens),
+        worker: Some(CompactionWorkerSettings {
+            input: project_worker.input.or(global_worker.input),
+            // Worker model changes provider routing and remains global-only.
+            model: global_worker.model,
+            max_tool_roundtrips: project_worker
+                .max_tool_roundtrips
+                .or(global_worker.max_tool_roundtrips),
+            timeout_ms: project_worker.timeout_ms.or(global_worker.timeout_ms),
+        }),
+        hard_wait_ms: project.hard_wait_ms.or(global.hard_wait_ms),
+        max_consecutive_failures: project
+            .max_consecutive_failures
+            .or(global.max_consecutive_failures),
+        reactive: project.reactive.or(global.reactive),
+        // Provider-native rewrites alter server-side semantics and are global-only.
+        provider_native: global.provider_native,
+        instructions: project.instructions.or(global.instructions),
+        model_tool: project.model_tool.or(global.model_tool),
+    })
 }
 
 /// Terminal-UI settings block (`"tui": { ... }` in settings.json).
@@ -247,10 +333,13 @@ pub(crate) struct RetrySettings {
     pub(crate) max_delay_ms: Option<u64>,
 }
 
-/// Default context token budget when none is configured. A conservative ceiling
-/// that fits common model context windows; it is only surfaced through
-/// [`Settings::context_token_budget`] and triggers nothing yet.
+/// Legacy fallback when neither an explicit budget nor a model window exists.
 const DEFAULT_CONTEXT_TOKEN_BUDGET: u64 = 128_000;
+pub(crate) const DEFAULT_SUMMARY_RESERVE: u64 = 8_192;
+const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 20_000;
+const DEFAULT_COMPACTION_HARD_WAIT_MS: u64 = 10_000;
+const MAX_COMPACTION_HARD_WAIT_MS: u64 = 120_000;
+const DEFAULT_COMPACTION_MAX_FAILURES: u32 = 3;
 /// Default independent microcompaction flush threshold. This matches the old
 /// default `contextTokenBudget / 2` behavior without coupling future budget edits
 /// to microcompaction.
@@ -291,6 +380,7 @@ impl Settings {
             self.tool_result_compaction.clone(),
             project.tool_result_compaction.clone(),
         );
+        let compaction = merge_compaction(self.compaction.clone(), project.compaction.clone());
         Settings {
             default_provider: self.default_provider,
             default_model: project.default_model.or(self.default_model),
@@ -360,6 +450,7 @@ impl Settings {
             default_approval: self.default_approval,
             // A local worktree location preference; project value wins.
             worktree_root: project.worktree_root.or(self.worktree_root),
+            compaction,
         }
     }
 
@@ -418,12 +509,67 @@ impl Settings {
         self.retry.clone().unwrap_or_default()
     }
 
-    /// Configured context token budget, or the built-in default when unset. The
-    /// harness compares the current context token total against this and
-    /// auto-compacts when it is exceeded.
+    /// Explicit legacy window override, or the unknown-model fallback when
+    /// unset. Production model-aware resolution preserves raw `None` separately.
     pub(crate) fn context_token_budget(&self) -> u64 {
         self.context_token_budget
             .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET)
+    }
+
+    /// Validated trigger-ladder tuning. The legacy absolute budget is checked
+    /// here because `enabled=false`, not a zero budget, is the off switch.
+    pub(crate) fn compaction_trigger(&self) -> Result<CompactionTriggerConfig> {
+        if let Some(budget) = self.context_token_budget
+            && budget < DEFAULT_SUMMARY_RESERVE
+        {
+            bail!(
+                "contextTokenBudget must be at least {DEFAULT_SUMMARY_RESERVE}; use compaction.enabled=false to disable automatic compaction"
+            );
+        }
+        let compaction = self.compaction.as_ref();
+        let thresholds = compaction.and_then(|value| value.thresholds.as_ref());
+        let warn = thresholds.and_then(|value| value.warn).unwrap_or(0.55);
+        let start = thresholds.and_then(|value| value.start).unwrap_or(0.65);
+        let hard = thresholds.and_then(|value| value.hard).unwrap_or(0.85);
+        if !(warn.is_finite()
+            && start.is_finite()
+            && hard.is_finite()
+            && 0.0 < warn
+            && warn < start
+            && start < hard
+            && hard < 1.0)
+        {
+            bail!("compaction thresholds must satisfy 0 < warn < start < hard < 1");
+        }
+        let keep_recent_tokens = compaction
+            .and_then(|value| value.keep_recent_tokens)
+            .unwrap_or(DEFAULT_COMPACTION_KEEP_RECENT_TOKENS);
+        if keep_recent_tokens == 0 {
+            bail!("compaction.keepRecentTokens must be greater than zero");
+        }
+        let max_consecutive_failures = compaction
+            .and_then(|value| value.max_consecutive_failures)
+            .unwrap_or(DEFAULT_COMPACTION_MAX_FAILURES);
+        if max_consecutive_failures == 0 {
+            bail!("compaction.maxConsecutiveFailures must be greater than zero");
+        }
+        let hard_wait_ms = compaction
+            .and_then(|value| value.hard_wait_ms)
+            .unwrap_or(DEFAULT_COMPACTION_HARD_WAIT_MS);
+        if hard_wait_ms > MAX_COMPACTION_HARD_WAIT_MS {
+            bail!(
+                "compaction.hardWaitMs must be at most {MAX_COMPACTION_HARD_WAIT_MS} milliseconds"
+            );
+        }
+        Ok(CompactionTriggerConfig {
+            enabled: compaction.and_then(|value| value.enabled).unwrap_or(true),
+            warn,
+            start,
+            hard,
+            keep_recent_tokens,
+            hard_wait_ms,
+            max_consecutive_failures,
+        })
     }
 
     /// Configured independent microcompaction watermark, or the built-in default
@@ -559,10 +705,15 @@ pub(crate) fn save_compaction_summarizer(mode: &str) -> Result<()> {
     update_global(&[("compactionSummarizer", Value::String(mode.to_string()))])
 }
 
-/// Persist the context token budget in the global settings file, clamped to a
-/// sane positive range so a hand-typed value cannot store a degenerate budget.
+/// Persist the legacy context window override. Values below the summary reserve
+/// are rejected; disabling automatic compaction is an explicit boolean policy.
 pub(crate) fn save_context_token_budget(budget: u64) -> Result<()> {
-    let budget = budget.clamp(MIN_CONTEXT_TOKEN_BUDGET, MAX_CONTEXT_TOKEN_BUDGET);
+    if budget < DEFAULT_SUMMARY_RESERVE {
+        bail!(
+            "contextTokenBudget must be at least {DEFAULT_SUMMARY_RESERVE}; use compaction.enabled=false to disable automatic compaction"
+        );
+    }
+    let budget = budget.min(MAX_CONTEXT_TOKEN_BUDGET);
     update_global(&[("contextTokenBudget", Value::from(budget))])
 }
 
@@ -1394,6 +1545,95 @@ mod tests {
     }
 
     #[test]
+    fn compaction_trigger_defaults_and_validates_legacy_off_switch() {
+        let defaults = Settings::default().compaction_trigger().unwrap();
+        assert!(defaults.enabled);
+        assert_eq!(
+            (defaults.warn, defaults.start, defaults.hard),
+            (0.55, 0.65, 0.85)
+        );
+        assert_eq!(defaults.keep_recent_tokens, 20_000);
+        assert_eq!(defaults.hard_wait_ms, 10_000);
+        assert_eq!(defaults.max_consecutive_failures, 3);
+
+        let too_small = Settings {
+            context_token_budget: Some(8_191),
+            ..Settings::default()
+        };
+        let error = too_small.compaction_trigger().unwrap_err().to_string();
+        assert!(error.contains("compaction.enabled=false"), "{error}");
+    }
+
+    #[test]
+    fn compaction_thresholds_must_be_ordered_and_project_knobs_merge() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(
+            &global,
+            r#"{
+              "compaction": {
+                "thresholds": { "warn": 0.50, "start": 0.60, "hard": 0.80 },
+                "worker": { "model": "anthropic/claude-haiku-4-5", "timeoutMs": 90000 },
+                "providerNative": "auto"
+              }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            r#"{
+              "compaction": {
+                "enabled": false,
+                "thresholds": { "start": 0.62 },
+                "keepRecentTokens": 12000,
+                "worker": { "model": "evil/redirect", "timeoutMs": 1000 },
+                "providerNative": "off"
+              }
+            }"#,
+        )
+        .unwrap();
+        let merged = Settings::load_from(Some(&global), &project).unwrap();
+        let trigger = merged.compaction_trigger().unwrap();
+        assert_eq!(
+            (trigger.warn, trigger.start, trigger.hard),
+            (0.50, 0.62, 0.80)
+        );
+        assert!(!trigger.enabled);
+        assert_eq!(trigger.keep_recent_tokens, 12_000);
+        let block = merged.compaction.unwrap();
+        assert_eq!(
+            block.worker.unwrap().model.as_deref(),
+            Some("anthropic/claude-haiku-4-5"),
+            "project config cannot redirect worker traffic"
+        );
+        assert_eq!(block.provider_native.as_deref(), Some("auto"));
+
+        let invalid = Settings {
+            compaction: Some(CompactionSettings {
+                thresholds: Some(CompactionThresholdSettings {
+                    warn: Some(0.7),
+                    start: Some(0.6),
+                    hard: Some(0.8),
+                }),
+                ..CompactionSettings::default()
+            }),
+            ..Settings::default()
+        };
+        assert!(invalid.compaction_trigger().is_err());
+
+        let unbounded_wait = Settings {
+            compaction: Some(CompactionSettings {
+                hard_wait_ms: Some(120_001),
+                ..CompactionSettings::default()
+            }),
+            ..Settings::default()
+        };
+        let error = unbounded_wait.compaction_trigger().unwrap_err().to_string();
+        assert!(error.contains("at most 120000"), "{error}");
+    }
+
+    #[test]
     fn microcompaction_watermark_defaults_independently_and_parses_when_present() {
         let dir = temp_dir();
         let defaulted = Settings::load_from(
@@ -1811,8 +2051,9 @@ mod tests {
         // Top-level scalar saves.
         save_default_approval("auto").unwrap();
         save_prompt_cache_retention("long").unwrap();
-        // Clamp: below/above the sane range is pulled into it.
-        save_context_token_budget(1).unwrap();
+        let error = save_context_token_budget(1).unwrap_err().to_string();
+        assert!(error.contains("compaction.enabled=false"), "{error}");
+        save_context_token_budget(DEFAULT_SUMMARY_RESERVE).unwrap();
         save_microcompaction_watermark(999_999_999).unwrap();
         save_max_tool_roundtrips(Some(99_999)).unwrap();
         save_worktree_root(Some("  ../trees  ")).unwrap();
@@ -1829,7 +2070,10 @@ mod tests {
             object.get("defaultApproval"),
             Some(&Value::String("auto".into()))
         );
-        assert_eq!(object.get("contextTokenBudget"), Some(&Value::from(1_000)));
+        assert_eq!(
+            object.get("contextTokenBudget"),
+            Some(&Value::from(DEFAULT_SUMMARY_RESERVE))
+        );
         assert_eq!(
             object.get("microcompactionWatermark"),
             Some(&Value::from(100_000_000))

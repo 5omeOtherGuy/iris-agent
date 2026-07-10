@@ -1444,8 +1444,12 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    after a model change. Auto-compaction redesign slice 0 (2026-07-10) extracts
    the Tier-2 engine state and worker pipeline, persists summary origin and
    reported worker usage, and adds the double-gated two-lane live-loop baseline
-   in `docs/benchmarks/auto-compaction-live-loop.md`; trigger behavior is
-   unchanged until slice 1.
+   in `docs/benchmarks/auto-compaction-live-loop.md`. Slice 1 (2026-07-10,
+   ADR-0054) replaces the absolute trigger with Mimir-resolved effective windows,
+   hybrid provider/local measurement, a warn/start/hard ladder, bounded hard
+   wait, deterministic fallback, and a model-backed failure breaker. `/context`
+   reports the measurement source, ladder, off state, and worker state. Mid-turn
+   governance remains the next behavior slice.
 7. Prebuilt-binary distribution ([#199](https://github.com/5omeOtherGuy/iris-agent/issues/199),
    [#233](https://github.com/5omeOtherGuy/iris-agent/issues/233)) is wired and now
    validated locally ([#252](https://github.com/5omeOtherGuy/iris-agent/issues/252)):

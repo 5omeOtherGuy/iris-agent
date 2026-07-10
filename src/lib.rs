@@ -492,9 +492,12 @@ fn run_agent_inner(
     // persistence, and the auto-compaction policy, wrapping the bare in-memory
     // agent. When the context token total exceeds the budget at a turn
     // boundary, the harness compacts before the provider request.
-    let budget = Some(settings.context_token_budget());
+    let (effective_window, compaction_trigger) =
+        resolved_compaction_trigger(&settings, &selection)?;
+    let budget = Some(effective_window);
     let mut harness =
         wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
+    harness.set_compaction_trigger(effective_window, compaction_trigger);
     // Post-change verification (issue #265): engaged only when a `verify` block
     // is present; the command runs under the unchanged approval gate.
     harness.set_verification(settings.verification());
@@ -537,6 +540,7 @@ fn run_agent_inner(
         settings.enabled_models.clone(),
     );
     switch_state.set_background_selection_cell(background_selection.clone());
+    switch_state.set_compaction_settings(settings.clone());
     let mut switch = Some(switch_state);
     let swap_cwd = cwd.clone();
     let swap = move |source: &cli::SessionSource| {
@@ -684,9 +688,12 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
         }
     };
     announce_skip_permissions(permission_defaults.skip_permissions, session.as_mut());
-    let budget = Some(settings.context_token_budget());
+    let (effective_window, compaction_trigger) =
+        resolved_compaction_trigger(&settings, &selection)?;
+    let budget = Some(effective_window);
     let mut harness =
         wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
+    harness.set_compaction_trigger(effective_window, compaction_trigger);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
     install_compaction_summarizer_factory(
@@ -796,6 +803,23 @@ fn install_compaction_summarizer_factory(
     }));
 }
 
+fn resolved_compaction_trigger(
+    settings: &config::Settings,
+    selection: &mimir::selection::ModelSelection,
+) -> Result<(u64, config::CompactionTriggerConfig)> {
+    let trigger = settings.compaction_trigger()?;
+    let resolved =
+        mimir::model_catalog::effective_context_window(selection, config::DEFAULT_SUMMARY_RESERVE)
+            .map(|window| window.effective);
+    let effective_window = match (settings.context_token_budget, resolved) {
+        (Some(legacy), Some(model)) => legacy.min(model),
+        (Some(legacy), None) => legacy,
+        (None, Some(model)) => model,
+        (None, None) => settings.context_token_budget(),
+    };
+    Ok((effective_window, trigger))
+}
+
 /// Resume an existing session by id: load its transcript from the store,
 /// reconstruct the provider-visible messages, seed the agent with them, and
 /// continue appending future turns to the same log. Errors clearly when the id
@@ -834,13 +858,15 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
         permission_defaults.approval_mode,
     );
 
-    let budget = Some(settings.context_token_budget());
     // Resume assembles instructions through the same harness-owned baukasten as
     // a fresh session, so a resumed turn gets identical fragment/context output.
     let tools = tools::built_in_tools_for(settings.bash_tool_mode());
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
+    let (effective_window, compaction_trigger) =
+        resolved_compaction_trigger(&settings, &selection)?;
+    let budget = Some(effective_window);
     let session_id = meta.id.clone();
     let background_selection = Arc::new(Mutex::new(selection.clone()));
     let background_session_id = Arc::new(Mutex::new(session_id.clone()));
@@ -871,6 +897,7 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
         entry_ids,
         budget,
     );
+    harness.set_compaction_trigger(effective_window, compaction_trigger);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
     install_compaction_summarizer_factory(
@@ -906,6 +933,7 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
         settings.enabled_models.clone(),
     );
     switch_state.set_background_selection_cell(background_selection.clone());
+    switch_state.set_compaction_settings(settings.clone());
     let mut switch = Some(switch_state);
     let swap_cwd = cwd.clone();
     let swap = move |source: &cli::SessionSource| {

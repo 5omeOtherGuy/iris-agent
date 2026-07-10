@@ -103,12 +103,13 @@
 - **Provider configuration** — `defaultProvider`, `defaultModel`, and `baseUrl`
   settings; supported provider ids are `openai-codex`, `anthropic`, and
   `antigravity`. Project-local settings may override only `defaultModel`,
-  `defaultReasoning`, `contextTokenBudget`, and `compactionSummarizer`; global
-  settings own provider, base-url, and model-cycle scope so a cloned repo
-  cannot redirect bearer tokens or silently change which provider a session
-  cycles to.
+  `defaultReasoning`, `contextTokenBudget`, `compactionSummarizer`, and the
+  project-safe fields of `compaction`; global settings own provider, base-url,
+  model-cycle scope, compaction worker model, and provider-native mode so a
+  cloned repo cannot redirect bearer tokens or silently change which provider
+  a session cycles to.
   OpenAI Codex additionally supports `IRIS_MODEL` and `IRIS_CODEX_BASE_URL` env
-  overrides. `contextTokenBudget` configures the auto-compaction threshold,
+  overrides. `contextTokenBudget` clamps the model-aware compaction window,
   `compactionSummarizer` picks who writes compaction summaries
   (`subagent`/`provider`/`excerpts`), `defaultReasoning` sets startup
   thinking/effort, and
@@ -290,10 +291,13 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 
 - **Durable compaction entries** — JSONL `compaction` entries replace covered
   message-id ranges with summary messages during read/resume rebuild. [Implemented]
-- **Auto-compaction** — when context estimates exceed `contextTokenBudget`, the
-  Wayland harness compacts at safe turn boundaries, retaining recent context and
-  preserving tool-call/result pairs. Branch-aware compaction is planned later.
-  [Implemented]
+- **Auto-compaction** — Mimir resolves the selected model's effective window;
+  Wayland combines provider usage with estimates for unseen messages and applies
+  a configurable warn/start/hard ladder at safe turn boundaries. Hard pressure
+  bounds worker wait and falls back to deterministic excerpts. An explicit
+  `contextTokenBudget` clamps the resolved window. Tool-call/result pairs remain
+  indivisible. Mid-turn governance and branch-aware compaction are planned.
+  (ADR-0054) [Partial]
 - **Background summaries** — the default `compactionSummarizer: subagent` uses
   a read-only worker and falls back through a direct provider request to
   deterministic bounded excerpts. The parent alone validates, persists, and
