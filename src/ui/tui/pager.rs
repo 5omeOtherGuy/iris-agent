@@ -41,8 +41,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 
 use super::screen::{Screen, filler_lines, render_editor_chrome, session_bar_lines};
-use super::wrap::pad_line_left;
-use super::{BOX_X_PADDING_U16, TEXT_COLUMN_X_PADDING, dim_style};
+use super::wrap::{display_width, pad_line_left, truncate_to_width};
+use super::{BOX_X_PADDING_U16, TEXT_COLUMN_X_PADDING, dim_style, panel_style};
 
 /// Iris-owned scrollback state for pager mode (ADR-0029).
 ///
@@ -514,10 +514,13 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     }
 }
 
-/// The pinned prompt band: the governing user prompt under the session bar. It
-/// starts collapsed to one dim disclosure row, and Ctrl+O expands it to the full
-/// prompt body on the same hanging columns as transcript user turns. The whole
-/// band is dim: it is a pinned reference, not the live turn.
+/// The pinned prompt band -- the governing user prompt (the "job card") under
+/// the session bar. Collapsed, it is one row: `▸ ` / `› ` chrome in muted bold,
+/// the prompt's opening line in body ink (`panel_style`), and a right-aligned dim
+/// `+N` counting the wrapped rows it hides. A click on the row or `o` (in pager
+/// mode) expands it to the full prompt body on the transcript's hanging columns,
+/// closed by the session bar's own muted rule. ctrl+o never routes here -- it
+/// toggles transcript folds.
 fn sticky_prompt_band(
     text: &str,
     width: u16,
@@ -541,29 +544,63 @@ fn sticky_prompt_band(
     }
 
     let dim = dim_style();
+    let ink = panel_style();
+    let chrome = dim.add_modifier(Modifier::BOLD);
     let arrow = if expanded {
         crate::ui::symbols::EXPANDED
     } else {
         crate::ui::symbols::COLLAPSED
     };
     let mut rows = Vec::new();
-    let mut first = Line::from(vec![
-        Span::styled(format!("{arrow} "), dim.add_modifier(Modifier::BOLD)),
-        Span::styled(
-            format!("{} ", crate::ui::symbols::USER),
-            dim.add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(wrapped[0].clone(), dim),
-    ]);
+
+    // First row: `▸ ` / `› ` chrome (muted bold) then the prompt's opening line in
+    // body ink (`panel_style`) -- the one legible piece of content in the top
+    // chrome, so the job card reads at a glance while its tones still read as
+    // chrome. Collapsed, a right-aligned dim `+N` reports how many wrapped rows
+    // stay hidden (the house `+N more` idiom, shortened); it is absent when the
+    // prompt fits one row.
+    let hidden = if expanded {
+        0
+    } else {
+        wrapped.len().saturating_sub(1)
+    };
+    let mut first_spans = vec![
+        Span::styled(format!("{arrow} "), chrome),
+        Span::styled(format!("{} ", crate::ui::symbols::USER), chrome),
+    ];
+    if hidden > 0 {
+        let marker = format!("+{hidden}");
+        let marker_width = display_width(&marker);
+        // Reserve the marker plus a one-cell gap on the right, then truncate the
+        // opening line with `…` so the ink text never collides with the dim `+N`.
+        let text_budget = text_measure.saturating_sub(marker_width + 1).max(1);
+        let mut opening = wrapped[0].clone();
+        if display_width(&opening) > text_budget {
+            opening = format!(
+                "{}\u{2026}",
+                truncate_to_width(&opening, text_budget.saturating_sub(1))
+            );
+        }
+        let filler = text_measure
+            .saturating_sub(display_width(&opening))
+            .saturating_sub(marker_width);
+        first_spans.push(Span::styled(opening, ink));
+        first_spans.push(Span::raw(" ".repeat(filler)));
+        first_spans.push(Span::styled(marker, dim));
+    } else {
+        first_spans.push(Span::styled(wrapped[0].clone(), ink));
+    }
+    let mut first = Line::from(first_spans);
     pad_line_left(&mut first, TEXT_COLUMN_X_PADDING);
     rows.push(first);
 
     if expanded {
         for part in wrapped.into_iter().skip(1) {
-            let mut line = Line::from(vec![Span::raw("    "), Span::styled(part, dim)]);
+            let mut line = Line::from(vec![Span::raw("    "), Span::styled(part, ink)]);
             pad_line_left(&mut line, TEXT_COLUMN_X_PADDING);
             rows.push(line);
         }
+        // The closing rule stays muted -- it is top chrome, not content.
         let mut rule = Line::from(Span::styled("─".repeat(rule_measure), dim));
         pad_line_left(&mut rule, inset);
         rows.push(rule);
@@ -1310,7 +1347,10 @@ mod tests {
             "collapsed band does not consume extra prompt rows: {:?}",
             rows[3]
         );
-        assert!(screen.toggle_sticky_prompt(), "ctrl+o target is available");
+        assert!(
+            screen.toggle_sticky_prompt(),
+            "band toggle target is available"
+        );
         let frame = compose_frame(&mut screen, size).lines;
         let rows = frame_rows(&frame, 80, 24);
         assert!(
@@ -1414,6 +1454,80 @@ mod tests {
             rows[3].contains("word word"),
             "expanded prompt reveals continuation rows: {:?}",
             rows[3]
+        );
+    }
+
+    #[test]
+    fn collapsed_band_paints_ink_text_and_a_muted_plus_n_marker() {
+        // A prompt long enough to wrap hides rows when collapsed: the opening
+        // line renders in body ink, the chrome stays muted-bold, and a dim
+        // right-aligned `+N` reports the hidden rows (job-card honesty).
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        let long = "word ".repeat(120);
+        screen.commit_user(long.trim());
+        for i in 0..80 {
+            screen.apply(UiEvent::Notice(format!("detail {i}")));
+        }
+        let size = Size::new(72, 24);
+        let frame = compose_frame(&mut screen, size).lines;
+        let band = &frame[2];
+
+        // The opening line is body ink (`panel_style`), not dim.
+        assert!(
+            band.spans
+                .iter()
+                .any(|s| s.style == panel_style() && s.content.contains("word")),
+            "the prompt's opening line is body ink: {:?}",
+            band.spans
+        );
+        // The disclosure + user chrome stays muted bold.
+        assert!(
+            band.spans.iter().any(|s| s.content.contains('\u{25b8}')
+                && s.style == dim_style().add_modifier(Modifier::BOLD)),
+            "the disclosure arrow is muted-bold chrome: {:?}",
+            band.spans
+        );
+        // A right-aligned dim `+N` marker counts the hidden rows.
+        let marker = band
+            .spans
+            .iter()
+            .find(|s| s.content.starts_with('+'))
+            .expect("a +N marker span when rows are hidden");
+        assert_eq!(marker.style, dim_style(), "the +N marker is dim/muted");
+        let n: usize = marker.content[1..].parse().expect("+N is a count");
+        assert!(n > 0, "the marker reports a positive hidden-row count");
+        // The truncated opening carries an ellipsis so ink never touches `+N`.
+        let text = frame_rows(&frame, 72, 24)[2].clone();
+        assert!(
+            text.contains('\u{2026}') && text.trim_end().ends_with(marker.content.as_ref()),
+            "collapsed row is `…` text then a right-aligned `+N`: {text:?}"
+        );
+    }
+
+    #[test]
+    fn collapsed_band_omits_the_marker_when_the_prompt_fits_one_row() {
+        // A prompt that fits a single row hides nothing: no `+N`, ink text.
+        let mut screen = footer_screen();
+        screen.pager_active = true;
+        screen.commit_user("a short governing prompt");
+        for i in 0..40 {
+            screen.apply(UiEvent::Notice(format!("detail {i}")));
+        }
+        let size = Size::new(80, 24);
+        let frame = compose_frame(&mut screen, size).lines;
+        let band = &frame[2];
+        assert!(
+            band.spans.iter().all(|s| !s.content.starts_with('+')),
+            "no marker when the prompt fits one row: {:?}",
+            band.spans
+        );
+        assert!(
+            band.spans
+                .iter()
+                .any(|s| s.style == panel_style() && s.content.contains("short governing prompt")),
+            "the whole prompt renders in body ink: {:?}",
+            band.spans
         );
     }
 
