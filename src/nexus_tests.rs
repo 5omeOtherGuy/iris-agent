@@ -7903,6 +7903,9 @@ struct FakeGuard {
     protected: Vec<PathBuf>,
     approved: RefCell<Vec<PathBuf>>,
     all_dirty: Cell<bool>,
+    /// Returned (once) from the next `after_exec`, to drive the loop's
+    /// violation-halt path without a real repo.
+    violation: RefCell<Option<GuardViolation>>,
 }
 
 impl FakeGuard {
@@ -7911,6 +7914,7 @@ impl FakeGuard {
             protected: Vec::new(),
             approved: RefCell::new(Vec::new()),
             all_dirty: Cell::new(false),
+            violation: RefCell::new(None),
         }
     }
     fn protecting(paths: Vec<PathBuf>) -> Self {
@@ -7918,7 +7922,18 @@ impl FakeGuard {
             protected: paths,
             approved: RefCell::new(Vec::new()),
             all_dirty: Cell::new(false),
+            violation: RefCell::new(None),
         }
+    }
+    /// A guard that halts the next call with a reason-only violation (no named
+    /// files), mirroring an external jj operation (issue #560).
+    fn halting(reason: &str) -> Self {
+        let guard = Self::none();
+        *guard.violation.borrow_mut() = Some(GuardViolation {
+            paths: Vec::new(),
+            reason: Some(reason.to_string()),
+        });
+        guard
     }
 }
 
@@ -7944,8 +7959,8 @@ impl MutationGuard for FakeGuard {
         self.approved.borrow_mut().extend_from_slice(paths);
     }
     fn before_exec(&self, _paths: &[PathBuf]) {}
-    fn after_exec(&self, _approved: &[PathBuf], _expected: Option<&str>) -> Vec<PathBuf> {
-        Vec::new()
+    fn after_exec(&self, _approved: &[PathBuf], _expected: Option<&str>) -> GuardViolation {
+        self.violation.borrow_mut().take().unwrap_or_default()
     }
     fn restore(&self, _paths: &[PathBuf]) -> Result<()> {
         Ok(())
@@ -8019,6 +8034,57 @@ fn denied_count(frontend: &RecordingFrontend) -> usize {
         .iter()
         .filter(|e| matches!(e, AgentEvent::ToolDenied(_)))
         .count()
+}
+
+// A reason-only guard halt (no named files, e.g. an external jj operation,
+// issue #560) fails the call with the reason and never claims a snapshot
+// restore that did not happen.
+#[test]
+fn reason_only_guard_halt_reports_reason_without_restore_claim() -> Result<()> {
+    let workspace = test_workspace()?;
+    let provider = FakeProvider::new(write_turn("out.txt", "new\n"));
+    let mut agent = Agent::new(provider, crate::tools::built_in_tools());
+    agent.set_approval_mode(ApprovalMode::Auto);
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
+    let guard = FakeGuard::halting("the working copy changed via a jj operation outside Iris");
+
+    run_preset_turn(
+        &mut agent,
+        "write it",
+        &workspace.path,
+        Some(&guard),
+        &frontend,
+    )?;
+
+    let events = frontend.events.borrow();
+    let error = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolError { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("a guard-halted call surfaces a tool error");
+    assert!(
+        error.contains("halted: the working copy changed via a jj operation outside Iris"),
+        "the halt names its cause: {error}"
+    );
+    assert!(
+        !error.contains("restored from snapshot") && !error.contains("file(s): ;"),
+        "a reason-only halt must not claim a restore or show an empty file list: {error}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::MutationViolation { .. })),
+        "no file-level violation event without named paths"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Notice(notice) if notice.contains("halted:"))),
+        "the halt is surfaced to the user as a notice"
+    );
+    Ok(())
 }
 
 #[test]

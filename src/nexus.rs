@@ -964,11 +964,36 @@ pub(crate) trait MutationGuard {
     /// change is ambiguous and, per ADR-0028's TOCTOU rule, treated as a
     /// user-attributed violation. Any *other* protected file that changed is
     /// likewise a violation for the loop to halt and offer restore.
-    fn after_exec(&self, approved: &[PathBuf], expected_after: Option<&str>) -> Vec<PathBuf>;
+    fn after_exec(&self, approved: &[PathBuf], expected_after: Option<&str>) -> GuardViolation;
 
     /// Restore the given protected files from the pre-exec snapshot. Best-effort
     /// recovery invoked by the loop after a detected violation.
     fn restore(&self, paths: &[PathBuf]) -> Result<()>;
+}
+
+/// Outcome of [`MutationGuard::after_exec`]: what, if anything, the guard found
+/// wrong after a mutating call (issues #262, #560).
+#[derive(Debug, Default)]
+pub(crate) struct GuardViolation {
+    /// Protected files that changed out-of-band, restorable from the pre-exec
+    /// snapshot via [`MutationGuard::restore`].
+    pub(crate) paths: Vec<PathBuf>,
+    /// A halt the guard cannot attribute to named files: the working copy
+    /// changed underneath it (e.g. an external jj operation) or its own
+    /// post-call re-check failed. The loop fails the call with this reason;
+    /// there is nothing file-level to restore beyond `paths`.
+    pub(crate) reason: Option<String>,
+}
+
+impl GuardViolation {
+    /// No violation: the call's changes are all accounted for.
+    pub(crate) fn clean() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.paths.is_empty() && self.reason.is_none()
+    }
 }
 
 /// Structured result of a successful tool call: the model-facing text plus
@@ -2767,10 +2792,15 @@ impl<P: ChatProvider> Agent<P> {
                             .map(str::to_owned),
                         _ => None,
                     };
-                    let violations = guard.after_exec(&mutated_paths, expected_after.as_deref());
-                    if !violations.is_empty() {
-                        let restored = guard.restore(&violations).is_ok();
-                        let paths: Vec<String> = violations
+                    let violation = guard.after_exec(&mutated_paths, expected_after.as_deref());
+                    if !violation.is_empty() {
+                        // Restore only named file violations; a reason-only halt
+                        // (e.g. an external jj operation) has nothing to restore,
+                        // and must not claim it restored anything (issue #560).
+                        let restored =
+                            !violation.paths.is_empty() && guard.restore(&violation.paths).is_ok();
+                        let paths: Vec<String> = violation
+                            .paths
                             .iter()
                             .map(|path| {
                                 path.strip_prefix(env.workspace)
@@ -2779,20 +2809,30 @@ impl<P: ChatProvider> Agent<P> {
                                     .to_string()
                             })
                             .collect();
-                        obs.on_event(AgentEvent::MutationViolation {
-                            call: call.clone(),
-                            paths: paths.clone(),
-                            restored,
-                        })?;
-                        let recovery = if restored {
+                        let what = match &violation.reason {
+                            Some(reason) => reason.clone(),
+                            None => format!(
+                                "modified protected uncommitted file(s): {}",
+                                paths.join(", ")
+                            ),
+                        };
+                        let recovery = if violation.paths.is_empty() {
+                            ""
+                        } else if restored {
                             "; restored from snapshot"
                         } else {
                             "; snapshot restore failed"
                         };
-                        ToolOutcome::Err(anyhow::anyhow!(
-                            "halted: modified protected uncommitted file(s): {}{recovery}",
-                            paths.join(", ")
-                        ))
+                        if violation.paths.is_empty() {
+                            obs.on_event(AgentEvent::Notice(format!("halted: {what}")))?;
+                        } else {
+                            obs.on_event(AgentEvent::MutationViolation {
+                                call: call.clone(),
+                                paths: paths.clone(),
+                                restored,
+                            })?;
+                        }
+                        ToolOutcome::Err(anyhow::anyhow!("halted: {what}{recovery}"))
                     } else {
                         outcome
                     }
