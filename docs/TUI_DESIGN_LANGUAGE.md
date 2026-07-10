@@ -721,10 +721,13 @@ Height caps at 16 rows or ⅓ of the pane.
 - **Directory tree**: breadcrumb (parents dim, clickable re-root up), 2-cell
   indent per level, `▾`/`▸` disclosure on dirs — no box-drawing tree guides.
   Attribution metas from the task partition: `◇ iris` dim, `± yours` orange,
-  `◉ open` for the composer-referenced file. `↵` on a file inserts
-  `@<relative-path>` into the composer; `/` filters flat (parent path as dim
-  meta). Data: `git ls-files --cached --others --exclude-standard`, plain
-  readdir outside a repo; 500 visible rows, then a dim `… N more` row.
+  `◉ open` for the composer-referenced file. A **collapsed** directory carries
+  the §9.1 state cluster as a rollup (`±N ◇M`) over the files beneath it, with
+  the file count as the muted tail; the count drops before the state at width.
+  `↵` on a file inserts `@<relative-path>` into the composer; `/` filters flat
+  (parent path as dim meta). Data: `git ls-files --cached --others
+  --exclude-standard`, plain readdir outside a repo; 500 visible rows, then a
+  dim `… N more` row.
 - These are **disclosures, not sidebars**: invariant #1 stands — nothing
   persistent, nothing beside the transcript.
 

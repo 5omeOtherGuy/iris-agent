@@ -6,6 +6,7 @@
 //! inserts `@<relative-path> ` into the composer; `↵` on a dir toggles it.
 //! No box-drawing tree guides — indent + `▾`/`▸` carry the structure.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -57,8 +58,10 @@ pub(crate) struct TreeMenu {
     cwd: PathBuf,
     /// Repo file list relative to `root` (`None` = non-repo readdir mode).
     files: Option<Vec<String>>,
-    /// Directory listing cache (key = dir rel path, `""` = root).
-    children: BTreeMap<String, Vec<Entry>>,
+    /// Directory listing cache (key = dir rel path, `""` = root). Behind a
+    /// `RefCell` so the read-only render path can fill it in place — the tree
+    /// is never cloned per frame to obtain `&mut` for the cache.
+    children: RefCell<BTreeMap<String, Vec<Entry>>>,
     expanded: BTreeSet<String>,
     selected: usize,
     mode: Mode,
@@ -72,7 +75,7 @@ impl TreeMenu {
             root: cwd.clone(),
             cwd,
             files: None,
-            children: BTreeMap::new(),
+            children: RefCell::new(BTreeMap::new()),
             expanded: BTreeSet::new(),
             selected: 0,
             mode: if filter {
@@ -95,7 +98,7 @@ impl TreeMenu {
 
     /// (Re)load the file list for the current root.
     fn reload(&mut self) {
-        self.children.clear();
+        self.children.get_mut().clear();
         self.expanded.clear();
         self.selected = 0;
         self.files = git::is_git_worktree(&self.root)
@@ -134,9 +137,10 @@ impl TreeMenu {
     }
 
     /// Immediate children of `dir` (rel path, `""` = root), dirs first then
-    /// files, both alphabetical. Cached.
-    fn children_of(&mut self, dir: &str) -> Vec<Entry> {
-        if let Some(cached) = self.children.get(dir) {
+    /// files, both alphabetical. Cached through the `RefCell` so rendering can
+    /// fill the cache without a `&mut` borrow of the tree.
+    fn children_of(&self, dir: &str) -> Vec<Entry> {
+        if let Some(cached) = self.children.borrow().get(dir) {
             return cached.clone();
         }
         let entries: Vec<Entry> = match &self.files {
@@ -223,7 +227,9 @@ impl TreeMenu {
                 dirs.into_iter().chain(plain).collect()
             }
         };
-        self.children.insert(dir.to_string(), entries.clone());
+        self.children
+            .borrow_mut()
+            .insert(dir.to_string(), entries.clone());
         entries
     }
 
@@ -234,14 +240,15 @@ impl TreeMenu {
         Some(files.iter().filter(|f| f.starts_with(&prefix)).count())
     }
 
-    /// Build the visible rows for the current expansion state (capped).
-    fn visible_rows(&mut self) -> (Vec<VisRow>, usize) {
+    /// Build the visible rows for the current expansion state (capped). Takes
+    /// `&self`: the listing cache lives behind a `RefCell`, so the render path
+    /// walks the tree without cloning it for a `&mut` borrow.
+    fn visible_rows(&self) -> (Vec<VisRow>, usize) {
         let mut rows = Vec::new();
         let mut overflow = 0usize;
-        let mut stack: Vec<(String, usize)> = vec![(String::new(), 0)];
         // Depth-first walk of expanded dirs.
         fn walk(
-            menu: &mut TreeMenu,
+            menu: &TreeMenu,
             dir: &str,
             depth: usize,
             rows: &mut Vec<VisRow>,
@@ -262,8 +269,7 @@ impl TreeMenu {
                 }
             }
         }
-        let (root, depth) = stack.pop().expect("root frame");
-        walk(self, &root, depth, &mut rows, &mut overflow);
+        walk(self, "", 0, &mut rows, &mut overflow);
         (rows, overflow)
     }
 
@@ -587,21 +593,12 @@ impl TreeMenu {
         git: Option<&GitStatus>,
         referenced: &[String],
     ) -> Vec<Line<'static>> {
-        // `visible_rows` needs `&mut` for the listing cache; clone the state
-        // cheaply instead of threading interior mutability through render.
-        let mut walker = TreeMenu {
-            root: self.root.clone(),
-            cwd: self.cwd.clone(),
-            files: self.files.clone(),
-            children: self.children.clone(),
-            expanded: self.expanded.clone(),
-            selected: self.selected,
-            mode: self.mode.clone(),
-        };
+        // The listing cache is interior-mutable (`RefCell`), so rendering
+        // borrows the tree and fills the cache in place — no per-frame clone.
         let mut lines = vec![self.breadcrumb(width)];
         match &self.mode {
             Mode::Browse => {
-                let (rows, overflow) = walker.visible_rows();
+                let (rows, overflow) = self.visible_rows();
                 for (index, row) in rows.iter().enumerate() {
                     lines.push(self.tree_row(
                         row,
@@ -612,8 +609,10 @@ impl TreeMenu {
                     ));
                 }
                 if overflow > 0 {
+                    // Mirror the git console's SWITCH overflow affordance: the
+                    // cap row names the way to reach the elided rows.
                     lines.push(Line::from(Span::styled(
-                        format!("   … {overflow} more"),
+                        format!("   … {overflow} more · / to filter"),
                         dim_style(),
                     )));
                 }
@@ -720,7 +719,8 @@ impl TreeMenu {
         if let Some(count) = count {
             let state_w: usize = meta.iter().map(|s| super::display_width(&s.content)).sum();
             let count_w = super::display_width(&count.content);
-            if label_w + state_w + count_w + 1 <= width {
+            // `<` (not `<=`) reserves the 1-col gap between label and meta.
+            if label_w + state_w + count_w < width {
                 meta.push(count);
             }
         }
@@ -758,7 +758,7 @@ mod tests {
             root: PathBuf::from("/repo"),
             cwd: PathBuf::from("/repo"),
             files: Some(files.iter().map(|f| f.to_string()).collect()),
-            children: BTreeMap::new(),
+            children: RefCell::new(BTreeMap::new()),
             expanded: BTreeSet::new(),
             selected: 0,
             mode: Mode::Browse,
@@ -777,7 +777,7 @@ mod tests {
 
     #[test]
     fn root_listing_sorts_dirs_first_then_files() {
-        let mut t = tree(FILES);
+        let t = tree(FILES);
         let (rows, overflow) = t.visible_rows();
         assert_eq!(overflow, 0);
         let names: Vec<&str> = rows.iter().map(|r| r.entry.name.as_str()).collect();
@@ -871,7 +871,7 @@ mod tests {
                 "repo/Cargo.toml".to_string(),
                 "other/README.md".to_string(),
             ]),
-            children: BTreeMap::new(),
+            children: RefCell::new(BTreeMap::new()),
             expanded: BTreeSet::new(),
             selected: 0,
             mode: Mode::Browse,
@@ -886,10 +886,19 @@ mod tests {
         };
         let text =
             lines_text(&t.render_lines(60, 20, false, Some(&status), &["Cargo.toml".to_string()]));
-        assert!(text.contains("± yours"), "dirty file keeps its marker: {text}");
-        assert!(text.contains("◉ open"), "referenced file keeps its marker: {text}");
+        assert!(
+            text.contains("± yours"),
+            "dirty file keeps its marker: {text}"
+        );
+        assert!(
+            text.contains("◉ open"),
+            "referenced file keeps its marker: {text}"
+        );
         // A row outside the cwd subtree degrades to no marker, not a panic.
-        assert!(text.contains("other/"), "out-of-cwd row still renders: {text}");
+        assert!(
+            text.contains("other/"),
+            "out-of-cwd row still renders: {text}"
+        );
     }
 
     const ROLLUP_FILES: &[&str] = &[
@@ -934,7 +943,10 @@ mod tests {
         let lines = t.render_lines(60, 20, false, Some(&status), &[]);
         let docs = row_text(&lines, "docs/");
         assert!(docs.contains("2 files"), "{docs:?}");
-        assert!(!docs.contains('±') && !docs.contains('◇'), "no state glyphs: {docs:?}");
+        assert!(
+            !docs.contains('±') && !docs.contains('◇'),
+            "no state glyphs: {docs:?}"
+        );
     }
 
     #[test]
@@ -947,7 +959,10 @@ mod tests {
         // The expanded dir row carries neither state nor inventory; its
         // children speak for themselves.
         assert!(!src.contains("files"), "no count on expanded dir: {src:?}");
-        assert!(!src.contains("±2"), "no state rollup on expanded dir: {src:?}");
+        assert!(
+            !src.contains("±2"),
+            "no state rollup on expanded dir: {src:?}"
+        );
     }
 
     #[test]
@@ -970,7 +985,10 @@ mod tests {
         let status = rollup_status();
         let lines = t.render_lines(60, 20, true, Some(&status), &[]);
         // The orange `±N` half is recolored to muted like every readout row.
-        let dirty = lines.iter().flat_map(|l| &l.spans).find(|s| s.content.starts_with('±'));
+        let dirty = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| s.content.starts_with('±'));
         let dirty = dirty.expect("rollup ± span present");
         assert_eq!(
             dirty.style.fg,
@@ -1002,12 +1020,28 @@ mod tests {
     fn visible_rows_cap_at_500_with_overflow_row() {
         let files: Vec<String> = (0..600).map(|i| format!("f{i:04}.txt")).collect();
         let refs: Vec<&str> = files.iter().map(String::as_str).collect();
-        let mut t = tree(&refs);
+        let t = tree(&refs);
         let (rows, overflow) = t.visible_rows();
         assert_eq!(rows.len(), 500);
         assert_eq!(overflow, 100);
         let text = lines_text(&t.render_lines(40, 1000, false, None, &[]));
         assert!(text.contains("… 100 more"), "{text}");
+        // The cap row carries the filter affordance (spec 1.5).
+        assert!(text.contains("… 100 more · / to filter"), "{text}");
+    }
+
+    #[test]
+    fn render_fills_the_shared_cache_without_cloning() {
+        // The render path is `&self`: it borrows the tree and fills the
+        // interior-mutable listing cache in place. A per-frame clone would
+        // discard the populated cache, leaving this tree's own cache empty.
+        let t = tree(FILES);
+        assert!(t.children.borrow().is_empty(), "cache starts empty");
+        let _ = t.render_lines(60, 16, false, None, &[]);
+        assert!(
+            t.children.borrow().contains_key(""),
+            "render populated the tree's own cache — no throwaway clone"
+        );
     }
 
     #[test]
