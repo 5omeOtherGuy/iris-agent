@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.1.0...iris-agent-v0.2.0) - 2026-07-10
 
+### Highlights
+
+- **The TUI instrument identity**
+  ([#522](https://github.com/5omeOtherGuy/iris-agent/pull/522)) — a power-on
+  lamp test and `I R I S` silkscreen at boot; detent flashes when a setting
+  clicks into place; an exit receipt; the `/settings` faceplate — switches,
+  dials, registers, and ports on one silkscreened panel where position is
+  state and every click saves; escapement-governed streaming that tracks the
+  model's cadence like a hand at the keys; and a living thought rail with a
+  working lamp, live elapsed time, and honest `+N rows` elision.
+- **Updates you can trust**
+  ([#529](https://github.com/5omeOtherGuy/iris-agent/pull/529),
+  [#531](https://github.com/5omeOtherGuy/iris-agent/pull/531)) — `iris update`
+  installs tagged stable releases only (never `main`, never a prerelease,
+  never a downgrade), verifies SHA-256 before replacing anything, and — like
+  `install.sh` — reports in the instrument voice.
+- **Governed context**
+  ([#518](https://github.com/5omeOtherGuy/iris-agent/pull/518),
+  [#523](https://github.com/5omeOtherGuy/iris-agent/pull/523)–[#527](https://github.com/5omeOtherGuy/iris-agent/pull/527),
+  [#530](https://github.com/5omeOtherGuy/iris-agent/pull/530)) — transcript
+  compaction workers, a model-aware trigger, configurable tool-result
+  compaction, context governed between provider round trips, and reactive
+  overflow recovery.
+
 ### Added
 
 - first-class install and update experience ([#531](https://github.com/5omeOtherGuy/iris-agent/pull/531))
@@ -32,10 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve persisted reasoning effort ([#519](https://github.com/5omeOtherGuy/iris-agent/pull/519))
 - address licenser-reported tui settings ([#516](https://github.com/5omeOtherGuy/iris-agent/pull/516))
 - avoid no-op thinking disclosure
-- install zig toolchain for release cross-build ([#510](https://github.com/5omeOtherGuy/iris-agent/pull/510))
 - apply subagent summarizer to all compaction ([#507](https://github.com/5omeOtherGuy/iris-agent/pull/507))
 - prefer completed Codex reasoning summaries ([#506](https://github.com/5omeOtherGuy/iris-agent/pull/506))
-- install cargo-zigbuild in release workflow ([#504](https://github.com/5omeOtherGuy/iris-agent/pull/504))
 
 ## [0.1.0](https://github.com/5omeOtherGuy/iris-agent/releases/tag/v0.1.0) - 2026-07-09
 
