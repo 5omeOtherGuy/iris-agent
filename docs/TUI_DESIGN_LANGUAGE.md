@@ -352,10 +352,25 @@ itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
      bar (§7.7): instant attack, quantized release (4 quanta per tick), and a
      peak tick that holds five ticks then decays one quantum per tick. Live
      only while the stream is — it exists only on the running indicator's
-     line, resets with the turn, and vanishes with it.
+     line, resets with the turn, and vanishes with it;
+  6. the **escapement** — the live streaming tails (the assistant active tail
+     and the reasoning stream, §7.4) advance in **word-quantized steps** on the
+     same tick grid, never in raw network bursts: a tiny bounded buffer
+     releases one word-quantum per beat (baseline `max(ceil(pending/2), 24)`
+     bytes extended to the next word boundary; CJK/no-boundary text falls back
+     to the char-snapped byte quantum), so display lag is backlog-proportional
+     and bounded at **≤ ~2 beats (~300 ms)**. It **flushes instantly** on
+     stream end, provider turn completion/cancel/error, an approval gate
+     opening, session reset, and entering reduced motion — the machine never
+     withholds against a decision. The committed-line pipeline (collector →
+     holdback → paced commit) is fed from the same drained output as the tail,
+     so pacing changes *when* a word shows, never *what* the finished message
+     says.
   No braille spinners, no rainbow meters, no easing, no fades, no ambient
   motion. Everything above degrades to its **static settled state** under
-  `prefers-reduced-motion: reduce` / `IRIS_REDUCED_MOTION`.
+  `prefers-reduced-motion: reduce` / `IRIS_REDUCED_MOTION` — for the
+  escapement, reduced motion is a **pass-through**: streamed text renders on
+  arrival, the raw truth.
 - **Interaction states are quiet.** Hover/selected rows in overlays use the
   `surface` fill — never a colored left-border accent. Focus is the cyan
   interactive role. State changes are reported by the symbol vocabulary, not by
@@ -422,9 +437,11 @@ grid, and the readout is never inset further than a tool's elapsed. Only the
 muted label tone and the `┊` body rail (at col 4, its text hanging at col 6) mark
 it as recessive. Folds by default (progressive disclosure); `ctrl+o` / header
 toggles `▾`⇄`▸`. Live reasoning pulses (`●` in the label, `▋` caret at the tail);
-finished reasoning may collapse to a line + token count. Short reasoning is shown
-whole and is not foldable (the arrow drops, but the gutter stays so the label
-holds its column).
+live reasoning text feeds through the escapement (§6 motion 6), so the caret
+steps evenly in word-quanta on the tick grid instead of jumping on network
+bursts. Finished reasoning may collapse to a line + token count. Short reasoning
+is shown whole and is not foldable (the arrow drops, but the gutter stays so the
+label holds its column).
 
 ### 7.5 Plan list
 The agent's task checklist. **Unboxed** (narration, not a tool event): a muted
