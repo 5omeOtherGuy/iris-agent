@@ -27,12 +27,12 @@ use crate::mimir::providers::anthropic_messages::AnthropicProvider;
 use crate::mimir::retry::RetryPolicy;
 use crate::mimir::selection::{CodexTransport, ContextManagement, PromptCacheRetention};
 use crate::session::{SessionLog, SessionStore};
-use crate::tools::ToolState;
+use crate::tools::{ToolState, built_in_tools};
 use crate::wayland::{Harness, SummarizerKind};
 use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
 /// A Claude Code subscription model id (see `anthropic_models.rs`).
@@ -137,6 +137,87 @@ impl ApprovalGate for NoToolGate {
     }
 }
 
+/// Allows calls against a read-only registry. The LVP advertises no mutating
+/// tools, so this gate is reached only for real repository reads.
+struct ReadOnlyGate;
+
+impl ApprovalGate for ReadOnlyGate {
+    fn review<'a>(
+        &'a self,
+        _call: &'a ToolCall,
+        _allow_always: bool,
+        _allow_project: bool,
+        _ctx: ReviewContext,
+    ) -> ApprovalFuture<'a> {
+        Box::pin(async { Ok(ApprovalDecision::Allow) })
+    }
+}
+
+#[derive(Clone)]
+struct TimedEvent {
+    at: Instant,
+    event: AgentEvent,
+}
+
+#[derive(Default)]
+struct LiveLoopObserver {
+    events: Mutex<Vec<TimedEvent>>,
+}
+
+impl AgentObserver for LiveLoopObserver {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        self.events
+            .lock()
+            .expect("live events lock")
+            .push(TimedEvent {
+                at: Instant::now(),
+                event,
+            });
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LiveLoopLane {
+    AnthropicHaiku,
+    CodexMini,
+}
+
+impl LiveLoopLane {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AnthropicHaiku => "anthropic/claude-haiku-4-5",
+            Self::CodexMini => "openai-codex/gpt-5.4-mini",
+        }
+    }
+
+    fn build_provider(self, cache_key: &str) -> Result<Box<dyn ChatProvider>> {
+        match self {
+            Self::AnthropicHaiku => Ok(Box::new(AnthropicProvider::new(
+                "claude-haiku-4-5",
+                "https://api.anthropic.com",
+                None,
+                LIVE_SYSTEM_PROMPT,
+                PromptCacheRetention::DEFAULT,
+                ContextManagement::default(),
+                RetryPolicy::default(),
+            )?)),
+            Self::CodexMini => Ok(Box::new(
+                crate::mimir::providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
+                    "gpt-5.4-mini",
+                    "https://chatgpt.com/backend-api",
+                    None,
+                    LIVE_SYSTEM_PROMPT,
+                    cache_key,
+                    PromptCacheRetention::DEFAULT,
+                    RetryPolicy::default(),
+                    CodexTransport::Auto,
+                )?,
+            )),
+        }
+    }
+}
+
 /// A no-op observer: the live harness reads usage from the recording provider,
 /// not from events.
 struct NoopObserver;
@@ -176,6 +257,299 @@ fn live_seed() -> Vec<Message> {
         seed.push(Message::assistant("ok"));
     }
     seed
+}
+
+const AUTO_LIVE_BUDGET: u64 = 8_000;
+const AUTO_LIVE_CARRY_HEADER: &str = "[files touched or read in the compacted range]";
+
+fn auto_live_seed(session: usize, workspace: &std::path::Path) -> Result<Vec<Message>> {
+    let needle = format!("NEEDLE-{session:02x}7f3a9: the flag is --enable-zeta");
+    let cargo = std::fs::read_to_string(workspace.join("Cargo.toml"))?;
+    let call_id = format!("auto-live-seed-read-{session}");
+    let mut seed = vec![
+        Message::user(&format!(
+            "Remember this exact project fact for later: {needle}. We are auditing auto-compaction."
+        )),
+        Message::assistant_tool_call(&ToolCall {
+            id: call_id.clone(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({ "path": "Cargo.toml" }),
+            thought_signature: None,
+        }),
+        Message::tool_result(
+            &call_id,
+            "read",
+            &serde_json::json!({
+                "ok": true,
+                "content": cargo,
+                "metadata": { "target": "Cargo.toml" },
+            })
+            .to_string(),
+        ),
+        Message::assistant("The needle and manifest are recorded."),
+    ];
+    for turn in 0..12 {
+        seed.push(Message::user(&format!(
+            "Seed filler {turn}: {}",
+            "Auto-compaction must preserve durable ranges, tool pairs, recall markers, and exact resume reconstruction. "
+                .repeat(18)
+        )));
+        seed.push(Message::assistant(
+            "Acknowledged. The constraints remain part of the session state.",
+        ));
+    }
+    Ok(seed)
+}
+
+fn context_bytes(messages: &[Message]) -> Vec<u8> {
+    serde_json::to_vec(messages).expect("messages serialize")
+}
+
+fn auto_live_session_count() -> usize {
+    std::env::var("IRIS_AUTO_COMPACTION_SESSIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(10)
+}
+
+fn compaction_json_entries(path: &std::path::Path) -> Result<Vec<serde_json::Value>> {
+    Ok(std::fs::read_to_string(path)?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
+        .collect())
+}
+
+fn live_loop_enabled(test_name: &str) -> bool {
+    if std::env::var("IRIS_BENCH_LIVE").ok().as_deref() != Some("1") {
+        eprintln!("{test_name}: skipped (set IRIS_BENCH_LIVE=1 to run)");
+        return false;
+    }
+    true
+}
+
+/// Repeated live auto-compaction protocol. Every row is one scripted session;
+/// errors are printed verbatim and excluded rather than converted into made-up
+/// metrics. Slice 0 reports G1 as `baseline-n/a` because no hard tier exists
+/// yet; slice 3 activates the non-blocking assertion.
+fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    println!(
+        "\n== LIVE auto-compaction loop ==\nlane={} sessions={} budget={} tokens",
+        lane.label(),
+        session_count,
+        AUTO_LIVE_BUDGET
+    );
+    println!(
+        "lane | session | compactions | G1 blocked | G2 max-after/under-budget | G3 needle/marker/carry | G4 exact | G5 metadata | real read | error"
+    );
+
+    for session in 0..session_count {
+        let result = run_auto_compaction_live_session(lane, session, &workspace);
+        match result {
+            Ok(row) => println!(
+                "{} | {session:02} | {} | baseline-n/a | {}/{} | {}/{}/{} | {} | {} | {} | -",
+                lane.label(),
+                row.compactions,
+                row.max_context_after_apply,
+                row.context_effective,
+                row.needle_answered,
+                row.recall_marker,
+                row.carry_block,
+                row.resume_exact,
+                row.measured_entries,
+                row.real_read,
+            ),
+            Err(error) => println!(
+                "{} | {session:02} | excluded | baseline-n/a | -/- | -/-/- | - | - | - | {error:#}",
+                lane.label()
+            ),
+        }
+    }
+}
+
+struct AutoLiveRow {
+    compactions: usize,
+    max_context_after_apply: u64,
+    context_effective: bool,
+    needle_answered: bool,
+    recall_marker: bool,
+    carry_block: bool,
+    resume_exact: bool,
+    measured_entries: bool,
+    real_read: bool,
+}
+
+fn run_auto_compaction_live_session(
+    lane: LiveLoopLane,
+    session: usize,
+    workspace: &std::path::Path,
+) -> Result<AutoLiveRow> {
+    let root = TempDir::new(&format!("auto-loop-{session}"));
+    let mut log = SessionLog::create_in(&root.path, workspace)?;
+    for message in auto_live_seed(session, workspace)? {
+        log.append(&message)?;
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()?
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .ok_or_else(|| anyhow::anyhow!("seeded session was not listed"))?;
+    let stored = store.open(&meta)?;
+    let entry_ids = stored.entry_ids.clone();
+    let log = SessionLog::resume(&path)?;
+
+    let parent_key = format!("iris-auto-loop-{}-{session}-parent", lane.label());
+    let provider = lane.build_provider(&parent_key)?;
+    let agent = Agent::resumed(provider, built_in_tools().into_read_only(), stored.messages);
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.to_path_buf(),
+        ToolState::new(),
+        Some(log),
+        entry_ids,
+        Some(AUTO_LIVE_BUDGET),
+    );
+    harness.set_summarizer(SummarizerKind::Subagent);
+    let worker_lane = lane;
+    let worker_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    harness.set_compaction_summarizer_factory(Arc::new(move || {
+        let seq = worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        worker_lane.build_provider(&format!(
+            "iris-auto-loop-{}-{session}-worker-{seq}",
+            worker_lane.label()
+        ))
+    }));
+
+    let observer = LiveLoopObserver::default();
+    let gate = ReadOnlyGate;
+    let token = CancellationToken::new();
+    let mut turn_timeline = Vec::new();
+    for turn in 0..10 {
+        let prompt = format!(
+            "Use the read tool on Cargo.toml, then reply in at most two short sentences. Turn {turn}. {}",
+            "Keep this filler distinct so the real provider context grows toward the next compaction boundary. "
+                .repeat(12)
+        );
+        let started = Instant::now();
+        block_on(harness.submit_turn(&prompt, &observer, &gate, &token))?;
+        turn_timeline.push((started, Instant::now()));
+        let applied = observer
+            .events
+            .lock()
+            .expect("live events lock")
+            .iter()
+            .filter(|timed| matches!(timed.event, AgentEvent::CompactionApplied { .. }))
+            .count();
+        if applied >= 2 {
+            break;
+        }
+    }
+
+    let probe = format!(
+        "What was the flag for NEEDLE-{session:02x}7f3a9? If it is behind a compaction reference, use recall. Reply with the flag exactly."
+    );
+    let started = Instant::now();
+    block_on(harness.submit_turn(&probe, &observer, &gate, &token))?;
+    turn_timeline.push((started, Instant::now()));
+
+    let live_messages = harness.messages().to_vec();
+    let live_bytes = context_bytes(&live_messages);
+    let rebuilt = store.open(&meta)?.messages;
+    let resume_exact = live_bytes == context_bytes(&rebuilt);
+    let context_text = live_messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let needle_answered = live_messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant)
+        .is_some_and(|message| message.content.contains("--enable-zeta"));
+    let real_read = live_messages.iter().any(|message| {
+        message.role == Role::Tool
+            && message.tool_name.as_deref() == Some("read")
+            && message.provider_turn_id.is_some()
+    });
+
+    let events = observer.events.lock().expect("live events lock");
+    let applies = events
+        .iter()
+        .filter_map(|timed| match &timed.event {
+            AgentEvent::CompactionApplied {
+                context_tokens_after_apply,
+                ..
+            } => Some((timed.at, *context_tokens_after_apply)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let _event_timeline_alignment = applies.iter().all(|(at, _)| {
+        turn_timeline
+            .iter()
+            .any(|(started, ended)| started <= at && at <= ended)
+    });
+    let max_context_after_apply = applies.iter().map(|(_, tokens)| *tokens).max().unwrap_or(0);
+    let context_effective = !applies.is_empty()
+        && applies
+            .iter()
+            .all(|(_, tokens)| *tokens <= AUTO_LIVE_BUDGET);
+    drop(events);
+
+    let entries = compaction_json_entries(&path)?;
+    let measured_entries = !entries.is_empty()
+        && entries.iter().all(|entry| {
+            let origin = entry
+                .get("origin")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            !origin.is_empty()
+                && entry.get("workerUsage").is_some()
+                && (origin == "excerpts"
+                    || entry
+                        .get("workerUsage")
+                        .is_some_and(|usage| !usage.is_null()))
+        });
+    Ok(AutoLiveRow {
+        compactions: applies.len(),
+        max_context_after_apply,
+        context_effective,
+        needle_answered,
+        recall_marker: context_text.matches("recall(handle=\"").count() >= applies.len(),
+        carry_block: context_text.contains(AUTO_LIVE_CARRY_HEADER),
+        resume_exact,
+        measured_entries,
+        real_read,
+    })
+}
+
+#[test]
+#[ignore = "live Anthropic API calls; set IRIS_BENCH_LIVE=1 to run"]
+fn auto_compaction_live_loop_anthropic() {
+    if !live_loop_enabled("auto_compaction_live_loop_anthropic") {
+        return;
+    }
+    if !claude_code_credentials_available() {
+        eprintln!(
+            "LIVE RUN FAILED: no Claude Code credentials discovered (claude_code_credentials_available() == false); expected ~/.claude/.credentials.json"
+        );
+        return;
+    }
+    auto_compaction_live_loop(LiveLoopLane::AnthropicHaiku, auto_live_session_count());
+}
+
+#[test]
+#[ignore = "live Codex API calls; set IRIS_BENCH_LIVE=1 to run"]
+fn auto_compaction_live_loop_codex() {
+    if !live_loop_enabled("auto_compaction_live_loop_codex") {
+        return;
+    }
+    auto_compaction_live_loop(LiveLoopLane::CodexMini, auto_live_session_count());
 }
 
 #[test]

@@ -353,6 +353,7 @@ impl UiEvent {
                 covered_messages,
                 original_tokens_estimate,
                 summary_tokens_estimate,
+                context_tokens_after_apply: _,
                 budget,
                 // Generation ordinal (ADR-0047) is instrumentation for the
                 // event/benchmark, not a display field; the UI does not surface
@@ -361,6 +362,8 @@ impl UiEvent {
                 // Carry count (ADR-0044) is event/benchmark instrumentation, not
                 // a display field; drop it in the display mapping too.
                 carried_paths: _,
+                origin: _,
+                worker_usage: _,
             } => UiEvent::CompactionApplied {
                 compaction_id,
                 covered_from,
@@ -375,6 +378,8 @@ impl UiEvent {
                 state,
                 covered_messages,
                 original_tokens_estimate,
+                origin: _,
+                worker_usage: _,
                 message,
             } => UiEvent::CompactionLifecycle {
                 job_id,

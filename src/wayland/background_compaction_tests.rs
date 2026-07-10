@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use super::{Harness, SummarizerKind};
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate,
-    AssistantTurn, ChatProvider, CompactionLifecycleState, Message, ProviderEvent, ProviderStream,
-    ReviewContext, ToolCall, Tools,
+    AssistantTurn, ChatProvider, CompactionLifecycleState, CompactionOrigin, Message,
+    ProviderEvent, ProviderStream, ProviderUsage, ReviewContext, ToolCall, Tools,
 };
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::{ToolState, built_in_tools};
@@ -131,6 +131,17 @@ impl Recorder {
             .filter(|event| matches!(event, AgentEvent::CompactionApplied { .. }))
             .count()
     }
+
+    fn applied_metadata(&self) -> Option<(CompactionOrigin, Option<ProviderUsage>)> {
+        self.events.borrow().iter().find_map(|event| match event {
+            AgentEvent::CompactionApplied {
+                origin,
+                worker_usage,
+                ..
+            } => Some((*origin, worker_usage.clone())),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -198,7 +209,19 @@ impl ChatProvider for SummaryProvider {
                 )
             });
         Ok(Box::pin(futures::stream::once(async move {
-            Ok(ProviderEvent::Completed(AssistantTurn::text(&text)))
+            let mut turn = AssistantTurn::text(&text);
+            turn.usage = Some(ProviderUsage {
+                provider: "test-provider".to_string(),
+                model: "test-summary-model".to_string(),
+                input_tokens: 120,
+                output_tokens: 30,
+                cache_read_input_tokens: 80,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 150,
+                cache_creation: None,
+            });
+            Ok(ProviderEvent::Completed(turn))
         })))
     }
 }
@@ -336,6 +359,11 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
     }
 
     assert_eq!(obs.applied(), 1);
+    let (origin, worker_usage) = obs.applied_metadata().expect("applied metadata");
+    assert_eq!(origin, CompactionOrigin::Subagent);
+    let worker_usage = worker_usage.expect("worker usage from live summarizer lane");
+    assert_eq!(worker_usage.total_tokens, 150);
+    assert_eq!(worker_usage.cache_read_input_tokens, 80);
     let tools = visible_tools.lock().unwrap();
     assert_eq!(tools.len(), 1);
     assert!(tools[0].contains(&"read".to_string()));
@@ -357,6 +385,8 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
 
     let entries = compaction_entries(&path);
     assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["origin"], "subagent");
+    assert_eq!(entries[0]["workerUsage"]["totalTokens"], 150);
     assert!(
         entries[0]["summary"]
             .as_str()

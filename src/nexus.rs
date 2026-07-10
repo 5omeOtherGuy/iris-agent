@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Error, Result, bail};
 use futures::Stream;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -376,6 +377,8 @@ pub(crate) enum AgentEvent {
         covered_messages: usize,
         original_tokens_estimate: u64,
         summary_tokens_estimate: u64,
+        /// Provider-visible context estimate immediately after the atomic swap.
+        context_tokens_after_apply: u64,
         budget: u64,
         /// 1-based compaction generation ordinal (ADR-0047): the Nth compaction
         /// in the session reports N. Instrumentation of compaction depth; does
@@ -385,6 +388,10 @@ pub(crate) enum AgentEvent {
         /// alongside the prose summary (ADR-0044). Additive instrumentation; 0
         /// when the covered range had no in-workspace tool targets.
         carried_paths: usize,
+        /// Summary source. Provider-neutral and safe for persistence/metrics.
+        origin: CompactionOrigin,
+        /// Realized summarizer usage when the lane reported it.
+        worker_usage: Option<ProviderUsage>,
     },
     /// Background compaction worker lifecycle (issue #472). Metadata only: the
     /// worker id, state, covered-count/token estimate, and a short status
@@ -396,6 +403,11 @@ pub(crate) enum AgentEvent {
         state: CompactionLifecycleState,
         covered_messages: usize,
         original_tokens_estimate: u64,
+        /// Summary source selected for this job.
+        origin: CompactionOrigin,
+        /// Realized usage once a worker has completed; `None` while running or
+        /// when the provider does not report usage.
+        worker_usage: Option<ProviderUsage>,
         message: Option<String>,
     },
     /// The harness flushed a batch of microcompaction folds at a safe turn
@@ -537,6 +549,27 @@ pub(crate) enum CompactionLifecycleState {
     Discarded,
     Failed,
     Cancelled,
+}
+
+/// Provider-neutral source of an accepted compaction summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum CompactionOrigin {
+    Excerpts,
+    Provider,
+    Subagent,
+    ProviderNative,
+}
+
+impl CompactionOrigin {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Excerpts => "excerpts",
+            Self::Provider => "provider",
+            Self::Subagent => "subagent",
+            Self::ProviderNative => "providerNative",
+        }
+    }
 }
 
 impl CompactionLifecycleState {
@@ -2692,7 +2725,8 @@ fn record_call(
     obs.on_event(event)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderUsage {
     pub(crate) provider: String,
     pub(crate) model: String,
@@ -2719,7 +2753,8 @@ pub(crate) struct ProviderUsage {
 /// reported by Anthropic's `usage.cache_creation` detail. Surfaced alongside
 /// the `cache_write_input_tokens` total so diagnostics can attribute writes to
 /// the 5-minute vs 1-hour cache tier.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct CacheCreation {
     pub(crate) ephemeral_5m_input_tokens: u64,
     pub(crate) ephemeral_1h_input_tokens: u64,
@@ -2798,7 +2833,7 @@ impl AssistantTurn {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ModelOrigin {
     pub(crate) provider: String,
     pub(crate) api: String,
@@ -2851,7 +2886,7 @@ pub(crate) struct ToolCall {
     pub(crate) thought_signature: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Message {
     pub(crate) role: Role,
     pub(crate) content: String,
@@ -2978,7 +3013,8 @@ impl Message {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Role {
     Developer,
     User,
