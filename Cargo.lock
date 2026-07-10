@@ -1525,7 +1525,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "iris-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
