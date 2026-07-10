@@ -163,12 +163,14 @@ mod tests {
                 tag: "before".to_string(),
                 started_at: at - Duration::from_millis(1),
                 usage: Some(usage(100, 70, 10)),
+                estimate_tokens: 0,
             },
             CapturedUsage {
                 is_summary: false,
                 tag: "after".to_string(),
                 started_at: at + Duration::from_millis(1),
                 usage: Some(usage(140, 60, 20)),
+                estimate_tokens: 0,
             },
         ];
         let applies = vec![(at, apply_reclamation(80, 20, 100))];

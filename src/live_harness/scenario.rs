@@ -36,6 +36,15 @@ pub(crate) trait Scenario {
     fn posture(&self) -> ScenarioPosture;
     /// The synthetic token window this scenario is tuned against.
     fn budget(&self) -> u64;
+    /// Post-run success criteria the scenario asserts on its own rows. The
+    /// default accepts any completed run; a scenario overrides this to fail a
+    /// run that completed without a provider error but did not exercise its
+    /// target behavior. A silently under-driving scenario is the bug this
+    /// guards against, so it is surfaced as a Fail, never a green pass.
+    fn verify_run(&self, rows: &[Row]) -> std::result::Result<(), String> {
+        let _ = rows;
+        Ok(())
+    }
 }
 
 /// Deterministic chars/4 token estimate, matching the seam's estimator so a
@@ -78,21 +87,81 @@ fn read_call(id: &str, target: &str) -> Message {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct AggressiveFill {
-    /// Number of parallel tool results in the single mega-turn.
-    pub(crate) parallel_results: usize,
-    /// Filler repetitions per tool result (the size knob).
+    /// Number of sequential tool-call round-trips the single turn drives. Each
+    /// read closes a pair boundary MID-TURN, where the governor can compact
+    /// (`compaction_governor::govern` runs only on `turn_continues` boundaries;
+    /// post-turn it early-returns). The pilot-a single-round-trip shape reached
+    /// tier=hard but never compacted -- this is the regression sentinel for #552
+    /// AND for that under-drive.
+    pub(crate) round_trips: usize,
+    /// Filler repetitions in the pre-turn seed. Sized so the seed loads BELOW
+    /// the start tier, so the start and hard crossings both happen mid-turn as
+    /// the scripted reads land, not on load.
+    pub(crate) seed_repeat: usize,
+    /// Filler repetitions per scripted read result (several thousand tokens
+    /// each): the mass one mid-turn round-trip adds toward the hard tier.
     pub(crate) result_repeat: usize,
     pub(crate) budget: u64,
 }
 
+/// Large, stable repository files the live turn reads one at a time. Each is
+/// well over a thousand tokens even after the read tool's caps, so a live read
+/// adds real mid-turn mass exactly as the scripted bodies model it in-gate.
+pub(crate) const S1_LIVE_READ_TARGETS: [&str; 4] = [
+    "src/nexus.rs",
+    "src/session.rs",
+    "src/config.rs",
+    "src/cli.rs",
+];
+
 impl AggressiveFill {
-    /// The default pilot cell: sized to cross the hard threshold on load.
+    /// The default pilot cell: seed below start, four mid-turn round-trips that
+    /// cross start then hard before the last one, so a continuing hard-tier
+    /// boundary lets #552 current-turn coverage fire.
     pub(crate) fn pilot() -> Self {
         Self {
-            parallel_results: 4,
-            result_repeat: 600,
+            round_trips: 4,
+            seed_repeat: 900,
+            result_repeat: 320,
             budget: 32_768,
         }
+    }
+
+    /// The synthetic start/hard thresholds this scenario is tuned against
+    /// (budget x default fractions), used by its own shape assertions.
+    pub(crate) fn start_threshold(&self) -> u64 {
+        (self.budget as f64 * 0.72) as u64
+    }
+
+    pub(crate) fn hard_threshold(&self) -> u64 {
+        (self.budget as f64 * 0.90) as u64
+    }
+
+    /// The pre-turn seed transcript, sized below the start tier.
+    pub(crate) fn seed_messages(&self) -> Vec<Message> {
+        vec![
+            Message::user(&format!(
+                "S1 aggressive-fill preamble; the runaway session is pre-loaded below the start tier so the start and hard crossings both happen mid-turn.\n{}",
+                "pre-turn seed filler that pushes the runaway session toward the start tier. "
+                    .repeat(self.seed_repeat)
+            )),
+            Message::assistant("Seed loaded; ready to read the buffers one at a time."),
+        ]
+    }
+
+    /// The scripted body one mid-turn read returns (several thousand tokens).
+    /// The in-gate fake-provider flow writes these as fixture files and the
+    /// live turn reads real repository files of at least this mass. Multi-line
+    /// (one moderate line per repeat) so the read tool renders it in full,
+    /// under its 2000-line / 50KB caps and without per-line truncation.
+    pub(crate) fn scripted_read_body(&self, i: usize) -> String {
+        let mut body = format!("READ-RESULT-{i}\n");
+        for line in 0..self.result_repeat {
+            body.push_str(&format!(
+                "line {line}: large scripted tool result body toward the hard tier.\n"
+            ));
+        }
+        body
     }
 }
 
@@ -102,26 +171,25 @@ impl Scenario for AggressiveFill {
     }
 
     fn seed(&self, _workspace: &Path) -> Result<Vec<Message>> {
-        let mut seed = vec![Message::user(
-            "One shot: read every telemetry buffer and report. This is a single large turn.",
-        )];
-        for i in 0..self.parallel_results {
-            let target = format!("crates/orbit/src/telemetry/buffer_{i}.rs");
-            let body = format!(
-                "PARALLEL-RESULT-{i} :: {}",
-                "large tool result body carried in the runaway mega-turn. "
-                    .repeat(self.result_repeat)
-            );
-            let call = format!("s1-{i}");
-            seed.push(read_call(&call, &target));
-            seed.push(read_result(&call, &target, &body));
-        }
-        seed.push(Message::assistant("All buffers read."));
-        Ok(seed)
+        Ok(self.seed_messages())
     }
 
     fn turns(&self) -> Vec<String> {
-        vec!["Summarize the buffers you just read in one short sentence.".to_string()]
+        // ONE turn that forces several sequential tool-call round-trips: the
+        // model must read each file on its own step, so every read closes a
+        // pair boundary mid-turn (mirrors `auto_compaction_live_loop`'s
+        // real-tool loop). Sequential, one read per reply -- not parallel --
+        // so the governor sees a continuing boundary between each read.
+        let list = S1_LIVE_READ_TARGETS
+            .iter()
+            .take(self.round_trips)
+            .map(|target| format!("- {target}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        vec![format!(
+            "Read each of these files, ONE AT A TIME (a single read tool call per reply, \
+             wait for each result before the next), then give a one-line summary of each:\n{list}"
+        )]
     }
 
     fn posture(&self) -> ScenarioPosture {
@@ -133,6 +201,27 @@ impl Scenario for AggressiveFill {
 
     fn budget(&self) -> u64 {
         self.budget
+    }
+
+    /// S1's target behavior is MID-TURN compaction. A run that completed but
+    /// observed fewer than three boundaries, or that never compacted, silently
+    /// under-drove and is a Fail -- exactly the pilot-a defect being fixed.
+    fn verify_run(&self, rows: &[Row]) -> std::result::Result<(), String> {
+        // One row per provider request == one round-trip boundary.
+        let boundaries = rows.len();
+        let compacted = rows
+            .iter()
+            .any(|row| row.lifecycle.compaction_generation_applied.is_some());
+        if boundaries < 3 {
+            return Err(format!(
+                "S1 produced no compaction: only {boundaries} boundaries (< 3 required); \
+                 the turn did not drive enough mid-turn round-trips"
+            ));
+        }
+        if !compacted {
+            return Err("S1 produced no compaction".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -344,26 +433,76 @@ mod tests {
     }
 
     #[test]
-    fn s1_is_a_single_mega_turn_with_parallel_results_crossing_hard() {
+    fn s1_seed_loads_below_start_and_scripted_reads_cross_hard_within_planned_round_trips() {
         let s1 = AggressiveFill::pilot();
+        // One turn (finding 1 keeps S1 a single turn), but it must drive several
+        // sequential round-trips.
+        assert_eq!(s1.turns().len(), 1, "S1 stays a single turn");
+        assert!(s1.round_trips >= 3, "needs >= 3 mid-turn boundaries");
+
+        // The seed loads BELOW the start tier, so the crossings are mid-turn.
         let seed = s1.seed(&ws()).expect("s1 seed");
-        // Single mega-turn: exactly one user message.
-        assert_eq!(count_role(&seed, Role::User), 1);
-        // Parallel tool results: one call + one result per parallel branch.
         assert_eq!(
-            count_role(&seed, Role::AssistantToolCall),
-            s1.parallel_results
+            count_role(&seed, Role::User),
+            1,
+            "single pre-turn user seed"
         );
-        assert_eq!(count_role(&seed, Role::Tool), s1.parallel_results);
-        assert!(s1.parallel_results >= 2, "parallel means at least two");
-        // Crosses the hard threshold on load.
-        let hard = (s1.budget() as f64 * 0.90) as u64;
+        let seed_tokens = est_tokens(&seed);
         assert!(
-            est_tokens(&seed) > hard,
-            "s1 must cross hard ({}): got {}",
-            hard,
-            est_tokens(&seed)
+            seed_tokens < s1.start_threshold(),
+            "seed must load below start ({}): got {seed_tokens}",
+            s1.start_threshold()
         );
+
+        // Pure token arithmetic against the estimator: seed + k scripted read
+        // results cross start then hard within the planned round-trips, and
+        // hard is crossed BEFORE the final round-trip so a continuing hard-tier
+        // boundary remains for the governor to compact on.
+        let body_tokens = est_tokens(std::slice::from_ref(&Message::tool_result(
+            "s1-probe",
+            "read",
+            &s1.scripted_read_body(0),
+        )));
+        let cumulative = |k: u64| seed_tokens + k * body_tokens;
+        let k_start = (1..=s1.round_trips as u64)
+            .find(|k| cumulative(*k) >= s1.start_threshold())
+            .expect("must cross start within planned round-trips");
+        let k_hard = (1..=s1.round_trips as u64)
+            .find(|k| cumulative(*k) >= s1.hard_threshold())
+            .expect("must cross hard within planned round-trips");
+        assert!(k_start < k_hard, "start is crossed before hard");
+        assert!(
+            k_hard < s1.round_trips as u64,
+            "hard must be crossed before the final round-trip so a continuing \
+             hard-tier boundary remains (k_hard={k_hard}, round_trips={})",
+            s1.round_trips
+        );
+    }
+
+    #[test]
+    fn s1_verify_run_fails_without_compaction_and_passes_with_one() {
+        let s1 = AggressiveFill::pilot();
+
+        // Under-drove: too few boundaries.
+        let one = vec![sample_row_no_compaction(0)];
+        assert!(
+            s1.verify_run(&one)
+                .unwrap_err()
+                .contains("S1 produced no compaction")
+        );
+
+        // Enough boundaries, but no compaction lifecycle event anywhere.
+        let none_compacted: Vec<Row> = (0..4).map(sample_row_no_compaction).collect();
+        assert_eq!(
+            s1.verify_run(&none_compacted).unwrap_err(),
+            "S1 produced no compaction"
+        );
+
+        // Three boundaries with a compaction event on one row: success.
+        let mut compacted = none_compacted.clone();
+        compacted[2].lifecycle.compaction_generation_applied = Some(1);
+        compacted[2].lifecycle.origin = Some("subagent".to_string());
+        assert!(s1.verify_run(&compacted).is_ok());
     }
 
     #[test]
@@ -382,6 +521,14 @@ mod tests {
         assert!(s3.reads >= 3, "fold-dominant needs many reads");
         let distinct: BTreeSet<&String> = read_targets.iter().collect();
         assert_eq!(distinct.len(), 1, "all reads target the same fold path");
+    }
+
+    fn sample_row_no_compaction(seq: u32) -> Row {
+        let mut row = super::metrics::sample_row_for_tests(seq, RowKind::Turn);
+        row.scenario = "S1".to_string();
+        row.lifecycle = LifecycleDelta::default();
+        row.tier = Tier::Hard;
+        row
     }
 
     #[test]
