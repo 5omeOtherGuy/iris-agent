@@ -34,6 +34,7 @@ use crate::tool_display::{
     bash_timeout_secs, command_display, display_path, exploration_summary, run_target, summarize,
 };
 use crate::tool_summary::summarize_output;
+use crate::ui::highlight;
 use crate::ui::palette;
 
 use super::panel::FooterField;
@@ -221,6 +222,22 @@ fn tool_path_arg(call: &ToolCall) -> Option<&str> {
         .and_then(|value| value.as_str())
 }
 
+fn path_syntax(path: &str) -> Option<String> {
+    let extension = std::path::Path::new(path).extension()?.to_str()?;
+    highlight::is_known_syntax(extension).then(|| extension.to_string())
+}
+
+/// Infer the syntax of file contents printed by a shell pipeline. This stays
+/// intentionally conservative: only a token with a known file extension opts
+/// the output into highlighting; ordinary logs keep their existing styling.
+fn infer_shell_output_syntax(command: &str) -> Option<String> {
+    command.split_whitespace().find_map(|token| {
+        let token = token
+            .trim_matches(|c: char| matches!(c, '\'' | '"' | '`' | '(' | ')' | ';' | '|' | '&'));
+        path_syntax(token)
+    })
+}
+
 impl ToolRenderer for ExploreRenderer {
     fn kind(&self) -> ToolPanelKind {
         ToolPanelKind::Explore
@@ -362,7 +379,11 @@ impl ToolRenderer for ShellRenderer {
     }
 
     fn body(&self, ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
-        let mut body = PanelBody::shell(ctx.width, ctx.preview_rows);
+        let mut body = PanelBody::shell(
+            ctx.width,
+            ctx.preview_rows,
+            raw_bash_command(call).and_then(infer_shell_output_syntax),
+        );
         let timeout = bash_timeout_secs(call);
         match raw_bash_command(call) {
             Some(raw) => {
@@ -434,8 +455,12 @@ impl ToolRenderer for ShellRenderer {
 
 /// Body shared by EDIT and the generic TOOL fallback (identical apart from the
 /// header title).
-fn generic_body(ctx: &RenderCtx, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
-    let mut body = PanelBody::new(ctx.width, ctx.preview_rows);
+fn generic_body(ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
+    let mut body = PanelBody::new(
+        ctx.width,
+        ctx.preview_rows,
+        tool_path_arg(call).and_then(path_syntax),
+    );
     match outcome {
         ToolOutcome::Running { .. } => body.line("running\u{2026}", dim_style()),
         ToolOutcome::Done { content, .. } => body.output(content),
@@ -464,7 +489,7 @@ impl ToolRenderer for EditRenderer {
     }
 
     fn body(&self, ctx: &RenderCtx, _call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
-        generic_body(ctx, outcome)
+        generic_body(ctx, _call, outcome)
     }
 }
 
@@ -482,7 +507,7 @@ impl ToolRenderer for GenericRenderer {
     }
 
     fn body(&self, ctx: &RenderCtx, _call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
-        generic_body(ctx, outcome)
+        generic_body(ctx, _call, outcome)
     }
 }
 
@@ -548,6 +573,23 @@ fn tool_output_line(prefix: &'static str, line: &str, base: Style) -> Line<'stat
     Line::from(spans)
 }
 
+fn linkify_output_line(mut line: Line<'static>) -> Line<'static> {
+    let mut spans = Vec::with_capacity(line.spans.len());
+    let mut root: Option<std::path::PathBuf> = None;
+    for span in line.spans.drain(..) {
+        let content = span.content.as_ref();
+        if crate::ui::hyperlink::find_file_refs(content).is_empty() {
+            spans.push(span);
+            continue;
+        }
+        let root = root.get_or_insert_with(|| std::env::current_dir().unwrap_or_default());
+        spans.extend(crate::ui::hyperlink::linkify_file_refs(
+            content, span.style, root,
+        ));
+    }
+    Line::from(spans)
+}
+
 /// A short-lived builder for tool-panel body rows. Owns the flood-cap and
 /// hidden-content logic so renderers and the transcript's thin wrappers share
 /// one implementation (no duplicated summary/flood logic). `width` is the
@@ -557,21 +599,23 @@ struct PanelBody {
     /// Viewport-aware live-tail preview budget (rows); see [`RenderCtx`].
     preview_rows: usize,
     indent: usize,
+    syntax: Option<String>,
     rows: Vec<TranscriptRow>,
 }
 
 impl PanelBody {
-    fn new(width: usize, preview_rows: usize) -> Self {
+    fn new(width: usize, preview_rows: usize, syntax: Option<String>) -> Self {
         Self {
             width,
             preview_rows,
             indent: 0,
+            syntax,
             rows: Vec::new(),
         }
     }
 
-    fn shell(width: usize, preview_rows: usize) -> Self {
-        Self::new(width, preview_rows)
+    fn shell(width: usize, preview_rows: usize, syntax: Option<String>) -> Self {
+        Self::new(width, preview_rows, syntax)
     }
 
     fn into_rows(self) -> Vec<TranscriptRow> {
@@ -638,7 +682,7 @@ impl PanelBody {
             self.line("", panel_style());
             self.line(&format!("  payload  {}", payload.lang), dim_style());
             self.payload_rule();
-            self.payload_body(&payload.body);
+            self.payload_body(&payload.body, &payload.lang);
             self.payload_line(&payload.closing);
         }
         for cont in &cmd.trailing {
@@ -676,9 +720,21 @@ impl PanelBody {
 
     /// Heredoc body, rendered whole. Collapse is binary and owned by the block
     /// header: an over-budget block arrives collapsed instead of eliding rows.
-    fn payload_body(&mut self, body: &[String]) {
-        for line in body {
-            self.payload_line(line);
+    fn payload_body(&mut self, body: &[String], lang: &str) {
+        let clamped = body
+            .iter()
+            .map(|line| truncate_clusters_with_ellipsis(line, MAX_TOOL_OUTPUT_LINE_CHARS))
+            .collect::<Vec<_>>();
+        let code = clamped.join("\n");
+        if let Some(lines) = highlight::highlight(&code, Some(lang)) {
+            for (plain, mut line) in clamped.iter().zip(lines) {
+                line.spans.insert(0, Span::raw("  "));
+                self.push_line(line, format!("  {plain}"), panel_style());
+            }
+        } else {
+            for line in body {
+                self.payload_line(line);
+            }
         }
     }
 
@@ -787,9 +843,37 @@ impl PanelBody {
             self.line("(no output)", dim_style());
             return;
         }
-        for (i, raw) in content.lines().enumerate() {
-            self.output_line(raw, i == 0);
+        let lines = content
+            .lines()
+            .map(|line| truncate_clusters_with_ellipsis(line, MAX_TOOL_OUTPUT_LINE_CHARS))
+            .collect::<Vec<_>>();
+        self.output_lines(&lines);
+    }
+
+    fn output_lines(&mut self, lines: &[String]) {
+        let code = lines.join("\n");
+        // Program-authored ANSI colors win. Otherwise parse the complete block
+        // at once so multiline syntax state (comments/strings) is retained.
+        let highlighted = (!code.contains('\u{1b}'))
+            .then(|| highlight::highlight(&code, self.syntax.as_deref()))
+            .flatten();
+        for (i, raw) in lines.iter().enumerate() {
+            if let Some(line) = highlighted.as_ref().and_then(|lines| lines.get(i)).cloned() {
+                self.highlighted_output_line(raw, line, i == 0);
+            } else {
+                self.output_line(raw, i == 0);
+            }
         }
+    }
+
+    fn highlighted_output_line(&mut self, raw: &str, mut line: Line<'static>, first: bool) {
+        let prefix = if first { "\u{2514} " } else { "  " };
+        line.spans.insert(0, Span::styled(prefix, dim_style()));
+        self.push_line(
+            linkify_output_line(line),
+            format!("{prefix}{}", strip_ansi_for_text(raw)),
+            stdout_style(),
+        );
     }
 
     /// TAIL-capped tool output for the LIVE streaming cell: show the most recent
@@ -822,18 +906,20 @@ impl PanelBody {
         }
         let start = lines.len() - take;
         if start == 0 {
-            for (offset, raw) in lines.iter().enumerate() {
-                let clamped = clamp_output_line(raw, width, budget);
-                self.output_line(&clamped, offset == 0);
-            }
+            let clamped = lines
+                .iter()
+                .map(|raw| clamp_output_line(raw, width, budget))
+                .collect::<Vec<_>>();
+            self.output_lines(&clamped);
             return;
         }
         // The earlier-lines marker, then the most recent tail.
         self.hidden_lines_marker(start, true);
-        for (offset, raw) in lines[start..].iter().enumerate() {
-            let clamped = clamp_output_line(raw, width, budget);
-            self.output_line(&clamped, offset == 0);
-        }
+        let clamped = lines[start..]
+            .iter()
+            .map(|raw| clamp_output_line(raw, width, budget))
+            .collect::<Vec<_>>();
+        self.output_lines(&clamped);
     }
 }
 
@@ -848,6 +934,14 @@ mod tests {
             thought_signature: None,
             name: name.to_string(),
             arguments,
+        }
+    }
+
+    fn body_line(row: &TranscriptRow) -> Option<&Line<'static>> {
+        match row.chrome.as_ref() {
+            Some(ChromeRow::Body { line, .. }) => Some(line),
+            Some(ChromeRow::BodyRight { left, .. }) => Some(left),
+            _ => row.line.as_ref(),
         }
     }
 
@@ -1074,6 +1168,77 @@ mod tests {
             rendered_has_expanded_content,
             "rendered output should preserve standard tab stops"
         );
+    }
+
+    #[test]
+    fn shell_file_output_is_syntax_highlighted_from_pipeline_path() {
+        let args = json!({
+            "command": "cat projects/iris/src/main.rs | head -300"
+        });
+        let shell_call = call("bash", args);
+        let rows = resolve(&shell_call).body(
+            &RenderCtx::for_width(100),
+            &shell_call,
+            &ToolOutcome::Done {
+                content: "fn main() {\n    let answer = 42; // visible\n}",
+                exit_code: Some(0),
+            },
+        );
+        let colors = rows
+            .iter()
+            .filter_map(body_line)
+            .flat_map(|line| line.spans.iter().filter_map(|span| span.style.fg))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            colors.len() > 2,
+            "expected several token colors, got {colors:?}"
+        );
+        assert!(rows.iter().any(|row| row.text.contains("let answer = 42")));
+    }
+
+    #[test]
+    fn ansi_colored_shell_output_takes_precedence_over_inferred_syntax() {
+        let args = json!({ "command": "cat src/main.rs" });
+        let shell_call = call("bash", args);
+        let rows = resolve(&shell_call).body(
+            &RenderCtx::for_width(80),
+            &shell_call,
+            &ToolOutcome::Done {
+                content: "\u{1b}[35mfn\u{1b}[0m main() {}",
+                exit_code: Some(0),
+            },
+        );
+        let output = rows.iter().find(|row| row.text.starts_with('└')).unwrap();
+        let line = body_line(output).unwrap();
+        assert!(
+            line.spans.iter().any(|span| {
+                span.style.fg.is_some()
+                    && span.style.fg != stdout_style().fg
+                    && span.style.fg != Some(palette::orange())
+            }),
+            "expected the program's ANSI color: {:?}",
+            line.spans
+        );
+        assert_eq!(output.text, "└ fn main() {}");
+    }
+
+    #[test]
+    fn file_oriented_generic_tool_output_uses_the_same_highlighter() {
+        let custom_call = call("inspect", json!({ "path": "src/lib.py" }));
+        let rows = resolve(&custom_call).body(
+            &RenderCtx::for_width(80),
+            &custom_call,
+            &ToolOutcome::Done {
+                content: "def answer():\n    return 42",
+                exit_code: None,
+            },
+        );
+        let colors = rows
+            .iter()
+            .filter_map(body_line)
+            .flat_map(|line| line.spans.iter().filter_map(|span| span.style.fg))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(colors.len() > 1, "expected Python token colors: {colors:?}");
     }
 
     #[test]

@@ -92,6 +92,12 @@ pub(crate) fn highlight(code: &str, lang: Option<&str>) -> Option<Vec<Line<'stat
     Some(lines)
 }
 
+/// Return whether `token` names a bundled syntax. This is used by tool-panel
+/// inference before opting an otherwise opaque output stream into highlighting.
+pub(crate) fn is_known_syntax(token: &str) -> bool {
+    syntax_set().find_syntax_by_token(token).is_some()
+}
+
 /// Build the `HighlightFn` the Markdown renderer injects at the fenced-code
 /// seam. `base` is the theme's base style (e.g. the thinking dim+italic) and
 /// `fallback` is the dim code-block style used when a language is unknown.
