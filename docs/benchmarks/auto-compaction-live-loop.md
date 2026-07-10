@@ -252,7 +252,7 @@ IRIS_BENCH_LIVE=1 IRIS_AUTO_COMPACTION_SESSIONS=10 \
 | lane | sessions | compactions | worst G1 | worst post-apply/start | G2 | G3 | G4 | G5 | reads | cache-hit observations | exclusions |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
 | `anthropic/claude-haiku-4-5` | 10 | 21 | 15.0 ms | 17,133 / 21,299 (80.4%) | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 8 × 0.000; 2 × unknown | 0 |
-| `openai-codex/gpt-5.4-mini` | 0 | 0 | — | — | — | — | — | — | — | — | 1 |
+| `openai-codex/gpt-5.4-mini` | 10 | 20 | 21.8 ms | 16,413 / 21,299 (77.1%) | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 1 × 0.462; 9 × 0.000 | 0 |
 
 Haiku per-session evidence:
 
@@ -269,13 +269,31 @@ Haiku per-session evidence:
 | 08 | 2 | 0.7 ms | 17,086 | pass | 0.000 |
 | 09 | 2 | 0.7 ms | 16,917 | pass | 0.000 |
 
-The Haiku run completed in 400.57 seconds with no provider, auth, tool,
-worker, persistence, or resume errors. The Codex lane was retried separately
-after the smoke and remained unavailable before a session could start:
+Codex per-session evidence:
+
+| session | compactions | G1 | maximum post-apply | G2–G5/read | worker cache hit |
+|---:|---:|---:|---:|---|---:|
+| 00 | 2 | 2.7 ms | 13,882 | pass | 0.462 |
+| 01 | 2 | 2.7 ms | 16,413 | pass | 0.000 |
+| 02 | 2 | 21.8 ms | 14,640 | pass | 0.000 |
+| 03 | 2 | 3.3 ms | 14,685 | pass | 0.000 |
+| 04 | 2 | 2.6 ms | 15,052 | pass | 0.000 |
+| 05 | 2 | 16.1 ms | 14,680 | pass | 0.000 |
+| 06 | 2 | 1.2 ms | 12,948 | pass | 0.000 |
+| 07 | 2 | 17.6 ms | 10,784 | pass | 0.000 |
+| 08 | 2 | 2.3 ms | 14,495 | pass | 0.000 |
+| 09 | 2 | 2.0 ms | 15,932 | pass | 0.000 |
+
+The Haiku run completed in 400.57 seconds and the Codex run in 745.95 seconds.
+Neither full run had a provider, auth, tool, worker, persistence, or resume
+error. The lanes were run separately against the same worker-v2 behavior after
+an account quota interruption. Preliminary Codex probes recorded this error
+verbatim before the quota reopened:
 
 ```text
 Codex request failed [status=429 endpoint=/codex/responses model=gpt-5.4-mini error_type=usage_limit_reached]
 ```
 
-This is not a passing Codex result and is not averaged into the Haiku table.
-The slice 4 two-lane exit criterion remains pending quota recovery.
+Those probes are not averaged into the passing table. After the quota reopened,
+a one-session probe passed with two compactions before the full 10-session
+Codex run above.
