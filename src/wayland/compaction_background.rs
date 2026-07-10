@@ -2,6 +2,18 @@
 
 use super::*;
 
+/// Outcome of the provider-native rung of the hard-tier fallback ladder
+/// (subagent -> provider-native -> deterministic excerpts).
+enum NativeFallbackOutcome {
+    /// Provider-native compaction shrank and was applied; carry the rewrite.
+    Applied(Vec<Message>),
+    /// The turn was cancelled mid-fallback; apply nothing.
+    Cancelled,
+    /// Provider-native was unsupported, failed, or did not shrink; the caller
+    /// falls through to the deterministic-excerpts terminal rung.
+    Unavailable,
+}
+
 impl CompactionEngine {
     pub(super) fn apply_excerpts(
         &mut self,
@@ -163,7 +175,9 @@ impl CompactionEngine {
         match job.receiver.try_recv() {
             Ok(result) => {
                 let job = self.background.take().expect("checked above");
-                self.finish_background_at_boundary(job, result, messages, cx)
+                // Non-blocking drain at a continuing boundary: no provider-native
+                // rung here (it blocks and is reserved for hard pressure).
+                self.finish_background_at_boundary(job, result, messages, cx, None)
             }
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
@@ -179,7 +193,7 @@ impl CompactionEngine {
                             .to_string(),
                     ),
                 )?;
-                self.apply_job_fallback(&job, messages, cx)
+                self.apply_job_fallback(&job, messages, cx, None)
             }
         }
     }
@@ -251,7 +265,9 @@ impl CompactionEngine {
             }
         };
         match result {
-            Ok(result) => self.finish_background_at_boundary(job, result, messages, cx),
+            Ok(result) => {
+                self.finish_background_at_boundary(job, result, messages, cx, Some(token))
+            }
             Err(RecvTimeoutError::Timeout) => {
                 job.token.cancel();
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);
@@ -261,11 +277,11 @@ impl CompactionEngine {
                     CompactionLifecycleState::Cancelled,
                     None,
                     Some(format!(
-                        "background compaction exceeded the {} ms hard wait; using deterministic fallback",
+                        "subagent summary exceeded the {} ms hard wait; escalating fallback",
                         self.hard_wait.as_millis()
                     )),
                 )?;
-                self.apply_job_fallback(&job, messages, cx)
+                self.apply_job_fallback(&job, messages, cx, Some(token))
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);
@@ -279,7 +295,7 @@ impl CompactionEngine {
                             .to_string(),
                     ),
                 )?;
-                self.apply_job_fallback(&job, messages, cx)
+                self.apply_job_fallback(&job, messages, cx, Some(token))
             }
         }
     }
@@ -290,6 +306,7 @@ impl CompactionEngine {
         result: BackgroundSummaryResult,
         messages: &[Message],
         cx: ApplyContext<'_>,
+        native: Option<&CancellationToken>,
     ) -> Result<Option<Vec<Message>>> {
         match result {
             BackgroundSummaryResult::Summary(summary) => {
@@ -312,7 +329,7 @@ impl CompactionEngine {
                                 .to_string(),
                         ),
                     )?;
-                    return self.apply_job_fallback(&job, messages, cx);
+                    return self.apply_job_fallback(&job, messages, cx, native);
                 }
                 let Some(plan) = self.revalidate(&job, messages) else {
                     self.emit_lifecycle(
@@ -352,7 +369,7 @@ impl CompactionEngine {
                                     .to_string(),
                             ),
                         )?;
-                        self.apply_job_fallback(&job, messages, cx)
+                        self.apply_job_fallback(&job, messages, cx, native)
                     }
                 }
             }
@@ -367,7 +384,7 @@ impl CompactionEngine {
                         "background compaction failed; using deterministic fallback: {message}"
                     )),
                 )?;
-                self.apply_job_fallback(&job, messages, cx)
+                self.apply_job_fallback(&job, messages, cx, native)
             }
             BackgroundSummaryResult::Cancelled => {
                 self.emit_lifecycle(
@@ -387,7 +404,19 @@ impl CompactionEngine {
         job: &BackgroundCompaction,
         messages: &[Message],
         cx: ApplyContext<'_>,
+        native: Option<&CancellationToken>,
     ) -> Result<Option<Vec<Message>>> {
+        // Hard-tier fallback ladder: prefer provider-native compaction before
+        // the lossy deterministic-excerpts terminal rung. Blocking is accepted
+        // here because this path only runs at hard pressure; the wait is bounded
+        // and cancellable through the turn token.
+        if let Some(token) = native {
+            match self.try_provider_native_fallback(job, messages, cx, token)? {
+                NativeFallbackOutcome::Applied(replacement) => return Ok(Some(replacement)),
+                NativeFallbackOutcome::Cancelled => return Ok(None),
+                NativeFallbackOutcome::Unavailable => {}
+            }
+        }
         let Some(plan) = self.revalidate(job, messages) else {
             self.emit_lifecycle(
                 cx.observer,
@@ -414,6 +443,189 @@ impl CompactionEngine {
                     ),
                 )?;
                 Ok(None)
+            }
+        }
+    }
+
+    /// Provider-native rung of the hard-tier fallback ladder. Runs one bounded,
+    /// cancellable provider-native compaction off the loop (the adapter may use
+    /// a blocking client, so it runs on its own OS thread) and applies it
+    /// through the same parent-owned path a subagent summary uses. A success
+    /// resets the model-backed circuit breaker exactly like a subagent apply.
+    /// Provider names never cross this boundary: eligibility is decided only by
+    /// the `compaction_capability` seam.
+    fn try_provider_native_fallback(
+        &mut self,
+        job: &BackgroundCompaction,
+        messages: &[Message],
+        cx: ApplyContext<'_>,
+        token: &CancellationToken,
+    ) -> Result<NativeFallbackOutcome> {
+        let Some(factory) = self.provider_compaction_factory.as_ref() else {
+            // Native compaction is not wired for this session; fall straight to
+            // the deterministic rung without a notice.
+            return Ok(NativeFallbackOutcome::Unavailable);
+        };
+        let factory = factory.clone();
+        let supported = match factory() {
+            Ok(provider) => {
+                provider.compaction_capability(job.original_tokens)
+                    == ProviderCompactionCapability::OpaqueBlocks
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "provider-native fallback probe failed; using deterministic excerpts"
+                );
+                false
+            }
+        };
+        if !supported {
+            self.emit_lifecycle(
+                cx.observer,
+                job,
+                CompactionLifecycleState::Discarded,
+                None,
+                Some(
+                    "provider-native compaction unavailable; using deterministic excerpts"
+                        .to_string(),
+                ),
+            )?;
+            return Ok(NativeFallbackOutcome::Unavailable);
+        }
+        if self.model_compaction_cap_reached(CompactionOrigin::ProviderNative) {
+            self.emit_lifecycle(
+                cx.observer,
+                job,
+                CompactionLifecycleState::Discarded,
+                None,
+                Some(
+                    "per-turn model-backed compaction cap reached; using deterministic excerpts"
+                        .to_string(),
+                ),
+            )?;
+            return Ok(NativeFallbackOutcome::Unavailable);
+        }
+        let Some(plan) = self.revalidate(job, messages) else {
+            return Ok(NativeFallbackOutcome::Unavailable);
+        };
+        self.emit_lifecycle(
+            cx.observer,
+            job,
+            CompactionLifecycleState::Running,
+            None,
+            Some(format!(
+                "subagent fallback escalating to provider-native compaction (~{} tokens)",
+                job.original_tokens
+            )),
+        )?;
+        let covered = messages[plan.start..plan.end].to_vec();
+        let worker = self.worker.clone();
+        let worker_token = CancellationToken::new();
+        let child_token = worker_token.clone();
+        let (tx, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name(format!("iris-{}-native-fallback", job.job_id))
+            .spawn(move || {
+                let result = run_provider_native_worker(factory, covered, worker, child_token);
+                let _ = tx.send(result);
+            })?;
+        // Bounded, cancellable wait: reuse the hard-wait budget as the boundary
+        // bound and poll the turn token in short slices so a cancelled turn
+        // stops the blocking provider request instead of running to completion.
+        let deadline = std::time::Instant::now() + self.hard_wait;
+        let result = loop {
+            if token.is_cancelled() {
+                worker_token.cancel();
+                self.emit_lifecycle(
+                    cx.observer,
+                    job,
+                    CompactionLifecycleState::Cancelled,
+                    None,
+                    Some("provider-native fallback cancelled with the turn".to_string()),
+                )?;
+                return Ok(NativeFallbackOutcome::Cancelled);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                worker_token.cancel();
+                break Err(RecvTimeoutError::Timeout);
+            }
+            match receiver.recv_timeout(remaining.min(std::time::Duration::from_millis(25))) {
+                Ok(result) => break Ok(result),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break Err(RecvTimeoutError::Disconnected),
+            }
+        };
+        match result {
+            Ok(BackgroundSummaryResult::Summary(summary)) => {
+                let usage = summary.worker_usage.clone();
+                match self.apply_summary(messages, plan, summary, cx)? {
+                    Some((_, replacement)) => {
+                        self.consecutive_failures = 0;
+                        self.breaker_notice_emitted = false;
+                        self.emit_lifecycle(
+                            cx.observer,
+                            job,
+                            CompactionLifecycleState::Applied,
+                            usage,
+                            Some("provider-native fallback compaction applied".to_string()),
+                        )?;
+                        Ok(NativeFallbackOutcome::Applied(replacement))
+                    }
+                    None => {
+                        self.emit_lifecycle(
+                            cx.observer,
+                            job,
+                            CompactionLifecycleState::Discarded,
+                            usage,
+                            Some(
+                                "provider-native compaction did not shrink; using deterministic excerpts"
+                                    .to_string(),
+                            ),
+                        )?;
+                        Ok(NativeFallbackOutcome::Unavailable)
+                    }
+                }
+            }
+            Ok(BackgroundSummaryResult::Cancelled) => Ok(NativeFallbackOutcome::Unavailable),
+            Ok(BackgroundSummaryResult::Failed(message)) => {
+                self.emit_lifecycle(
+                    cx.observer,
+                    job,
+                    CompactionLifecycleState::Failed,
+                    None,
+                    Some(format!(
+                        "provider-native compaction failed; using deterministic excerpts: {message}"
+                    )),
+                )?;
+                Ok(NativeFallbackOutcome::Unavailable)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.emit_lifecycle(
+                    cx.observer,
+                    job,
+                    CompactionLifecycleState::Failed,
+                    None,
+                    Some(format!(
+                        "provider-native compaction exceeded the {} ms bound; using deterministic excerpts",
+                        self.hard_wait.as_millis()
+                    )),
+                )?;
+                Ok(NativeFallbackOutcome::Unavailable)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.emit_lifecycle(
+                    cx.observer,
+                    job,
+                    CompactionLifecycleState::Failed,
+                    None,
+                    Some(
+                        "provider-native fallback worker stopped before returning a summary; using deterministic excerpts"
+                            .to_string(),
+                    ),
+                )?;
+                Ok(NativeFallbackOutcome::Unavailable)
             }
         }
     }
@@ -455,6 +667,24 @@ impl CompactionEngine {
     }
 
     pub(super) fn plan(&self, messages: &[Message], keep_target: u64) -> Option<CompactionPlan> {
+        self.plan_with_mode(messages, keep_target, PlanTurnMode::Respect)
+    }
+
+    /// Plan a coverable range. `mode` decides whether the current (in-flight)
+    /// assistant turn is protected. `Respect` keeps today's turn-respecting
+    /// walk-back (Start/Warn and model-requested compaction). `HardCurrentTurn`
+    /// skips that walk-back so the current turn's completed content becomes
+    /// coverable when the keep-tail cut lands mid-turn -- the only way to relieve
+    /// context once every pre-turn message is already compacted. Every other
+    /// guard is identical in both modes: the keep-tail loop, the persisted bound
+    /// `k.min(n)`, entry-id contiguity, and the pair-safety trims (start skips
+    /// leading tool fragments; end backs off so no tool-call/result pair splits).
+    pub(super) fn plan_with_mode(
+        &self,
+        messages: &[Message],
+        keep_target: u64,
+        mode: PlanTurnMode,
+    ) -> Option<CompactionPlan> {
         let n = self.persisted.min(messages.len());
         let mut k = messages.len();
         let mut tail = 0u64;
@@ -467,7 +697,8 @@ impl CompactionEngine {
             k -= 1;
         }
         let mut end = k.min(n);
-        if end < messages.len() && messages[end].role != Role::User {
+        if mode == PlanTurnMode::Respect && end < messages.len() && messages[end].role != Role::User
+        {
             end = assistant_turn_start(messages, end);
         }
         let mut start =

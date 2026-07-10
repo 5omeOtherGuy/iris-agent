@@ -1876,3 +1876,334 @@ fn breaker_disables_model_jobs_but_keeps_deterministic_compaction() {
         AgentEvent::Notice(message) if message.contains("disabled after 3 consecutive failures")
     )));
 }
+
+/// Regression for the live stress session where auto-compaction went fully
+/// inert inside one long agentic turn (issue: hard-tier current-turn coverage).
+/// Once every pre-turn message is compacted, the keep-tail cut lands mid-turn
+/// and the turn-respecting planner walks `end` back to the turn's opening user
+/// message, so `plan()` returns `None` for the rest of the turn and context
+/// runs away unbounded. The hard tier must instead cover the current turn's
+/// completed content so the context can never grow without bound in one turn.
+///
+/// On `origin/main` this fails: the turn-respecting walk-back leaves only the
+/// opening user message coverable (a non-shrinking one-message range), so no
+/// compaction applies and `max_measured` blows past the hard threshold.
+fn drive_single_turn_boundary(
+    harness: &mut Harness<SilentProvider>,
+    workspace: &Path,
+    messages: &mut Vec<Message>,
+    obs: &Recorder,
+    token: &CancellationToken,
+    round_trip: usize,
+) {
+    harness.compaction.persist_messages(messages);
+    let directive = block_on(harness.compaction.govern(
+        BoundaryContext {
+            messages,
+            last_usage: None,
+            round_trip,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace,
+            output_store: harness.output_store.as_ref(),
+            task_state: None,
+            observer: obs,
+        },
+        token,
+    ))
+    .unwrap();
+    if let ContextDirective::Replace {
+        messages: replacement,
+    } = directive
+    {
+        *messages = replacement;
+    }
+}
+
+fn push_turn_round(messages: &mut Vec<Message>, round: usize, needle: &str) {
+    // A realistic in-turn round: a short assistant note (a coverable non-tool
+    // anchor), a tool call, then a large tool result. No user message is ever
+    // appended, so the whole transcript is a single agentic turn.
+    messages.push(Message::assistant(&format!(
+        "progress note for round {round}: continuing the large task"
+    )));
+    let call_id = format!("call_turn_{round}");
+    messages.push(Message::assistant_tool_call(&ToolCall {
+        id: call_id.clone(),
+        name: "read".to_string(),
+        arguments: serde_json::json!({ "path": format!("f{round}.rs") }),
+        thought_signature: None,
+    }));
+    // The needle sits past the excerpt-truncation window so a compacted
+    // (excerpted) result drops it, while a retained result still contains it.
+    let big = format!("{} :: {needle}", "tool output line. ".repeat(240));
+    messages.push(Message::tool_result(&call_id, "read", &big));
+}
+
+#[test]
+fn hard_tier_covers_current_turn_and_bounds_runaway_within_one_turn() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let log = SessionLog::create_in(&root.path, &workspace.path).unwrap();
+    let path = log.path().to_path_buf();
+    let agent = Agent::resumed(SilentProvider, built_in_tools(), Vec::new());
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(log),
+        Vec::new(),
+        Some(131_072),
+    );
+    // Deterministic only: no summarizer factory means `has_model_worker()` is
+    // false, so relief comes purely from the hard-tier excerpts ladder.
+    harness.set_summarizer(SummarizerKind::Excerpts);
+    harness.set_compaction_trigger(
+        131_072,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.85,
+            keep_recent_tokens: 4_000,
+            hard_wait_ms: 10,
+            max_consecutive_failures: 3,
+            reactive: true,
+        },
+    );
+    // Small explicit thresholds so a handful of large tool rounds crosses hard.
+    let ladder = harness.compaction.ladder.as_mut().unwrap();
+    ladder.warn = 6_000;
+    ladder.start = 8_000;
+    ladder.hard = 12_000;
+    ladder.keep_recent_tokens = 4_000;
+    ladder.deterministic_only = false;
+    harness.compaction.begin_turn();
+
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    // One turn: opening user message, then many large tool rounds, no more users.
+    let mut messages = vec![Message::user("TURN-OPEN: perform the large task")];
+    let mut needles = Vec::new();
+    let mut max_measured = 0u64;
+    let mut measured_at_hard_boundaries = Vec::new();
+    for round in 0..40 {
+        let needle = format!("TURN-RESULT-NEEDLE-{round:02}");
+        needles.push(needle.clone());
+        push_turn_round(&mut messages, round, &needle);
+        drive_single_turn_boundary(
+            &mut harness,
+            &workspace.path,
+            &mut messages,
+            &obs,
+            &token,
+            round + 1,
+        );
+        let measured = super::context_tokens(&messages);
+        max_measured = max_measured.max(measured);
+        measured_at_hard_boundaries.push(measured);
+    }
+
+    // (2) Context can never run away unboundedly within one turn. On main this
+    // grows past ~45k; the fix keeps it bounded near keep_recent + summaries.
+    assert!(
+        max_measured < 30_000,
+        "context ran away to {max_measured} tokens within one turn: {measured_at_hard_boundaries:?}"
+    );
+
+    // (1) Compaction landed mid-turn, covering current-turn content: at least
+    // one early tool-result needle is no longer in the live context.
+    assert!(obs.applied() > 0, "no compaction applied mid-turn");
+    let live = messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        needles.iter().any(|needle| !live.contains(needle.as_str())),
+        "no current-turn content was compacted"
+    );
+
+    // (3) The session log stays byte-exact resumable.
+    harness.compaction.persist_messages(&messages);
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .unwrap();
+    let rebuilt = store.open(&meta).unwrap();
+    let live_json = messages
+        .iter()
+        .map(|message| serde_json::to_string(message).unwrap())
+        .collect::<Vec<_>>();
+    let rebuilt_json = rebuilt
+        .messages
+        .iter()
+        .map(|message| serde_json::to_string(message).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        live_json, rebuilt_json,
+        "live context and resume rebuild diverged"
+    );
+}
+
+/// Build a single-turn transcript already at hard pressure, with a subagent
+/// primary summarizer that blocks (so it can never win the hard-wait race) and
+/// deterministic thresholds. Returns everything a hard-tier govern call needs.
+fn single_turn_hard_ladder_harness(
+    root: &Path,
+    workspace: &Path,
+) -> (Harness<SilentProvider>, PathBuf, Vec<Message>) {
+    let log = SessionLog::create_in(root, workspace).unwrap();
+    let path = log.path().to_path_buf();
+    let agent = Agent::resumed(SilentProvider, built_in_tools(), Vec::new());
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.to_path_buf(),
+        ToolState::new(),
+        Some(log),
+        Vec::new(),
+        Some(131_072),
+    );
+    harness.set_summarizer(SummarizerKind::Subagent);
+    // A subagent worker that blocks until cancelled: the hard-wait always times
+    // out, forcing the fallback ladder.
+    harness.set_compaction_summarizer_factory(BlockingSummaryProvider::factory(Arc::new(
+        Mutex::new(Vec::new()),
+    )));
+    harness.set_compaction_trigger(
+        131_072,
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.85,
+            keep_recent_tokens: 4_000,
+            hard_wait_ms: 20,
+            max_consecutive_failures: 3,
+            reactive: true,
+        },
+    );
+    let ladder = harness.compaction.ladder.as_mut().unwrap();
+    ladder.warn = 3_000;
+    ladder.start = 5_000;
+    ladder.hard = 8_000;
+    ladder.keep_recent_tokens = 4_000;
+    ladder.deterministic_only = false;
+    harness.compaction.begin_turn();
+
+    let mut messages = vec![Message::user("LADDER-TURN-OPEN: perform the large task")];
+    for round in 0..12 {
+        push_turn_round(&mut messages, round, &format!("LADDER-NEEDLE-{round:02}"));
+    }
+    harness.compaction.persist_messages(&messages);
+    (harness, path, messages)
+}
+
+#[test]
+fn hard_ladder_escalates_from_subagent_timeout_to_provider_native_when_supported() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let (mut harness, path, messages) =
+        single_turn_hard_ladder_harness(&root.path, &workspace.path);
+    let native_requests = Arc::new(Mutex::new(Vec::new()));
+    let requests = native_requests.clone();
+    harness.set_provider_compaction_factory(Arc::new(move || {
+        Ok(Box::new(NativeCompactionProvider {
+            requests: requests.clone(),
+        }))
+    }));
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    let directive = block_on(harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 1,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: harness.output_store.as_ref(),
+            task_state: None,
+            observer: &obs,
+        },
+        &token,
+    ))
+    .unwrap();
+    assert!(matches!(directive, ContextDirective::Replace { .. }));
+
+    // The subagent timed out and the ladder escalated to provider-native.
+    assert_eq!(native_requests.lock().unwrap().len(), 1);
+    let entries = compaction_entries(&path);
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["origin"] == "providerNative"),
+        "expected a provider-native compaction entry, got {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|entry| entry["origin"] == "excerpts"),
+        "provider-native success must not fall through to excerpts: {entries:?}"
+    );
+    // A provider-native fallback success resets the model-backed breaker.
+    assert_eq!(harness.compaction.consecutive_failures, 0);
+    assert!(obs.events.borrow().iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactionLifecycle { message: Some(message), .. }
+            if message.contains("escalating to provider-native compaction")
+    )));
+}
+
+#[test]
+fn hard_ladder_falls_through_to_excerpts_when_native_capability_is_none() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let (mut harness, path, messages) =
+        single_turn_hard_ladder_harness(&root.path, &workspace.path);
+    // A provider factory whose compaction capability is None (the default):
+    // the ladder must fall through to deterministic excerpts.
+    harness.set_provider_compaction_factory(Arc::new(|| Ok(Box::new(SilentProvider))));
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    let directive = block_on(harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 1,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: harness.output_store.as_ref(),
+            task_state: None,
+            observer: &obs,
+        },
+        &token,
+    ))
+    .unwrap();
+    assert!(matches!(directive, ContextDirective::Replace { .. }));
+
+    let entries = compaction_entries(&path);
+    assert!(
+        entries.iter().any(|entry| entry["origin"] == "excerpts"),
+        "expected a deterministic excerpts entry, got {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["origin"] == "providerNative"),
+        "unsupported native capability must not produce a provider-native entry: {entries:?}"
+    );
+    assert!(obs.events.borrow().iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactionLifecycle { message: Some(message), .. }
+            if message.contains("provider-native compaction unavailable; using deterministic excerpts")
+    )));
+}

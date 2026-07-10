@@ -35,8 +35,8 @@ use anyhow::Result;
 use serde_json::json;
 
 use super::{
-    ApplyContext, CompactionEngine, CompactionSummary, context_tokens, fold_tail_start, summarize,
-    valid_compaction_range,
+    ApplyContext, CompactionEngine, CompactionSummary, PlanTurnMode, context_tokens,
+    fold_tail_start, summarize, valid_compaction_range,
 };
 use crate::config::{Settings, ToolResultCompactionPolicy};
 use crate::nexus::{AgentEvent, AgentObserver, Message, Role, ToolCall};
@@ -484,4 +484,127 @@ fn live_context_equals_resume_rebuild_under_random_ops() {
 
     assert!(compactions > 0, "no compactions ran across {SEEDS} seeds");
     assert!(folds > 0, "no folds ran across {SEEDS} seeds");
+}
+
+/// A single agentic turn: one opening user message, then interleaved assistant
+/// notes and complete tool-call/result pairs, with no further user message.
+fn single_turn_transcript() -> Vec<Message> {
+    let mut messages = vec![Message::user(&"open the large task ".repeat(4))];
+    for round in 0..4 {
+        messages.push(Message::assistant(&format!(
+            "progress note {round} ...................................."
+        )));
+        let id = format!("call_{round:02}");
+        messages.push(Message::assistant_tool_call(&ToolCall {
+            id: id.clone(),
+            name: "read".to_string(),
+            arguments: json!({ "path": "a.rs" }),
+            thought_signature: None,
+        }));
+        messages.push(Message::tool_result(
+            &id,
+            "read",
+            &format!("result {round} :: {}", "output line. ".repeat(30)),
+        ));
+    }
+    messages
+}
+
+fn persisted_engine(
+    messages: &[Message],
+) -> (
+    CompactionEngine,
+    crate::tools::test_support::TestDir,
+    crate::tools::test_support::TestDir,
+) {
+    let sessions = temp_dir();
+    let ws = temp_dir();
+    let workspace = root_of(&ws);
+    let log = SessionLog::create_in(&sessions.path, &workspace).unwrap();
+    let mut engine = CompactionEngine::new(
+        Some(log),
+        0,
+        Vec::new(),
+        Some(BUDGET),
+        Arc::new(AtomicBool::new(false)),
+    );
+    engine.persist_messages(messages);
+    (engine, sessions, ws)
+}
+
+/// Hard mode skips the assistant-turn walk-back so the current turn's completed
+/// content becomes coverable, while the turn-respecting planner collapses the
+/// covered range back to the turn's opening user message.
+#[test]
+fn plan_hard_mode_skips_turn_walk_back_and_covers_current_turn() {
+    let messages = single_turn_transcript();
+    let (engine, _sessions, _ws) = persisted_engine(&messages);
+
+    // Keep exactly the last three messages, so the keep-tail cut lands mid-turn
+    // (on an assistant note, not a user message).
+    let keep = context_tokens(&messages[messages.len() - 3..]);
+
+    let respect = engine
+        .plan_with_mode(&messages, keep, PlanTurnMode::Respect)
+        .expect("respect-mode plan");
+    let hard = engine
+        .plan_with_mode(&messages, keep, PlanTurnMode::HardCurrentTurn)
+        .expect("hard-mode plan");
+
+    // Turn-respecting walk-back collapses to the opening user message only.
+    assert_eq!(respect.start, 0);
+    assert_eq!(respect.end, 1);
+
+    // Hard mode covers the current turn's completed content past the opener.
+    assert_eq!(hard.start, 0);
+    assert!(
+        hard.end > respect.end,
+        "hard mode covered {}..{}, respect covered {}..{}",
+        hard.start,
+        hard.end,
+        respect.start,
+        respect.end
+    );
+    assert!(
+        (hard.start..hard.end).any(|i| messages[i].role == Role::Tool),
+        "hard-mode range {}..{} must include current-turn tool content",
+        hard.start,
+        hard.end
+    );
+
+    // Every unchanged guard still holds for the hard-mode range.
+    assert!(valid_compaction_range(&messages, hard.start, hard.end));
+    assert!(!splits_pair_by_id(&messages, hard.start, hard.end));
+    assert!((hard.start..hard.end).all(|i| engine.entry_ids[i].is_some()));
+    // Persisted bound k.min(n) and keep-tail are respected.
+    assert!(hard.end <= engine.persisted);
+    assert!(context_tokens(&messages[hard.end..]) <= keep);
+}
+
+/// Hard mode still backs the covered range off a tool-call/result pair: even
+/// when the raw keep-tail cut would sever a pair, the end trim preserves it.
+#[test]
+fn plan_hard_mode_still_enforces_pair_trims() {
+    let messages = single_turn_transcript();
+    let (engine, _sessions, _ws) = persisted_engine(&messages);
+
+    // Keep from index 3 (the first tool result) onward, so the raw cut lands on
+    // a tool result whose call sits just inside the range -- a pair split unless
+    // the end trim backs off.
+    let keep = context_tokens(&messages[3..]);
+    assert_eq!(messages[3].role, Role::Tool);
+    assert_eq!(messages[2].role, Role::AssistantToolCall);
+
+    let hard = engine
+        .plan_with_mode(&messages, keep, PlanTurnMode::HardCurrentTurn)
+        .expect("hard-mode plan");
+
+    // The trim backed end off the call at index 2 so the pair is not split.
+    assert!(
+        hard.end <= 2,
+        "hard-mode end {} split the call/result pair at 2/3",
+        hard.end
+    );
+    assert!(valid_compaction_range(&messages, hard.start, hard.end));
+    assert!(!splits_pair_by_id(&messages, hard.start, hard.end));
 }
