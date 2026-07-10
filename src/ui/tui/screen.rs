@@ -3708,10 +3708,9 @@ mod tests {
         assert_eq!(flow_text(&meter), "███···");
     }
 
-    #[test]
-    fn narrow_width_drops_the_flow_meter_before_the_counters() {
-        use crate::ui::tui::WORKING_FRAMES;
-        let usage = crate::nexus::ProviderUsage {
+    /// The design-language §7.7 example's turn telemetry (`↑177k ↓5.7k`).
+    fn indicator_usage() -> crate::nexus::ProviderUsage {
+        crate::nexus::ProviderUsage {
             provider: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             input_tokens: 177_000,
@@ -3721,7 +3720,13 @@ mod tests {
             reasoning_output_tokens: 0,
             total_tokens: 182_700,
             cache_creation: None,
-        };
+        }
+    }
+
+    #[test]
+    fn narrow_width_drops_the_flow_meter_before_the_counters() {
+        use crate::ui::tui::WORKING_FRAMES;
+        let usage = indicator_usage();
         let flow = FlowMeter {
             display: FLOW_QUANTA,
             ..FlowMeter::default()
@@ -3761,6 +3766,40 @@ mod tests {
             }
         }
         assert!(counters_survive_without_meter);
+    }
+
+    #[test]
+    fn working_indicator_golden_frame_matches_the_design_language_example() {
+        use crate::ui::tui::WORKING_FRAMES;
+        // Drive the meter to the §7.7 example's mid-fill + held peak through
+        // its public sampling API: a burst to level 28, then a steady flow at
+        // level 22 (the release passes through 24 on the way down).
+        let mut flow = FlowMeter::default();
+        flow.observe_bytes(bytes_for_level(28));
+        flow.tick();
+        for _ in 0..2 {
+            flow.observe_bytes(bytes_for_level(22));
+            flow.tick();
+        }
+        assert_eq!((flow.display, flow.peak), (22, 28));
+
+        let usage = indicator_usage();
+        let line = line_text(&working_indicator_line_with_activity(
+            WORKING_FRAMES[0],
+            Duration::from_secs(87),
+            true,
+            Some("Responding"),
+            Some(&usage),
+            0,
+            Some(&flow),
+            80,
+        ));
+        // The docs/TUI_DESIGN_LANGUAGE.md §7.7 example, byte for byte — the
+        // doc example and this frame must move together.
+        assert_eq!(
+            line.trim(),
+            "●··· 1:27 ┊ ESC ┊ Responding ┊ ↑177k ↓5.7k ██▊▏··"
+        );
     }
 
     #[test]

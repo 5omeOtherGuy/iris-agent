@@ -263,6 +263,7 @@ GIT / TASK (session bar + git console)
 
 METER
   ●●●○○○○○○○  context meter — 10-dot LED strip (filled muted · edge orange · empty dim)
+  ▏▎▍▌▋▊▉█    flow-meter fill — left-anchored eighth-block ramp (bright accent)
 
 FRAME (box-drawing, square corners ONLY)
   ┌ ┐ └ ┘   corners        │  vertical        ─  horizontal        ├ ┤  tees
@@ -271,6 +272,13 @@ FRAME (box-drawing, square corners ONLY)
 **Punctuation law:** use the ellipsis `…` (never `...`); use the Unicode minus
 `−` for removals (never ASCII `-`); use `┊` as the soft separator (never ASCII
 `|`). A glyph is added only when it carries meaning — do not decorate.
+
+**Meter marks (exact):** `·` is the **shared unlit cell** — the LED chase's
+dark cells and the flow meter's unlit cells speak one vocabulary: a slot that
+could light, dark right now. The flow meter (§7.7) fills with the left-anchored
+eighth-block ramp ` ▏▎▍▌▋▊▉█`, and `▏` doubles as its **peak tick** (dim, in an
+unlit cell): the decaying high-water mark of the last burst — a sanctioned
+double duty, defined here so it stays the only one.
 
 **Git/task senses (exact, one job each):**
 
@@ -319,12 +327,20 @@ itself a monospace specimen (LED strip + `›` + tagline, one orange accent).
      strip fills two LEDs per tick, holds all-lit for two ticks, releases. Runs
      once, on the start page only, and any key completes it instantly;
   4. the **detent flash** — when a bottom-statusline segment changes (model,
-     effort, approval policy), the context meter lights a new LED, or a
+     effort, approval policy), the context meter's lit-LED count moves, or a
      settings-panel control clicks to a new position (§10.1), the changed
-     element alone renders bright for two ticks, then settles: the mechanical
-     acknowledgment that a switch clicked into a new position. Never fires from
-     startup initialization (it is armed only once the first frame settles), so
-     a flash is always news.
+     element alone acknowledges it for two ticks, then settles: a newly lit
+     LED renders **bright**; LEDs that go dark (compaction reclaiming
+     capacity) hold a dim `●` after-image — **the exhale** — before settling
+     to `○`; when growth and shrinkage land in the same tick the bright flash
+     wins. The mechanical acknowledgment that a switch clicked into a new
+     position. Never fires from startup initialization (it is armed only once
+     the first frame settles), so a flash is always news;
+  5. the **flow meter** — the working indicator's 6-cell display-stream inflow
+     bar (§7.7): instant attack, quantized release (4 quanta per tick), and a
+     peak tick that holds five ticks then decays one quantum per tick. Live
+     only while the stream is — it exists only on the running indicator's
+     line, resets with the turn, and vanishes with it.
   No braille spinners, no rainbow meters, no easing, no fades, no ambient
   motion. Everything above degrades to its **static settled state** under
   `prefers-reduced-motion: reduce` / `IRIS_REDUCED_MOTION`.
@@ -440,11 +456,15 @@ An **inline** LED-chase readout shown while the agent runs. Never framed, never
 a braille spinner, one line:
 
 ```
-●···  1:27 ┊ ESC ┊ ↑177k ↓5.7k
+●··· 1:27 ┊ ESC ┊ Responding ┊ ↑177k ↓5.7k ██▊▏··
 ```
 
 The lit cell bounces across a 4-cell strip. One blank line above/below when
 adjacent to other blocks. Telemetry (`↑`/`↓`) and the `ESC` hint are optional.
+The trailing 6-cell **flow meter** (§6 motion 5) meters display-stream inflow
+on a fixed log scale — bright eighth-block fill, the chase's dim `·` for unlit
+cells, a dim `▏` peak tick — and sits last deliberately: end-of-line truncation
+drops it first, so the telemetry counters outrank it at narrow widths.
 
 ### 7.8 Turn divider
 A quiet unboxed rule rendered **after a tool-backed agent turn** (not after
