@@ -4708,7 +4708,7 @@ mod tests {
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         let working_idx = texts
             .iter()
-            .position(|line| line.contains("●···") && line.contains("┊ ESC ┊"))
+            .position(|line| line.contains("●···") && line.contains("┊ ······ ┊"))
             .expect("working indicator");
         let status_idx = texts
             .iter()
@@ -4757,7 +4757,8 @@ mod tests {
         assert!(!before.contains("WORKING"), "{before}");
         assert!(!before.contains("Working…"), "{before}");
         assert!(before.contains("●···"), "{before}");
-        assert!(before.contains("┊ ESC ┊"), "{before}");
+        assert!(!before.contains("┊ ESC ┊"), "{before}");
+        assert!(before.contains("┊ ······ ┊"), "{before}");
         assert!(before.contains("↑177k ↓5.7k"), "{before}");
         assert!(!before.contains('|'), "{before}");
         assert!(!before.contains("T+"), "{before}");
@@ -4897,12 +4898,12 @@ mod tests {
         assert_eq!(
             frames,
             vec![
-                "●··· 1:27 ┊ ESC",
-                "·●·· 1:27 ┊ ESC",
-                "··●· 1:27 ┊ ESC",
-                "···● 1:27 ┊ ESC",
-                "··●· 1:27 ┊ ESC",
-                "·●·· 1:27 ┊ ESC",
+                "●··· 1:27",
+                "·●·· 1:27",
+                "··●· 1:27",
+                "···● 1:27",
+                "··●· 1:27",
+                "·●·· 1:27",
             ]
         );
     }
@@ -4951,7 +4952,7 @@ mod tests {
         .trim()
         .to_string();
 
-        assert_eq!(without_telemetry, "●··· 1:27 ┊ ESC");
+        assert_eq!(without_telemetry, "●··· 1:27");
         assert_eq!(without_interrupt, "●··· 1:27 ┊ ↑12k ↓5.7k");
         assert_eq!(elapsed_only, "●··· 1:27");
         assert!(!without_telemetry.contains("┊ ┊"));

@@ -805,7 +805,7 @@ pub(super) fn working_indicator_line(
 fn working_indicator_line_with_activity(
     frame: &str,
     elapsed: Duration,
-    can_interrupt: bool,
+    _can_interrupt: bool,
     activity: Option<&str>,
     usage: Option<&ProviderUsage>,
     queued: usize,
@@ -815,9 +815,9 @@ fn working_indicator_line_with_activity(
     let mut spans = led_frame_spans(frame);
     spans.push(Span::raw(" "));
     spans.push(Span::styled(format_elapsed_compact(elapsed), panel_style()));
-    if can_interrupt {
+    if let Some(flow) = flow {
         spans.push(working_sep());
-        spans.push(Span::styled("ESC", panel_style()));
+        spans.extend(flow.spans());
     }
     if let Some(activity) = activity {
         spans.push(working_sep());
@@ -844,15 +844,6 @@ fn working_indicator_line_with_activity(
             ),
             dim_style(),
         ));
-    }
-    // The flow meter rides last on the line deliberately (spec §2.1): the
-    // end-of-line truncation below makes it the first thing dropped at narrow
-    // widths — the telemetry counters outrank the meter, with no new
-    // truncation logic. One plain space, not a `┊`: the bar is an instrument
-    // face, not another metadata field.
-    if let Some(flow) = flow {
-        spans.push(Span::raw(" "));
-        spans.extend(flow.spans());
     }
     let mut line = Line::from(spans);
     truncate_line(&mut line, content_width(width));
@@ -4203,7 +4194,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_width_drops_the_flow_meter_before_the_counters() {
+    fn narrow_width_keeps_the_flow_meter_before_the_counters() {
         use crate::ui::tui::WORKING_FRAMES;
         let usage = indicator_usage();
         let flow = FlowMeter {
@@ -4223,28 +4214,25 @@ mod tests {
             ))
         };
 
-        // The fullest form carries the counters AND the meter…
+        // The fullest form carries the meter before the counters, where the ESC
+        // hint used to sit.
         let full = line_at(80);
         assert!(full.contains("↑177k ↓5.7k"), "{full:?}");
         assert!(full.contains("██████"), "{full:?}");
+        assert!(!full.contains("ESC"), "{full:?}");
+        assert!(full.find("██████") < full.find("↑177k ↓5.7k"), "{full:?}");
 
-        // …and position does the truncation work (spec §2.1): at every width
-        // the meter only ever renders behind intact counters, and some width
-        // keeps the counters while dropping the meter.
-        let mut counters_survive_without_meter = false;
+        // Position does the truncation work: some narrow width keeps the live
+        // meter after elapsed while dropping the later counters.
+        let mut meter_survives_without_counters = false;
         for width in 1..=80 {
             let text = line_at(width);
-            if text.contains('█') {
-                assert!(
-                    text.contains("↑177k ↓5.7k"),
-                    "meter must not outlive the counters at {width}: {text:?}"
-                );
-            }
-            if text.contains("↑177k ↓5.7k") && !text.contains('█') {
-                counters_survive_without_meter = true;
+            assert!(!text.contains("ESC"), "{text:?}");
+            if text.contains('█') && !text.contains("↑177k ↓5.7k") {
+                meter_survives_without_counters = true;
             }
         }
-        assert!(counters_survive_without_meter);
+        assert!(meter_survives_without_counters);
     }
 
     #[test]
@@ -4275,10 +4263,7 @@ mod tests {
         ));
         // The docs/TUI_DESIGN_LANGUAGE.md §7.7 example, byte for byte — the
         // doc example and this frame must move together.
-        assert_eq!(
-            line.trim(),
-            "●··· 1:27 ┊ ESC ┊ Responding ┊ ↑177k ↓5.7k ██▊▏··"
-        );
+        assert_eq!(line.trim(), "●··· 1:27 ┊ ██▊▏·· ┊ Responding ┊ ↑177k ↓5.7k");
     }
 
     #[test]
