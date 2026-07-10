@@ -1373,8 +1373,17 @@ impl Screen {
                 self.reduced_motion,
             );
         } else if after < before && self.detents.armed && !self.reduced_motion {
+            // A second reclaim landing while the echo is still live extends
+            // the SAME after-image: it must cover every LED vacated while it
+            // is live, so a stacked drop keeps the higher earlier mark (max);
+            // a settled exhale's stale mark is replaced outright.
+            let before = before as u8;
+            self.detents.exhale_top = if self.detents.exhale > 0 {
+                self.detents.exhale_top.max(before)
+            } else {
+                before
+            };
             self.detents.exhale = FLASH_TICKS;
-            self.detents.exhale_top = before as u8;
         }
     }
 
@@ -3504,6 +3513,31 @@ mod tests {
         screen.tick();
         screen.tick();
         assert_eq!(lit_dots(&screen), 4, "settled");
+    }
+
+    #[test]
+    fn stacked_reclaims_extend_one_exhale_across_the_full_vacated_range() {
+        let mut screen = footer_screen("~/repo");
+        screen.arm_detents();
+        screen.apply(provider_turn(210_000)); // 7 LEDs
+        screen.tick();
+        screen.tick();
+
+        // Two reclaims land back to back with no intervening tick: 7→5, then
+        // 5→2. The second must not shrink the live echo's span — the
+        // after-image covers EVERY LED vacated while it is live (3..=7), for
+        // two full ticks from the second event.
+        screen.apply(compaction(60_000, 0)); // 210k → 150k: 5 LEDs
+        screen.apply(UiEvent::FoldApplied {
+            folds: 1,
+            reclaimed_tokens_estimate: 90_000,
+            trigger: crate::nexus::FoldTrigger::CompactionBoundary,
+        }); // 150k → 60k: 2 LEDs
+        assert_eq!(lit_dots(&screen), 7, "2 lit + 5 after-images");
+        screen.tick();
+        assert_eq!(lit_dots(&screen), 7, "still exhaling after one tick");
+        screen.tick();
+        assert_eq!(lit_dots(&screen), 2, "settled");
     }
 
     #[test]
