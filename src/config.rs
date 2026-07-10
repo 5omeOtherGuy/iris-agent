@@ -86,10 +86,9 @@ pub(crate) struct Settings {
     /// providers a session talks to, so it is global-only: a cloned repo cannot
     /// silently change the cycle scope.
     pub(crate) enabled_models: Option<Vec<String>>,
-    /// How compaction produces its summary text: `subagent` (default) asks a
-    /// read-only background worker for a structured handoff summary, falling
-    /// back to older provider/excerpts summarization when needed; `provider`
-    /// uses the active model directly; `excerpts` keeps the deterministic
+    /// How compaction produces its summary text: `provider` (default) uses the
+    /// active model directly; `subagent` asks a read-only background worker for
+    /// a structured handoff summary; `excerpts` keeps the deterministic
     /// stand-in only. A cost/quality knob like
     /// [`Settings::context_token_budget`] (it can only choose who writes the
     /// summary, never where requests go), so a project file may tune it.
@@ -597,21 +596,22 @@ impl Settings {
             .unwrap_or(DEFAULT_MICROCOMPACTION_WATERMARK)
     }
 
-    /// Configured compaction summarizer, defaulting to the read-only subagent
-    /// worker path (issue #472). `provider` and `excerpts` remain fallback modes.
+    /// Configured compaction summarizer, defaulting to the active provider.
+    /// Provider-native compaction takes precedence when supported; this setting
+    /// is the portable fallback for unsupported selections.
     /// An unknown value falls back to the default rather than erroring, matching
     /// how other tuning knobs degrade.
     pub(crate) fn compaction_summarizer(&self) -> crate::wayland::SummarizerKind {
         match self.compaction_summarizer.as_deref() {
             Some("excerpts") => crate::wayland::SummarizerKind::Excerpts,
-            Some("provider") => crate::wayland::SummarizerKind::Provider,
-            Some("subagent") | None => crate::wayland::SummarizerKind::Subagent,
+            Some("provider") | None => crate::wayland::SummarizerKind::Provider,
+            Some("subagent") => crate::wayland::SummarizerKind::Subagent,
             Some(other) => {
                 tracing::warn!(
                     value = other,
-                    "unknown compactionSummarizer; using 'subagent'"
+                    "unknown compactionSummarizer; using 'provider'"
                 );
-                crate::wayland::SummarizerKind::Subagent
+                crate::wayland::SummarizerKind::Provider
             }
         }
     }
@@ -669,8 +669,8 @@ impl Settings {
             .and_then(|value| value.provider_native.as_deref())
             .map(str::trim)
         {
-            None | Some("off") => Ok(ProviderNativeMode::Off),
-            Some("auto") => Ok(ProviderNativeMode::Auto),
+            Some("off") => Ok(ProviderNativeMode::Off),
+            None | Some("auto") => Ok(ProviderNativeMode::Auto),
             Some(_) => bail!("compaction.providerNative must be off|auto"),
         }
     }
@@ -2151,10 +2151,10 @@ mod tests {
     }
 
     #[test]
-    fn provider_native_defaults_off_and_is_global_only() {
+    fn provider_native_defaults_auto_and_is_global_only() {
         assert_eq!(
             Settings::default().compaction_provider_native().unwrap(),
-            ProviderNativeMode::Off
+            ProviderNativeMode::Auto
         );
 
         let dir = temp_dir();
@@ -2239,7 +2239,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_summarizer_defaults_to_subagent_and_accepts_explicit_modes() {
+    fn compaction_summarizer_defaults_to_provider_and_accepts_explicit_modes() {
         let dir = temp_dir();
         let defaulted = Settings::load_from(
             Some(&dir.path.join("none.json")),
@@ -2248,7 +2248,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             defaulted.compaction_summarizer(),
-            crate::wayland::SummarizerKind::Subagent
+            crate::wayland::SummarizerKind::Provider
         );
 
         let project = dir.path.join("project.json");

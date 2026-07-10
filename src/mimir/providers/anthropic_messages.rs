@@ -566,7 +566,7 @@ impl AnthropicProvider {
             "Anthropic native compaction request failed (status={}, error_type={error_type})",
             status.as_u16()
         );
-        if status.as_u16() == 400 {
+        if is_anthropic_native_unsupported(status.as_u16(), &body) {
             return NativeCompactionAttempt::Unsupported(error);
         }
         match classify_http_status_retryable(status.as_u16()) {
@@ -575,6 +575,10 @@ impl AnthropicProvider {
             HttpClass::Fatal => NativeCompactionAttempt::Fatal(error),
         }
     }
+}
+
+fn is_anthropic_native_unsupported(status: u16, body: &str) -> bool {
+    status == 400 && !super::is_context_overflow_response(status, body)
 }
 
 enum NativeCompactionAttempt {
@@ -2547,6 +2551,18 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(output.usage.as_ref().unwrap().input_tokens, 50_000);
         assert_eq!(output.usage.as_ref().unwrap().output_tokens, 800);
         assert_eq!(output.usage.as_ref().unwrap().total_tokens, 50_800);
+    }
+
+    #[test]
+    fn native_compaction_overflow_does_not_poison_the_unsupported_model_cache() {
+        assert!(!is_anthropic_native_unsupported(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
+        ));
+        assert!(is_anthropic_native_unsupported(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"compact is unsupported"}}"#,
+        ));
     }
 
     fn json_contains_key(value: &Value, key: &str) -> bool {

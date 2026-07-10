@@ -200,8 +200,11 @@ If unset, `promptCacheRetention` defaults to `short`; set it to `none` to omit
 provider-native prompt-cache hints.
 
 Automatic compaction uses the selected model's effective context window. An
-explicit `contextTokenBudget` remains an absolute upper bound. Tune or disable
-the trigger ladder with:
+explicit `contextTokenBudget` remains an absolute upper bound. Provider-native
+compaction and active-provider summaries are the defaults; unsupported native
+routes fall back through the portable summarizer. Microcompaction and
+tool-result compaction remain disabled unless enabled explicitly. Tune or
+disable the trigger ladder with:
 
 ```json
 {

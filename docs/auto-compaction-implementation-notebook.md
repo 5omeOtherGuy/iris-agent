@@ -132,7 +132,7 @@ envelope, usage, and `providerNative` origin. Rebuild is byte-identical before
 translation. Only Mimir decides whether the envelope matches the exact adapter
 and model; a selection change discards an in-flight native job.
 
-Decision: `compaction.providerNative=auto` is global-only and default-off. The
+Decision: `compaction.providerNative=auto` is global-only and the default. The
 legacy Anthropic compact field stays rejected so one reducer has one control.
 Anthropic capability is not advertised below the public 50,000-token trigger
 floor. A rejected model is cached for the process and later jobs use the

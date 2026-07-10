@@ -566,7 +566,7 @@ fn remote_v2_compaction_probe_is_flag_gated_and_uses_a_trigger_item() {
     assert!(openai_native_probe_enabled(Some("true")));
     assert!(!openai_native_probe_enabled(Some("0")));
 
-    let request = build_codex_native_compaction_probe_request(
+    let request = build_codex_native_compaction_request(
         "gpt-5.4-mini",
         "IRIS PROMPT",
         &[Message::user("old context")],
@@ -599,15 +599,93 @@ fn remote_v2_compaction_probe_captures_one_deduplicated_stream_item() {
         "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}]}}\n\n",
         "data: [DONE]\n\n"
     );
-    let block = parse_codex_compaction_probe_reader(
+    let output = parse_codex_compaction_probe_reader(
         std::io::Cursor::new(stream),
         "gpt-5.4-mini",
         &CancellationToken::new(),
     )
     .unwrap();
+    let block = output.block;
     assert_eq!(block["adapter"], "openai-codex-responses");
     assert_eq!(block["model"], "gpt-5.4-mini");
     assert_eq!(block["block"]["encrypted_content"], "opaque");
+}
+
+#[test]
+fn native_compaction_parser_captures_usage_and_merge_accounts_for_both_calls() {
+    let stream = concat!(
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}],\"usage\":{\"input_tokens\":100,\"output_tokens\":5,\"total_tokens\":105}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let native = parse_codex_compaction_probe_reader(
+        std::io::Cursor::new(stream),
+        "gpt-test-usage",
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let summary = ProviderUsage {
+        provider: PROVIDER_ID.to_string(),
+        model: "gpt-test-usage".to_string(),
+        input_tokens: 80,
+        output_tokens: 20,
+        cache_read_input_tokens: 10,
+        cache_write_input_tokens: 0,
+        reasoning_output_tokens: 4,
+        total_tokens: 100,
+        cache_creation: None,
+    };
+    let merged = merge_openai_compaction_usage(native.usage, Some(summary)).unwrap();
+    assert_eq!(merged.input_tokens, 180);
+    assert_eq!(merged.output_tokens, 25);
+    assert_eq!(merged.total_tokens, 205);
+    assert_eq!(merged.reasoning_output_tokens, 4);
+}
+
+#[test]
+fn native_compaction_failure_classification_does_not_cache_overflow() {
+    assert_eq!(
+        classify_codex_native_failure(400, r#"{"error":{"code":"context_length_exceeded"}}"#),
+        CodexNativeFailure::Fatal,
+    );
+    assert_eq!(
+        classify_codex_native_failure(400, r#"{"error":{"code":"unsupported_feature"}}"#),
+        CodexNativeFailure::Unsupported,
+    );
+    assert_eq!(
+        classify_codex_native_failure(401, ""),
+        CodexNativeFailure::Reauth,
+    );
+    assert_eq!(
+        classify_codex_native_failure(429, ""),
+        CodexNativeFailure::Retry,
+    );
+}
+
+#[test]
+fn native_compaction_capability_has_no_input_floor_and_honors_rejection_cache() {
+    let model = "gpt-test-native-capability-cache";
+    assert_eq!(
+        codex_native_compaction_capability(model),
+        ProviderCompactionCapability::OpaqueBlocks,
+    );
+    NATIVE_COMPACTION_UNSUPPORTED_MODELS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .insert(model.to_string());
+    assert_eq!(
+        codex_native_compaction_capability(model),
+        ProviderCompactionCapability::None,
+    );
+}
+
+#[test]
+fn native_compaction_portable_summary_prompt_is_text_only_and_preserves_focus() {
+    let prompt = native_compaction_summary_instructions("retain issue 42 and src/lib.rs");
+    assert!(prompt.contains("self-contained handoff summary"));
+    assert!(prompt.contains("do not call tools"));
+    assert!(prompt.contains("retain issue 42 and src/lib.rs"));
 }
 
 #[test]

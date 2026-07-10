@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::future::Future;
-#[cfg(test)]
 use std::io::BufRead;
 use std::io::BufReader;
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,8 @@ use super::transport::{
 use crate::mimir::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
 use crate::mimir::selection::{CodexTransport, PromptCacheRetention, ReasoningEffort};
 use crate::nexus::{
-    AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderStream, ProviderUsage,
+    AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderCompactionCapability,
+    ProviderCompactionFuture, ProviderCompactionOutput, ProviderStream, ProviderUsage,
     ReasoningBlock, Role, ToolCall, Tools,
 };
 
@@ -37,6 +39,7 @@ use crate::nexus::{
 // every provider adapter.
 const PROVIDER_ID: &str = "openai-codex";
 const API_ID: &str = "openai-codex-responses";
+static NATIVE_COMPACTION_UNSUPPORTED_MODELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_MAX_AGE: Duration = Duration::from_secs(55 * 60);
@@ -148,7 +151,7 @@ impl OpenAiCodexResponsesProvider {
         ) {
             bail!("OpenAI native compaction probe is disabled");
         }
-        let request = build_codex_native_compaction_probe_request(
+        let request = build_codex_native_compaction_request(
             &self.model,
             &self.system_prompt,
             messages,
@@ -175,6 +178,240 @@ impl OpenAiCodexResponsesProvider {
             );
         }
         parse_codex_compaction_probe_reader(BufReader::new(response), &self.model, cancel)
+            .map(|output| output.block)
+    }
+
+    fn compact_context_blocking(
+        &self,
+        messages: &[Message],
+        instructions: &str,
+        cancel: &CancellationToken,
+    ) -> Result<ProviderCompactionOutput> {
+        if cancel.is_cancelled() {
+            bail!("provider-native compaction cancelled");
+        }
+        let request = build_codex_native_compaction_request(
+            &self.model,
+            &self.system_prompt,
+            messages,
+            self.cache_retention,
+        );
+        let native = self.run_native_compaction_request(&request, cancel)?;
+        if let Some(usage) = &native.usage {
+            self.record_usage(usage);
+        }
+
+        // Codex compaction items are intentionally opaque and carry no portable
+        // text. Iris therefore pays for a second inference call so cross-model
+        // resume retains the provider-independent summary required by ADR-0056.
+        let summary_request = build_codex_request(
+            &self.model,
+            &native_compaction_summary_instructions(instructions),
+            messages,
+            &Tools::new(Vec::new()),
+            self.reasoning,
+            Some(&self.prompt_cache_key),
+            None,
+            self.cache_retention,
+        );
+        let mut sink = DiscardTextSink;
+        let turn = self.run_blocking(
+            resolve_codex_url(&self.base_url)?,
+            &summary_request,
+            &mut sink,
+            cancel,
+        )?;
+        let summary = turn
+            .text
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| anyhow!("Codex native compaction returned empty portable text"))?;
+        let usage = merge_openai_compaction_usage(native.usage, turn.usage);
+        Ok(ProviderCompactionOutput {
+            summary,
+            provider_blocks: vec![native.block],
+            usage,
+        })
+    }
+
+    fn run_native_compaction_request(
+        &self,
+        request: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<CodexNativeCompaction> {
+        let url = resolve_codex_url(&self.base_url)?;
+        let mut force_refresh = false;
+        let mut reauth_used = false;
+        let mut transient_retries = 0u32;
+        loop {
+            if cancel.is_cancelled() {
+                bail!("provider-native compaction cancelled");
+            }
+            let token = if force_refresh {
+                self.tokens.force_refresh(&self.client)
+            } else {
+                self.tokens.access_token(&self.client)
+            }?;
+            force_refresh = false;
+            match self.send_native_compaction_once(url.clone(), &token, request, cancel) {
+                CodexNativeCompactionAttempt::Done(output) => return Ok(output),
+                CodexNativeCompactionAttempt::Unsupported(error) => {
+                    NATIVE_COMPACTION_UNSUPPORTED_MODELS
+                        .get_or_init(|| Mutex::new(HashSet::new()))
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .insert(self.model.clone());
+                    return Err(error);
+                }
+                CodexNativeCompactionAttempt::Reauth(error) if !reauth_used => {
+                    reauth_used = true;
+                    force_refresh = true;
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "Codex native compaction auth rejected; refreshing once"
+                    );
+                }
+                CodexNativeCompactionAttempt::Retry(error, retry_after)
+                    if transient_retries < self.retry_policy.max_retries =>
+                {
+                    transient_retries += 1;
+                    let delay = self
+                        .retry_policy
+                        .backoff_delay(transient_retries, retry_after);
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        attempt = transient_retries,
+                        delay_ms = delay.as_millis() as u64,
+                        "Codex native compaction transient error; retrying"
+                    );
+                    sleep_codex_native_retry(delay, cancel);
+                }
+                CodexNativeCompactionAttempt::Reauth(error)
+                | CodexNativeCompactionAttempt::Retry(error, _)
+                | CodexNativeCompactionAttempt::Fatal(error) => return Err(error),
+            }
+        }
+    }
+
+    fn send_native_compaction_once(
+        &self,
+        url: Url,
+        token: &AccessToken,
+        request: &Value,
+        cancel: &CancellationToken,
+    ) -> CodexNativeCompactionAttempt {
+        let headers = match codex_headers(token) {
+            Ok(headers) => headers,
+            Err(error) => return CodexNativeCompactionAttempt::Fatal(error),
+        };
+        let response = match self.client.post(url).headers(headers).json(request).send() {
+            Ok(response) => response,
+            Err(error) => {
+                return CodexNativeCompactionAttempt::Retry(
+                    anyhow::Error::new(error)
+                        .context("failed to send Codex native compaction request"),
+                    None,
+                );
+            }
+        };
+        let status = response.status();
+        if status.is_success() {
+            return match parse_codex_compaction_probe_reader(
+                BufReader::new(response),
+                &self.model,
+                cancel,
+            ) {
+                Ok(output) => CodexNativeCompactionAttempt::Done(output),
+                Err(error) => CodexNativeCompactionAttempt::Retry(error, None),
+            };
+        }
+        let retry_after = retry_after_hint(response.headers());
+        let body = response.text().unwrap_or_default();
+        let error_type = extract_error_field(&body, "type")
+            .or_else(|| extract_error_field(&body, "code"))
+            .unwrap_or_else(|| "unknown_error".to_string());
+        let error = anyhow!(
+            "Codex native compaction failed [status={} endpoint=/codex/responses model={} error_type={error_type}]",
+            status.as_u16(),
+            self.model
+        );
+        match classify_codex_native_failure(status.as_u16(), &body) {
+            CodexNativeFailure::Unsupported => CodexNativeCompactionAttempt::Unsupported(error),
+            CodexNativeFailure::Reauth => CodexNativeCompactionAttempt::Reauth(error),
+            CodexNativeFailure::Retry => CodexNativeCompactionAttempt::Retry(error, retry_after),
+            CodexNativeFailure::Fatal => CodexNativeCompactionAttempt::Fatal(error),
+        }
+    }
+}
+
+struct CodexNativeCompaction {
+    block: Value,
+    usage: Option<ProviderUsage>,
+}
+
+enum CodexNativeCompactionAttempt {
+    Done(CodexNativeCompaction),
+    Unsupported(anyhow::Error),
+    Reauth(anyhow::Error),
+    Retry(anyhow::Error, Option<Duration>),
+    Fatal(anyhow::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexNativeFailure {
+    Unsupported,
+    Reauth,
+    Retry,
+    Fatal,
+}
+
+fn classify_codex_native_failure(status: u16, body: &str) -> CodexNativeFailure {
+    if status == 400 && !super::is_context_overflow_response(status, body) {
+        return CodexNativeFailure::Unsupported;
+    }
+    match classify_http_status_retryable(status) {
+        HttpClass::Reauth => CodexNativeFailure::Reauth,
+        HttpClass::Retry => CodexNativeFailure::Retry,
+        HttpClass::Fatal => CodexNativeFailure::Fatal,
+    }
+}
+
+fn sleep_codex_native_retry(delay: Duration, cancel: &CancellationToken) {
+    let slice = Duration::from_millis(50);
+    let started = Instant::now();
+    while !cancel.is_cancelled() && started.elapsed() < delay {
+        std::thread::sleep(slice.min(delay.saturating_sub(started.elapsed())));
+    }
+}
+
+fn merge_openai_compaction_usage(
+    native: Option<ProviderUsage>,
+    summary: Option<ProviderUsage>,
+) -> Option<ProviderUsage> {
+    match (native, summary) {
+        (Some(mut total), Some(summary)) => {
+            total.input_tokens = total.input_tokens.saturating_add(summary.input_tokens);
+            total.output_tokens = total.output_tokens.saturating_add(summary.output_tokens);
+            total.cache_read_input_tokens = total
+                .cache_read_input_tokens
+                .saturating_add(summary.cache_read_input_tokens);
+            total.cache_write_input_tokens = total
+                .cache_write_input_tokens
+                .saturating_add(summary.cache_write_input_tokens);
+            total.reasoning_output_tokens = total
+                .reasoning_output_tokens
+                .saturating_add(summary.reasoning_output_tokens);
+            total.total_tokens = total.total_tokens.saturating_add(summary.total_tokens);
+            Some(total)
+        }
+        (native, summary) => native.or(summary),
+    }
+}
+
+struct DiscardTextSink;
+
+impl TurnSink for DiscardTextSink {
+    fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -229,6 +466,35 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
             move |sink, cancel| async move { provider.run_auto(url, request, sink, cancel).await },
             cancel,
         ))
+    }
+
+    fn compaction_capability(&self, _input_tokens: u64) -> ProviderCompactionCapability {
+        // Unlike Anthropic's compact beta, Codex advertises no provider-side
+        // minimum input floor. Wayland's model-aware start/hard ladder decides
+        // when the request is economical; Mimir only caches proven rejection.
+        codex_native_compaction_capability(&self.model)
+    }
+
+    fn compact_context<'a>(
+        &'a self,
+        messages: &'a [Message],
+        instructions: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> ProviderCompactionFuture<'a> {
+        Box::pin(async move { self.compact_context_blocking(messages, instructions, cancel) })
+    }
+}
+
+fn codex_native_compaction_capability(model: &str) -> ProviderCompactionCapability {
+    let unsupported = NATIVE_COMPACTION_UNSUPPORTED_MODELS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .contains(model);
+    if unsupported {
+        ProviderCompactionCapability::None
+    } else {
+        ProviderCompactionCapability::OpaqueBlocks
     }
 }
 
@@ -716,8 +982,7 @@ fn openai_native_probe_enabled(value: Option<&str>) -> bool {
     value.is_some_and(|value| matches!(value.trim(), "1" | "true" | "on"))
 }
 
-#[cfg(test)]
-fn build_codex_native_compaction_probe_request(
+fn build_codex_native_compaction_request(
     model: &str,
     instructions: &str,
     messages: &[Message],
@@ -740,7 +1005,16 @@ fn build_codex_native_compaction_probe_request(
     body
 }
 
-#[cfg(test)]
+fn native_compaction_summary_instructions(instructions: &str) -> String {
+    let instructions = instructions.trim();
+    let base = "Write a self-contained handoff summary of the supplied transcript. Preserve the goal, completed work, decisions, constraints, exact identifiers and paths, failures, and next steps. Respond with summary text only and do not call tools.";
+    if instructions.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} Additional focus: {instructions}")
+    }
+}
+
 fn extract_codex_compaction_block(response: &Value, model: &str) -> Option<Value> {
     let item = response
         .get("output")
@@ -755,13 +1029,13 @@ fn extract_codex_compaction_block(response: &Value, model: &str) -> Option<Value
     }))
 }
 
-#[cfg(test)]
 fn parse_codex_compaction_probe_reader(
     reader: impl BufRead,
     model: &str,
     cancel: &CancellationToken,
-) -> Result<Value> {
+) -> Result<CodexNativeCompaction> {
     let mut blocks = Vec::new();
+    let mut usage = None;
     for_each_sse_event(reader, cancel, |data| {
         if data.is_empty() || data == "[DONE]" {
             return Ok(());
@@ -780,15 +1054,21 @@ fn parse_codex_compaction_probe_reader(
             event.get("type").and_then(Value::as_str),
             Some("response.completed" | "response.done")
         ) && let Some(response) = event.get("response")
-            && let Some(block) = extract_codex_compaction_block(response, model)
-            && !blocks.contains(&block)
         {
-            blocks.push(block);
+            if let Some(block) = extract_codex_compaction_block(response, model)
+                && !blocks.contains(&block)
+            {
+                blocks.push(block);
+            }
+            usage = extract_openai_usage(response, model);
         }
         Ok(())
     })?;
     match blocks.len() {
-        1 => Ok(blocks.pop().expect("one checked block")),
+        1 => Ok(CodexNativeCompaction {
+            block: blocks.pop().expect("one checked block"),
+            usage,
+        }),
         count => bail!(
             "Codex native compaction probe returned {count} opaque blocks; expected exactly one"
         ),
