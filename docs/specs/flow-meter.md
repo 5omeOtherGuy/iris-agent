@@ -120,6 +120,17 @@ go dark, capacity comes back — and today it happens with no acknowledgment.
   `Detents` in `src/ui/tui/screen.rs`; do not build a parallel system.
 - Increase and decrease in the same tick: the increase's bright flash wins
   (news of growth outranks the echo of shrinkage).
+- **Implementation reality (verified):** today the meter fill
+  (`footer.context_used_tokens`) updates ONLY in the `ProviderTurnCompleted`
+  branch (screen.rs ~1321–1350); `CompactionApplied`/`FoldApplied`
+  (~1355–1373) adjust accounting but never the meter, so a reclaim currently
+  repaints the meter a full turn late, silently. The exhale must fire AT the
+  compaction/fold event: update the meter's used-tokens from the screen's
+  compaction accounting at those events (derive the post-reclaim total from
+  the fields those events carry; if only estimates exist, use them and say so
+  in a comment — an honest estimate now beats an exact number a turn late),
+  then arm the exhale on the darkening edge. The existing strictly-greater
+  `advanced` gate stays for the bright flash.
 
 ## 4 · Design-language amendments (same change)
 
