@@ -36,7 +36,7 @@ for messages appended after that response. A context rewrite invalidates the
 provider anchor. Usage-blind lanes and resumed sessions use local estimates until
 a provider reports usage.
 
-At existing turn boundaries:
+At pre-turn, post-turn, and continuing between-round-trip boundaries:
 
 - `warn` emits `ContextPressure` without mutation;
 - `start` starts one background job, or applies deterministic excerpts when
@@ -75,5 +75,5 @@ emit a notice and never fail the user's turn.
 - `/context` labels measurement provenance, ladder thresholds, and job state.
 - Model switches recompute the window before the next request.
 - Tiny-window sessions trade summary quality for deterministic progress.
-- The trigger still runs only at turn boundaries. Mid-turn governor boundaries
-  are a separate decision and implementation slice.
+- ADR-0055 supplies the provider-neutral mid-turn governor seam. Outside the
+  hard tier, worker start and ready-result drain do not wait for model traffic.

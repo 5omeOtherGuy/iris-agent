@@ -665,6 +665,12 @@ pub(crate) type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput>>
 /// while `review` is async (and therefore raceable against cancellation).
 pub(crate) type ApprovalFuture<'a> = Pin<Box<dyn Future<Output = Result<ApprovalDecision>> + 'a>>;
 
+/// A `!Send` governor future tied to the current loop boundary. The TUI runtime
+/// is single-threaded; model-backed compaction work runs in its own worker and
+/// only the bounded hard-tier wait may keep this future pending.
+pub(crate) type ContextGovernorFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ContextDirective>> + 'a>>;
+
 /// Fire-and-forget observer for semantic events and provider-round-trip commit
 /// boundaries. The default boundary hook is inert; Wayland uses it to persist
 /// complete message groups without teaching Nexus about sessions or JSONL.
@@ -756,6 +762,49 @@ pub(crate) trait SteeringSource {
     fn take_steering(&self) -> Vec<String>;
     /// Drain the follow-up messages to inject after the agent would stop.
     fn take_follow_up(&self) -> Vec<String>;
+}
+
+/// Most recent provider-reported usage plus the message prefix represented by
+/// that report. The governor adds local estimates only after this prefix.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProviderUsageAnchor<'a> {
+    pub(crate) usage: &'a ProviderUsage,
+    pub(crate) message_count: usize,
+}
+
+/// Provider-neutral state at a safe between-round-trips boundary. The message
+/// slice ends after complete tool-call/result groups; queued steering has not
+/// been injected yet.
+pub(crate) struct BoundaryContext<'a> {
+    pub(crate) messages: &'a [Message],
+    pub(crate) last_usage: Option<ProviderUsageAnchor<'a>>,
+    pub(crate) round_trip: usize,
+    pub(crate) turn_continues: bool,
+}
+
+/// Whole-context decision returned by a [`ContextGovernor`]. Nexus owns only
+/// the atomic replacement; the governor owns every policy and persistence
+/// decision that produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ContextDirective {
+    Proceed,
+    Replace { messages: Vec<Message> },
+}
+
+/// Host-supplied context policy consulted only when another provider request
+/// will follow. Object-safe like [`ApprovalGate`]; Nexus knows no budgets,
+/// sessions, summaries, or provider-specific compaction behavior.
+pub(crate) trait ContextGovernor {
+    fn at_boundary<'a>(&'a self, cx: BoundaryContext<'a>) -> ContextGovernorFuture<'a>;
+}
+
+/// Per-turn host hooks that travel together through the loop. Bundling the
+/// observer and optional governor keeps the loop call surface compact while
+/// preserving two distinct contracts.
+#[derive(Clone, Copy)]
+pub(crate) struct TurnContextHooks<'a> {
+    pub(crate) observer: &'a dyn AgentObserver,
+    pub(crate) governor: Option<&'a dyn ContextGovernor>,
 }
 
 /// Structured review facts Nexus derives at the gate and threads to the
@@ -1296,9 +1345,9 @@ pub(crate) struct Agent<P> {
     // ([`run_verification_command`]) may also set it, but that value is always
     // overwritten by the next `submit_turn` reset before the harness reads it.
     mutated_this_turn: bool,
-    // Last authoritative provider total and the transcript length it covered.
+    // Last authoritative provider usage and the transcript length it covered.
     // Wayland adds estimates only for messages appended after this anchor.
-    last_provider_usage: Option<(u64, usize)>,
+    last_provider_usage: Option<(ProviderUsage, usize)>,
 }
 
 /// Result of consuming one provider stream to its terminal event (or to a
@@ -1474,6 +1523,8 @@ impl<P: ChatProvider> Agent<P> {
 
     pub(crate) fn last_provider_usage_anchor(&self) -> Option<(u64, usize)> {
         self.last_provider_usage
+            .as_ref()
+            .map(|(usage, count)| (usage.total_tokens, *count))
     }
 
     /// Whether a mutating tool call succeeded during the turn just run (issue
@@ -1538,18 +1589,50 @@ impl<P: ChatProvider> Agent<P> {
         token: &CancellationToken,
         steer: Option<&dyn SteeringSource>,
     ) -> Result<()> {
-        self.submit_turn_with_context(TurnInput::new(prompt), obs, gate, env, token, steer)
-            .await
+        self.submit_turn_with_context_and_governor(
+            TurnInput::new(prompt),
+            TurnContextHooks {
+                observer: obs,
+                governor: None,
+            },
+            gate,
+            env,
+            token,
+            steer,
+        )
+        .await
     }
 
-    /// Submit one visible user prompt with hidden provider-context messages
-    /// immediately before it. Wayland uses this neutral seam for dynamic
-    /// context such as the available-skills catalog and selected skill bodies;
-    /// Nexus neither identifies nor interprets those messages.
-    pub(crate) async fn submit_turn_with_context(
+    /// Submit one turn with a host-supplied between-round-trips context policy.
+    /// Normal bare-agent callers use [`submit_turn`](Self::submit_turn), whose
+    /// governor is inert (`None`).
+    pub(crate) async fn submit_turn_with_governor(
+        &mut self,
+        prompt: &str,
+        hooks: TurnContextHooks<'_>,
+        gate: &dyn ApprovalGate,
+        env: &ToolEnv<'_>,
+        token: &CancellationToken,
+        steer: Option<&dyn SteeringSource>,
+    ) -> Result<()> {
+        self.submit_turn_with_context_and_governor(
+            TurnInput::new(prompt),
+            hooks,
+            gate,
+            env,
+            token,
+            steer,
+        )
+        .await
+    }
+
+    /// Submit one visible prompt with hidden provider-context messages and an
+    /// optional governor. Wayland uses this entry point so skill injections and
+    /// compaction governance share one loop; Nexus interprets neither policy.
+    pub(crate) async fn submit_turn_with_context_and_governor(
         &mut self,
         input: TurnInput<'_>,
-        obs: &dyn AgentObserver,
+        hooks: TurnContextHooks<'_>,
         gate: &dyn ApprovalGate,
         env: &ToolEnv<'_>,
         token: &CancellationToken,
@@ -1568,7 +1651,7 @@ impl<P: ChatProvider> Agent<P> {
         // The bare agent does no persistence. It announces complete round-trip
         // boundaries to the host; the harness also diffs `messages()` after the
         // turn as the final/error backstop.
-        self.complete_turn(unanswered_start, obs, gate, env, token, steer)
+        self.complete_turn(unanswered_start, hooks, gate, env, token, steer)
             .await
     }
 
@@ -1647,12 +1730,14 @@ impl<P: ChatProvider> Agent<P> {
     async fn complete_turn(
         &mut self,
         unanswered_start: usize,
-        obs: &dyn AgentObserver,
+        hooks: TurnContextHooks<'_>,
         gate: &dyn ApprovalGate,
         env: &ToolEnv<'_>,
         token: &CancellationToken,
         steer: Option<&dyn SteeringSource>,
     ) -> Result<()> {
+        let obs = hooks.observer;
+        let governor = hooks.governor;
         // Start of the current unanswered user-message run (the prompt, plus any
         // injected steering/follow-up not yet answered by the provider). Cleared
         // once a provider turn commits assistant content; a cancellation before
@@ -1812,9 +1897,7 @@ impl<P: ChatProvider> Agent<P> {
                     // user run: a later cancellation must not truncate it.
                     unanswered_start = None;
 
-                    self.last_provider_usage = usage
-                        .as_ref()
-                        .map(|usage| (usage.total_tokens, self.messages.len()));
+                    let usage_anchor = usage.clone();
                     obs.on_event(AgentEvent::ProviderTurnCompleted {
                         turn_id: provider_turn_id.clone(),
                         response_id,
@@ -1831,6 +1914,8 @@ impl<P: ChatProvider> Agent<P> {
                         obs.on_event(AgentEvent::Notice(notice.to_string()))?;
                     }
                     if tool_calls.is_empty() {
+                        self.last_provider_usage =
+                            usage_anchor.map(|usage| (usage, self.messages.len()));
                         // The agent would stop here. Steering queued during this
                         // (tool-less) response runs first, then follow-up. Either
                         // keeps the loop alive with another turn; with neither,
@@ -1853,6 +1938,12 @@ impl<P: ChatProvider> Agent<P> {
                             return Ok(());
                         }
                         obs.on_messages_committed(&self.messages);
+                        if !self
+                            .govern_at_boundary(governor, obs, token, roundtrip + 1, true)
+                            .await?
+                        {
+                            return Ok(());
+                        }
                         self.inject_user(injected, obs, &mut unanswered_start)?;
                         // A tool-less steering/follow-up continuation is not a
                         // tool round-trip, so it must not advance the soft-cap
@@ -1870,6 +1961,11 @@ impl<P: ChatProvider> Agent<P> {
                                 .with_provider_turn_id(&provider_turn_id),
                         );
                     }
+                    // Provider usage already includes the assistant response,
+                    // including tool calls. Only the tool results appended after
+                    // this anchor are locally estimated by the governor.
+                    self.last_provider_usage =
+                        usage_anchor.map(|usage| (usage, self.messages.len()));
 
                     let tools_phase = self
                         .run_tools(tool_calls, obs, gate, env, token, &provider_turn_id)
@@ -1877,12 +1973,71 @@ impl<P: ChatProvider> Agent<P> {
                     obs.on_messages_committed(&self.messages);
                     match tools_phase {
                         ToolsPhase::Ended => return Ok(()),
-                        ToolsPhase::Continue => {}
+                        ToolsPhase::Continue => {
+                            if !self
+                                .govern_at_boundary(governor, obs, token, roundtrip + 1, true)
+                                .await?
+                            {
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
             roundtrip += 1;
         }
+    }
+
+    /// Consult the host policy at one pair-closed continuation boundary. A
+    /// governor failure is non-fatal by contract: report it and keep the user's
+    /// turn moving. Cancellation wins the race and ends the turn without
+    /// injecting any queued user message after the boundary.
+    async fn govern_at_boundary(
+        &mut self,
+        governor: Option<&dyn ContextGovernor>,
+        obs: &dyn AgentObserver,
+        token: &CancellationToken,
+        round_trip: usize,
+        turn_continues: bool,
+    ) -> Result<bool> {
+        let Some(governor) = governor else {
+            return Ok(true);
+        };
+        let last_usage = self
+            .last_provider_usage
+            .as_ref()
+            .map(|(usage, message_count)| ProviderUsageAnchor {
+                usage,
+                message_count: *message_count,
+            });
+        let cx = BoundaryContext {
+            messages: &self.messages,
+            last_usage,
+            round_trip,
+            turn_continues,
+        };
+        let directive = tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                self.emit_interrupted(obs)?;
+                return Ok(false);
+            }
+            result = governor.at_boundary(cx) => result,
+        };
+        match directive {
+            Ok(ContextDirective::Proceed) => {}
+            Ok(ContextDirective::Replace { messages }) => self.replace_messages(messages),
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "context governor failed; continuing turn"
+                );
+                let _ = obs.on_event(AgentEvent::Notice(format!(
+                    "automatic context management failed; continuing without rewriting context: {error}"
+                )));
+            }
+        }
+        Ok(true)
     }
 
     /// Inject the host-queued user messages drained at one injection point

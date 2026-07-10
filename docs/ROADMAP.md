@@ -1449,8 +1449,13 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    ADR-0054) replaces the absolute trigger with Mimir-resolved effective windows,
    hybrid provider/local measurement, a warn/start/hard ladder, bounded hard
    wait, deterministic fallback, and a model-backed failure breaker. `/context`
-   reports the measurement source, ladder, off state, and worker state. Mid-turn
-   governance remains the next behavior slice.
+   reports the measurement source, ladder, off state, and worker state. Slice 2
+   persists completed provider round trips before the next request and proves a
+   crash-mid-turn resume is byte-identical. Slice 3 (ADR-0055) adds the
+   `ContextGovernor` seam: ready summaries and hard-tier deterministic relief
+   can apply inside long tool loops, steering injects after the swap, governor
+   failures never fail the user turn, and active job ranges freeze overlapping
+   folds.
 7. Prebuilt-binary distribution ([#199](https://github.com/5omeOtherGuy/iris-agent/issues/199),
    [#233](https://github.com/5omeOtherGuy/iris-agent/issues/233)) is wired and now
    validated locally ([#252](https://github.com/5omeOtherGuy/iris-agent/issues/252)):

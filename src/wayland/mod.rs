@@ -8,6 +8,8 @@
 //! filesystem-free.
 
 mod compaction;
+mod compaction_background;
+mod compaction_governor;
 mod fold;
 pub(crate) mod git_safety;
 pub(crate) mod skills;
@@ -41,10 +43,11 @@ use crate::config::{
 use crate::handles::HandleStore;
 use crate::nexus::ToolOutputStore;
 use crate::nexus::{
-    Agent, AgentEvent, AgentObserver, ApprovalGate, ChatProvider, CompactionLifecycleState,
-    CompactionOrigin, ContextMeasurementSource, ContextPressureTier, FoldTrigger, Message,
+    Agent, AgentEvent, AgentObserver, ApprovalGate, BoundaryContext, ChatProvider,
+    CompactionLifecycleState, CompactionOrigin, ContextDirective, ContextGovernor,
+    ContextGovernorFuture, ContextMeasurementSource, ContextPressureTier, FoldTrigger, Message,
     ProviderEvent, ProviderUsage, Role, SessionSpanReader, SteeringSource, ToolEnv, Tools,
-    TurnInput, VerificationOutcome, VerifyRun,
+    TurnContextHooks, TurnInput, VerificationOutcome, VerifyRun,
 };
 use crate::session::{
     CompactionTaskState, SessionLog, estimate_tokens, message_token_estimate, preview_line,
@@ -70,19 +73,64 @@ struct SessionSpanSource {
 /// Forwards normal runtime events while intercepting Nexus's provider-round-trip
 /// commit hook. Persistence remains Wayland-owned and best-effort; Nexus sees
 /// only a message snapshot and never a session log or entry id.
-struct PersistingObserver<'a> {
+struct TurnContextController<'a> {
     inner: &'a dyn AgentObserver,
-    compaction: RefCell<&'a mut CompactionEngine>,
+    compaction: RefCell<Option<&'a mut CompactionEngine>>,
+    workspace: &'a Path,
+    output_store: Option<&'a HandleStore>,
+    git_safety: &'a git_safety::GitSafety,
+    task_workflow_enabled: bool,
+    token: &'a CancellationToken,
 }
 
-impl AgentObserver for PersistingObserver<'_> {
+impl AgentObserver for TurnContextController<'_> {
     fn on_event(&self, event: AgentEvent) -> Result<()> {
         self.inner.on_event(event)
     }
 
     fn on_messages_committed(&self, messages: &[Message]) {
-        self.compaction.borrow_mut().persist_messages(messages);
+        self.compaction
+            .borrow_mut()
+            .as_deref_mut()
+            .expect("context engine is present outside governor await")
+            .persist_messages(messages);
         self.inner.on_messages_committed(messages);
+    }
+}
+
+impl ContextGovernor for TurnContextController<'_> {
+    fn at_boundary<'a>(&'a self, cx: BoundaryContext<'a>) -> ContextGovernorFuture<'a> {
+        Box::pin(async move {
+            let task_state = if self.task_workflow_enabled {
+                self.git_safety
+                    .active_task_compaction_state_during_iris(MAX_CARRY_PATHS)
+                    .map(|(task_body, ledger_paths)| CompactionTaskState {
+                        task_body,
+                        ledger_paths,
+                    })
+            } else {
+                None
+            };
+            let engine = self
+                .compaction
+                .borrow_mut()
+                .take()
+                .expect("context engine is present at boundary entry");
+            let result = engine
+                .govern(
+                    cx,
+                    ApplyContext {
+                        workspace: self.workspace,
+                        output_store: self.output_store,
+                        task_state: task_state.as_ref(),
+                        observer: self.inner,
+                    },
+                    self.token,
+                )
+                .await;
+            self.compaction.borrow_mut().replace(engine);
+            result
+        })
     }
 }
 
@@ -998,14 +1046,22 @@ impl<P: ChatProvider> Harness<P> {
         // The turn span covers the loop; `Instrument` carries it across awaits
         // (a held `enter()` guard does not).
         let result = {
-            let observer = PersistingObserver {
+            let controller = TurnContextController {
                 inner: obs,
-                compaction: RefCell::new(&mut self.compaction),
+                compaction: RefCell::new(Some(&mut self.compaction)),
+                workspace: &self.workspace,
+                output_store: self.output_store.as_ref(),
+                git_safety: &self.git_safety,
+                task_workflow_enabled: self.task_workflow_enabled,
+                token,
             };
             self.agent
-                .submit_turn_with_context(
+                .submit_turn_with_context_and_governor(
                     TurnInput::with_context(prompt, context),
-                    &observer,
+                    TurnContextHooks {
+                        observer: &controller,
+                        governor: Some(&controller),
+                    },
                     gate,
                     &env,
                     token,
@@ -1180,14 +1236,22 @@ impl<P: ChatProvider> Harness<P> {
                             output_sink: None,
                             mutation_guard: Some(&self.git_safety),
                         };
-                        let observer = PersistingObserver {
+                        let controller = TurnContextController {
                             inner: obs,
-                            compaction: RefCell::new(&mut self.compaction),
+                            compaction: RefCell::new(Some(&mut self.compaction)),
+                            workspace: &self.workspace,
+                            output_store: self.output_store.as_ref(),
+                            git_safety: &self.git_safety,
+                            task_workflow_enabled: self.task_workflow_enabled,
+                            token,
                         };
                         self.agent
-                            .submit_turn(
+                            .submit_turn_with_governor(
                                 &feedback,
-                                &observer,
+                                TurnContextHooks {
+                                    observer: &controller,
+                                    governor: Some(&controller),
+                                },
                                 gate,
                                 &env,
                                 token,
@@ -1237,26 +1301,8 @@ impl<P: ChatProvider> Harness<P> {
     /// is attached (a fold has nowhere to be recorded), so detection is gated
     /// exactly like flushing.
     fn pending_folds(&self) -> Vec<fold::FoldPlan> {
-        if !self.compaction.tool_result_policy.enabled || self.compaction.session.is_none() {
-            return Vec::new();
-        }
-        let messages = self.agent.messages();
-        // Protect the recent tail: the fold engine never folds at or after this
-        // index (the model's immediate working set stays verbatim).
-        let tail_start = fold_tail_start(
-            messages,
-            self.compaction
-                .tool_result_policy
-                .semantic_dedupe
-                .protect_recent_tokens,
-        );
-        fold::plan_folds(
-            messages,
-            &self.compaction.entry_ids,
-            tail_start,
-            &self.workspace,
-            &self.compaction.tool_result_policy,
-        )
+        self.compaction
+            .pending_folds(self.agent.messages(), &self.workspace)
     }
 
     /// Detected-but-unflushed folds at the current boundary, for the context
@@ -2081,115 +2127,26 @@ impl<P: ChatProvider> Harness<P> {
         &mut self,
         messages: &[Message],
         plan: CompactionPlan,
-        mut summary: CompactionSummary,
+        summary: CompactionSummary,
         obs: &dyn AgentObserver,
     ) -> Result<Option<CompactionOutcome>> {
-        if !valid_compaction_range(messages, plan.start, plan.end) {
-            return Ok(None);
-        }
-        let covered = plan.end - plan.start;
-        let covered_slice = &messages[plan.start..plan.end];
-        let original_tokens = context_tokens(covered_slice);
-        let carry_paths = derive_carry_paths(covered_slice, self.workspace());
         let task_state = self.compaction_task_state();
-        if let Some(store) = self.output_store.as_ref() {
-            let covered_ids = &self.compaction.entry_ids[plan.start..plan.end];
-            let blob =
-                recall::serialize_covered(covered_slice, covered_ids, &plan.from_id, &plan.to_id);
-            match store.put(&blob) {
-                Ok(handle) => {
-                    let marker = recall::recall_marker(&handle, &plan.from_id, &plan.to_id);
-                    summary.text = format!("{}\n\n{marker}", summary.text);
-                }
-                Err(error) => tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "recall handle registration failed; compaction proceeds without a recall reference"
-                ),
-            }
-        }
-        let body = render_compaction_body_with_task_state(
-            &summary.text,
-            &carry_paths,
-            task_state.as_ref(),
-        );
-        let body_tokens = estimate_tokens(&body);
-        if body_tokens >= original_tokens {
-            tracing::warn!(
-                body_tokens,
-                original_tokens,
-                "compaction summary + deterministic carry did not shrink the covered range; skipping"
-            );
-            return Ok(None);
-        }
-
-        let log = self
-            .compaction
-            .session
-            .as_mut()
-            .expect("compaction callers check the session first");
-        let compaction_id = log.append_compaction_with_metadata(
-            &plan.from_id,
-            &plan.to_id,
-            &summary.text,
-            &carry_paths,
-            task_state.as_ref(),
-            Some(body_tokens),
-            summary.origin,
-            summary.worker_usage.as_ref(),
+        let applied = self.compaction.apply_summary(
+            messages,
+            plan,
+            summary,
+            ApplyContext {
+                workspace: &self.workspace,
+                output_store: self.output_store.as_ref(),
+                task_state: task_state.as_ref(),
+                observer: obs,
+            },
         )?;
-        let generation = log.compaction_generation();
-        tracing::info!(
-            covered,
-            from = %plan.from_id,
-            to = %plan.to_id,
-            compaction_id = %compaction_id,
-            "compacted context range"
-        );
-
-        let old_persisted = self.compaction.persisted;
-        let mut new_messages = Vec::with_capacity(messages.len() - covered + 1);
-        let mut new_entry_ids: Vec<Option<String>> =
-            Vec::with_capacity(old_persisted - covered + 1);
-        for (message, id) in messages[..plan.start]
-            .iter()
-            .zip(&self.compaction.entry_ids[..plan.start])
-        {
-            new_messages.push(message.clone());
-            new_entry_ids.push(id.clone());
-        }
-        new_messages.push(Message::user(&body));
-        new_entry_ids.push(None);
-        for (offset, message) in messages[plan.end..].iter().enumerate() {
-            new_messages.push(message.clone());
-            if plan.end + offset < old_persisted {
-                new_entry_ids.push(self.compaction.entry_ids[plan.end + offset].clone());
-            }
-        }
-
-        let context_tokens_after_apply = context_tokens(&new_messages);
-        self.agent.replace_messages(new_messages);
-        self.compaction.persisted = new_entry_ids.len();
-        self.compaction.entry_ids = new_entry_ids;
-
-        obs.on_event(AgentEvent::CompactionApplied {
-            compaction_id,
-            covered_from: plan.from_id,
-            covered_to: plan.to_id,
-            covered_messages: covered,
-            original_tokens_estimate: original_tokens,
-            summary_tokens_estimate: body_tokens,
-            context_tokens_after_apply,
-            budget: self.compaction.budget.unwrap_or(0),
-            generation,
-            carried_paths: carry_paths.len(),
-            origin: summary.origin,
-            worker_usage: summary.worker_usage,
-        })?;
-        Ok(Some(CompactionOutcome {
-            covered,
-            original_tokens,
-            summary_tokens: body_tokens,
-        }))
+        let Some((outcome, replacement)) = applied else {
+            return Ok(None);
+        };
+        self.agent.replace_messages(replacement);
+        Ok(Some(outcome))
     }
 
     /// Produce the summary text for a covered range using the configured

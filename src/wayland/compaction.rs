@@ -109,6 +109,14 @@ pub(super) struct CompactionEngine {
     pub(super) resume_last_activity_ms: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ApplyContext<'a> {
+    pub(super) workspace: &'a Path,
+    pub(super) output_store: Option<&'a HandleStore>,
+    pub(super) task_state: Option<&'a CompactionTaskState>,
+    pub(super) observer: &'a dyn AgentObserver,
+}
+
 impl CompactionEngine {
     pub(super) fn new(
         session: Option<SessionLog>,
@@ -189,6 +197,122 @@ impl CompactionEngine {
                 }
             }
         }
+    }
+
+    /// Parent-owned compaction mutation shared by turn-edge and governed
+    /// mid-turn callers. It validates shrink, registers recall/carry, appends
+    /// the durable entry, updates the engine's id map, and returns the exact
+    /// provider-visible replacement Nexus must install atomically.
+    pub(super) fn apply_summary(
+        &mut self,
+        messages: &[Message],
+        plan: CompactionPlan,
+        mut summary: CompactionSummary,
+        cx: ApplyContext<'_>,
+    ) -> Result<Option<(CompactionOutcome, Vec<Message>)>> {
+        if !valid_compaction_range(messages, plan.start, plan.end) {
+            return Ok(None);
+        }
+        let covered = plan.end - plan.start;
+        let covered_slice = &messages[plan.start..plan.end];
+        let original_tokens = context_tokens(covered_slice);
+        let carry_paths = derive_carry_paths(covered_slice, cx.workspace);
+        if let Some(store) = cx.output_store {
+            let covered_ids = &self.entry_ids[plan.start..plan.end];
+            let blob =
+                recall::serialize_covered(covered_slice, covered_ids, &plan.from_id, &plan.to_id);
+            match store.put(&blob) {
+                Ok(handle) => {
+                    let marker = recall::recall_marker(&handle, &plan.from_id, &plan.to_id);
+                    summary.text = format!("{}\n\n{marker}", summary.text);
+                }
+                Err(error) => tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "recall handle registration failed; compaction proceeds without a recall reference"
+                ),
+            }
+        }
+        let body =
+            render_compaction_body_with_task_state(&summary.text, &carry_paths, cx.task_state);
+        let body_tokens = estimate_tokens(&body);
+        if body_tokens >= original_tokens {
+            tracing::warn!(
+                body_tokens,
+                original_tokens,
+                "compaction summary + deterministic carry did not shrink the covered range; skipping"
+            );
+            return Ok(None);
+        }
+
+        let log = self
+            .session
+            .as_mut()
+            .expect("compaction callers check the session first");
+        let compaction_id = log.append_compaction_with_metadata(
+            &plan.from_id,
+            &plan.to_id,
+            &summary.text,
+            &carry_paths,
+            cx.task_state,
+            Some(body_tokens),
+            summary.origin,
+            summary.worker_usage.as_ref(),
+        )?;
+        let generation = log.compaction_generation();
+        tracing::info!(
+            covered,
+            from = %plan.from_id,
+            to = %plan.to_id,
+            compaction_id = %compaction_id,
+            "compacted context range"
+        );
+
+        let old_persisted = self.persisted;
+        let mut new_messages = Vec::with_capacity(messages.len() - covered + 1);
+        let mut new_entry_ids: Vec<Option<String>> =
+            Vec::with_capacity(old_persisted - covered + 1);
+        for (message, id) in messages[..plan.start]
+            .iter()
+            .zip(&self.entry_ids[..plan.start])
+        {
+            new_messages.push(message.clone());
+            new_entry_ids.push(id.clone());
+        }
+        new_messages.push(Message::user(&body));
+        new_entry_ids.push(None);
+        for (offset, message) in messages[plan.end..].iter().enumerate() {
+            new_messages.push(message.clone());
+            if plan.end + offset < old_persisted {
+                new_entry_ids.push(self.entry_ids[plan.end + offset].clone());
+            }
+        }
+
+        let context_tokens_after_apply = context_tokens(&new_messages);
+        self.persisted = new_entry_ids.len();
+        self.entry_ids = new_entry_ids;
+
+        cx.observer.on_event(AgentEvent::CompactionApplied {
+            compaction_id,
+            covered_from: plan.from_id,
+            covered_to: plan.to_id,
+            covered_messages: covered,
+            original_tokens_estimate: original_tokens,
+            summary_tokens_estimate: body_tokens,
+            context_tokens_after_apply,
+            budget: self.budget.unwrap_or(0),
+            generation,
+            carried_paths: carry_paths.len(),
+            origin: summary.origin,
+            worker_usage: summary.worker_usage,
+        })?;
+        Ok(Some((
+            CompactionOutcome {
+                covered,
+                original_tokens,
+                summary_tokens: body_tokens,
+            },
+            new_messages,
+        )))
     }
 }
 

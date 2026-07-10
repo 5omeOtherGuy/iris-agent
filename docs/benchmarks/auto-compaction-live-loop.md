@@ -163,3 +163,71 @@ G1 remains inapplicable until slice 3.
 
 The run completed in 103.30 seconds. No provider, auth, tool, worker,
 persistence, or resume errors occurred.
+
+## Slice 3 passing run — 2026-07-10
+
+Base: `95d7bc2` plus the slice 3 worktree. Synthetic effective window: 32,768
+tokens. Start threshold: 21,299 tokens. Parent turns used the two protocol
+lanes. Every model-backed summary used `anthropic/claude-opus-4-6` with medium
+thinking.
+
+Regeneration command:
+
+```sh
+IRIS_BENCH_LIVE=1 IRIS_AUTO_COMPACTION_SESSIONS=10 \
+  cargo test --locked auto_compaction_live_loop_ -- \
+  --ignored --nocapture --test-threads=1
+```
+
+G1 is active in this slice. For each compaction lifecycle/apply event inside a
+continuing turn, the instrument measures the gap to the next
+`ProviderTurnStarted` event. It excludes hard-tier boundaries and post-turn
+events with no next request in that turn. G2–G5 retain the slice-1 definitions.
+
+| lane | sessions | compactions | worst G1 non-hard block | worst post-apply/start | G2 | G3 | G4 | G5 | real reads | exclusions |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `anthropic/claude-haiku-4-5` | 10 | 20 | 1.2 ms / 200 ms (0.6%) | 16,958 / 21,299 (79.6%) | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 0 |
+| `openai-codex/gpt-5.4-mini` | 10 | 20 | 2.7 ms / 200 ms (1.4%) | 18,277 / 21,299 (85.8%) | 10/10 | 10/10 | 10/10 | 10/10 | 10/10 | 0 |
+
+Per-session evidence:
+
+| lane | session | compactions | G1 block | maximum post-apply | G3 needle/marker/carry | G4 | G5 | read | error |
+|---|---:|---:|---:|---:|---|---|---|---|---|
+| Anthropic | 00 | 2 | 0.8 ms | 16,872 | pass/pass/pass | pass | pass | pass | — |
+| Anthropic | 01 | 2 | 0.7 ms | 16,948 | pass/pass/pass | pass | pass | pass | — |
+| Anthropic | 02 | 2 | 0.9 ms | 16,848 | pass/pass/pass | pass | pass | pass | — |
+| Anthropic | 03 | 2 | 1.2 ms | 16,824 | pass/pass/pass | pass | pass | pass | — |
+| Anthropic | 04 | 2 | 0.8 ms | 16,823 | pass/pass/pass | pass | pass | pass | — |
+| Anthropic | 05 | 2 | 0.7 ms | 16,958 | pass/pass/pass | pass | pass | pass | — |
+| Anthropic | 06 | 2 | 0.7 ms | 16,904 | pass/pass/pass | pass | pass | pass | — |
+| Anthropic | 07 | 2 | 1.1 ms | 16,856 | pass/pass/pass | pass | pass | pass | — |
+| Anthropic | 08 | 2 | 0.8 ms | 16,858 | pass/pass/pass | pass | pass | pass | — |
+| Anthropic | 09 | 2 | 0.7 ms | 16,839 | pass/pass/pass | pass | pass | pass | — |
+| Codex | 00 | 2 | 2.7 ms | 18,277 | pass/pass/pass | pass | pass | pass | — |
+| Codex | 01 | 2 | 2.6 ms | 15,115 | pass/pass/pass | pass | pass | pass | — |
+| Codex | 02 | 2 | 2.1 ms | 15,042 | pass/pass/pass | pass | pass | pass | — |
+| Codex | 03 | 2 | 1.9 ms | 12,581 | pass/pass/pass | pass | pass | pass | — |
+| Codex | 04 | 2 | 2.1 ms | 12,831 | pass/pass/pass | pass | pass | pass | — |
+| Codex | 05 | 2 | 2.1 ms | 14,006 | pass/pass/pass | pass | pass | pass | — |
+| Codex | 06 | 2 | 1.1 ms | 16,885 | pass/pass/pass | pass | pass | pass | — |
+| Codex | 07 | 2 | 1.8 ms | 14,563 | pass/pass/pass | pass | pass | pass | — |
+| Codex | 08 | 2 | 2.1 ms | 14,471 | pass/pass/pass | pass | pass | pass | — |
+| Codex | 09 | 2 | 2.2 ms | 16,321 | pass/pass/pass | pass | pass | pass | — |
+
+No session was excluded. The full run completed in 1,120.02 seconds. No
+provider, auth, tool, worker, persistence, or resume errors occurred.
+
+Post-fix smoke after moving the bounded hard wait off the current-thread loop
+and making it cancellation-raceable used the same command with
+`IRIS_AUTO_COMPACTION_SESSIONS=1`. Anthropic passed with two compactions, G1
+0.8 ms, post-apply 16,899/21,299, and G2–G5 plus the real read all green. The
+Codex row was excluded before a session ran because the lane returned:
+
+```text
+Codex request failed [status=429 endpoint=/codex/responses model=gpt-5.4-mini error_type=usage_limit_reached]
+```
+
+The smoke had one exclusion and no fabricated metrics. The preceding full
+Codex run remains the slice result; the post-run change affects only hard-wait
+cancellation and the controller's borrow lifetime, while the full run's
+non-hard G1 path is unchanged.
