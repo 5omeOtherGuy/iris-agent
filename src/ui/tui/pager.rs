@@ -17,10 +17,10 @@
 //!   ([`render_frame`]) are pure and golden-frame tested on a `TestBackend`.
 //!
 //! The pager renders the SAME logical document as the inline surface
-//! ([`super::screen`]'s `render_document_with_hints`), sliced to the viewport:
-//! session bar pinned at the top, bottom-anchored transcript tail (follow
-//! view; the scroll offset lands in the next slice), working indicator and
-//! composer pinned at the bottom.
+//! ([`super::screen`]'s `render_document_with_hints`), sliced to the viewport.
+//! Normal posture pins the session bar at the top and the working indicator plus
+//! composer at the bottom around a scrollable transcript. Focus posture removes
+//! the top bar and collapses an empty composer to one bottom metadata row.
 
 use std::io::{self, Stdout, Write};
 use std::sync::Once;
@@ -367,13 +367,12 @@ pub(super) struct ComposedFrame {
     pub(super) cursor: Option<(u16, u16)>,
 }
 
-/// Compose the pager frame for `size` from the same components the inline
-/// document renderer assembles, in the same order: session bar pinned at the
-/// top, the transcript window at the Iris-owned scroll offset, filler (or the
-/// start page) while the transcript is short, then the working indicator and
-/// composer chrome pinned at the bottom. The transcript is rendered
-/// visible-range-only through the wrap cache, so frame cost is O(viewport),
-/// independent of transcript length (ADR-0029).
+/// Compose the pager frame from the same components as the inline document.
+/// Normal posture pins the session bar above the transcript window and the
+/// working indicator plus composer below it. Focus posture gives the top rows to
+/// the transcript and replaces an empty composer with its compact metadata row.
+/// The transcript is rendered visible-range-only through the wrap cache, so
+/// frame cost is O(viewport), independent of transcript length (ADR-0029).
 pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     let width = size.width.max(1);
     let height = usize::from(size.height.max(1));
@@ -1132,10 +1131,11 @@ mod tests {
         let frame = compose_frame(&mut screen, Size::new(80, 24)).lines;
         let anchor = frame_rows(&frame, 80, 24)[2].clone();
         assert!(anchor.contains("row 0") || anchor.trim().is_empty());
-        // Height-only resize: the same top offset stays anchored.
+        // Crossing the responsive floor removes the two-row top bar, but the
+        // same transcript offset stays anchored at its new top edge.
         let frame = compose_frame(&mut screen, Size::new(80, 12)).lines;
         let rows = frame_rows(&frame, 80, 12);
-        assert_eq!(rows[2], anchor, "anchor row survives a resize");
+        assert_eq!(rows[0], anchor, "anchor row survives a resize");
     }
 
     #[test]

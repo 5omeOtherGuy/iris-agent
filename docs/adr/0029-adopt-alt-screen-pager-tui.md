@@ -36,9 +36,13 @@ Iris adopts a grok-style alt-screen pager as the default rich TUI:
   mode, and `--plain` remains the accessible text path.
 - **Rendering**: in pager mode, Iris renders full frames from the same logical
   `Screen` state through ratatui `Terminal` (alternate screen, synchronized
-  output, cell diffing). Fixed regions: session bar (viewport-pinned, rows
-  0–1), scrollback pane (transcript with an Iris-owned scroll offset), working
-  indicator, composer. The design language (symbols, palette, hairlines,
+  output, cell diffing). Normal fixed regions: session bar (viewport-pinned,
+  rows 0–1), scrollback pane (transcript with an Iris-owned scroll offset),
+  working indicator, composer. Focus mode is a responsive posture of that same
+  state: it removes the passive top bar, collapses an empty composer to one
+  bottom session-readout row, and folds the readout into the composer top edge
+  while editing. It activates explicitly via `/focus` and automatically at the
+  12-row design floor. The design language (symbols, palette, hairlines,
   no-box rules) is unchanged.
 - **Scrollback pane**: Iris-owned scroll state with follow mode
   (follow-by-overscroll re-engage, follow indicator, anchored folds), per-row

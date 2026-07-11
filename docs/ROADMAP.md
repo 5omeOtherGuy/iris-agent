@@ -161,7 +161,8 @@ Implemented today:
   explicit overlay focus routing, a shared Unicode/ANSI text engine, a built-in
   tool renderer registry, terminal-depth palette degradation, frame-owned pager
   hit targets, grapheme-honest truncation, reactive-only motion with live reduced
-  motion, and an opt-in tmux live-rendering harness for manual visual checks of
+  motion, transcript-first focus mode (`/focus`, automatic at the 12-row design
+  floor), and an opt-in tmux live-rendering harness for manual visual checks of
   pane rendering. Diff evidence and failed shell output stay open by default;
   settled non-redacted reasoning is collapsible.
 - Unit tests for the REPL, tool loop, approvals, tool implementations, path
@@ -1181,10 +1182,11 @@ while keeping the inline renderer as an automatic fallback.
 [ADR-0029](adr/0029-adopt-alt-screen-pager-tui.md) settles the screen-mode
 policy (`alt_screen = auto|always|never` + `--no-alt-screen`, multiplexer
 auto-degrade), the render backend (stock ratatui `Terminal` full frames from
-the existing `Screen` state), the fixed-region layout (session bar /
-scrollback pane / working indicator / composer), the focus model (Tab toggles
-panes; typing returns to the prompt; Esc is never nav), the mouse-capture
-runtime toggle, and the clipboard ladder (native → OSC 52 → tmux buffer).
+the existing `Screen` state), the normal fixed-region layout plus its responsive
+focus posture (session bar / scrollback pane / working indicator / composer),
+the focus model (Tab toggles panes; typing returns to the prompt; Esc is never
+nav), the mouse-capture runtime toggle, and the clipboard ladder (native → OSC
+52 → tmux buffer).
 Binary-verified reference behavior: `.iris-reference/grok-pager-dossier.md`.
 
 Slices, in order (each landed green through the gate):
@@ -1205,6 +1207,12 @@ Slices, in order (each landed green through the gate):
   (`tui.scrollSpeed`); Ctrl+T + `/mouse` toggle restores native select/copy
   (`○ mouse off` statusline hint); clipboard ladder (native → OSC 52)
   unchanged behind `/copy`; `alt_screen` default flipped to `auto`.
+- **Responsive focus posture** — done. `/focus` toggles a session-scoped
+  transcript-first layout; panes at the 12-row design floor select it
+  automatically. An empty composer collapses to one bottom session-readout row,
+  typing reveals it with session metadata in the top edge, and submit collapses
+  it again. Pager and inline render the same posture; reviews and modals remain
+  visible.
 - **Capability doctor** — done ([#295]). `/terminal-setup` reports terminal,
   multiplexer, SSH, kitty keyboard protocol, OSC 52/tmux clipboard with exact
   `set -g …` fix lines and the Ctrl+J newline fallback.

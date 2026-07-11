@@ -3305,7 +3305,7 @@ mod tests {
     #[test]
     fn empty_composer_keeps_blank_line_below_placeholder() {
         let mut screen = Screen::new();
-        let lines = rendered_lines(&mut screen, 80, 8)
+        let lines = rendered_lines(&mut screen, 80, 13)
             .into_iter()
             .map(|line| line_text(&line))
             .collect::<Vec<_>>();
@@ -3901,7 +3901,7 @@ mod tests {
         screen.apply(UiEvent::Notice("a note".to_string()));
         screen.end_turn();
 
-        let rendered = rendered_text(&mut screen, 80, 12);
+        let rendered = rendered_text(&mut screen, 80, 13);
         assert!(rendered.contains("first answer"), "{rendered:?}");
         assert!(rendered.contains("a note"), "{rendered:?}");
         assert!(
@@ -4000,7 +4000,7 @@ mod tests {
             branch: Some("feat/rate-limit".to_string()),
             ..Default::default()
         }));
-        let rendered = rendered_text(&mut screen, 180, 12);
+        let rendered = rendered_text(&mut screen, 180, 13);
 
         // Runtime status is the composer's bottom statusline, with the
         // approval-policy segment (symbol + label) after the model.
@@ -4089,7 +4089,7 @@ mod tests {
     #[test]
     fn composer_editor_uses_canonical_multiline_shape() {
         let mut screen = Screen::new();
-        let lines = rendered_lines(&mut screen, 80, 8);
+        let lines = rendered_lines(&mut screen, 80, 13);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         // The composer top edge is a plain full hairline — no box corners.
         let top = texts
@@ -4506,7 +4506,7 @@ mod tests {
             Some("off".to_string()),
             "~/project".to_string(),
         );
-        let lines = rendered_lines(&mut screen, 120, 10);
+        let lines = rendered_lines(&mut screen, 120, 13);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         let status_idx = texts
             .iter()
@@ -4647,7 +4647,7 @@ mod tests {
             screen.apply(UiEvent::AssistantText(format!("line {i}")));
         }
 
-        let lines = rendered_lines(&mut screen, 180, 12);
+        let lines = rendered_lines(&mut screen, 180, 13);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         let status_idx = texts
             .iter()
@@ -6353,7 +6353,7 @@ mod tests {
     #[test]
     fn unsourced_composer_chrome_has_no_status_or_workspace_label() {
         let mut screen = Screen::new();
-        let rendered = rendered_text(&mut screen, 80, 10);
+        let rendered = rendered_text(&mut screen, 80, 13);
 
         // No footer yet: hairline + blank statusline + input, no status text.
         assert!(!rendered.contains("◉ CODE"), "{rendered}");
@@ -6366,7 +6366,7 @@ mod tests {
     fn sourced_top_border_omits_unknown_effort_and_workspace_omits_branch() {
         let mut screen = Screen::new();
         screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
-        let rendered = rendered_text(&mut screen, 100, 10);
+        let rendered = rendered_text(&mut screen, 100, 13);
 
         // No effort token between the model and the policy separator.
         assert!(
@@ -6391,7 +6391,7 @@ mod tests {
             branch: Some("branch".to_string()),
             ..Default::default()
         }));
-        let rendered = rendered_text(&mut screen, 100, 10);
+        let rendered = rendered_text(&mut screen, 100, 13);
 
         assert!(
             rendered.contains("◉ CODE ─ GPT-5.5 HIGH ─ ▲ on-request"),
@@ -7296,7 +7296,7 @@ mod tests {
         let mut screen = Screen::new();
         screen.apply(UiEvent::SessionStarted);
 
-        for (width, height) in [(50, 14), (32, 10), (60, 16), (32, 10)] {
+        for (width, height) in [(50, 14), (32, 10), (60, 16), (32, 14)] {
             surface.render(
                 Size::new(width, height),
                 &rendered_lines(&mut screen, width, height),
@@ -7727,7 +7727,7 @@ mod tests {
                 cache_creation: None,
             }),
         });
-        let rendered = rendered_text(&mut screen, 120, 12);
+        let rendered = rendered_text(&mut screen, 120, 13);
         assert!(rendered.contains("◉ CODE ─ OPUS-4.8 XHIGH"), "{rendered}");
         assert!(rendered.contains("↑100 ↓20"), "{rendered}");
         assert!(
@@ -7740,7 +7740,7 @@ mod tests {
             Some("high".to_string()),
             "~/repo".to_string(),
         );
-        let refreshed = rendered_text(&mut screen, 120, 12);
+        let refreshed = rendered_text(&mut screen, 120, 13);
         assert!(refreshed.contains("◉ CODE ─ OPUS-4.8 HIGH"), "{refreshed}");
         assert!(refreshed.contains("↑100 ↓20"), "{refreshed}");
         assert!(
