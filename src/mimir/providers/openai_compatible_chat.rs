@@ -678,6 +678,10 @@ fn tool_declarations(tools: &Tools) -> Vec<Value> {
 
 fn parse_usage(value: &Value, provider: &str, model: &str) -> Option<ProviderUsage> {
     let usage = value.get("usage")?;
+    // Diagnostics only: the verbatim `usage` object this endpoint sent (see
+    // HARNESS.md). Off unless RUST_LOG enables the `iris::usage_raw` target;
+    // never a reported metric.
+    tracing::debug!(target: "iris::usage_raw", provider, model, usage = %usage, "openai-compatible chat raw usage");
     let input_tokens = usage
         .get("prompt_tokens")
         .or_else(|| usage.get("input_tokens"))

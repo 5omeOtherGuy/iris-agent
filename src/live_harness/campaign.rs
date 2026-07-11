@@ -236,6 +236,10 @@ pub(crate) struct Artifacts {
     pub(crate) jsonl: PathBuf,
     pub(crate) markdown: PathBuf,
     pub(crate) manifest: PathBuf,
+    /// Sidecar carrying the assistant's final text per request, keyed by
+    /// cell_id + run_seq + request_seq to the row JSONL. Diagnoses an early-stop
+    /// turn without touching the stable Row schema.
+    pub(crate) transcripts: PathBuf,
 }
 
 impl Artifacts {
@@ -244,6 +248,7 @@ impl Artifacts {
             jsonl: dir.join(format!("{campaign}.jsonl")),
             markdown: dir.join(format!("{campaign}.md")),
             manifest: dir.join(format!("{campaign}.manifest")),
+            transcripts: dir.join(format!("{campaign}.transcripts.jsonl")),
         }
     }
 }
@@ -256,6 +261,19 @@ pub(crate) fn append_rows(path: &Path, rows: &[Row]) -> Result<()> {
         .open(path)?;
     for row in rows {
         writeln!(file, "{}", serde_json::to_string(row)?)?;
+    }
+    Ok(())
+}
+
+/// Append transcript entries to the campaign transcript sidecar, one compact
+/// object per line. Same append-only, one-per-run persistence as `append_rows`.
+pub(crate) fn append_transcripts(path: &Path, transcripts: &[Transcript]) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    for transcript in transcripts {
+        writeln!(file, "{}", serde_json::to_string(transcript)?)?;
     }
     Ok(())
 }

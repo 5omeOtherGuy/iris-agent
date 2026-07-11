@@ -34,6 +34,13 @@ pub(crate) struct CapturedUsage {
     /// (provider-measured input minus estimator) instead of a per-turn
     /// measurement broadcast across the turn's requests (pilot-a finding 2).
     pub(crate) estimate_tokens: u64,
+    /// The assistant's final text on this request, truncated to
+    /// `TRANSCRIPT_TEXT_CAP` chars, or `None` when the request produced only a
+    /// tool call (no assistant text). Recorded so an early-stop turn is
+    /// diagnosable from the artifacts (what the model said before it quit).
+    pub(crate) assistant_text: Option<String>,
+    /// True when `assistant_text` was truncated at the cap.
+    pub(crate) assistant_text_truncated: bool,
 }
 
 /// Wraps a real provider and records the `ProviderUsage` on every completed
@@ -83,16 +90,26 @@ impl<P: ChatProvider> ChatProvider for RecordingProvider<P> {
             .map(crate::session::message_token_estimate)
             .fold(0u64, u64::saturating_add);
         let started_at = Instant::now();
+        let cap = TRANSCRIPT_TEXT_CAP;
         let usages = self.usages.clone();
         let stream = self.inner.respond_stream(messages, tools, cancel)?;
         let mapped = stream.map(move |item| {
             if let Ok(ProviderEvent::Completed(turn)) = &item {
+                let (assistant_text, assistant_text_truncated) = match &turn.text {
+                    Some(text) if !text.is_empty() => {
+                        let truncated = text.chars().count() > cap;
+                        (Some(text.chars().take(cap).collect::<String>()), truncated)
+                    }
+                    _ => (None, false),
+                };
                 usages.lock().expect("usages lock").push(CapturedUsage {
                     is_summary,
                     tag: tag.clone(),
                     started_at,
                     usage: turn.usage.clone(),
                     estimate_tokens,
+                    assistant_text,
+                    assistant_text_truncated,
                 });
             }
             item

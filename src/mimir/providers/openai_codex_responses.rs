@@ -1936,6 +1936,11 @@ fn extract_reasoning_text(value: &Value) -> String {
 
 fn extract_openai_usage(value: &Value, model: &str) -> Option<ProviderUsage> {
     let usage = value.get("usage")?;
+    // Diagnostics only: the verbatim `usage` object this endpoint sent, so a
+    // live campaign can settle whether the codex lane surfaces
+    // `cache_write_tokens` at all. Off unless RUST_LOG enables the
+    // `iris::usage_raw` target; never a reported metric. See HARNESS.md.
+    tracing::debug!(target: "iris::usage_raw", model, usage = %usage, "codex responses raw usage");
     let input_tokens = usage
         .get("input_tokens")
         .and_then(Value::as_u64)
