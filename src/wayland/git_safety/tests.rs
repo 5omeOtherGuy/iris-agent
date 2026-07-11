@@ -695,7 +695,7 @@ fn jj_recovery_finds_unsettled_task() {
 }
 
 #[test]
-fn jj_external_operation_after_task_is_a_violation() {
+fn jj_external_operation_halts_before_execution_once() {
     let Some(repo) = init_jj_repo() else {
         return;
     };
@@ -711,35 +711,137 @@ fn jj_external_operation_after_task_is_a_violation() {
     assert!(violations.is_empty());
 
     run_jj(&repo.path, &["describe", "-m", "external operation"]);
-    guard.before_exec(std::slice::from_ref(&target));
-    fs::write(&target, "second iris\n").unwrap();
-    let violation = guard.after_exec(
-        std::slice::from_ref(&target),
-        Some(&crate::tools::content_hash(b"second iris\n")),
-    );
-    assert!(
-        !violation.is_empty(),
-        "external jj operation must not silently advance the task baseline"
-    );
+    let violation = guard.before_exec(std::slice::from_ref(&target));
     assert!(
         violation
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains("jj operation outside Iris")),
-        "external-op halt names its cause, not a fake file list: {violation:?}"
+        "external-op preflight halt names its cause: {violation:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "iris\n",
+        "a preflight halt leaves the target untouched"
     );
 
-    // The halt fires exactly once: the guard resyncs to the new operation, so
-    // the next call proceeds instead of re-tripping forever (issue #560).
-    guard.before_exec(std::slice::from_ref(&target));
-    fs::write(&target, "third iris\n").unwrap();
-    let violation = guard.after_exec(
-        std::slice::from_ref(&target),
-        Some(&crate::tools::content_hash(b"third iris\n")),
+    // The halt fires exactly once: preflight resyncs to the external operation,
+    // so an immediate retry proceeds instead of re-tripping forever (issue #560).
+    assert!(
+        guard.before_exec(std::slice::from_ref(&target)).is_empty(),
+        "an external-op halt must not poison the retry"
+    );
+}
+
+#[test]
+fn jj_external_operation_refreshes_protected_set_before_retry() {
+    let Some(repo) = init_jj_repo() else {
+        return;
+    };
+    let target = repo.path.join("committed.txt");
+
+    run_jj(&repo.path, &["new"]);
+    fs::write(&target, "external dirty\n").unwrap();
+    run_jj(&repo.path, &["describe", "-m", "dirty revision"]);
+    let dirty_revision = run_jj(
+        &repo.path,
+        &["log", "-r", "@", "--no-graph", "-T", "change_id.short()"],
+    );
+    let base_revision = run_jj(
+        &repo.path,
+        &["log", "-r", "@-", "--no-graph", "-T", "change_id.short()"],
+    );
+    run_jj(&repo.path, &["new", base_revision.trim()]);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "base\n");
+
+    // Exercise the always-on guard with durable task workflow disabled.
+    let guard = GitSafety::new_with_workflow(&repo.path, false);
+    guard.note_mutation();
+    guard.approve(std::slice::from_ref(&target), false);
+
+    run_jj(&repo.path, &["edit", dirty_revision.trim()]);
+    let violation = guard.before_exec(std::slice::from_ref(&target));
+    assert!(
+        !violation.is_empty(),
+        "the external operation must halt this attempt"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "external dirty\n",
+        "preflight leaves the external working-copy state intact"
+    );
+    assert_eq!(
+        guard.unapproved_protected(std::slice::from_ref(&target)),
+        vec![target.clone()],
+        "the recaptured baseline protects newly dirty paths and invalidates prior approval"
     );
     assert!(
+        guard.before_exec(std::slice::from_ref(&target)).is_empty(),
+        "the operation mismatch still fires exactly once"
+    );
+}
+
+#[test]
+fn jj_operation_read_failure_halts_before_execution() {
+    let Some(repo) = init_jj_repo() else {
+        return;
+    };
+    let target = repo.path.join("new.txt");
+    let guard = guard(&repo.path);
+    guard.note_mutation();
+
+    let jj_dir = repo.path.join(".jj");
+    let hidden = repo.path.join(".jj-hidden");
+    fs::rename(&jj_dir, &hidden).unwrap();
+    let violation = guard.before_exec(std::slice::from_ref(&target));
+    fs::rename(&hidden, &jj_dir).unwrap();
+
+    assert!(
+        violation
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("could not read jj operation before this call")),
+        "an unreadable operation boundary fails closed: {violation:?}"
+    );
+    assert!(!target.exists(), "the halted call produced no side effect");
+}
+
+#[test]
+fn jj_operation_during_call_window_is_attributed_to_the_call() {
+    let Some(repo) = init_jj_repo() else {
+        return;
+    };
+    let guard = guard(&repo.path);
+    guard.note_mutation();
+
+    assert!(guard.before_exec(&[]).is_empty());
+    run_jj(
+        &repo.path,
+        &["describe", "-m", "operation inside Iris call"],
+    );
+    let violation = guard.after_exec(&[], None);
+    assert!(
         violation.is_empty(),
-        "an external-op halt must not poison later calls: {violation:?}"
+        "an operation completed inside the call window is not retroactively halted: {violation:?}"
+    );
+    assert!(
+        guard.before_exec(&[]).is_empty(),
+        "postflight resync keeps the next preflight clean"
+    );
+}
+
+#[test]
+fn jj_operation_observation_does_not_snapshot_dirty_working_copy() {
+    let Some(repo) = init_jj_repo() else {
+        return;
+    };
+    let before = super::jj::current_operation_id(&repo.path).unwrap();
+    fs::write(repo.path.join("unobserved.txt"), "dirty\n").unwrap();
+
+    let observed = super::jj::current_operation_id(&repo.path).unwrap();
+    assert_eq!(
+        observed, before,
+        "reading the current operation must not snapshot the working copy"
     );
 }
 

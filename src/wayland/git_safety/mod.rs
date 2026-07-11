@@ -162,12 +162,8 @@ struct Task {
     linked_worktree: bool,
     /// jj operation recorded before Iris's first mutation in this task.
     jj_base_op: Option<String>,
-    /// Latest jj operation Iris recorded after snapshotting its own mutation.
+    /// Latest jj operation assigned to a completed Iris call window.
     jj_last_op: Option<String>,
-    /// Set when another jj operation advanced the workspace after Iris's last
-    /// recorded snapshot. The next mutation returns a violation instead of
-    /// silently rebasing the task baseline.
-    jj_external_op: bool,
     /// When this task first opened (epoch millis), for the expiry sweep.
     created_ms: u64,
     /// The per-task advisory `flock` lease, held for the task's lifetime
@@ -215,7 +211,6 @@ impl Task {
             linked_worktree,
             jj_base_op: None,
             jj_last_op: None,
-            jj_external_op: false,
             created_ms: task_state::now_ms(),
             _lease: lease,
             body: None,
@@ -246,7 +241,6 @@ impl Task {
             linked_worktree,
             jj_base_op: None,
             jj_last_op: None,
-            jj_external_op: false,
             created_ms: task_state::now_ms(),
             _lease: None,
             body: None,
@@ -277,7 +271,6 @@ impl Task {
             linked_worktree: false,
             jj_base_op: None,
             jj_last_op: None,
-            jj_external_op: false,
             created_ms: task_state::now_ms(),
             _lease: None,
             body: None,
@@ -314,7 +307,6 @@ impl Task {
             external_settlement_blocked_while_clean: false,
             jj_base_op: Some(base_op.clone()),
             jj_last_op: Some(base_op),
-            jj_external_op: false,
         }
     }
 }
@@ -1176,7 +1168,10 @@ impl MutationGuard for GitSafety {
                             summary
                         });
                         if !self.workflow_enabled {
-                            state.task = Some(Task::guard_only(task_id, baseline, None, false));
+                            let mut task = Task::guard_only(task_id, baseline, None, false);
+                            task.jj_base_op = Some(base_op.clone());
+                            task.jj_last_op = Some(base_op);
+                            state.task = Some(task);
                             return summary;
                         }
                         let lease = match lock::try_exclusive(&lock::lease_path(
@@ -1319,11 +1314,72 @@ impl MutationGuard for GitSafety {
         }
     }
 
-    fn before_exec(&self, paths: &[PathBuf]) {
+    fn before_exec(&self, paths: &[PathBuf]) -> GuardViolation {
         let mut state = self.state.lock().unwrap();
         let Some(task) = state.task.as_mut() else {
-            return;
+            return GuardViolation::clean();
         };
+        // Observe jj without snapshotting the working copy. An operation that
+        // predates this call is external to its execution window. Refresh the
+        // protected baseline and revoke prior dirty-file approvals before
+        // resynchronizing, then stop before the tool can produce side effects.
+        // If the operation boundary cannot be read or refreshed, fail closed.
+        if matches!(self.mode, Mode::Jj(_)) && !task.degraded {
+            let op = match jj::current_operation_id(&self.workspace) {
+                Ok(op) => op,
+                Err(error) => {
+                    return GuardViolation {
+                        paths: Vec::new(),
+                        reason: Some(format!(
+                            "could not read jj operation before this call; safety could not be verified ({error:#})"
+                        )),
+                    };
+                }
+            };
+            if task.jj_last_op.as_deref() != Some(op.as_str()) {
+                let baseline = match jj::capture_baseline(&self.workspace, |path| {
+                    self.normalize(path)
+                }) {
+                    Ok(baseline) => baseline,
+                    Err(error) => {
+                        return GuardViolation {
+                            paths: Vec::new(),
+                            reason: Some(format!(
+                                "could not refresh the jj safety baseline before this call ({error:#})"
+                            )),
+                        };
+                    }
+                };
+                let resynced_op = match jj::current_operation_id(&self.workspace) {
+                    Ok(op) => op,
+                    Err(error) => {
+                        return GuardViolation {
+                            paths: Vec::new(),
+                            reason: Some(format!(
+                                "could not confirm the refreshed jj safety baseline before this call ({error:#})"
+                            )),
+                        };
+                    }
+                };
+                let had_boundary = task.jj_last_op.is_some();
+                task.baseline = baseline;
+                task.approved.clear();
+                task.all_dirty_approved = false;
+                task.snapshot = Snapshot::default();
+                task.pre_modes.clear();
+                task.jj_last_op = Some(resynced_op);
+                self.persist_task(task);
+                let reason = if had_boundary {
+                    "the working copy changed via a jj operation outside Iris; the safety baseline and dirty-file approvals were refreshed (the next call proceeds from the new state)"
+                } else {
+                    "the prior jj operation boundary was unavailable; the safety baseline and dirty-file approvals were refreshed (the next call proceeds from the new state)"
+                };
+                return GuardViolation {
+                    paths: Vec::new(),
+                    reason: Some(reason.to_string()),
+                };
+            }
+        }
         // Snapshot the protected set (git mode) plus this call's known targets so
         // the checkpoint chain can capture a clean file's exact pre-task content
         // before Iris overwrites it. In degraded mode there is no protected set,
@@ -1355,13 +1411,7 @@ impl MutationGuard for GitSafety {
             .map(|path| (path.clone(), FileMode::of(path)))
             .collect();
         task.snapshot = Snapshot::capture(capture);
-        if let Mode::Jj(_) = &self.mode
-            && let Ok(op) = jj::current_operation_id(&self.workspace)
-            && let Some(last) = task.jj_last_op.as_deref()
-            && op != last
-        {
-            task.jj_external_op = true;
-        }
+        GuardViolation::clean()
     }
 
     fn after_exec(&self, approved: &[PathBuf], expected_after: Option<&str>) -> GuardViolation {
@@ -1398,34 +1448,18 @@ impl MutationGuard for GitSafety {
                 self.checkpoint_degraded(task, approved);
                 return GuardViolation::clean();
             }
-            if task.jj_external_op {
-                task.jj_external_op = false;
-                // Resync to the current operation so this halt fires exactly
-                // once: without it every later call in the task re-trips the
-                // stale comparison and poisons the whole session (issue #560).
-                match jj::current_operation_id(&self.workspace) {
-                    Ok(op) => task.jj_last_op = Some(op),
-                    Err(error) => {
-                        tracing::warn!(error = %format!("{error:#}"), "jj operation resync failed after external operation")
-                    }
-                }
-                return GuardViolation {
-                    paths: approved.iter().map(|path| self.normalize(path)).collect(),
-                    reason: Some(
-                        "the working copy changed via a jj operation outside Iris; this call was halted (the next call proceeds from the new state)"
-                            .to_string(),
-                    ),
-                };
-            }
             if matches!(self.mode, Mode::Jj(_)) {
                 match jj::snapshot(&self.workspace) {
-                    // The snapshot itself appends to the jj op log whenever the
-                    // working copy changed, so record the resulting operation as
-                    // ours unconditionally -- comparing the next call against a
-                    // pre-snapshot id would flag our own snapshot as external
-                    // (issue #560).
+                    // The whole successful preflight-to-postflight window belongs
+                    // to this call for guard attribution. `jj status` may append
+                    // another operation while snapshotting working-copy changes;
+                    // persist the final id so neither the tool's operation nor
+                    // our snapshot is mistaken for a later external operation.
                     Ok(_) => match jj::current_operation_id(&self.workspace) {
-                        Ok(op) => task.jj_last_op = Some(op),
+                        Ok(op) => {
+                            task.jj_last_op = Some(op);
+                            self.persist_task(task);
+                        }
                         Err(error) => {
                             tracing::warn!(error = %format!("{error:#}"), "jj operation update failed")
                         }

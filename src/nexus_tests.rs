@@ -7903,9 +7903,9 @@ struct FakeGuard {
     protected: Vec<PathBuf>,
     approved: RefCell<Vec<PathBuf>>,
     all_dirty: Cell<bool>,
-    /// Returned (once) from the next `after_exec`, to drive the loop's
-    /// violation-halt path without a real repo.
-    violation: RefCell<Option<GuardViolation>>,
+    /// Returned (once) from the next `before_exec`, to drive a preflight halt
+    /// without a real repository.
+    preflight_violation: RefCell<Option<GuardViolation>>,
 }
 
 impl FakeGuard {
@@ -7914,7 +7914,7 @@ impl FakeGuard {
             protected: Vec::new(),
             approved: RefCell::new(Vec::new()),
             all_dirty: Cell::new(false),
-            violation: RefCell::new(None),
+            preflight_violation: RefCell::new(None),
         }
     }
     fn protecting(paths: Vec<PathBuf>) -> Self {
@@ -7922,14 +7922,14 @@ impl FakeGuard {
             protected: paths,
             approved: RefCell::new(Vec::new()),
             all_dirty: Cell::new(false),
-            violation: RefCell::new(None),
+            preflight_violation: RefCell::new(None),
         }
     }
     /// A guard that halts the next call with a reason-only violation (no named
     /// files), mirroring an external jj operation (issue #560).
     fn halting(reason: &str) -> Self {
         let guard = Self::none();
-        *guard.violation.borrow_mut() = Some(GuardViolation {
+        *guard.preflight_violation.borrow_mut() = Some(GuardViolation {
             paths: Vec::new(),
             reason: Some(reason.to_string()),
         });
@@ -7958,9 +7958,14 @@ impl MutationGuard for FakeGuard {
         }
         self.approved.borrow_mut().extend_from_slice(paths);
     }
-    fn before_exec(&self, _paths: &[PathBuf]) {}
+    fn before_exec(&self, _paths: &[PathBuf]) -> GuardViolation {
+        self.preflight_violation
+            .borrow_mut()
+            .take()
+            .unwrap_or_default()
+    }
     fn after_exec(&self, _approved: &[PathBuf], _expected: Option<&str>) -> GuardViolation {
-        self.violation.borrow_mut().take().unwrap_or_default()
+        GuardViolation::clean()
     }
     fn restore(&self, _paths: &[PathBuf]) -> Result<()> {
         Ok(())
@@ -8036,11 +8041,11 @@ fn denied_count(frontend: &RecordingFrontend) -> usize {
         .count()
 }
 
-// A reason-only guard halt (no named files, e.g. an external jj operation,
-// issue #560) fails the call with the reason and never claims a snapshot
-// restore that did not happen.
+// A reason-only preflight halt (no named files, e.g. an external jj operation,
+// issue #560) prevents execution, reports the reason, and never claims a
+// snapshot restore that did not happen.
 #[test]
-fn reason_only_guard_halt_reports_reason_without_restore_claim() -> Result<()> {
+fn reason_only_guard_preflight_prevents_execution_without_restore_claim() -> Result<()> {
     let workspace = test_workspace()?;
     let provider = FakeProvider::new(write_turn("out.txt", "new\n"));
     let mut agent = Agent::new(provider, crate::tools::built_in_tools());
@@ -8065,8 +8070,8 @@ fn reason_only_guard_halt_reports_reason_without_restore_claim() -> Result<()> {
         })
         .expect("a guard-halted call surfaces a tool error");
     assert!(
-        error.contains("halted: the working copy changed via a jj operation outside Iris"),
-        "the halt names its cause: {error}"
+        error.contains("not executed: the working copy changed via a jj operation outside Iris"),
+        "the preflight halt names its cause and confirms no execution: {error}"
     );
     assert!(
         !error.contains("restored from snapshot") && !error.contains("file(s): ;"),
@@ -8079,10 +8084,20 @@ fn reason_only_guard_halt_reports_reason_without_restore_claim() -> Result<()> {
         "no file-level violation event without named paths"
     );
     assert!(
-        events
+        events.iter().any(
+            |event| matches!(event, AgentEvent::Notice(notice) if notice.contains("not executed:"))
+        ),
+        "the preflight halt is surfaced to the user as a notice"
+    );
+    assert!(
+        !events
             .iter()
-            .any(|event| matches!(event, AgentEvent::Notice(notice) if notice.contains("halted:"))),
-        "the halt is surfaced to the user as a notice"
+            .any(|event| matches!(event, AgentEvent::ToolStarted(call) if call.name == "write")),
+        "a preflight-halted tool must never enter the started state"
+    );
+    assert!(
+        !workspace.path.join("out.txt").exists(),
+        "the preflight-halted tool produced no side effect"
     );
     Ok(())
 }

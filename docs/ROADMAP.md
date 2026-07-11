@@ -1050,8 +1050,13 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
   ([#262](https://github.com/5omeOtherGuy/iris-agent/issues/262)) — gates the rest. Done.
   Baseline + attribution ledger + choke-point gate: edit/write route a
   pre-existing dirty target through per-file, per-task approval; bash is
-  detect-and-restore around a protected-set snapshot; non-git/`.jj` degrade with
-  an honest notice.
+  detect-and-restore around a protected-set snapshot. The native jj backend
+  brackets each mutating call with non-snapshotting operation reads: a
+  pre-existing external operation refreshes the protected baseline, revokes stale
+  dirty-file approvals, and stops before execution; an unreadable operation
+  boundary also stops the call. Operations completed inside the call window are
+  attributed to that call. Non-repository workspaces degrade with an honest
+  notice.
 - Task-scoped checkpoint/rollback
   ([#263](https://github.com/5omeOtherGuy/iris-agent/issues/263)) — Done. Op-log-shaped
   git checkpoint chain under `refs/iris/checkpoints/<task-id>/` (plumbing only,
