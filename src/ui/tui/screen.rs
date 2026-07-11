@@ -902,6 +902,10 @@ fn working_lines(
 /// The composer placeholder at rest — exact product casing (§9.4). Swapped for
 /// the review decision echo while a gated tool waits (`Screen::composer_placeholder`).
 const PLACEHOLDER_PROMPT: &str = "Give Iris a task...";
+/// At the documented 12-row design floor, reclaim fixed chrome automatically so
+/// the live agent loop keeps nearly the whole pane. Taller panes opt in via
+/// `/focus`; the start page and explicit session dropdowns retain normal chrome.
+const FOCUS_MODE_AUTO_MAX_HEIGHT: u16 = 12;
 
 /// Build a styled, empty editor for the bordered composer panel: dim
 /// placeholder and a reversed block cursor the widget draws itself (no hardware
@@ -1036,6 +1040,9 @@ pub(crate) struct Screen {
     /// flag, per the ADR's "no pager-only transcript state beyond
     /// scroll/focus" rule.
     pub(crate) scroll: super::pager::ScrollState,
+    /// Whether focus mode was explicitly requested for this session. The
+    /// effective layout also activates at [`FOCUS_MODE_AUTO_MAX_HEIGHT`].
+    focus_mode: bool,
     /// Whether the alt-screen pager renders this screen. Gates the pager-only
     /// scroll keys so inline-mode input routing is untouched.
     pub(crate) pager_active: bool,
@@ -1167,6 +1174,7 @@ impl Screen {
             session_menu: None,
             last_session_bar: None,
             scroll: super::pager::ScrollState::default(),
+            focus_mode: false,
             pager_active: false,
             mouse_capture: true,
             scroll_speed: 3,
@@ -1825,6 +1833,33 @@ impl Screen {
 
     pub(super) fn wrapped_lines_incremental(&mut self, width: u16) -> TranscriptRender {
         self.transcript.render_incremental(width)
+    }
+
+    // --- focus mode ---
+
+    /// Set the session-scoped focus-mode preference. The reactive small-height
+    /// posture remains automatic even when the explicit preference is off.
+    pub(crate) fn set_focus_mode(&mut self, enabled: bool) {
+        self.focus_mode = enabled;
+    }
+
+    /// Toggle the session-scoped focus-mode preference and return its new state.
+    pub(crate) fn toggle_focus_mode(&mut self) -> bool {
+        self.focus_mode = !self.focus_mode;
+        self.focus_mode
+    }
+
+    /// Effective focus layout for this frame. Explicit session-bar disclosures
+    /// and the start page keep their full chrome; they are user-requested control
+    /// surfaces rather than passive distraction.
+    fn focus_mode_active(&self, height: u16) -> bool {
+        (self.focus_mode || height <= FOCUS_MODE_AUTO_MAX_HEIGHT)
+            && self.start_page.is_none()
+            && self.session_menu.is_none()
+    }
+
+    fn focus_composer_collapsed(&self) -> bool {
+        self.editor_is_empty() && self.modal.is_none() && !self.awaiting_approval
     }
 
     // --- editor ---
@@ -3037,6 +3072,9 @@ pub(crate) enum BarSegment {
 /// footer yet. `height` caps the dropdown at [`MAX_DROPDOWN_ROWS`] or ⅓ of
 /// the pane, whichever is smaller.
 pub(super) fn session_bar_lines(screen: &Screen, width: u16, height: u16) -> Vec<Line<'static>> {
+    if screen.focus_mode_active(height) {
+        return Vec::new();
+    }
     let inset = BOX_X_PADDING_U16.min(width.saturating_sub(1));
     let content_width = width.saturating_sub(inset.saturating_mul(2)).max(1);
     let Some(mut bar) = session_bar(screen, content_width) else {
@@ -3065,6 +3103,64 @@ pub(super) fn session_bar_lines(screen: &Screen, width: u16, height: u16) -> Vec
     pad_line_left(&mut rule, usize::from(inset));
     lines.push(rule);
     lines
+}
+
+/// Focus mode's collapsed one-row footer. It reuses the session-bar grammar
+/// byte-for-byte, but moves it to the pane bottom and omits the closing rule.
+fn focus_metadata_row(screen: &Screen, width: u16) -> Line<'static> {
+    let inset = BOX_X_PADDING_U16.min(width.saturating_sub(1));
+    let content_width = width.saturating_sub(inset.saturating_mul(2)).max(1);
+    let mut line = session_bar(screen, content_width).unwrap_or_default();
+    pad_line_left(&mut line, usize::from(inset));
+    truncate_line(&mut line, usize::from(width));
+    line
+}
+
+/// Focus mode's expanded composer edge: the normal border-weight hairline now
+/// carries the session metadata. Text keeps the session-bar tones; only the
+/// structural rule uses the composer bezel tone (or review accent).
+fn focus_composer_hairline(screen: &Screen, width: usize, review: bool) -> Line<'static> {
+    if width < 8 {
+        return composer_hairline(width, review);
+    }
+    let rule_style = if review {
+        prompt_style()
+    } else {
+        border_style()
+    };
+    let inner_width = width.saturating_sub(4);
+    let Some(mut metadata) = session_bar(screen, u16::try_from(inner_width).unwrap_or(u16::MAX))
+    else {
+        return composer_hairline(width, review);
+    };
+
+    // The session bar right-aligns CTX with one whitespace fill span. Turn that
+    // fill into a rule while preserving one breathing cell at each end.
+    for span in &mut metadata.spans {
+        let cells = display_width(span.content.as_ref());
+        if cells >= 2 && span.content.chars().all(char::is_whitespace) {
+            span.content = format!(" {} ", "─".repeat(cells.saturating_sub(2))).into();
+            span.style = rule_style;
+        }
+    }
+
+    let used = spans_width(&metadata.spans).min(inner_width);
+    let trailing = inner_width.saturating_sub(used);
+    let mut spans = Vec::with_capacity(metadata.spans.len() + 3);
+    spans.push(Span::styled("─ ".to_string(), rule_style));
+    spans.extend(metadata.spans);
+    if trailing > 0 {
+        let fill = if trailing == 1 {
+            "─".to_string()
+        } else {
+            format!(" {}", "─".repeat(trailing - 1))
+        };
+        spans.push(Span::styled(fill, rule_style));
+    }
+    spans.push(Span::styled(" ─".to_string(), rule_style));
+    let mut line = Line::from(spans);
+    truncate_line(&mut line, width);
+    line
 }
 
 /// `@path` tokens in the composer text: the tree dropdown's `◉ open` markers.
@@ -3210,7 +3306,11 @@ pub(super) fn render_editor_chrome(
     width: u16,
     height: u16,
 ) -> Vec<Line<'static>> {
-    let switch_status = if height > MIN_EDITOR_H {
+    let focus_mode = screen.focus_mode_active(height);
+    if focus_mode && screen.focus_composer_collapsed() {
+        return vec![focus_metadata_row(screen, width)];
+    }
+    let switch_status = if !focus_mode && height > MIN_EDITOR_H {
         switch_status_line(screen, width)
     } else {
         None
@@ -3273,10 +3373,10 @@ pub(super) fn render_editor_chrome(
     // Keep one soft row under the normal composer, but do not spend an extra
     // blank row while a docked overlay (or the docked approval panel, which now
     // lives in the same region) already occupies the lower viewport.
-    let bottom_padding_rows = if menu_wanted == 0 {
-        EDITOR_BOTTOM_PADDING_ROWS
-    } else {
+    let bottom_padding_rows = if focus_mode || menu_wanted > 0 {
         0
+    } else {
+        EDITOR_BOTTOM_PADDING_ROWS
     };
     let heights = chrome_heights(area.height, menu_wanted, editor_rows, bottom_padding_rows);
     let chrome_h = heights.menu.saturating_add(heights.editor);
@@ -3341,7 +3441,15 @@ pub(super) fn render_editor_chrome(
     // statusline. Painted last so they are never overwritten by the
     // textarea/approval body at very small heights.
     if heights.editor > 0 {
-        let hairline = composer_hairline(usize::from(box_area.width), screen.awaiting_approval);
+        let hairline = if focus_mode {
+            focus_composer_hairline(
+                screen,
+                usize::from(box_area.width),
+                screen.awaiting_approval,
+            )
+        } else {
+            composer_hairline(usize::from(box_area.width), screen.awaiting_approval)
+        };
         buf.set_line(box_area.x, box_area.y, &hairline, box_area.width);
     }
     let status_y = heights.editor.saturating_sub(pad_rows).saturating_sub(1);
@@ -3606,7 +3714,7 @@ mod tests {
     fn composer_frame_styles(
         screen: &mut Screen,
     ) -> (ratatui::style::Style, ratatui::style::Style) {
-        let lines = super::render_editor_chrome(screen, 80, 12);
+        let lines = super::render_editor_chrome(screen, 80, 13);
         let find = |ch: char| {
             lines
                 .iter()
@@ -5155,7 +5263,7 @@ mod tests {
 
         let mut screen = footer_screen("~/repo");
         screen.commit_user("hello");
-        let size = Size::new(80, 12);
+        let size = Size::new(80, 13);
         let _ = render_document_with_hints(&mut screen, size);
         // Unchanged bar: the stable prefix extends past the two bar rows.
         let unchanged = render_document_with_hints(&mut screen, size);
@@ -5443,7 +5551,7 @@ mod tests {
         };
 
         let mut screen = Screen::new();
-        let (focused, _) = render_document_with_chrome_tail(&mut screen, Size::new(80, 10));
+        let (focused, _) = render_document_with_chrome_tail(&mut screen, Size::new(80, 13));
         assert!(
             has_marker(&focused),
             "focused composer must emit the IME marker"
@@ -5451,11 +5559,135 @@ mod tests {
 
         // While a turn runs the composer is frozen: no marker (cursor hidden).
         screen.start_turn();
-        let (running, _) = render_document_with_chrome_tail(&mut screen, Size::new(80, 10));
+        let (running, _) = render_document_with_chrome_tail(&mut screen, Size::new(80, 13));
         assert!(
             !has_marker(&running),
             "a running turn must not emit the composer cursor marker"
         );
+    }
+
+    #[test]
+    fn focus_mode_collapses_empty_composer_and_reveals_it_while_typing() {
+        use super::{Screen, render_document_with_chrome_tail};
+        use ratatui::layout::Size;
+
+        let mut screen = Screen::new();
+        screen.set_footer_with_context(
+            "gpt-5.5".to_string(),
+            Some("high".to_string()),
+            Some("300k".to_string()),
+            "~/repo".to_string(),
+        );
+        screen.set_footer_git(Some(git_status("main")));
+        screen.set_focus_mode(true);
+
+        let (hidden, tail) = render_document_with_chrome_tail(&mut screen, Size::new(80, 30));
+        let hidden_text = hidden.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert_eq!(tail, 1, "hidden focus chrome is exactly one bottom row");
+        assert_eq!(
+            hidden.len(),
+            1,
+            "no top session bar or empty composer remains"
+        );
+        assert!(hidden_text.contains("~/repo"), "{hidden_text:?}");
+        assert!(hidden_text.contains("git main"), "{hidden_text:?}");
+        assert!(hidden_text.contains("CTX 0/300k"), "{hidden_text:?}");
+        assert!(!hidden_text.contains("Give Iris a task"), "{hidden_text:?}");
+        assert!(!hidden_text.contains("CODE"), "{hidden_text:?}");
+
+        screen.set_editor("hello");
+        let (expanded, tail) = render_document_with_chrome_tail(&mut screen, Size::new(80, 30));
+        let expanded_text = expanded
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(tail, 4, "focus composer has no trailing padding row");
+        assert_eq!(
+            expanded_text.matches("CTX ").count(),
+            1,
+            "metadata moves into the top edge"
+        );
+        assert!(expanded_text.contains("~/repo"), "{expanded_text:?}");
+        assert!(expanded_text.contains("git main"), "{expanded_text:?}");
+        assert!(expanded_text.contains("hello"), "{expanded_text:?}");
+        assert!(expanded_text.contains("CODE"), "{expanded_text:?}");
+
+        assert_eq!(screen.submit(), "hello");
+        let (hidden_again, tail) = render_document_with_chrome_tail(&mut screen, Size::new(80, 30));
+        assert_eq!(tail, 1);
+        assert_eq!(
+            hidden_again.len(),
+            1,
+            "sending collapses the composer again"
+        );
+
+        screen.show_approval(false, false, false);
+        let (review, review_tail) =
+            render_document_with_chrome_tail(&mut screen, Size::new(80, 30));
+        let review_text = review.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(review_tail > 1, "review must reveal the safety affordance");
+        assert!(review_text.contains("REVIEW"), "{review_text:?}");
+    }
+
+    #[test]
+    fn pager_focus_mode_moves_session_metadata_from_top_to_bottom() {
+        use ratatui::layout::Size;
+
+        let mut screen = Screen::new();
+        screen.pager_active = true;
+        screen.set_footer_with_context(
+            "gpt-5.5".to_string(),
+            None,
+            Some("300k".to_string()),
+            "~/repo".to_string(),
+        );
+        screen.set_focus_mode(true);
+
+        let frame = super::super::pager::compose_frame(&mut screen, Size::new(80, 24)).lines;
+        let rows = frame.iter().map(line_text).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 24);
+        assert!(
+            !rows[0].contains("~/repo"),
+            "top bar is absent: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[23].contains("~/repo"),
+            "bottom readout: {:?}",
+            rows[23]
+        );
+        assert!(
+            rows[23].contains("CTX 0/300k"),
+            "bottom readout: {:?}",
+            rows[23]
+        );
+        assert_eq!(rows.iter().filter(|row| row.contains("CTX ")).count(), 1);
+    }
+
+    #[test]
+    fn focus_mode_automatically_activates_only_at_the_small_height_floor() {
+        use super::{Screen, render_document_with_chrome_tail};
+        use ratatui::layout::Size;
+
+        let mut screen = Screen::new();
+        screen.set_footer_with_context(
+            "gpt-5.5".to_string(),
+            None,
+            Some("300k".to_string()),
+            "~/repo".to_string(),
+        );
+
+        let (small, small_tail) = render_document_with_chrome_tail(&mut screen, Size::new(80, 12));
+        assert_eq!(small_tail, 1);
+        assert_eq!(small.len(), 1, "12-row panes automatically use focus mode");
+
+        let (normal, normal_tail) =
+            render_document_with_chrome_tail(&mut screen, Size::new(80, 13));
+        let normal_text = normal.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(normal_tail > 1);
+        assert!(normal_text.contains("Give Iris a task"), "{normal_text:?}");
+        assert_eq!(normal_text.matches("CTX ").count(), 1);
     }
 
     #[test]

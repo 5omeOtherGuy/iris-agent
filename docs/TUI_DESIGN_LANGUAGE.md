@@ -30,8 +30,10 @@ one line of the terminal grid. "Two cells of indent" means `2ch`, not "about
 ## 1 · The pane — global anatomy
 
 Iris is a **single vertically scrolling transcript column** framed by a quiet
-**session bar pinned at the top** and a **fixed multiline composer pinned at
-the bottom**. That is the entire chrome. There is:
+**session bar pinned at the top** and a **multiline composer pinned at the
+bottom**. Focus mode folds those two chrome regions into one conditional bottom
+surface (§1.2); the transcript grammar does not change. That is the entire
+chrome. There is:
 
 - **no sidebar** — no file tree, no history rail, no agent avatar;
 - **no top tab bar** — the session bar is one quiet row (location + context),
@@ -47,7 +49,9 @@ halves are never merged onto one line again:
   branch` left, the right-aligned context readout `CTX <used>/<cap>` + 10-dot
   meter right, over a soft (dim) hairline.
 - **Composer statusline (pane bottom — "what am I running"):** mode · model ·
-  effort · approval policy, below the input rows.
+  effort · approval policy, below the input rows. In focus mode, session
+  metadata moves into the composer's top edge while input is visible, then
+  becomes the composer's one-row collapsed posture while input is empty.
 
 ```
 ┌───────────────────────────── pane (one column) ─────────────────────────────┐
@@ -112,6 +116,44 @@ terminals and normal tmux; tmux control mode, Zellij, `TERM=dumb`, and
 non-TTY stdio degrade to inline with a one-line notice. `--plain` remains the
 ANSI-free text path. Detection failures degrade to inline, never to a broken
 alt screen.
+
+### 1.2 Focus mode — transcript-first posture
+
+Focus mode removes passive chrome without changing the transcript. Enable it for
+the session with `/focus`; `/focus on` and `/focus off` are deterministic forms.
+At terminal heights of **12 rows or fewer**, Iris selects focus mode
+automatically. `/focus off` returns to this automatic policy rather than
+suppressing the short-pane safety valve.
+
+Empty posture — one bottom row, all other rows belong to the live session:
+
+```
+<transcript / live agent loop>
+
+  ~/iris-agent ┊ git main                    CTX 94k/300k ●●●○○○○○○○
+```
+
+Editing posture — the same session readout is machined into the composer top
+edge; runtime state remains on the bottom statusline:
+
+```
+  ─ ~/iris-agent ┊ git main ────────── CTX 94k/300k ●●●○○○○○○○ ─
+    Fix the failing pager test
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  ◉ CODE ─ GPT-5.5 XHIGH ─ ◆ always-approve
+```
+
+- **No new grammar.** The collapsed row is the session bar without its closing
+  hairline. The expanded edge reuses `─`, the border role, session-bar field
+  styles, drop order, context meter, and 2-cell shared measure.
+- **Input drives disclosure.** The first edit, paste, or prompt-history recall
+  reveals the composer. Submit and clear collapse it when the buffer becomes
+  empty. Mid-run steering follows the same rule.
+- **Safety and controls win.** Approval review and docked modals reveal the
+  composer even with an empty buffer. The start page and an explicit session-bar
+  disclosure temporarily keep normal chrome.
+- **Both render backends agree.** Pager mode omits the pinned top bar; inline mode
+  omits the document-leading bar. Both place the collapsed row at the live tail.
 
 ---
 
@@ -715,10 +757,11 @@ The statusline is split across the pane: the **session bar** (top) answers
 
 ### 9.1 Session bar (pane top)
 
-A quiet, always-visible row pinned above the transcript (the transcript
-scrolls beneath it), with one soft hairline under it (dim `─` repeat — NOT the
-full border weight; visibly lighter than the composer's top edge). No
-background fill, no color bar.
+In normal posture, a quiet, always-visible row is pinned above the transcript
+(the transcript scrolls beneath it), with one soft hairline under it (dim `─`
+repeat — NOT the full border weight; visibly lighter than the composer's top
+edge). Focus mode relocates this readout per §1.2. No background fill, no color
+bar.
 
 ```
 ~/iris-agent ┊ git main                      CTX 94k/300k ●●●○○○○○○○
@@ -835,8 +878,12 @@ chrome — **not** a card floating in the transcript.
 
 ### 9.2 The composer
 
-**Always present at the bottom. Never hidden, revealed, or collapsed** — there
-is no show/hide mechanic anywhere. Row order, top → bottom:
+**Normal posture:** always present at the bottom. **Focus posture:** conditional.
+An empty editor collapses to the one-row session readout; the first typed cell
+reveals the composer, and submit or clear collapses it again. A modal or approval
+review also reveals it so controls and safety affordances never disappear.
+
+Normal row order, top → bottom:
 
 ```
 ────────────────────────────────────────────  ← top edge: full border-frame hairline
@@ -871,7 +918,9 @@ state symbol + label, never color alone:
 | **REVIEW posture** (`awaiting_approval`) | leading segment is `▲ REVIEW` (orange symbol, bold label); every other segment dims |
 
 **Narrow widths, drop in order:** policy → effort → minimum `◉ CODE ─ MODEL`.
-cwd/branch/context NEVER appear here — they live on the session bar.
+cwd/branch/context never appear on this bottom row. In focus mode they occupy
+the composer's top-edge rule while editing and its one-row collapsed posture
+while empty (§1.2).
 
 **The REVIEW posture (§8.5).** While a gated tool awaits the user's decision
 (`awaiting_approval`), the leading segment swaps `◉ MODE` for `▲ REVIEW`
@@ -1207,7 +1256,9 @@ starts the session with it.
 9. **One type size.** Hierarchy never uses a larger font in the pane.
 10. **Closed symbol set.** No glyph outside §5; `…`/`−`/`┊` (not `...`/`-`/`|`);
     no emoji.
-11. **Composer is unconditional.** No show/hide/reveal/collapse mechanic.
+11. **Composer posture is honest.** Normal mode keeps it unconditional. Focus
+    mode collapses only an empty editor; typing, modal controls, and approval
+    review reveal it immediately (§1.2, §9.2).
 12. **Motion** is only the closed quantized set of §6 — the live working LED
     chase, edge pulse, the start page's one-shot lamp test,
     and the two-tick detent flash — all stepped on the tick grid, all

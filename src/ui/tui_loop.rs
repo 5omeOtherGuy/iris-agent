@@ -1472,6 +1472,37 @@ fn is_settings_command(text: &str) -> bool {
     cmd == "/settings"
 }
 
+/// Apply the session-scoped focus-mode command. `None` means ordinary input;
+/// `Some` means the line was consumed and carries the honest readout to show.
+/// This is safe during a running turn because it changes presentation only.
+fn apply_focus_command(screen: &mut Screen, text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((cmd, rest)) => (cmd, rest.trim()),
+        None => (trimmed, ""),
+    };
+    if cmd != "/focus" {
+        return None;
+    }
+    let enabled = match rest {
+        "" => screen.toggle_focus_mode(),
+        "on" => {
+            screen.set_focus_mode(true);
+            true
+        }
+        "off" => {
+            screen.set_focus_mode(false);
+            false
+        }
+        _ => return Some("usage: /focus [on|off]".to_string()),
+    };
+    Some(if enabled {
+        "focus mode on".to_string()
+    } else {
+        "focus mode automatic \u{2014} activates at 12 rows".to_string()
+    })
+}
+
 fn route_command<P: ChatProvider>(
     prompt: &str,
     harness: &mut Harness<P>,
@@ -1767,6 +1798,12 @@ fn route_command<P: ChatProvider>(
                 Some(0) => apply_notices(tui, vec![format!("no matches for {rest:?}")]),
                 Some(_) => {}
             }
+            Ok(RouteOutcome::Consumed)
+        }
+        "/focus" => {
+            let notice = apply_focus_command(&mut tui.screen, prompt)
+                .expect("/focus match must be consumed by focus command parser");
+            apply_notices(tui, vec![notice]);
             Ok(RouteOutcome::Consumed)
         }
         "/mouse" if rest.is_empty() => {
@@ -3642,7 +3679,9 @@ fn handle_running_event(
                 }
                 KeyCode::Enter => {
                     let text = screen.submit();
-                    if is_settings_command(text.trim()) {
+                    if let Some(notice) = apply_focus_command(screen, &text) {
+                        screen.apply(UiEvent::Notice(notice));
+                    } else if is_settings_command(text.trim()) {
                         // `/settings` is a UI command, not model input: defer
                         // opening the settings picker to the next safe boundary
                         // instead of steering the literal text into the turn
@@ -5201,6 +5240,36 @@ mod tests {
         // Drained once: a second boundary check does not re-open it.
         assert!(!steering.take_settings());
         assert!(screen.editor_is_empty(), "the composer is cleared");
+    }
+
+    #[test]
+    fn running_focus_command_toggles_ui_without_steering() {
+        let mut screen = Screen::new();
+        let steering = SteeringQueue::default();
+        let mut pending: Option<PendingApproval> = None;
+        for ch in "/focus on".chars() {
+            handle_running_event(&mut screen, key(KeyCode::Char(ch)), &mut pending, &steering);
+        }
+        assert!(handle_running_event(
+            &mut screen,
+            key(KeyCode::Enter),
+            &mut pending,
+            &steering,
+        ));
+        assert_eq!(steering.len(), 0, "/focus is never model input");
+        assert!(
+            screen.editor_is_empty(),
+            "the composer collapses after submit"
+        );
+        assert_eq!(
+            apply_focus_command(&mut screen, "/focus off"),
+            Some("focus mode automatic \u{2014} activates at 12 rows".to_string())
+        );
+        assert_eq!(
+            apply_focus_command(&mut screen, "/focus sideways"),
+            Some("usage: /focus [on|off]".to_string())
+        );
+        assert_eq!(apply_focus_command(&mut screen, "/focused"), None);
     }
 
     #[test]

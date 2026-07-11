@@ -162,6 +162,11 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/focus",
+        description: "Toggle distraction-free focus mode [on|off]",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/mouse",
         description: "Toggle mouse capture (off = terminal-native select/copy) (pager mode)",
         action: SlashAction::Submit,
@@ -348,6 +353,16 @@ mod tests {
             .expect("/skills must be registered");
         assert_eq!(command.action, SlashAction::Submit);
         assert_eq!(matches("/ski")[0].name, "/skills");
+    }
+
+    #[test]
+    fn focus_command_is_registered_and_submits() {
+        let command = COMMANDS
+            .iter()
+            .find(|command| command.name == "/focus")
+            .expect("/focus must be registered");
+        assert_eq!(command.action, SlashAction::Submit);
+        assert_eq!(matches("/foc")[0].name, "/focus");
     }
 
     #[test]
