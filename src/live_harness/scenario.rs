@@ -222,8 +222,12 @@ impl Scenario for AggressiveFill {
             .collect::<Vec<_>>()
             .join("\n");
         vec![format!(
-            "Read each of these files, ONE AT A TIME (a single read tool call per reply, \
-             wait for each result before the next), then give a one-line summary of each:\n{list}"
+            "MANDATORY VERIFICATION TASK: you MUST read every file listed below with the \
+             read tool before answering; summaries from memory or from file names are \
+             invalid and fail the verification. Read them ONE AT A TIME (a single read \
+             tool call per reply, wait for each result before the next). Do not stop \
+             early, do not skip files, do not batch reads. Only after the final read, \
+             give a one-line summary of each:\n{list}"
         )]
     }
 

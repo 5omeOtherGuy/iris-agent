@@ -26,11 +26,20 @@ config loader (PR #569) with zero code edits.
   investigation; folds ruled out (fold_flushes=0 on every row) and the
   runtime injects no model-visible warn notice.
 
-## Open questions
+## Resolutions (2026-07-11, probe campaigns `probe-terra-28k`, `probe-terra-32k`, `probe-sol-s1`, `probe-sonnet-s1`, `probe-terra-diag`)
 
-1. Terra early-stop at budget 24576: next probe budget 28672; harness gap --
-   rows do not record assistant text, so behavioral stops cannot be diagnosed
-   from artifacts alone.
-2. Codex lane reports no `cache_write_tokens` live (null on all 19 usage rows;
-   cache reads flow fine) despite GPT-5.6 documentation and the #557 parsing.
-   Endpoint-vs-parsing undetermined; needs one raw usage JSON capture.
+1. Early-stop: NOT budget, folds, warn-tier, #574 code, or environment. The
+   probe ladder eliminated each: fails at 24k/28k/32k, on pre- and post-#574
+   code (bisect worktree at 3d8f2ff), on terra AND sol -- while sonnet passes
+   S1 on the same binary. Time series: 2/2 pass -> 7/7 early-stop (~13h later)
+   -> 1/1 pass (2h after that). Conclusion: time-varying `/codex/responses`
+   endpoint behavior (models intermittently refuse repetitive sequential-read
+   instructions). Mitigations shipped: S1 drive prompt hardened to
+   mandatory-verification language (this PR), and #577 transcripts record the
+   model's stated stop reason for any recurrence.
+2. Cache writes: settled = endpoint. Raw usage capture (#577,
+   `RUST_LOG=iris::usage_raw=debug`, 24/24 requests in `probe-terra-diag`)
+   shows the endpoint always sends `"cache_write_tokens": 0` -- including
+   requests straddling two compaction generations with certain prefix
+   re-writes. #557 parsing is correct; the subscription `/codex/responses`
+   lane does not meter cache writes. `write_unreported` already encodes this.

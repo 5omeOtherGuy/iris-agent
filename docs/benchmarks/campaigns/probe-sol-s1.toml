@@ -1,0 +1,11 @@
+# Control: does S1 still drive a non-terra codex model through all 6 reads?
+schema = 1
+[campaign]
+name = "probe-sol-s1"
+runs = 1
+[[lanes]]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "low"
+[[cells]]
+scenario = "S1"

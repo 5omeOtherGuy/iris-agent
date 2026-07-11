@@ -1,0 +1,13 @@
+# Cross-provider control: sonnet passed S1 in pilot-a. If it still passes, the
+# early-stop is a codex-endpoint behavior change; if it fails too, something
+# environmental broke the live drive universally.
+schema = 1
+[campaign]
+name = "probe-sonnet-s1"
+runs = 1
+[[lanes]]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+effort = "low"
+[[cells]]
+scenario = "S1"

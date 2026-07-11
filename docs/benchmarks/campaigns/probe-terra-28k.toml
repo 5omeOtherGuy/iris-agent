@@ -1,0 +1,14 @@
+# Terra early-stop probe: budget 28672 puts the S1 seed at 49% (run starts in
+# tier none, vs 57%/warn at 24576 where terra quit after one read). Hard =
+# 25.8k; six ~2k reads from 14.1k should cross it.
+schema = 1
+[campaign]
+name = "probe-terra-28k"
+runs = 2
+[[lanes]]
+provider = "codex"
+model = "gpt-5.6-terra"
+effort = "low"
+[[cells]]
+scenario = "S1"
+budget = 28672
