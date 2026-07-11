@@ -6,26 +6,64 @@
   <img alt="Iris terminal banner. A user asks: What are you? The thinking indicator pulses, and the answer is: A precise, token-efficient coding agent for the terminal." src="docs/assets/hero-dark.svg" width="640">
 </picture>
 
-A fast coding agent for the terminal, built for token efficiency.
+A coding agent for the terminal, built around token efficiency.
+
+Iris is a single native binary. It runs an interactive REPL in your terminal,
+talks to multiple LLM providers, and drives a small set of workspace tools
+(read, write, edit, bash, grep, find, ls) behind approval gates. What makes it
+distinct is the context layer: Iris measures the token cost of every tool result
+and every context rewrite, and spends that budget deliberately so long,
+tool-heavy sessions stay readable and stay within their window.
 
 ---
 
-## What's new in 0.3.0
+## Highlights
 
-Long, tool-heavy sessions stay readable and within their context budget:
+- **Token-efficient tool output, measured, not asserted.** Every native tool
+  returns the smallest result that preserves task success, and `bash` filters
+  command output inside the runtime before it reaches the transcript. Reductions
+  are pinned by tests against a corpus of real command output — for example
+  ~98% on a passing `cargo build`, ~85–94% on `cargo test`, ~79% on
+  `npm install`. Failure detail (failing-test names, panics, `file:line`,
+  compiler diagnostics, diff hunks) is exempt and survives verbatim.
 
-- **Sharper TUI** — diffs and failed shell results stay prominent, successful
-  tools collapse into compact history, tool output gains syntax highlighting,
-  and thinking, focus, scrolling, Unicode wrapping, and reduced-motion behavior
-  are more stable.
-- **Durable compaction** — Iris compacts between provider round trips and under
-  hard pressure, using provider-native state when supported plus a portable
-  summary for resume or model switches. Opt-in microcompaction folds stale tool
-  results without deleting their originals; `recall` can retrieve them later.
-- **Policy in your hands** — `/settings` exposes automatic compaction,
-  warn/start/hard thresholds, retained tail, hard wait, reactive recovery,
-  summarizer, and worker input. Full compaction is on by default;
-  microcompaction and tool-result compaction remain opt-in.
+- **Non-blocking background compaction.** When context crosses the `start`
+  threshold, Iris launches a summariser worker and immediately keeps working.
+  The compacted context is computed off the main loop and swapped in at a later
+  round-trip boundary, so a summary that finishes mid-loop applies as soon as
+  it is ready instead of stalling the turn. Under hard pressure it waits only up
+  to a bounded budget, then falls back deterministically.
+
+- **Reversible microcompaction (opt-in).** Instead of deleting spent context,
+  Iris folds stale tool results into deterministic, ID-tagged stubs. The
+  original call/result stays in the session transcript, and the model can pull
+  any of them back with the read-only `recall` tool. Folding is deterministic
+  and loses nothing that is not recoverable.
+
+- **Cache-aware fold-flush scheduling.** Folds carry a cost: flushing them
+  rewrites the prompt prefix, which forces a cache write. Iris models this with a
+  provider-neutral `CacheProfile` and prefers to release pending folds at moments
+  the prefix cache breaks anyway — a compaction, a model or provider switch, a
+  cold resume, or a manual `/compact` — where the flush is effectively free. A
+  configurable token watermark remains as a pressure backstop. (Measured: a
+  warm, badly-timed fold flush cost ~2,129 cache-write tokens on the live seed;
+  the same flush at a compaction boundary is free by construction.)
+
+- **Multiple providers, switchable at runtime.** OpenAI Codex, Anthropic (Claude
+  Code OAuth lane), and Antigravity (Gemini). `/model` and `/reasoning` switch
+  provider, model, and thinking effort at safe turn boundaries; `/scoped-models`
+  defines the model cycle you page through. Switches are classified so a
+  reasoning-only change never rewrites the prefix.
+
+- **A terminal UI that behaves.** A ratatui TUI with a plain-text fallback for
+  pipes and CI. It renders inline (no alternate screen, no mouse capture), so
+  native scrollback, copy-mode, and text selection keep working, and
+  detach/reattach under tmux just works. Diffs and failed shell results stay
+  prominent; successful tools collapse into compact history.
+
+- **No runtime dependencies.** `grep` and `find` run in-process via the ripgrep
+  library crates, so no `rg` or `fd` binary needs to be on `PATH`. On Linux the
+  `bash` tool can be confined by the kernel (Landlock LSM).
 
 ## Install
 
@@ -41,55 +79,21 @@ Override the install directory with `IRIS_INSTALL_DIR` or pin a version with
 `IRIS_VERSION=vX.Y.Z`. Manual installs use the same archive plus checksum from
 the [latest release](https://github.com/5omeOtherGuy/iris-agent/releases/latest).
 
-With a Rust toolchain, install from [crates.io](https://crates.io/crates/iris-agent)
-instead:
+With a Rust toolchain, install from
+[crates.io](https://crates.io/crates/iris-agent) instead:
 
 ```bash
 cargo install iris-agent --locked
 ```
 
-Keep an installed copy current with:
+Keep an installed copy current with `iris update`. It installs only stable
+tagged releases — never `main`, never a prerelease — and never downgrades: a
+prebuilt binary verifies the new checksum and atomically replaces itself, a
+source build re-runs `cargo install` pinned to the latest release tag.
 
-```bash
-iris update
-```
+## Quickstart
 
-A prebuilt binary downloads the latest release, verifies its checksum, and
-atomically replaces itself; a source build re-runs `cargo install` pinned to
-the latest release tag. Either way `iris update` installs only stable tagged
-releases — never `main`, never a prerelease — and never downgrades.
-
-**Runtime dependencies: none beyond the binary.** The `grep` and `find` tools
-search in-process via the ripgrep library crates (`grep`, `ignore`, `globset`),
-so no `rg` or `fd` binary needs to be on `PATH`.
-
-## Documentation
-
-OpenWiki-generated agent docs live in `openwiki/` and are prepared with
-[docs/OPENWIKI.md](docs/OPENWIKI.md). The docs website is intentionally kept in a
-separate repository so the Rust CLI release path does not depend on a frontend
-stack.
-
-## Platforms
-
-| Platform | Status | `bash` sandbox |
-| --- | --- | --- |
-| Linux | Supported | Kernel-enforced (Landlock LSM), opt-in via `IRIS_SECURITY_OPT_IN=1` |
-| macOS | Supported | None yet — the shell runs **unconfined** |
-| Windows | Unsupported | — |
-
-macOS caveat: the `bash` sandbox is Linux-only. On macOS every shell command
-runs without kernel confinement. Iris still asks before running mutating tools,
-and when a `bash` approval prompt is shown on macOS, it states `unsandboxed` at
-the point you approve a command, so the posture is visible where you decide, not
-buried in a startup line. `IRIS_SECURITY_OPT_IN=1` controls workspace path and
-Landlock enforcement, not whether mutating tools require approval. macOS
-Seatbelt confinement is a planned follow-up ([docs/ROADMAP.md](docs/ROADMAP.md));
-until it lands, treat macOS shell commands as unsandboxed.
-
-## Run
-
-Create credentials for the provider you want, then start the REPL:
+Create credentials for a provider, then start the REPL:
 
 ```bash
 iris login openai-codex   # or: anthropic · antigravity
@@ -98,76 +102,54 @@ iris                      # /exit or /quit to leave
 
 From a source checkout, replace `iris` with `cargo run --`.
 
+Useful commands at the prompt:
+
+- `/model` — view or switch provider/model at a turn boundary.
+- `/reasoning off|minimal|low|medium|high|xhigh` — change thinking effort.
+- `/settings` — compaction policy, thresholds, summariser, and worker input.
+- `/context` — itemise the current window (system + tools, raw vs summarised
+  conversation, folded-reclaimed tokens, pending folds).
+- `/compact` — compact now.
+- `/resume`, `/new` — swap the live session at a safe turn boundary.
+- `$` or `/skills` — open the installed-skill picker.
+
 ### Headless print mode
 
 Run one turn without the REPL and print just the final answer to stdout:
 
 ```bash
-iris -p "summarize the build failure"          # --print is the long form
+iris -p "summarize the build failure"           # --print is the long form
 cat build.log | iris -p "explain this failure"  # piped stdin merges into the prompt
 iris --print "apply the fix" --approve          # auto-approve gated tools
 ```
 
 Print mode is non-interactive: it exits 0 on success and nonzero on failure, and
 never prompts. Mutating tools (`bash`, `edit`, `write`) are denied by default;
-pass `--approve` to auto-approve them. When stdin is piped it is appended to the
-prompt after a blank line; on a TTY there is nothing to merge. Only the final
-assistant answer reaches stdout.
-
-### Terminal multiplexers (tmux)
-
-Iris renders inline -- no alternate screen, no mouse capture -- so the terminal
-keeps owning what a multiplexer user expects it to own: the transcript flows
-into native scrollback, wheel scroll / copy-mode / text selection work
-unmodified, and detach/reattach just works. Narrow panes are fine; the layout
-wraps to any width.
-
-Resize behavior: until the transcript has scrolled past the pane, resizes never
-touch the pane's scrollback, so whatever was there before Iris started (shell
-history, for example) survives every split and drag. Once the transcript has
-scrolled, a resize rebuilds the pane's scrollback from Iris state so history
-rewraps to the new width.
-
-Optional tmux settings that improve the experience:
-
-```tmux
-set -g focus-events on   # pause the working animation in unfocused panes
-```
-
-tmux >= 3.4 additionally passes synchronized-output through, making mid-turn
-updates flicker-free, and `extended-keys` enables the enhanced keyboard
-protocol Iris negotiates where available.
+pass `--approve` to auto-approve them.
 
 ### Resuming sessions
 
 ```bash
-iris -c                    # or --continue: resume the newest session for this directory
+iris -c                    # --continue: resume the newest session for this directory
 iris resume                # pick a session to resume (picker on a TTY; list otherwise)
 iris resume <session-id>   # resume a specific session by id
 ```
 
-`iris -c`/`--continue` reopens the most recent session for the current
-directory; it errors clearly when the directory has no prior session. `iris
-resume` with no id opens a `/resume` picker on a rich TTY, or prints the
-directory's sessions (id, age, first-message preview) and exits on a plain/piped
-front-end. Mid-session, `/resume` opens the same picker and `/new` starts a
-fresh session — both swap the live session at a safe turn boundary without
-restarting the process.
+## Supported providers
 
-At the prompt, `/model` views or switches provider/model and
-`/reasoning off|minimal|low|medium|high|xhigh` changes thinking effort at a safe
-turn boundary. In the rich TUI, `$` or `/skills` opens the installed-skill
-picker. `/resume`, `/new`, `/settings`,
-`/scoped-models`, `/trust` (or `/permissions`), `/login`, and `/logout` open
-selectors or actions; in the text fallback those selector commands report that
-they are TUI-only. `/session` shows the
-current session's file, id, message counts, and context-token estimate;
-`/copy` puts the last assistant reply on the system clipboard (OSC 52 fallback
-over SSH); `/debug` writes a debug snapshot of the rendered screen and the
-conversation context to `~/.iris/iris-debug.log`.
+| Provider id | Auth | Notes |
+| --- | --- | --- |
+| `openai-codex` | OpenAI Codex OAuth (browser or `--device-code`) | Default provider when no setting is present. |
+| `anthropic` | Claude Code OAuth (browser PKCE, manual-paste fallback) | Can bootstrap from an existing Claude Code token at `~/.claude/.credentials.json`. |
+| `antigravity` | Google OAuth for Gemini Code Assist | Needs `ANTIGRAVITY_CLIENT_SECRET` at login/refresh time. |
+
+Choose the default with `defaultProvider`/`defaultModel` in
+`~/.iris/settings.json`, or switch live with `/model`. The full set of provider
+credentials, settings keys, project-permission (`/trust`) rules, skills
+discovery, and environment variables is documented below.
 
 <details>
-<summary><b>Providers, settings &amp; environment</b></summary>
+<summary><b>Providers, settings, permissions &amp; environment</b></summary>
 
 ### Credentials and provider selection
 
@@ -295,6 +277,21 @@ inject through the old fragment surface (ADR-0026). Project docs
 (`AGENTS.md`/`CLAUDE.md`) remain the intentional repo/user steering channel;
 review them like any other project instruction file.
 
+Per-project permissions persist in `~/.iris/trust.json`, keyed by the canonical
+(symlink-resolved) working directory (ADR-0027):
+
+- At an approval prompt, `[p]` ("always for this project") persists a grant:
+  the tool name for `write`/`edit`, the exact command for `bash`. Granted
+  tools/commands auto-approve in this directory from then on, across sessions.
+- Destructive commands (`rm`, `dd`, `mkfs`, ...) always re-prompt and can never
+  be granted — no `[p]` is offered for them.
+- `/trust` (alias: `/permissions`) opens the rich-TUI project-permissions
+  editor. The text fallback has no editor, but its approval prompt still
+  supports `[p]` grants.
+- The store is HOME-owned; a repo-committed file can never grant permissions.
+  `IRIS_TRUST_PATH` may override the store only with an absolute path outside
+  the project directory.
+
 ### Skills
 
 Iris loads Codex-compatible filesystem skills. A skill is a directory containing
@@ -309,46 +306,17 @@ description: Review a patch for correctness, safety, and missing tests.
 Follow the review workflow here.
 ```
 
-Discovery matches Codex's local layout:
+Discovery matches Codex's local layout: `.agents/skills` from the repo root down
+to the cwd, `<repo>/.codex/skills`, `~/.agents/skills`, `$CODEX_HOME/skills`
+(default `~/.codex/skills`) and its bundled `.system` root, `~/.iris/skills`, and
+`/etc/codex/skills` + `/etc/iris/skills` for admin-installed skills.
 
-- `.agents/skills` in each directory from the repository root to the current
-  working directory;
-- `<repo>/.codex/skills` for Codex's legacy project location;
-- `~/.agents/skills` for user skills;
-- `$CODEX_HOME/skills` (default `~/.codex/skills`) and its bundled `.system`
-  root for existing Codex installs;
-- `~/.iris/skills` for Iris-only installs;
-- `/etc/codex/skills` and `/etc/iris/skills` for administrator-installed skills.
-
-Type `$` or run `/skills` to search and insert a path-qualified mention. A
-unique `$skill-name` works directly. Iris also advertises skill names,
-descriptions, and paths to the model so it can select a matching skill
-implicitly. Only metadata enters the initial context, capped at 2% of the
-configured context budget; the full `SKILL.md` loads when selected. Set
+Type `$` or run `/skills` to search and insert a path-qualified mention. Only
+skill metadata enters the initial context (capped at 2% of the configured
+budget); the full `SKILL.md` loads when selected. Iris also advertises skill
+names and descriptions to the model so it can select one implicitly; set
 `policy.allow_implicit_invocation: false` in `agents/openai.yaml` to require an
-explicit mention. Skill edits are detected at the next turn boundary.
-Optional `metadata.short-description`, `interface`, `dependencies`, and
-`policy` fields use Codex's `agents/openai.yaml` schema. Iris honors
-`skills.include_instructions` and ordered `skills.config` enable/disable rules
-from `$CODEX_HOME/config.toml`. A selected global skill may read references
-beneath its own directory even when workspace confinement is enabled; no skill
-root grants write access outside the workspace.
-
-Per-project permissions persist in `~/.iris/trust.json`, keyed by the canonical
-(symlink-resolved) working directory (ADR-0027):
-
-- At an approval prompt, `[p]` ("always for this project") persists a grant:
-  the tool name for `write`/`edit`, the exact command for `bash`. Granted
-  tools/commands auto-approve in this directory from then on, across sessions.
-- Destructive commands (`rm`, `dd`, `mkfs`, ...) always re-prompt and can never
-  be granted — no `[p]` is offered for them.
-- `/trust` (alias: `/permissions`) opens the rich-TUI project-permissions
-  editor: toggle `write`/`edit` grants and revoke stored `bash` command/prefix
-  grants. The text fallback has no editor, but its approval prompt still
-  supports `[p]` grants.
-- The store is HOME-owned; a repo-committed file can never grant permissions.
-  `IRIS_TRUST_PATH` may override the store only with an absolute path outside
-  the project directory.
+explicit mention.
 
 ### Environment variables
 
@@ -358,71 +326,55 @@ Per-project permissions persist in `~/.iris/trust.json`, keyed by the canonical
 - `IRIS_CONFIG_PATH` — global settings-file path; defaults to `~/.iris/settings.json`.
 - `IRIS_TRUST_PATH` — project-permission policy store path; defaults to `~/.iris/trust.json`; overrides must be absolute and outside the project directory.
 - `IRIS_SESSION_DIR` — session transcript root; defaults to `~/.iris/sessions`.
-- `CODEX_HOME` — optional existing Codex home; Iris reads its `skills`
-  directory and skill settings in `config.toml` for compatibility.
+- `IRIS_SECURITY_OPT_IN` — set to `1` to enable Linux workspace-path and Landlock enforcement.
+- `CODEX_HOME` — optional existing Codex home; Iris reads its `skills` directory and skill settings in `config.toml`.
 - `CLAUDE_CONFIG_DIR` — Claude Code config directory override for Anthropic token bootstrap.
-- `ANTIGRAVITY_CLIENT_SECRET` — Antigravity Google OAuth client secret, read at runtime or embedded when set while building Iris; required for `login antigravity` and refresh unless the binary was built with it.
-- `ANTIGRAVITY_PROJECT_ID` — optional Antigravity project-id override; when set it wins over any persisted project id, otherwise Iris discovers/persists one from `loadCodeAssist` and errors if discovery fails.
+- `ANTIGRAVITY_CLIENT_SECRET` — Antigravity Google OAuth client secret, read at runtime or embedded when set while building; required for `login antigravity` and refresh unless the binary was built with it.
+- `ANTIGRAVITY_PROJECT_ID` — optional Antigravity project-id override.
 
 </details>
 
-## Status
+## How context compaction works
 
-As of 2026-07-03: Milestone 1, the async-hard runtime, and the Milestone 2
-foundations are complete. The active gate is the first Git-Centered Workflow
-slice — dirty-tree safety, task checkpoint/rollback, final diff summary, and
-the verification loop (epic
-[#261](https://github.com/5omeOtherGuy/iris-agent/issues/261), design accepted
-in ADR-0028). Per-result output reduction is measured (see
-[Token efficiency](#token-efficiency)). The end-to-end tokens-per-task benchmark
-([#210](https://github.com/5omeOtherGuy/iris-agent/issues/210)) has a committed
-plan, replay harness, and report; deterministic replay shows the default arm
-spending fewer prompt tokens than a reductions-off baseline with equal success,
-but the real-provider confirmation that closes the Milestone-2 gate is still
-pending.
+Iris keeps a long session inside its window with a few layered mechanisms, each
+measured before it is claimed:
 
-Implemented:
+1. **Per-result reduction (on by default).** Native tools return bounded
+   windows, oversized outputs move behind session handles, and `bash` filters
+   captured command output inside the runtime before it enters the transcript.
+   Semantics never change: any filter error or unparsable output returns the raw
+   output, exit codes are never altered, and `raw: true` bypasses filtering.
+   ([ADR-0036](docs/adr/0036-tools-are-token-efficient-by-design.md),
+   [ADR-0037](docs/adr/0037-native-output-filtering-for-bash-pass-through.md))
 
-- Interactive terminal TUI, with a plain-text fallback for pipes and CI.
-- Tokio async runtime with turn-level cancellation.
-- Multiple providers (OpenAI Codex, Anthropic, Antigravity) with runtime model/reasoning switching.
-- Workspace-scoped tools: read, write, edit, bash, grep, find, ls.
-- Opt-in `read` skim mode: language-aware stripping of comments, docstrings,
-  and blank lines for exploration reads (50-72% token reduction on
-  comment-heavy source, asserted as minimum bars; data formats pass through
-  byte-identical; a skim read does not satisfy read-before-edit). See the
-  [read skim benchmark](docs/benchmarks/issue-337-read-skim-tokens.md).
-- Approval gates with diff previews for mutating tools.
-- JSONL transcript persistence and linear resume (`iris --continue`, `iris
-  resume`, in-session `/resume` picker and `/new`).
-- Large-output handles and turn-boundary auto-compaction.
-- Native bash output filtering: command output is reduced inside the runtime
-  before it enters the transcript (measured; see
-  [Token efficiency](#token-efficiency)).
-- Codex-compatible native skills with repo/user/system/admin discovery, progressive
-  disclosure, explicit and implicit invocation, and a searchable TUI picker.
+2. **Background compaction (on by default).** A context governor runs at
+   round-trip boundaries. At the `start` threshold it launches one summariser
+   worker and returns immediately; the rewrite is installed at a later boundary
+   when it is ready. At `hard` it waits only up to `hardWaitMs`, then falls back
+   through a provider-native rung to deterministic excerpts. A portable summary
+   is persisted beside any provider-native block so a session survives a model
+   switch or resume.
+   ([ADR-0055](docs/adr/0055-govern-context-between-provider-round-trips.md),
+   [ADR-0057](docs/adr/0057-cover-the-current-turn-under-hard-pressure-and-escalate-fallback.md))
 
-Next:
+3. **Microcompaction (opt-in).** Spent tool results — a superseded read, a
+   retired failure — are folded into deterministic stubs rather than dropped.
+   The original stays durable in the JSONL transcript, and `recall` returns it
+   on demand, with an optional filter pattern to search a folded range.
+   ([ADR-0048](docs/adr/0048-fold-spent-tool-results-behind-handles.md),
+   [ADR-0046](docs/adr/0046-recall-compacted-originals-mid-session.md))
 
-- Git-centered workflow slice: dirty-tree safety, checkpoint/rollback, final
-  diff summary, verification loop (epic #261, ADR-0028).
-- Token-efficiency benchmark: real-provider tokens-per-task confirmation (#210;
-  plan, replay harness, and report already landed).
-- Persistent approval policies, modes, and subagents.
+4. **Cache-aware flush timing.** Fold *detection* runs every boundary; fold
+   *flushing* waits for a moment the prefix cache breaks anyway, priced against a
+   provider-neutral `CacheProfile`. The `cacheTiming` policy selects which
+   triggers release pending folds.
+   ([ADR-0051](docs/adr/0051-cache-aware-fold-flush-scheduling.md))
 
 ## Token efficiency
 
-Every tool result carries the fewest tokens that preserve full task success
-([ADR-0036](docs/adr/0036-tools-are-token-efficient-by-design.md)). Native
-tools return bounded windows, oversized results move behind session handles,
-and `bash` filters captured command output inside the runtime before it
-reaches the transcript
-([ADR-0037](docs/adr/0037-native-output-filtering-for-bash-pass-through.md)):
-structured Rust filters for the highest-volume command classes, declarative
-filters for roughly 60 more commands.
-
-Measured on a committed corpus of captured real command outputs; the numbers
-are asserted as minimum bars by tests, not just reported:
+Every tool result carries the fewest tokens that preserve full task success.
+Measured on a committed corpus of captured real command outputs; the numbers are
+asserted as minimum bars by tests, not just reported:
 
 | command class | token reduction |
 |---|---|
@@ -434,31 +386,58 @@ are asserted as minimum bars by tests, not just reported:
 | git diff (lockfile churn) | 58% |
 | git status | 50% |
 
-Reduction never changes semantics:
+Reduction never changes semantics: failure detail survives verbatim, filter
+errors return raw output, exit codes are untouched, `raw: true` bypasses
+filtering, and filter overhead is under 10 ms per call (all test-asserted). The
+opt-in `read` skim mode strips comments, docstrings, and blank lines for
+exploration reads (50–72% reduction on comment-heavy source; data formats pass
+through byte-identical; a skim read does not satisfy read-before-edit).
 
-- Failure detail is exempt: failing-test names, panic messages, `file:line`
-  references, compiler diagnostics, and source diff hunks survive verbatim
-  (test-asserted per fixture).
-- Any filter error or unparsable output returns the raw output; exit codes
-  are never altered.
-- `raw: true` on a bash call bypasses filtering; full output stays reachable
-  via session handles.
-- Filter overhead is under 10 ms per call (asserted).
+Full tables and regeneration commands:
+[bash filter benchmark](docs/benchmarks/adr-0037-bash-filter-tokens.md),
+[read skim benchmark](docs/benchmarks/issue-337-read-skim-tokens.md).
 
-Full table, bars, and the regeneration command:
-[bash filter benchmark](docs/benchmarks/adr-0037-bash-filter-tokens.md).
+**End-to-end cost is not yet a headline claim.** The
+[tokens-per-task benchmark](docs/BENCHMARK_PLAN.md) (issue #210)
+replays three workloads deterministically and shows the default arm spending
+fewer prompt tokens than a reductions-off baseline (3.4–9.1% on the current
+fixtures) with identical success and every task-critical fact preserved. But
+replay proves the plumbing, not that a model still completes the task from
+reduced context: the real-provider confirmation is pending, so no headline
+efficiency number is claimed yet.
 
-End-to-end, does a *completed task* cost fewer tokens with reductions on? The
-[tokens-per-task benchmark](docs/benchmarks/tokens-per-task.md)
-([plan](docs/BENCHMARK_PLAN.md), issue #210) measures this. Deterministic replay
-of three workloads (fix-a-failing-test, multi-file rename, large-log triage)
-shows the default arm spending fewer prompt tokens than a reductions-off baseline
-(3.4-9.1% on the current fixtures) with identical success and zero approval
-prompts, and asserts the reduced output still carries every task-critical fact
-verbatim. Replay proves the plumbing, not that a model still completes the task
-from reduced context: the real-provider confirmation (>= 3 real runs per cell)
-is pending, so this Milestone-2 gate stays open ([roadmap](docs/ROADMAP.md)) and
-no headline efficiency number is claimed yet.
+## Status
+
+Pre-1.0 and under active development — expect rough edges and breaking changes.
+
+- **Platforms:** Linux and macOS are supported; Windows is not. On Linux the
+  `bash` tool can be kernel-confined (Landlock LSM, opt-in via
+  `IRIS_SECURITY_OPT_IN=1`). **On macOS the shell runs unconfined** — there is no
+  sandbox yet, so treat macOS shell commands as unsandboxed. Iris still asks
+  before running mutating tools on every platform, and states `unsandboxed` at
+  the point you approve a `bash` command on macOS.
+- **Implemented:** interactive TUI with a plain-text fallback; Tokio async
+  runtime with turn-level cancellation; three providers with runtime model and
+  reasoning switching; workspace-scoped tools with approval gates and diff
+  previews; JSONL transcript persistence with continue/resume; background
+  compaction and opt-in microcompaction with `recall`; Codex-compatible skills.
+- **In progress:** a git-centered workflow slice (dirty-tree safety, task
+  checkpoint/rollback, final diff summary, verification loop; ADR-0028), the
+  real-provider tokens-per-task confirmation (#210), macOS Seatbelt confinement,
+  and a general-purpose subagent surface (a read-only backend contract exists;
+  spawning subagents as tools is on the roadmap). See
+  [docs/ROADMAP.md](docs/ROADMAP.md) and
+  [docs/FEATURES.md](docs/FEATURES.md).
+
+## Documentation
+
+- [Roadmap](docs/ROADMAP.md) — milestone sequencing and acceptance gates.
+- [Feature list](docs/FEATURES.md) — implemented/planned capability inventory.
+- [Architecture Decision Records](docs/adr/README.md) — accepted/proposed decisions.
+- [Product brief](PRODUCT.md) — target users, purpose, and product principles.
+- [Naming convention](docs/NAMING.md) — how the Iris/Wayland/Nexus/Mimir tiers are named.
+- [Releasing](docs/RELEASING.md) — operator runbook for cutting a release.
+- OpenWiki-generated agent docs live in `openwiki/` (see [docs/OPENWIKI.md](docs/OPENWIKI.md)).
 
 ## Testing
 
@@ -466,21 +445,8 @@ no headline efficiency number is claimed yet.
 cargo test
 ```
 
-## Documentation
-
-- [Naming convention](docs/NAMING.md) — how the Iris/Wayland/Nexus/Mimir tiers are named.
-- [Roadmap](docs/ROADMAP.md) — milestone sequencing and acceptance gates.
-- [Releasing](docs/RELEASING.md) — operator runbook for cutting a public release.
-- [Feature list](docs/FEATURES.md) — implemented/planned capability inventory.
-- [Product brief](PRODUCT.md) — target users, product purpose, voice, and product principles.
-- [Design system summary](DESIGN.md) — concise visual-system summary for the Iris TUI.
-- [Current codemap](docs/CODEMAPS/INDEX.md) — source-grounded map of the current codebase.
-- [TUI design language](docs/TUI_DESIGN_LANGUAGE.md) — terminal layout, spacing, and menu rules.
-- [TUI live testing](docs/TUI_LIVE_TESTING.md) — opt-in tmux harness for manual pane-rendering checks.
-- [Architecture Decision Records](docs/adr/README.md) — accepted/proposed architecture decisions.
-- [Competitor matrix](docs/COMPETITOR_MATRIX.md) — verified competitor feature matrix.
-- [Competitor analysis](docs/COMPETITOR_ANALYSIS.md) — strategic competitor notes.
-
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE). Some files are derived from
+[OpenAI Codex](https://github.com/openai/codex) and are distributed under the
+Apache License 2.0; each carries an SPDX header, and [NOTICE](NOTICE) lists them.
