@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.2.0...iris-agent-v0.3.0) - 2026-07-10
+
+### Added
+
+- enable native OpenAI compaction ([#562](https://github.com/5omeOtherGuy/iris-agent/pull/562))
+- add compaction live-measurement campaign harness ([#559](https://github.com/5omeOtherGuy/iris-agent/pull/559))
+- *(openai)* report prompt-cache write tokens in usage ([#557](https://github.com/5omeOtherGuy/iris-agent/pull/557))
+- add gpt-5.6 Codex model family ([#555](https://github.com/5omeOtherGuy/iris-agent/pull/555))
+- *(tui)* highlight tool output syntax ([#554](https://github.com/5omeOtherGuy/iris-agent/pull/554))
+- *(dev)* add main-aware iris launcher ([#551](https://github.com/5omeOtherGuy/iris-agent/pull/551))
+- *(tui)* refine tool rendering and interaction ([#550](https://github.com/5omeOtherGuy/iris-agent/pull/550))
+- *(settings)* expose auto-compaction policy controls ([#544](https://github.com/5omeOtherGuy/iris-agent/pull/544))
+- auto-discover peer-tool AGENTS.md on first startup ([#541](https://github.com/5omeOtherGuy/iris-agent/pull/541))
+- *(compaction)* tune defaults from benchmark evidence ([#539](https://github.com/5omeOtherGuy/iris-agent/pull/539))
+- add model-requested compaction tool ([#538](https://github.com/5omeOtherGuy/iris-agent/pull/538))
+- add provider-native compaction blocks ([#537](https://github.com/5omeOtherGuy/iris-agent/pull/537))
+- add compaction inspection surfaces ([#534](https://github.com/5omeOtherGuy/iris-agent/pull/534))
+
+### Fixed
+
+- *(live-harness)* give S1 a 20 percent provider-discount margin past hard ([#568](https://github.com/5omeOtherGuy/iris-agent/pull/568))
+- *(git-safety)* scope the dirty-tree guard to its workspace fence ([#567](https://github.com/5omeOtherGuy/iris-agent/pull/567))
+- *(tui)* format shell payloads and highlight edit diffs ([#564](https://github.com/5omeOtherGuy/iris-agent/pull/564))
+- *(live-harness)* S1 compacts mid-turn; estimate_error per-request (pilot-a findings) ([#566](https://github.com/5omeOtherGuy/iris-agent/pull/566))
+- *(git-safety)* stop jj guard halt loop after its own snapshot operation ([#563](https://github.com/5omeOtherGuy/iris-agent/pull/563))
+- *(live-harness)* sanitize temp-dir tags to a single path component ([#561](https://github.com/5omeOtherGuy/iris-agent/pull/561))
+- *(tui)* restore start LED sweep ([#558](https://github.com/5omeOtherGuy/iris-agent/pull/558))
+- *(dev)* harden iris launcher sync ([#556](https://github.com/5omeOtherGuy/iris-agent/pull/556))
+- *(compaction)* harden hard-tier fallback ladder (#552 follow-ups) ([#553](https://github.com/5omeOtherGuy/iris-agent/pull/553))
+- *(compaction)* cover the current turn under hard pressure and escalate fallback ([#552](https://github.com/5omeOtherGuy/iris-agent/pull/552))
+- *(compaction)* raise hard-wait defaults and expose it in /settings ([#549](https://github.com/5omeOtherGuy/iris-agent/pull/549))
+- *(settings)* validate merged compaction ladder, emit cancel lifecycle, size narrow controls ([#547](https://github.com/5omeOtherGuy/iris-agent/pull/547))
+- *(tui)* place flow meter in working indicator ([#542](https://github.com/5omeOtherGuy/iris-agent/pull/542))
+
+### Other
+
+- *(compaction)* drain worker-arm boundaries until the mid-turn apply lands ([#548](https://github.com/5omeOtherGuy/iris-agent/pull/548))
+- *(compaction)* add pair-splitting and live==resumed property tests ([#546](https://github.com/5omeOtherGuy/iris-agent/pull/546))
+- *(compaction)* mechanize G1-timing flaky-exclusion rule ([#545](https://github.com/5omeOtherGuy/iris-agent/pull/545))
+- *(compaction)* record live protocol closeout ([#543](https://github.com/5omeOtherGuy/iris-agent/pull/543))
+- *(compaction)* force two live applies before recall ([#540](https://github.com/5omeOtherGuy/iris-agent/pull/540))
+
 ## [0.2.0](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.1.0...iris-agent-v0.2.0) - 2026-07-10
 
 ### Highlights
