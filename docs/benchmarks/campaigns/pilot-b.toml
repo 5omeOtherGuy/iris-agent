@@ -1,0 +1,23 @@
+# Pilot B -- pilot-a cells on the OpenAI Codex lane (gpt-5.6-terra, low).
+# Validates: config loader on the codex lane; gpt-5.6 cache_write_tokens
+# reporting (PR #557); native OpenAI compaction rung (#562); per-row
+# write_unreported rule (#569).
+schema = 1
+
+[campaign]
+name = "pilot-b"
+runs = 2
+
+[[lanes]]
+provider = "codex"
+model = "gpt-5.6-terra"
+effort = "low"
+
+[[cells]]
+scenario = "S1"
+
+[[cells]]
+scenario = "S3"
+
+[[cells]]
+scenario = "S4-small"
