@@ -10,6 +10,23 @@ A fast coding agent for the terminal, built for token efficiency.
 
 ---
 
+## What's new in 0.3.0
+
+Long, tool-heavy sessions stay readable and within their context budget:
+
+- **Sharper TUI** — diffs and failed shell results stay prominent, successful
+  tools collapse into compact history, tool output gains syntax highlighting,
+  and thinking, focus, scrolling, Unicode wrapping, and reduced-motion behavior
+  are more stable.
+- **Durable compaction** — Iris compacts between provider round trips and under
+  hard pressure, using provider-native state when supported plus a portable
+  summary for resume or model switches. Opt-in microcompaction folds stale tool
+  results without deleting their originals; `recall` can retrieve them later.
+- **Policy in your hands** — `/settings` exposes automatic compaction,
+  warn/start/hard thresholds, retained tail, hard wait, reactive recovery,
+  summarizer, and worker input. Full compaction is on by default;
+  microcompaction and tool-result compaction remain opt-in.
+
 ## Install
 
 Prebuilt binaries ship for Linux and macOS (x86_64 and aarch64) — no Rust
@@ -212,7 +229,7 @@ disable the trigger ladder with:
     "enabled": true,
     "thresholds": { "warn": 0.60, "start": 0.72, "hard": 0.90 },
     "keepRecentTokens": 8000,
-    "hardWaitMs": 10000,
+    "hardWaitMs": 120000,
     "maxConsecutiveFailures": 3
   }
 }
