@@ -10,8 +10,14 @@
 //! comet trail behind the travel direction. Under `IRIS_REDUCED_MOTION` the
 //! mark holds a single static lit dot at the center, matching how the working
 //! indicator freezes. The loop's spinner tick drives the animation; the head
-//! advances one dot per [`MARK_ADVANCE_INTERVAL`]. The silkscreen row is
-//! printed hardware, so it never animates.
+//! advances one dot per [`MARK_ADVANCE_INTERVAL`].
+//!
+//! **Power-on.** An interactive launch runs a brief quantized lamp test. The
+//! silkscreen row is visible from the first frame; the LEDs fill left-to-right
+//! two dots per loop tick, hold all-lit for two ticks, then release into the
+//! idle ping-pong as the launcher menu goes live. Hidden menu rows remain blank
+//! during boot, so the page never reflows. Any key completes boot instantly;
+//! `IRIS_REDUCED_MOTION` starts settled.
 
 use std::time::{Duration, Instant};
 
@@ -31,6 +37,12 @@ pub(crate) const MARK_DOTS: usize = 12;
 /// Minimum wall-clock interval between head advances (~one dot per 130ms).
 const MARK_ADVANCE_INTERVAL: Duration = Duration::from_millis(130);
 
+/// LEDs lit per loop tick during the quantized power-on lamp test.
+const BOOT_FILL_PER_TICK: usize = 2;
+
+/// Loop ticks the strip holds all-lit before releasing into the idle sweep.
+const BOOT_HOLD_TICKS: u8 = 2;
+
 /// Launcher menu width cap (marker + label + dotted leader + key hint).
 const MENU_WIDTH: usize = 44;
 
@@ -40,6 +52,14 @@ const WORDMARK: &str = "I R I S";
 
 /// Compile-time crate version, the silkscreen rev on the faceplate.
 const REV: &str = env!("CARGO_PKG_VERSION");
+
+/// Power-on phase: fill the strip, hold every lamp lit, then run the sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootPhase {
+    Fill { lit: usize },
+    Hold { ticks: u8 },
+    Done,
+}
 
 /// One launcher activation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +103,8 @@ pub(crate) struct StartPage {
     /// when the terminal can actually deliver it; the Settings row stays
     /// reachable by `↑`/`↓` + `↵` either way.
     punctuation_chords: bool,
+    /// Power-on lamp-test progress. Reduced motion starts settled.
+    boot: BootPhase,
 }
 
 impl StartPage {
@@ -95,13 +117,30 @@ impl StartPage {
             reduced_motion,
             recoverable,
             punctuation_chords,
+            boot: if reduced_motion {
+                BootPhase::Done
+            } else {
+                BootPhase::Fill { lit: 0 }
+            },
         }
     }
 
-    /// Apply the live reduced-motion preference. Entering reduced motion freezes
-    /// the sweep at the center datum; leaving it resumes from the previous head.
+    /// Complete the lamp test immediately; the triggering key still acts.
+    pub(crate) fn skip_boot(&mut self) {
+        self.boot = BootPhase::Done;
+    }
+
+    pub(crate) fn booting(&self) -> bool {
+        self.boot != BootPhase::Done
+    }
+
+    /// Apply the live reduced-motion preference. Enabling it settles an active
+    /// lamp test immediately; disabling it never replays startup.
     pub(crate) fn set_reduced_motion(&mut self, reduced_motion: bool) {
         self.reduced_motion = reduced_motion;
+        if reduced_motion {
+            self.skip_boot();
+        }
     }
 
     /// Move the selection up, wrapping around.
@@ -128,6 +167,27 @@ impl StartPage {
     fn tick_at(&mut self, now: Instant) -> bool {
         if self.reduced_motion {
             return false;
+        }
+        match self.boot {
+            BootPhase::Fill { lit } => {
+                let lit = (lit + BOOT_FILL_PER_TICK).min(MARK_DOTS);
+                self.boot = if lit == MARK_DOTS {
+                    BootPhase::Hold { ticks: 0 }
+                } else {
+                    BootPhase::Fill { lit }
+                };
+                return true;
+            }
+            BootPhase::Hold { ticks } => {
+                let ticks = ticks + 1;
+                self.boot = if ticks >= BOOT_HOLD_TICKS {
+                    BootPhase::Done
+                } else {
+                    BootPhase::Hold { ticks }
+                };
+                return true;
+            }
+            BootPhase::Done => {}
         }
         let Some(last) = self.last_advance else {
             self.last_advance = Some(now);
@@ -176,6 +236,28 @@ impl StartPage {
     #[cfg(test)]
     pub(crate) fn selected(&self) -> usize {
         self.selected
+    }
+
+    /// Lamp-test row: cells before `lit` glow orange and the leading edge is
+    /// bold. During the hold every LED remains lit.
+    fn boot_mark_spans(&self, lit: usize) -> Vec<Span<'static>> {
+        let edge_style = prompt_style().add_modifier(Modifier::BOLD);
+        let lit_style = prompt_style();
+        let mut spans = Vec::with_capacity(MARK_DOTS * 2 - 1);
+        for cell in 0..MARK_DOTS {
+            if cell > 0 {
+                spans.push(Span::raw(" "));
+            }
+            let span = if cell + 1 == lit && lit < MARK_DOTS {
+                Span::styled(symbols::RUNNING.to_string(), edge_style)
+            } else if cell < lit {
+                Span::styled(symbols::RUNNING.to_string(), lit_style)
+            } else {
+                Span::styled(symbols::EMPTY.to_string(), dim_style())
+            };
+            spans.push(span);
+        }
+        spans
     }
 
     /// The silkscreen row directly under the strip: the letter-spaced wordmark
@@ -315,22 +397,31 @@ fn centered(spans: Vec<Span<'static>>, content_width: usize, width: usize) -> Li
 }
 
 impl Component for StartPage {
-    /// The faceplate block: the IrisMark row, its silkscreen row, one blank
-    /// row, then the menu rows, all centered in `width`.
+    /// The block keeps one height throughout startup: menu rows are blank until
+    /// the lamp test releases into the live launcher.
     fn render(&self, width: usize) -> Vec<Line<'static>> {
         let mark_width = MARK_DOTS * 2 - 1;
         let menu_width = MENU_WIDTH.min(width.saturating_sub(2)).max(12);
+        let mark = match self.boot {
+            BootPhase::Fill { lit } => self.boot_mark_spans(lit),
+            BootPhase::Hold { .. } => self.boot_mark_spans(MARK_DOTS),
+            BootPhase::Done => self.mark_spans(),
+        };
         let mut lines = vec![
-            centered(self.mark_spans(), mark_width, width),
+            centered(mark, mark_width, width),
             centered(self.silkscreen_spans(), mark_width, width),
             Line::default(),
         ];
         for index in 0..MENU_ITEMS.len() {
-            lines.push(centered(
-                self.menu_row(index, menu_width),
-                menu_width,
-                width,
-            ));
+            if self.booting() {
+                lines.push(Line::default());
+            } else {
+                lines.push(centered(
+                    self.menu_row(index, menu_width),
+                    menu_width,
+                    width,
+                ));
+            }
         }
         lines
     }
@@ -369,6 +460,7 @@ mod tests {
     #[test]
     fn loop_tick_cadence_preserves_the_130ms_phase() {
         let mut page = StartPage::new(false, 0, true);
+        page.skip_boot();
         let start = Instant::now();
 
         assert!(page.tick_at(start));
@@ -385,6 +477,46 @@ mod tests {
         assert_eq!(page.head(), 4);
         assert!(page.tick_at(start + Duration::from_millis(600)));
         assert_eq!(page.head(), 5);
+    }
+
+    #[test]
+    fn power_on_fills_holds_then_releases_into_the_sweep() {
+        let mut page = StartPage::new(false, 0, true);
+        let first = page.render(80);
+        assert!(page.booting());
+        assert_eq!(first.len(), 3 + MENU_ITEMS.len());
+        assert_eq!(line_text(&first[0]).matches('●').count(), 0);
+        assert!(line_text(&first[1]).contains(WORDMARK));
+        assert!(
+            first[3..]
+                .iter()
+                .all(|line| line_text(line).trim().is_empty())
+        );
+
+        for lit in (BOOT_FILL_PER_TICK..=MARK_DOTS).step_by(BOOT_FILL_PER_TICK) {
+            assert!(page.tick());
+            assert_eq!(line_text(&page.render(80)[0]).matches('●').count(), lit);
+        }
+        for _ in 0..BOOT_HOLD_TICKS {
+            assert!(page.booting());
+            assert!(page.tick());
+        }
+
+        assert!(!page.booting());
+        let live = page.render(80);
+        assert_eq!(line_text(&live[0]).matches('●').count(), 1);
+        assert!(line_text(&live[3]).contains("New session"));
+        page.advance_for_test();
+        assert_eq!(page.head(), 1, "the ping-pong sweep takes over");
+    }
+
+    #[test]
+    fn skip_boot_reveals_the_launcher_without_consuming_sweep_state() {
+        let mut page = StartPage::new(false, 0, true);
+        page.skip_boot();
+        assert!(!page.booting());
+        assert_eq!(page.head(), 0);
+        assert!(line_text(&page.render(80)[3]).contains("New session"));
     }
 
     #[test]
@@ -541,6 +673,7 @@ mod tests {
     #[test]
     fn trail_follows_behind_the_travel_direction() {
         let mut page = StartPage::new(false, 0, true);
+        page.skip_boot();
         page.advance_for_test();
         page.advance_for_test();
         page.advance_for_test();

@@ -3019,6 +3019,12 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
         return IdleKey::Continue;
     }
 
+    // Any key completes the lamp test immediately, then keeps its normal
+    // meaning. Startup is a visual ritual, never an input gate.
+    if let Some(page) = screen.start_page.as_mut() {
+        page.skip_boot();
+    }
+
     // Start-page launcher routing: the listed ctrl-chords activate directly,
     // and while the composer is empty ↑/↓/↵ drive the launcher selection. The
     // composer stays live throughout — typing a task and submitting it starts
@@ -4570,10 +4576,24 @@ mod tests {
     fn start_page_composer_stays_live_and_submit_starts_the_session() {
         let mut screen = Screen::new();
         screen.show_start_page(0, true);
-        // Typing goes to the composer, not the launcher.
+        assert!(
+            screen
+                .start_page
+                .as_ref()
+                .is_some_and(|page| page.booting())
+        );
+        // Typing goes to the composer and settles the lamp test; the triggering
+        // key is not consumed.
         for c in "fix the bug".chars() {
             handle_idle_event(&mut screen, key(KeyCode::Char(c)));
         }
+        assert!(
+            screen
+                .start_page
+                .as_ref()
+                .is_some_and(|page| !page.booting()),
+            "the first key settles startup"
+        );
         assert_eq!(screen.editor_text(), "fix the bug");
         // With a non-empty composer, ↑/↓/↵ belong to the editor/submit path.
         match handle_idle_event(&mut screen, key(KeyCode::Enter)) {
