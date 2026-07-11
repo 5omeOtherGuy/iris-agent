@@ -1,0 +1,14 @@
+# Confound probe: pilot-b S1 (budget 32768) completed all 6 reads PRE-#574;
+# the 24k/28k early-stop probes ran POST-#574, which changed runner workspace
+# provisioning + scenario materialize hooks. Re-run 32768 on current main:
+# early-stop here means #574 regressed the live S1 drive, not budget.
+schema = 1
+[campaign]
+name = "probe-terra-32k"
+runs = 2
+[[lanes]]
+provider = "codex"
+model = "gpt-5.6-terra"
+effort = "low"
+[[cells]]
+scenario = "S1"

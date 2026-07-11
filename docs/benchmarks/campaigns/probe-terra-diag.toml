@@ -1,0 +1,12 @@
+# Combined diagnostic probe: transcripts (terra's stated stop reason) + raw
+# usage capture (does /codex/responses ever emit cache_write_tokens?).
+schema = 1
+[campaign]
+name = "probe-terra-diag"
+runs = 1
+[[lanes]]
+provider = "codex"
+model = "gpt-5.6-terra"
+effort = "low"
+[[cells]]
+scenario = "S1"
