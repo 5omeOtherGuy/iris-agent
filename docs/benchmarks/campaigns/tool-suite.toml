@@ -1,0 +1,45 @@
+# Tool-suite -- a pilot-sized live tool-efficiency campaign, as a config file.
+#
+# Covers the four T-series tool-efficiency scenarios (the migrated
+# tokens-per-task suite) on ONE lane, n=2, ready for the operator to run. Rows
+# ride the same schema and per-campaign artifact folders as a compaction
+# campaign; the T-series run with compaction/folds off so each tool result's
+# mass is measured raw. Full field/default/range reference + a walkthrough:
+# docs/benchmarks/HARNESS.md ("Tool-efficiency testing").
+#
+# Run it (double-gated; consumes real subscription rate limits):
+#   IRIS_BENCH_LIVE=1 IRIS_BENCH_CAMPAIGN_FILE=docs/benchmarks/campaigns/tool-suite.toml \
+#     cargo test --release -- --ignored live_campaign --nocapture
+#
+# To bench a different model, change the lane `model` (and `provider`/`effort`
+# if needed) and add a `[prices.<model-id>]` block so the report can price it.
+
+schema = 1
+
+[campaign]
+name = "tool-suite"
+runs = 2
+
+# Anthropic-only, low effort. Any config lane works; tool efficiency is
+# lane-agnostic (the cache columns still populate on the Codex lane).
+[[lanes]]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+effort = "low"
+
+# T1 read/skim token mass (issue-337): full read vs skim over one source.
+[[cells]]
+scenario = "T1"
+
+# T2 search-output classes (issue-338/339/340): grep + ls + find over a wide tree.
+[[cells]]
+scenario = "T2"
+
+# T3 edit-result classes (issue-341): an exact edit and a tolerant edit.
+[[cells]]
+scenario = "T3"
+
+# T4 chained tool suite (chained-all-four): read + grep + edit + shell in one
+# turn. Fail-loud floor is >= 4 round-trips; raise it here with `round_trips`.
+[[cells]]
+scenario = "T4"

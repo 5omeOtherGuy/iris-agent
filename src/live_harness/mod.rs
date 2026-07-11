@@ -14,7 +14,9 @@
 //! - `economics`-- cache-economics pairing across applies (promoted).
 //! - `lanes`    -- lane descriptors + generic provider construction + parsing.
 //! - `metrics`  -- row schema, derived aggregates, model-keyed price book.
-//! - `scenario` -- Scenario trait, the synthetic generators, the id registry.
+//! - `scenario` -- Scenario trait, the synthetic S-series generators, id registry.
+//! - `tool_scenarios` -- the T-series tool-efficiency scenarios (reuse
+//!   `bench_tokens` fixtures/probes through the same Row schema).
 //! - `config`   -- config-file campaign schema, parse, and validation (goal 1).
 //! - `probes`   -- recall-probe bank + mechanical scoring (goal 7).
 //! - `campaign` -- specs, matrix expansion, manifest, artifact writing (pure).
@@ -31,6 +33,7 @@ mod probes;
 mod runner;
 mod scenario;
 mod support;
+mod tool_scenarios;
 mod verdict;
 
 // Hub re-exports so every submodule reaches the promoted helpers and sibling
@@ -44,6 +47,7 @@ pub(crate) use self::metrics::*;
 pub(crate) use self::runner::*;
 pub(crate) use self::scenario::*;
 pub(crate) use self::support::*;
+pub(crate) use self::tool_scenarios::*;
 pub(crate) use self::verdict::*;
 
 /// The single live campaign entry point. Double-gated: `#[ignore]` keeps it out

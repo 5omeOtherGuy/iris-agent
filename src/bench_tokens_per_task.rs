@@ -3,6 +3,17 @@
 //! (grep grouping #338, find grouping #340) lower the prompt tokens spent to
 //! COMPLETE a realistic task, without lowering task success.
 //!
+//! DEPRECATED (2026-07-11): this tool-efficiency suite is being migrated into
+//! the live-harness **T-series** scenarios (`live_harness/tool_scenarios.rs`:
+//! T1 read/skim, T2 search-output, T3 edit-result, T4 chained), which measure
+//! the same fixture masses through the live harness's uniform `Row` schema,
+//! per-campaign artifact folders, and config-file loader. The fixtures and
+//! render/edit probes here are REUSED by the T-series (this module exposes
+//! `fixtures`/`probes` as `pub(crate)` for exactly that). This suite is not
+//! removed yet; issue #573 tracks removal after one live T-series campaign
+//! validates end-to-end. See `docs/BENCHMARK_PLAN.md` and
+//! `docs/benchmarks/HARNESS.md`.
+//!
 //! This module is the thin root of a data-driven benchmark package
 //! (`src/bench_tokens/`); adding a workload is a table-row change in
 //! `workloads.rs`, not new control flow. The pieces:
@@ -38,12 +49,17 @@
 mod analysis;
 #[path = "bench_tokens/arms.rs"]
 mod arms;
+// `pub(crate)` so the live-harness T-series tool-efficiency scenarios
+// (`live_harness/tool_scenarios.rs`) reuse these fixtures instead of rewriting
+// them; the legacy replay tests below still use them via `super::fixtures`.
 #[path = "bench_tokens/fixtures.rs"]
-mod fixtures;
+pub(crate) mod fixtures;
 #[path = "bench_tokens/observer.rs"]
 mod observer;
+// `pub(crate)` so the live-harness T-series scenarios reuse the render/edit
+// probes for their in-gate parity checks against the legacy fixture masses.
 #[path = "bench_tokens/probes.rs"]
-mod probes;
+pub(crate) mod probes;
 #[path = "bench_tokens/provider.rs"]
 mod provider;
 #[path = "bench_tokens/runner.rs"]
@@ -327,7 +343,9 @@ mod replay {
     #[test]
     fn tokens_per_task_replay_report() {
         // Prints the deterministic replay table committed to
-        // docs/benchmarks/tokens-per-task.md (run with --nocapture).
+        // docs/benchmarks/campaigns/legacy-tokens-per-task/tokens-per-task.md
+        // (run with --nocapture). DEPRECATED: see the T-series migration note in
+        // this module's header.
         println!(
             "| workload | arm | success | turns | cumulative proxy tokens | final context proxy | reduction |"
         );
