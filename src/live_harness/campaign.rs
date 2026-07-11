@@ -6,8 +6,8 @@
 
 use super::*;
 use crate::config::{
-    CompactionTriggerConfig, DEFAULT_COMPACTION_HARD, DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
-    DEFAULT_COMPACTION_START,
+    CompactionTriggerConfig, DEFAULT_COMPACTION_HARD, DEFAULT_COMPACTION_HARD_WAIT_MS,
+    DEFAULT_COMPACTION_KEEP_RECENT_TOKENS, DEFAULT_COMPACTION_START,
 };
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -35,7 +35,11 @@ impl CellSettings {
             start: DEFAULT_COMPACTION_START,
             hard: DEFAULT_COMPACTION_HARD,
             keep_tail_tokens: DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
-            hard_wait_ms: 10_000,
+            // Mirror the SHIPPED default (PR #549), not a stale literal. The
+            // pre-fix `10_000` drifted from `DEFAULT_COMPACTION_HARD_WAIT_MS`
+            // (120_000), so a "defaults" cell no longer described the shipped
+            // posture; the fingerprint shifts w10000 -> w120000 accordingly.
+            hard_wait_ms: DEFAULT_COMPACTION_HARD_WAIT_MS,
             summarizer: "subagent".to_string(),
             retention_tier: "5m".to_string(),
         }
@@ -89,21 +93,25 @@ impl CellSettings {
     }
 }
 
-/// One (scenario, settings) pair; combined with each lane and each run index to
-/// form the matrix.
+/// One (scenario, settings) pair plus optional scenario size-knob overrides;
+/// combined with each lane and each run index to form the matrix.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CellSpec {
     pub(crate) scenario_id: String,
     pub(crate) settings: CellSettings,
+    pub(crate) knobs: ScenarioKnobs,
 }
 
-/// A full campaign: which lanes, which cells, and how many runs per cell.
+/// A full campaign: which lanes, which cells, how many runs per cell, the
+/// flaky-exclusion budget for its verdict, and the model-keyed price book.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CampaignSpec {
     pub(crate) name: String,
     pub(crate) lanes: Vec<LaneSpec>,
     pub(crate) cells: Vec<CellSpec>,
     pub(crate) runs: u32,
+    pub(crate) exclusion_budget: usize,
+    pub(crate) prices: PriceBook,
 }
 
 /// One fully-resolved unit of work: a lane, a scenario+settings cell, and a run
@@ -113,6 +121,7 @@ pub(crate) struct PlannedRun {
     pub(crate) lane: LaneSpec,
     pub(crate) scenario_id: String,
     pub(crate) settings: CellSettings,
+    pub(crate) knobs: ScenarioKnobs,
     pub(crate) run_seq: u32,
     pub(crate) cell_id: String,
     pub(crate) key: String,
@@ -138,9 +147,10 @@ pub(crate) fn expand(spec: &CampaignSpec) -> Vec<PlannedRun> {
             let id = cell_id(lane, &cell.scenario_id, &cell.settings);
             for run_seq in 0..spec.runs {
                 runs.push(PlannedRun {
-                    lane: *lane,
+                    lane: lane.clone(),
                     scenario_id: cell.scenario_id.clone(),
                     settings: cell.settings.clone(),
+                    knobs: cell.knobs.clone(),
                     run_seq,
                     cell_id: id.clone(),
                     key: run_key(&id, run_seq),
@@ -218,7 +228,10 @@ pub(crate) fn date_utc(unix_secs: u64) -> String {
     format!("{year:04}-{m:02}-{d:02}")
 }
 
-/// The artifact paths for a campaign on a given date (`YYYY-MM-DD`).
+/// The artifact paths for a campaign run. The runner places these inside a
+/// per-campaign, per-date folder (`docs/benchmarks/campaigns/<name>/<date>/`),
+/// so the file stems are the plain campaign name (the folder already carries the
+/// name and date). Archiving the `.manifest` re-runs the campaign from scratch.
 pub(crate) struct Artifacts {
     pub(crate) jsonl: PathBuf,
     pub(crate) markdown: PathBuf,
@@ -226,12 +239,11 @@ pub(crate) struct Artifacts {
 }
 
 impl Artifacts {
-    pub(crate) fn new(dir: &Path, campaign: &str, date: &str) -> Self {
-        let stem = format!("{campaign}-{date}");
+    pub(crate) fn new(dir: &Path, campaign: &str) -> Self {
         Self {
-            jsonl: dir.join(format!("{stem}.jsonl")),
-            markdown: dir.join(format!("{stem}.md")),
-            manifest: dir.join(format!("{stem}.manifest")),
+            jsonl: dir.join(format!("{campaign}.jsonl")),
+            markdown: dir.join(format!("{campaign}.md")),
+            manifest: dir.join(format!("{campaign}.manifest")),
         }
     }
 }
@@ -262,24 +274,35 @@ pub(crate) fn format_report(
         "Verdict: {} (exclusions {} / budget {}). Notional prices: {} (as of {}).\n\n",
         if verdict.passed { "PASS" } else { "FAIL" },
         verdict.exclusions,
-        LIVE_EXCLUSION_BUDGET,
-        "see metrics.rs price table",
+        spec.exclusion_budget,
+        "built-in table + campaign [prices.*] overrides",
         PRICE_TABLE.as_of,
     ));
+    let any_unpriced = derived.iter().any(|(_, run)| run.notional_usd.is_none());
+    if any_unpriced {
+        out.push_str(
+            "Note: `notional_usd` is `null` for any lane whose model has no price. \
+             Supply `[prices.<model-id>]` in the campaign config to price it.\n\n",
+        );
+    }
     out.push_str(
         "| cell | run | requests | input | output | cache_read | notional_usd | outcome |\n",
     );
     out.push_str("| --- | --- | --- | --- | --- | --- | --- | --- |\n");
     for (cell, run) in derived {
+        let notional = match run.notional_usd {
+            Some(usd) => format!("{usd:.4}"),
+            None => "null".to_string(),
+        };
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {:.4} | {:?} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {:?} |\n",
             cell,
             run.run_seq,
             run.requests,
             run.input_total,
             run.output_total,
             run.cache_read_total,
-            run.notional_usd,
+            notional,
             run.outcome,
         ));
     }
@@ -305,24 +328,18 @@ pub(crate) fn format_report(
 /// any real spend widens.
 pub(crate) fn pilot_a() -> CampaignSpec {
     let defaults = CellSettings::defaults();
+    let cell = |scenario_id: &str| CellSpec {
+        scenario_id: scenario_id.to_string(),
+        settings: defaults.clone(),
+        knobs: ScenarioKnobs::default(),
+    };
     CampaignSpec {
         name: "pilot-a".to_string(),
         lanes: vec![anthropic_sonnet(LaneEffort::Low)],
-        cells: vec![
-            CellSpec {
-                scenario_id: "S1".to_string(),
-                settings: defaults.clone(),
-            },
-            CellSpec {
-                scenario_id: "S3".to_string(),
-                settings: defaults.clone(),
-            },
-            CellSpec {
-                scenario_id: "S4-small".to_string(),
-                settings: defaults,
-            },
-        ],
+        cells: vec![cell("S1"), cell("S3"), cell("S4-small")],
         runs: 2,
+        exclusion_budget: LIVE_EXCLUSION_BUDGET,
+        prices: PriceBook::builtin(),
     }
 }
 
@@ -410,7 +427,7 @@ mod tests {
     fn report_includes_verdict_and_rows() {
         let spec = pilot_a();
         let derived = vec![(
-            "S1::anthropic/claude-sonnet-4-6@low::s72-h90-k8000-w10000-subagent-5m".to_string(),
+            "S1::anthropic/claude-sonnet-4-6@low::s72-h90-k8000-w120000-subagent-5m".to_string(),
             DerivedRun {
                 run_seq: 0,
                 requests: 3,
@@ -418,7 +435,7 @@ mod tests {
                 output_total: 200,
                 cache_read_total: 7_000,
                 cache_write_total: Some(2_000),
-                notional_usd: 0.05,
+                notional_usd: Some(0.05),
                 cache_hit_ratio: 0.7,
                 post_apply_rewrite_mass: 2_000,
                 wall_ms_total: 1_000.0,
@@ -444,7 +461,7 @@ mod tests {
     fn report_surfaces_scenario_failures_verbatim() {
         let spec = pilot_a();
         let failures = vec![(
-            "S1::anthropic/claude-sonnet-4-6@low::s72-h90-k8000-w10000-subagent-5m#run0"
+            "S1::anthropic/claude-sonnet-4-6@low::s72-h90-k8000-w120000-subagent-5m#run0"
                 .to_string(),
             "S1 produced no compaction".to_string(),
         )];

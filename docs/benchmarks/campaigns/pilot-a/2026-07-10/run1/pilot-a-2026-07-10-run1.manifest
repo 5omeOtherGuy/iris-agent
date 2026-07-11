@@ -1,0 +1,6 @@
+S1::anthropic/claude-sonnet-4-6@low::s72-h90-k8000-w10000-subagent-5m#run0
+S1::anthropic/claude-sonnet-4-6@low::s72-h90-k8000-w10000-subagent-5m#run1
+S3::anthropic/claude-sonnet-4-6@low::s72-h90-k8000-w10000-subagent-5m#run0
+S3::anthropic/claude-sonnet-4-6@low::s72-h90-k8000-w10000-subagent-5m#run1
+S4-small::anthropic/claude-sonnet-4-6@low::s72-h90-k8000-w10000-subagent-5m#run0
+S4-small::anthropic/claude-sonnet-4-6@low::s72-h90-k8000-w10000-subagent-5m#run1

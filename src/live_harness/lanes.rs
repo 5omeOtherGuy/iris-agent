@@ -41,19 +41,43 @@ pub(crate) enum ProviderLane {
     Codex,
 }
 
+impl ProviderLane {
+    /// Accepted provider tokens, listed in every parse error.
+    pub(crate) const ACCEPTED: [&'static str; 2] = ["anthropic", "codex"];
+
+    /// Parse a provider token from a config file. Unknown tokens name the field,
+    /// the offending value, and the accepted set (system-boundary validation).
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "anthropic" => Ok(Self::Anthropic),
+            "codex" => Ok(Self::Codex),
+            other => Err(anyhow::anyhow!(
+                "lane provider {other:?} is not supported; accepted providers: {}",
+                Self::ACCEPTED.join(", ")
+            )),
+        }
+    }
+}
+
 /// The reasoning/thinking effort a lane requests. Pilots stay `Low`; `Medium`
-/// is reserved for the quality campaigns.
+/// and `High` are for the quality campaigns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaneEffort {
     Low,
     Medium,
+    High,
 }
 
 impl LaneEffort {
+    /// Accepted effort tokens, listed in every parse error so the message names
+    /// the valid set (config validation is a system boundary).
+    pub(crate) const ACCEPTED: [&'static str; 3] = ["low", "medium", "high"];
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
             Self::Medium => "medium",
+            Self::High => "high",
         }
     }
 
@@ -61,20 +85,47 @@ impl LaneEffort {
         match self {
             Self::Low => ReasoningEffort::Low,
             Self::Medium => ReasoningEffort::Medium,
+            Self::High => ReasoningEffort::High,
+        }
+    }
+
+    /// Parse an effort token from a config file, verbatim. Unknown tokens name
+    /// the field, the offending value, and the accepted set.
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => Err(anyhow::anyhow!(
+                "lane effort {other:?} is not supported; accepted efforts: {}",
+                Self::ACCEPTED.join(", ")
+            )),
         }
     }
 }
 
 /// One lane descriptor: the provider lane, the model id it drives, and the
-/// effort it requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// effort it requests. `model_id` is an owned string so a config file can name
+/// any model verbatim; the provider constructor receives it unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LaneSpec {
     pub(crate) lane: ProviderLane,
-    pub(crate) model_id: &'static str,
+    pub(crate) model_id: String,
     pub(crate) effort: LaneEffort,
 }
 
 impl LaneSpec {
+    /// Generic construction from a (provider kind, model id, effort) tuple --
+    /// the single path both the config loader and the const-fn fixtures build
+    /// through. The model id is passed to the provider constructor verbatim.
+    pub(crate) fn new(lane: ProviderLane, model_id: impl Into<String>, effort: LaneEffort) -> Self {
+        Self {
+            lane,
+            model_id: model_id.into(),
+            effort,
+        }
+    }
+
     /// A stable label used in row schemas and manifests: `provider/model@effort`.
     pub(crate) fn label(&self) -> String {
         let provider = match self.lane {
@@ -118,7 +169,7 @@ impl LaneSpec {
     pub(crate) fn build_provider(&self, cache_key: &str) -> Result<Box<dyn ChatProvider>> {
         match self.lane {
             ProviderLane::Anthropic => Ok(Box::new(AnthropicProvider::new(
-                self.model_id,
+                &self.model_id,
                 "https://api.anthropic.com",
                 Some(self.effort.reasoning()),
                 LANE_SYSTEM_PROMPT,
@@ -127,7 +178,7 @@ impl LaneSpec {
                 RetryPolicy::default(),
             )?)),
             ProviderLane::Codex => Ok(Box::new(OpenAiCodexResponsesProvider::new(
-                self.model_id,
+                &self.model_id,
                 "https://chatgpt.com/backend-api",
                 Some(self.effort.reasoning()),
                 LANE_SYSTEM_PROMPT,
@@ -140,23 +191,16 @@ impl LaneSpec {
     }
 }
 
-/// The initial anthropic/sonnet-4.6 lane at the given effort.
-pub(crate) const fn anthropic_sonnet(effort: LaneEffort) -> LaneSpec {
-    LaneSpec {
-        lane: ProviderLane::Anthropic,
-        model_id: "claude-sonnet-4-6",
-        effort,
-    }
+/// The initial anthropic/sonnet-4.6 lane at the given effort. A thin fixture
+/// over [`LaneSpec::new`]; config campaigns build the same shape from `[[lanes]]`.
+pub(crate) fn anthropic_sonnet(effort: LaneEffort) -> LaneSpec {
+    LaneSpec::new(ProviderLane::Anthropic, "claude-sonnet-4-6", effort)
 }
 
 /// The initial codex/gpt-5.6-luna lane at the given effort. Defined
 /// unconditionally; runtime use is gated on [`LaneSpec::available`].
-pub(crate) const fn codex_luna(effort: LaneEffort) -> LaneSpec {
-    LaneSpec {
-        lane: ProviderLane::Codex,
-        model_id: "gpt-5.6-luna",
-        effort,
-    }
+pub(crate) fn codex_luna(effort: LaneEffort) -> LaneSpec {
+    LaneSpec::new(ProviderLane::Codex, "gpt-5.6-luna", effort)
 }
 
 /// Every lane the harness knows about, in a stable order. A campaign selects a
@@ -186,6 +230,35 @@ mod tests {
                 "openai-codex/gpt-5.6-luna@medium",
             ]
         );
+    }
+
+    #[test]
+    fn provider_and_effort_parse_accepts_known_and_names_the_set_on_error() {
+        assert_eq!(
+            ProviderLane::parse("anthropic").unwrap(),
+            ProviderLane::Anthropic
+        );
+        assert_eq!(ProviderLane::parse("codex").unwrap(), ProviderLane::Codex);
+        let err = ProviderLane::parse("gemini").unwrap_err().to_string();
+        assert!(err.contains("gemini"), "names the offending value: {err}");
+        assert!(
+            err.contains("anthropic") && err.contains("codex"),
+            "lists the set: {err}"
+        );
+
+        assert_eq!(LaneEffort::parse("high").unwrap(), LaneEffort::High);
+        let err = LaneEffort::parse("turbo").unwrap_err().to_string();
+        assert!(
+            err.contains("turbo") && err.contains("low, medium, high"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn generic_construction_drives_any_model_verbatim() {
+        let lane = LaneSpec::new(ProviderLane::Anthropic, "claude-opus-9", LaneEffort::High);
+        assert_eq!(lane.label(), "anthropic/claude-opus-9@high");
+        assert_eq!(lane.model_id, "claude-opus-9");
     }
 
     #[test]

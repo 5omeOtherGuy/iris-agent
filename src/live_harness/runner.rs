@@ -19,9 +19,10 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
-/// The docs/benchmarks/data directory this repo writes campaign artifacts to.
-fn artifacts_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/benchmarks/data")
+/// The base directory campaign artifact folders live under. Each run writes into
+/// `docs/benchmarks/campaigns/<name>/<date>/` beneath this (created on demand).
+fn artifacts_base_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/benchmarks/campaigns")
 }
 
 fn now_secs() -> u64 {
@@ -57,7 +58,7 @@ fn summarizer_kind(label: &str) -> SummarizerKind {
 /// numbers.
 fn execute_run(spec: &CampaignSpec, planned: &PlannedRun) -> Result<RunResult> {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let scenario = pilot_scenario(&planned.scenario_id)
+    let scenario = build_scenario(&planned.scenario_id, &planned.knobs)
         .ok_or_else(|| anyhow::anyhow!("unknown scenario {}", planned.scenario_id))?;
     let posture = scenario.posture();
     let budget = scenario.budget();
@@ -102,7 +103,7 @@ fn execute_run(spec: &CampaignSpec, planned: &PlannedRun) -> Result<RunResult> {
     let trigger: CompactionTriggerConfig = planned.settings.trigger_config(posture, budget);
     harness.set_compaction_trigger(budget, trigger);
     harness.set_summarizer(summarizer_kind(&planned.settings.summarizer));
-    let worker_lane = planned.lane;
+    let worker_lane = planned.lane.clone();
     harness.set_compaction_summarizer_factory(Arc::new(move || {
         worker_lane.build_provider("iris-campaign-compaction-worker")
     }));
@@ -182,7 +183,6 @@ fn assemble_rows(
         })
         .collect();
 
-    let write_visible = planned.lane.supports_native_compaction();
     let mut rows = Vec::with_capacity(captured.len());
     let mut prev_at: Option<Instant> = None;
     for (index, sample) in captured.iter().enumerate() {
@@ -221,14 +221,32 @@ fn assemble_rows(
 
         let usage = sample.usage.as_ref();
         let input_tokens = usage.map(|u| u.input_tokens).unwrap_or(0);
-        let (cache_write_5m, cache_write_1h) = if write_visible {
-            let creation = usage.and_then(|u| u.cache_creation.as_ref());
-            (
-                Some(creation.map(|c| c.ephemeral_5m_input_tokens).unwrap_or(0)),
-                Some(creation.map(|c| c.ephemeral_1h_input_tokens).unwrap_or(0)),
-            )
-        } else {
-            (None, None)
+        // write_unreported is an HONEST per-row flag, not a per-lane constant
+        // (goal 2). Since PR #557 the Codex adapter parses cache writes, so a
+        // Codex row that reports a nonzero write is NOT blind. The Anthropic
+        // lane reports the 5m/1h split via `cache_creation`; the Codex lane
+        // reports a single flat write with no retention split, stored in the 5m
+        // slot with 1h = 0. Residual ambiguity (documented in the schema): a
+        // Codex row reporting a zero write cannot distinguish "wrote nothing"
+        // from "the endpoint did not surface a write", so it is conservatively
+        // flagged write_unreported = true.
+        let (cache_write_5m, cache_write_1h, write_unreported) = match planned.lane.lane {
+            ProviderLane::Anthropic => {
+                let creation = usage.and_then(|u| u.cache_creation.as_ref());
+                (
+                    Some(creation.map(|c| c.ephemeral_5m_input_tokens).unwrap_or(0)),
+                    Some(creation.map(|c| c.ephemeral_1h_input_tokens).unwrap_or(0)),
+                    false,
+                )
+            }
+            ProviderLane::Codex => {
+                let reported_write = usage.map(|u| u.cache_write_input_tokens).unwrap_or(0);
+                if reported_write > 0 {
+                    (Some(reported_write), Some(0), false)
+                } else {
+                    (None, None, true)
+                }
+            }
         };
         rows.push(Row {
             campaign: spec.name.clone(),
@@ -249,7 +267,7 @@ fn assemble_rows(
             cache_read: usage.map(|u| u.cache_read_input_tokens).unwrap_or(0),
             cache_write_5m,
             cache_write_1h,
-            write_unreported: !write_visible,
+            write_unreported,
             context_measured_tokens: input_tokens,
             context_estimate_tokens: estimate,
             estimate_error: Row::estimate_error_of(input_tokens, estimate),
@@ -274,10 +292,11 @@ fn assemble_rows(
 /// in the manifest, writing rows to JSONL as they land and a `.md` report at the
 /// end. Rate-limit friendly: one run at a time, manifest persisted per run.
 pub(crate) fn run_campaign(spec: &CampaignSpec) -> Result<()> {
-    let dir = artifacts_dir();
-    std::fs::create_dir_all(&dir)?;
     let date = date_utc(now_secs());
-    let artifacts = Artifacts::new(&dir, &spec.name, &date);
+    // Per-campaign, per-date artifact folder (goal 3), created on demand.
+    let dir = artifacts_base_dir().join(&spec.name).join(&date);
+    std::fs::create_dir_all(&dir)?;
+    let artifacts = Artifacts::new(&dir, &spec.name);
     let plan = expand(spec);
     let mut manifest = Manifest::load(artifacts.manifest.clone())?;
 
@@ -301,7 +320,7 @@ pub(crate) fn run_campaign(spec: &CampaignSpec) -> Result<()> {
         match execute_run(spec, run) {
             Ok(result) => {
                 append_rows(&artifacts.jsonl, &result.rows)?;
-                let price = PRICE_TABLE.price_for(run.lane.lane);
+                let price = spec.prices.price_for(&run.lane.model_id);
                 derived.push((
                     run.cell_id.clone(),
                     DerivedRun::from_rows(
@@ -332,7 +351,7 @@ pub(crate) fn run_campaign(spec: &CampaignSpec) -> Result<()> {
         }
     }
 
-    let verdict = live_run_verdict(&outcomes);
+    let verdict = live_run_verdict_with_budget(&outcomes, spec.exclusion_budget);
     let report = format_report(spec, &derived, verdict, &failures);
     std::fs::write(&artifacts.markdown, report)?;
     println!(
@@ -415,6 +434,56 @@ mod tests {
         // NOT the -3.6k phantom the turn-end broadcast produced.
         assert_eq!(rows[0].estimate_error, 100);
         assert_eq!(rows[1].estimate_error, 100);
+    }
+
+    /// Goal 2: `write_unreported` is a per-row honest flag. A Codex row that
+    /// reports a nonzero cache write is NOT blind (write_unreported=false) and
+    /// its write is preserved in the 5m slot; a Codex row reporting a zero write
+    /// stays flagged because zero is ambiguous. The Anthropic lane is never
+    /// write-blind. Deterministic (assemble_rows only, no live traffic).
+    #[test]
+    fn write_unreported_is_codex_lane_and_zero_reported_write_only() {
+        let fingerprint = CellSettings::defaults().fingerprint(ScenarioPosture {
+            auto_compaction: true,
+            folds: true,
+        });
+        let spec = pilot_a();
+        let codex = PlannedRun {
+            lane: codex_luna(LaneEffort::Low),
+            scenario_id: "S4-small".to_string(),
+            settings: CellSettings::defaults(),
+            knobs: ScenarioKnobs::default(),
+            run_seq: 0,
+            cell_id: "codex-cell".to_string(),
+            key: "codex-cell#run0".to_string(),
+        };
+        let mut wrote = usage(5_000, 40);
+        wrote.cache_write_input_tokens = 1_800;
+        let at = Instant::now();
+        let captured = vec![
+            CapturedUsage {
+                is_summary: false,
+                tag: "zero-write".to_string(),
+                started_at: at,
+                usage: Some(usage(5_000, 40)),
+                estimate_tokens: 5_000,
+            },
+            CapturedUsage {
+                is_summary: false,
+                tag: "reported-write".to_string(),
+                started_at: at + Duration::from_millis(1),
+                usage: Some(wrote),
+                estimate_tokens: 5_000,
+            },
+        ];
+        let rows = assemble_rows(&spec, &codex, &captured, &[], &fingerprint);
+        // Zero reported write on the Codex lane: blind + ambiguous -> flagged.
+        assert!(rows[0].write_unreported);
+        assert_eq!(rows[0].cache_write_5m, None);
+        // Nonzero reported write: NOT blind, write preserved in the 5m slot.
+        assert!(!rows[1].write_unreported);
+        assert_eq!(rows[1].cache_write_5m, Some(1_800));
+        assert_eq!(rows[1].cache_write_1h, Some(0));
     }
 
     /// A fake provider that emits one `read` tool call per fixture across

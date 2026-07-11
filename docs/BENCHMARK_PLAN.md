@@ -174,10 +174,18 @@ IRIS_BENCH_REAL=1 IRIS_BENCH_N=3 \
 
 # Campaign runbook: compaction live-measurement harness
 
+> User entry point: **`docs/benchmarks/HARNESS.md`**. It is the single, current
+> reference for running the harness -- safety model, credential prerequisites,
+> quickstart, the full config-file schema (field/default/range), the scenario
+> catalog, how to read every artifact column, resume semantics, and a
+> tune-your-model walkthrough. This section is the design-level plan; when the
+> two differ, HARNESS.md is authoritative for how to run.
+
 The `live_harness` module (design: `compaction-live-harness`) generalizes the
 per-experiment live bench into a lane x scenario x settings-cell x n matrix
-runner. A new experiment is a config cell, not new Rust. Every number in an
-artifact comes from real `ProviderUsage` or session-log lifecycle entries; the
+runner. A new experiment is a config cell (a TOML campaign file), not new Rust.
+Every number in an artifact comes from real `ProviderUsage` or session-log
+lifecycle entries; the
 estimator's value appears only as the `estimate_error` diagnostic column.
 
 ## Double-gated, never in the gate
@@ -221,23 +229,30 @@ posture. A campaign (`CampaignSpec`) lists lanes, cells, and runs-per-cell.
 # Deterministic, in-gate (no cost):
 cargo test --locked live_harness
 
-# Live campaign (opt-in, consumes rate limits / notional cost):
+# Built-in live campaign (opt-in, consumes rate limits / notional cost):
 IRIS_BENCH_LIVE=1 IRIS_BENCH_CAMPAIGN=pilot-a \
+  cargo test --release -- --ignored live_campaign --nocapture
+
+# Config-file campaign (any model, no Rust edit):
+IRIS_BENCH_LIVE=1 IRIS_BENCH_CAMPAIGN_FILE=docs/benchmarks/campaigns/pilot-a.toml \
   cargo test --release -- --ignored live_campaign --nocapture
 ```
 
-Runs execute sequentially (rate-limit friendly). A campaign manifest
-(`<campaign>-<date>.manifest`) records each completed run key and is persisted
-per run, so an interrupted campaign resumes past finished runs instead of
-restarting. A lane with no credentials is skipped, not failed. Pilot A is
-anthropic-only, low effort, n=2, cells S1 + S3 + S4-small at compaction
-defaults -- it validates plumbing, schema, and artifact writing before spend
-widens.
+Select a campaign with exactly one of `IRIS_BENCH_CAMPAIGN=<name>` or
+`IRIS_BENCH_CAMPAIGN_FILE=<path>` (both, or neither, is a named error). Runs
+execute sequentially (rate-limit friendly). The manifest records each completed
+run key and is persisted per run, so an interrupted campaign resumes past
+finished runs; archive the `.manifest` to re-run from scratch. A lane with no
+credentials is skipped, not failed. Pilot A is anthropic-only, low effort, n=2,
+cells S1 + S3 + S4-small at compaction defaults -- it validates plumbing, schema,
+and artifact writing before spend widens.
 
 ## Read the artifacts
 
-Artifacts land in `docs/benchmarks/data/`:
-- `<campaign>-<date>.jsonl` -- one `Row` per line; diff two campaigns by cell_id.
-- `<campaign>-<date>.md` -- verdict (flaky-exclusion rule #545), per-cell
-  headline numbers, and the row-schema reference.
-- `<campaign>-<date>.manifest` -- completed run keys (resume bookkeeping).
+Artifacts land in a per-campaign, per-date folder
+`docs/benchmarks/campaigns/<name>/<date>/` (full column reference in
+HARNESS.md):
+- `<name>.jsonl` -- one `Row` per line; diff two campaigns by cell_id.
+- `<name>.md` -- verdict (flaky-exclusion rule #545), per-cell headline numbers,
+  scenario failures, and the row-schema reference.
+- `<name>.manifest` -- completed run keys (resume bookkeeping).

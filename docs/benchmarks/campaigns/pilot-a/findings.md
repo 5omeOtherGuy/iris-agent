@@ -2,7 +2,8 @@
 
 First live campaign of the `live_harness` module (PR #559). Anthropic-only, low
 effort, n=2, cells S1 + S3 + S4-small at compaction defaults. Artifacts:
-`docs/benchmarks/data/pilot-a-2026-07-10.{jsonl,md,manifest}`.
+`docs/benchmarks/campaigns/pilot-a/2026-07-10/run3/pilot-a-2026-07-10.{jsonl,md,manifest}`
+(the three archived runs sit under `docs/benchmarks/campaigns/pilot-a/2026-07-10/run{1,2,3}/`).
 
 The campaign validated plumbing, schema, and artifact writing, and surfaced two
 findings. Both are fixed in-tree with in-gate deterministic tests; the live path
@@ -93,5 +94,6 @@ provider-discount margin assertion in the shape test.
 Run 2 also produced the first live cache break-even point (S1 run 1, boundary
 4): the apply broke the warm prefix (cache reads 23.4k -> 2.2k, 9.7k re-write
 at 1.25x) in exchange for input dropping 25.7k -> 11.9k -- payback in roughly
-one request. Artifacts: pilot-a-2026-07-10.{jsonl,md} (run 2),
-pilot-a-2026-07-10-run1.{jsonl,md} (run 1).
+one request. Artifacts (archived under
+`docs/benchmarks/campaigns/pilot-a/2026-07-10/`): `run3/pilot-a-2026-07-10.{jsonl,md}`
+(this run) and `run1/pilot-a-2026-07-10-run1.{jsonl,md}` (the prior run).
