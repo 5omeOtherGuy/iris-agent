@@ -526,6 +526,55 @@ effort = "low"
     }
 
     #[test]
+    fn t_series_cells_parse_with_the_round_trips_and_budget_knobs() {
+        // A T-series cell is a first-class scenario id; its `round_trips` knob
+        // (the repetition / fail-loud floor) and `budget` validate on the same
+        // ranges the S-series knobs do.
+        let ok = minimal().replace(
+            "scenario = \"S1\"",
+            "scenario = \"T4\"\nround_trips = 6\nbudget = 65536",
+        );
+        let spec = campaign_from_toml(&ok).expect("T4 cell parses");
+        assert_eq!(spec.cells[0].scenario_id, "T4");
+        assert_eq!(spec.cells[0].knobs.round_trips, Some(6));
+        assert_eq!(spec.cells[0].knobs.budget, Some(65_536));
+
+        // Out-of-range T-series knobs are rejected with the same named bounds.
+        let bad_rt = minimal().replace("scenario = \"S1\"", "scenario = \"T2\"\nround_trips = 99");
+        let err = campaign_from_toml(&bad_rt).unwrap_err().to_string();
+        assert!(
+            err.contains("cells.round_trips") && err.contains("1..=16"),
+            "{err}"
+        );
+        let bad_budget = minimal().replace("scenario = \"S1\"", "scenario = \"T1\"\nbudget = 4096");
+        let err = campaign_from_toml(&bad_budget).unwrap_err().to_string();
+        assert!(
+            err.contains("cells.budget") && err.contains("8192"),
+            "{err}"
+        );
+    }
+
+    /// The committed `tool-suite.toml` example loads and expands to a valid
+    /// T1-T4 tool-efficiency plan on one lane, so the file the docs point the
+    /// operator at is proven runnable in the gate.
+    #[test]
+    fn committed_tool_suite_toml_expands_to_a_t_series_plan() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/benchmarks/campaigns/tool-suite.toml");
+        let spec = load_campaign_file(&path).expect("load committed tool-suite.toml");
+        assert_eq!(spec.name, "tool-suite");
+        assert_eq!(spec.lanes.len(), 1);
+        let ids: Vec<&str> = spec.cells.iter().map(|c| c.scenario_id.as_str()).collect();
+        assert_eq!(ids, ["T1", "T2", "T3", "T4"]);
+        // Every cell resolves to a fixture-backed T-series scenario.
+        for cell in &spec.cells {
+            let scenario = build_scenario(&cell.scenario_id, &cell.knobs)
+                .unwrap_or_else(|| panic!("registry builds {}", cell.scenario_id));
+            assert_eq!(scenario.workspace_kind(), WorkspaceKind::Fixtures);
+        }
+    }
+
+    #[test]
     fn unknown_top_level_key_is_rejected_not_ignored() {
         let text = format!("{}\n[campaign]\nname = \"dup\"", minimal());
         // Duplicate table is a TOML parse error; a stray key likewise.

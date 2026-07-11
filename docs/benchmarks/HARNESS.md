@@ -14,9 +14,18 @@ sessions through the real Harness/compaction surfaces against a live provider,
 records one JSONL row per provider request, and writes a per-run aggregate report
 plus a resumable manifest. A new experiment is a config cell, not new code.
 
+One system covers two measurement families through the same row schema and
+artifacts: the **S-series** (S1-S4) isolate compaction behaviors, and the
+**T-series** (T1-T4) measure tool-output token efficiency (the migrated
+tokens-per-task suite). A tool-efficiency campaign is just a config file naming
+T-series cells; its rows carry the same cache/estimate columns as a compaction
+campaign, for free.
+
 - A **lane** is a (provider, model, effort) tuple.
-- A **scenario** (S1-S4) is a deterministic session driver that isolates one
-  compaction behavior.
+- A **scenario** is a deterministic session driver: an **S-series** id
+  (`S1`-`S4`) isolates one compaction behavior; a **T-series** id (`T1`-`T4`)
+  drives the built-in tools over a materialized fixture tree to measure
+  tool-output mass.
 - A **cell** is a (scenario, settings) pair, optionally with size-knob overrides.
 - A **campaign** is a set of lanes x cells x runs-per-cell, defined in one config
   file (or a built-in like `pilot-a`).
@@ -116,9 +125,9 @@ the shipped `CellSettings::defaults()`).
 
 | field | type | default | accepted range |
 | --- | --- | --- | --- |
-| `scenario` | string | (required) | `S1` \| `S2` \| `S3` \| `S4` \| `S4-small` |
+| `scenario` | string | (required) | `S1` \| `S2` \| `S3` \| `S4` \| `S4-small` \| `T1` \| `T2` \| `T3` \| `T4` |
 | `budget` | integer | scenario default | `>= 8192` |
-| `round_trips` | integer | scenario default | `1..=16` (S1) |
+| `round_trips` | integer | scenario default | `1..=16` (S1; also the T-series repetition / fail-loud floor) |
 | `seed_repeat` | integer | scenario default | `>= 1` (S1) |
 | `result_repeat` | integer | scenario default | `>= 1` (S1, S3) |
 | `start` | float | `0.72` | `0.1..=0.95` |
@@ -168,6 +177,37 @@ carries its own fail-loud success criteria where relevant.
 - **S4 cache-churn** (`S4-small` is the small pilot) -- alternating hot-prefix
   and forced-churn turns. Measures: the cache break-even of an apply. Knobs:
   `budget`. Use for cache-economics / break-even studies.
+
+### T-series (tool-efficiency)
+
+The T-series drive the built-in tools over deterministic fixture trees
+(materialized fresh per run, reusing the `bench_tokens` fixtures) and run with
+compaction and folds OFF so each tool result's mass is measured raw. Their
+fail-loud rule is uniform: rows are one per provider request and a tool
+round-trip is a request, so a run that answered without running the target tools
+is a **hard failure** (`Tn exercised only k tool round-trip(s) ... the model
+skipped the target tools`), recorded verbatim -- never a green pass. Knobs:
+`round_trips` (repetitions / round-trip floor) and `budget`.
+
+- **T1 read/skim token mass** (issue-337) -- reads one comment-heavy source in
+  full and again with `skim: true`. Measures: how much of a file each read
+  returns and that skim keeps every exported name plus a body local (`due_ids`).
+  Fixture: `probe_read`. Use to bound `read` output cost.
+- **T2 search-output classes** (issue-338/339/340) -- runs `grep`, `ls`, and
+  `find` over a wide tree. Measures: grep path-grouping, ls listing, and find
+  directory-compaction mass. Fixtures: `probe_grep` + a > 1000-file find tree.
+  Use to bound search-result cost.
+- **T3 edit-result classes** (issue-341) -- applies an exact edit and a tolerant
+  (curly-quote) edit. Measures: the `edit` result envelope per outcome class
+  (exact stays terse; a tolerant match echoes the applied region, ADR-0038).
+  Fixture: the legacy `exact`/`tolerant` edit-case contents. Use to bound edit
+  result cost.
+- **T4 chained tool suite** (the chained-all-four flow) -- one chained turn:
+  read to locate, grep to survey, edit to repair, shell to check, across four
+  PR-seeded repair subprojects (`bytes`/`clap`/`nushell`/`dayjs`). Measures:
+  residual tool mass across a realistic multi-tool session. Fail-loud floor:
+  `>= 4` round-trips (raise with `round_trips`). Use as the end-to-end
+  tool-efficiency cell.
 
 ## Reading the artifacts
 
@@ -245,3 +285,44 @@ The `estimate_error` column is your sanity check throughout: if it grows beyond 
 small consistent drift, the estimator is diverging from the provider and any
 threshold tuned against the estimator alone will fire late live (pilot-A finding
 2 root-caused exactly this).
+
+## Tool-efficiency testing: a walkthrough
+
+Goal: measure how many tokens your model's tool results cost -- and whether the
+default-on reductions (grep grouping, find compaction, read skim, terse edit
+echoes) hold up on a real model -- through the same rows and artifacts as a
+compaction campaign.
+
+1. **Start from the committed example.** `docs/benchmarks/campaigns/tool-suite.toml`
+   is a pilot-sized T1-T4 campaign on one lane, ready to run:
+
+   ```bash
+   IRIS_BENCH_LIVE=1 \
+   IRIS_BENCH_CAMPAIGN_FILE=docs/benchmarks/campaigns/tool-suite.toml \
+     cargo test --release -- --ignored live_campaign --nocapture
+   ```
+
+2. **Read the per-request mass.** In the `<name>.jsonl`, the request AFTER a tool
+   call carries that tool result in its `input_tokens` (the T-series run with
+   compaction/folds off, so nothing reclaims it). Compare `input_tokens` growth
+   across T1's full-read vs skim turns, or T2's grep/ls/find turns, to see each
+   tool's realized output mass on your model.
+
+3. **Sweep a knob.** Copy the file and vary one T-series `round_trips` to add
+   repetitions (more samples per cell) or raise T4's fail-loud floor:
+
+   ```toml
+   [[cells]]
+   scenario = "T2"
+   round_trips = 3   # three grep+ls+find sweeps instead of one
+   ```
+
+4. **Trust the fail-loud rule.** If a run's report shows a `## Scenario failures`
+   block naming a T cell (`Tn exercised only k tool round-trip(s) ...`), the
+   model skipped the tools that run -- the row is not a silent zero, it is a
+   recorded hard failure. Re-read the turn prompt or raise the model's effort.
+
+The in-gate parity tests (`live_harness::tool_scenarios::tests`) pin each
+T-series scenario to the legacy tokens-per-task probe fixtures, so a T-series
+read/grep/find/edit measures the byte-for-byte same input the retired
+`bench_tokens` suite did.

@@ -21,6 +21,15 @@ pub(crate) fn materialize(fixture: &str) -> TestDir {
     dir
 }
 
+/// Copy a fixture tree INTO an existing directory (stripping the `.txt` suffix),
+/// for a caller that owns the destination workspace. The live-harness T-series
+/// scenarios materialize their fixtures into the campaign tool workspace this
+/// way; they share the exact same `.txt`-stripping copy as [`materialize`], so a
+/// T-series read measures the byte-for-byte same fixture the legacy probes do.
+pub(crate) fn materialize_into(fixture: &str, dst: &Path) {
+    copy_stripping_txt(&fixtures_root().join(fixture), dst);
+}
+
 /// Build a wide file tree that trips find's compaction rail: > `DEFAULT_FIND_LIMIT`
 /// (1000) matches so the default limit omits some (needs_compact), with the
 /// shown prefix small enough to fit the byte budget so grouping wins on bytes

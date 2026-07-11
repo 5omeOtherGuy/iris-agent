@@ -1,8 +1,25 @@
 # Benchmark Plan: tokens-per-completed-task (Milestone 2, issue #210)
 
+> **DEPRECATED (2026-07-11): the legacy tool-efficiency suite is being migrated
+> into the live harness.** The tokens-per-task suite below (`src/bench_tokens*`,
+> its replay/headline tests, and the `chained-suite` / `headline-matrix` /
+> `tokens-per-task` artifacts) is superseded by the live-harness **T-series**
+> scenarios (T1 read/skim, T2 search-output, T3 edit-result, T4 chained), which
+> measure the same tool-output token masses through the same `Row` schema,
+> per-campaign artifact folders, and config-file loader as the compaction
+> S-series. Reuse the T-series for new tool-efficiency work; see
+> `docs/benchmarks/HARNESS.md` (scenario catalog + tool-efficiency walkthrough)
+> and the committed `docs/benchmarks/campaigns/tool-suite.toml` example. The
+> legacy code is **not removed in this migration PR** (issue #573 tracks removal
+> after one live T-series campaign validates end-to-end); the sections
+> below are preserved for provenance. The archived legacy artifacts now live
+> under `docs/benchmarks/campaigns/legacy-tokens-per-task/`,
+> `legacy-chained-suite/<date>/`, and `legacy-headline-matrix/<date>/`.
+
 Written before the run. Deviations from this plan are recorded honestly in the
-report (`docs/benchmarks/tokens-per-task.md`) and the lab notebook
-(`docs/benchmarks/tokens-per-task-notebook.md`).
+report (`docs/benchmarks/campaigns/legacy-tokens-per-task/tokens-per-task.md`)
+and the lab notebook
+(`docs/benchmarks/campaigns/legacy-tokens-per-task/tokens-per-task-notebook.md`).
 
 ## Question
 

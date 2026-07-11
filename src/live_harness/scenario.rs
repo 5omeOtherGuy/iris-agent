@@ -22,6 +22,20 @@ pub(crate) struct ScenarioPosture {
     pub(crate) folds: bool,
 }
 
+/// The tool workspace a scenario drives its live turns against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceKind {
+    /// The live repository root. The S-series compaction scenarios read real
+    /// source files (`src/nexus.rs`, ...) so a live read adds genuine mid-turn
+    /// mass; nothing is written into the repo.
+    Repo,
+    /// A fresh temp tree the scenario materializes before the session seeds. The
+    /// T-series tool-efficiency scenarios build deterministic fixture trees
+    /// (reusing `bench_tokens` fixtures) so a live model's tools operate on
+    /// fixed inputs, comparable to the legacy tokens-per-task probes.
+    Fixtures,
+}
+
 /// A campaign-drivable scenario. Synthetic generators and (future) real-world
 /// drivers both implement this so the runner is scenario-agnostic.
 pub(crate) trait Scenario {
@@ -43,6 +57,21 @@ pub(crate) trait Scenario {
     /// guards against, so it is surfaced as a Fail, never a green pass.
     fn verify_run(&self, rows: &[Row]) -> std::result::Result<(), String> {
         let _ = rows;
+        Ok(())
+    }
+    /// The tool workspace this scenario drives against. Defaults to the live
+    /// repository (the S-series posture); a scenario that needs a materialized
+    /// fixture tree overrides this to [`WorkspaceKind::Fixtures`] and provides
+    /// its files through [`Scenario::materialize`].
+    fn workspace_kind(&self) -> WorkspaceKind {
+        WorkspaceKind::Repo
+    }
+    /// Materialize any fixture files the scenario's turns reference into the
+    /// tool `workspace`, before the session seeds. Called by the runner only
+    /// for a [`WorkspaceKind::Fixtures`] scenario; the default no-op fits the
+    /// repo-reading S-series.
+    fn materialize(&self, workspace: &Path) -> Result<()> {
+        let _ = workspace;
         Ok(())
     }
 }
@@ -445,7 +474,12 @@ pub(crate) struct ScenarioKnobs {
 /// - S2 (multi-turn grind): budget.
 /// - S3 (fold-dominant): result_repeat, budget.
 /// - S4-small (cache-churn): budget.
+/// - T1-T4 (tool-efficiency): round_trips (as the repetition/round-trip knob),
+///   budget. See `tool_scenarios.rs`.
 pub(crate) fn build_scenario(id: &str, knobs: &ScenarioKnobs) -> Option<Box<dyn Scenario>> {
+    if let Some(scenario) = build_tool_scenario(id, knobs) {
+        return Some(scenario);
+    }
     match id {
         "S1" => {
             let mut s = AggressiveFill::pilot();
@@ -505,8 +539,11 @@ pub(crate) fn pilot_scenario(id: &str) -> Option<Box<dyn Scenario>> {
 }
 
 /// The scenario ids a campaign cell may name, listed in error messages so a bad
-/// `scenario = "..."` in a config file names the accepted set.
-pub(crate) const ACCEPTED_SCENARIO_IDS: [&str; 5] = ["S1", "S2", "S3", "S4", "S4-small"];
+/// `scenario = "..."` in a config file names the accepted set. The S-series
+/// measure compaction; the T-series (`tool_scenarios.rs`) measure tool-output
+/// token efficiency through the same row schema and artifact layout.
+pub(crate) const ACCEPTED_SCENARIO_IDS: [&str; 9] =
+    ["S1", "S2", "S3", "S4", "S4-small", "T1", "T2", "T3", "T4"];
 
 #[cfg(test)]
 mod tests {

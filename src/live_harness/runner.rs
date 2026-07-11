@@ -57,11 +57,23 @@ fn summarizer_kind(label: &str) -> SummarizerKind {
 /// the caller, which records them as an excluded run rather than fabricating
 /// numbers.
 fn execute_run(spec: &CampaignSpec, planned: &PlannedRun) -> Result<RunResult> {
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scenario = build_scenario(&planned.scenario_id, &planned.knobs)
         .ok_or_else(|| anyhow::anyhow!("unknown scenario {}", planned.scenario_id))?;
     let posture = scenario.posture();
     let budget = scenario.budget();
+
+    // The tool workspace: the S-series read the live repo; the T-series drive
+    // against a fresh materialized fixture tree. `_fixture_ws` (a temp dir
+    // removed on drop) is held for the whole run so the fixtures survive every
+    // turn, then cleaned up when execute_run returns.
+    let (workspace, _fixture_ws) = match scenario.workspace_kind() {
+        WorkspaceKind::Repo => (PathBuf::from(env!("CARGO_MANIFEST_DIR")), None),
+        WorkspaceKind::Fixtures => {
+            let dir = TempDir::new(&format!("tool-ws-{}-{}", planned.cell_id, planned.run_seq));
+            scenario.materialize(&dir.path)?;
+            (dir.path.clone(), Some(dir))
+        }
+    };
 
     // Seed and resume exactly as startup does, so the loaded prefix is
     // compactable through the production seam.

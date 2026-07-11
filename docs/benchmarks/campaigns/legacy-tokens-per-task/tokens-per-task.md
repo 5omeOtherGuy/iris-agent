@@ -1,8 +1,17 @@
+> **Archived (moved 2026-07-11).** This report is a historical artifact of the
+> legacy tokens-per-task tool-efficiency suite (`src/bench_tokens*`). The
+> tool-efficiency measurements are being migrated into the live-harness
+> **T-series** scenarios (T1-T4), which ride the same `Row` schema and
+> per-campaign artifact folders. See `docs/benchmarks/HARNESS.md` (scenario
+> catalog + tool-efficiency walkthrough) and the migration note in
+> `docs/BENCHMARK_PLAN.md`. Nothing here was deleted; the suite is retired once a
+> live T-series campaign validates end-to-end.
+
 # Tokens per completed task -- end-to-end benchmark (issue #210, Milestone 2)
 
 Does Iris's default-on tool-output reduction lower the prompt tokens spent to
 COMPLETE a realistic task, without lowering task success? Plan:
-[`docs/BENCHMARK_PLAN.md`](../BENCHMARK_PLAN.md). Running log of decisions and
+[`docs/BENCHMARK_PLAN.md`](../../../BENCHMARK_PLAN.md). Running log of decisions and
 deviations: [`tokens-per-task-notebook.md`](./tokens-per-task-notebook.md).
 
 Two arms, identical except one benchmark-only switch:
@@ -37,7 +46,7 @@ Out of scope end-to-end (stated plainly, per ADR-0036 and the issue):
 
 - **bash output filtering (ADR-0037)** -- auto-bash is deferred, so a bash-using
   workload cannot run prompt-free under auto. Its proof stays per-result
-  ([`adr-0037-bash-filter-tokens.md`](./adr-0037-bash-filter-tokens.md)).
+  ([`adr-0037-bash-filter-tokens.md`](../../adr-0037-bash-filter-tokens.md)).
 - **`read` skim (#337), grep `maxPerFile` (#338)** -- opt-in, identical across
   arms.
 

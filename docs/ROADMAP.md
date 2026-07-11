@@ -954,7 +954,10 @@ Potential scope:
 End-to-end measurement partially landed (issue #210): the plan
 (`docs/BENCHMARK_PLAN.md`), the benchmark-only arm switch, three committed
 workload fixtures with mechanical success checks, and a re-runnable replay
-harness are in tree, reported in `docs/benchmarks/tokens-per-task.md`. The
+harness are in tree, reported in
+`docs/benchmarks/campaigns/legacy-tokens-per-task/tokens-per-task.md` (the
+tool-efficiency suite is migrating into the live-harness T-series; see
+`docs/BENCHMARK_PLAN.md`). The
 deterministic replay proves the token plumbing on the search/log workflows --
 arm A (defaults) spends fewer prompt tokens than arm B (baseline) with 100%
 success and zero approval prompts (3.4-9.1% on the current fixtures, a
@@ -969,7 +972,7 @@ Acceptance signal: a benchmark shows that handle-returning tool outputs reduce
 prompt tokens without reducing task success on at least one realistic workflow
 such as large search results, large test logs, or multi-file inspection. (Replay
 evidence committed; real-provider confirmation pending -- see
-`docs/benchmarks/tokens-per-task.md`.)
+`docs/benchmarks/campaigns/legacy-tokens-per-task/tokens-per-task.md`.)
 
 Gate before Milestone 3: token accounting and the handle/result shape must be
 stable enough that the context engine can build on them rather than replace them.

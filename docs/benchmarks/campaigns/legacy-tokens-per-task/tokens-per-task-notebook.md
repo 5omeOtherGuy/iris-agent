@@ -1,4 +1,8 @@
 <!-- typos: this is a running lab notebook, not polished prose -->
+> **Archived (moved 2026-07-11).** Historical lab notebook for the legacy
+> tokens-per-task suite; the tool-efficiency measurements now live in the
+> live-harness T-series (see `docs/benchmarks/HARNESS.md`). Preserved verbatim.
+
 # Lab Notebook: tokens-per-task benchmark (issue #210)
 
 A live, running record of observations, decisions, deviations, and reactions
@@ -370,7 +374,7 @@ test). Real-provider harness (`run_real_arm` + `tokens_per_task_headline`,
 `#[ignore]`d, `IRIS_BENCH_REAL=1`-gated) compiles under `--all-targets`.
 
 **DECISION — report + ROADMAP + README.**
-- `docs/benchmarks/tokens-per-task.md` committed: method, the replay table with
+- `docs/benchmarks/campaigns/legacy-tokens-per-task/tokens-per-task.md` committed: method, the replay table with
   the real measured numbers, repro commands, and a loud "what replay does /
   does not prove" + "headline pending operator run" section.
 - ROADMAP "End-to-end measurement pending" note rewritten to cite the plan +
@@ -1070,7 +1074,7 @@ First full authorized headline matrix: 3 models (gpt-5.4-mini, gpt-5.3-codex-spa
 claude-haiku-4-5) x 3 workloads x 2 arms x N=5 = 90 real sessions, reasoning=low
 (held identical across arms), real usage-record input tokens. Smoke-guard first
 (all 3 reachable, all succeeded). Committed artifact:
-docs/benchmarks/headline-matrix-2026-07-05.{md,jsonl}.
+docs/benchmarks/campaigns/legacy-headline-matrix/2026-07-05/headline-matrix-2026-07-05.{md,jsonl}.
 
 **Overall verdict: BASELINE WINS -- no tokens-per-task claim shipped.**
 
@@ -1108,7 +1112,7 @@ Operator-requested second matrix: the two stronger models at low thinking, to
 test whether a per-turn reduction signal is cleaner than on the default 3-spec
 set. 2 models x 3 workloads x 2 arms x N=5 = 60 real sessions. Smoke first
 (both reachable; `openai-codex:gpt-5.4` full model IS served, not just -mini).
-Committed artifact: headline-matrix-sonnet46-gpt54-2026-07-05.{md,jsonl}.
+Committed artifact: docs/benchmarks/campaigns/legacy-headline-matrix/2026-07-05/headline-matrix-sonnet46-gpt54-2026-07-05.{md,jsonl}.
 
 **Verdict: BASELINE WINS (no claim) -- but directionally favorable, INCONCLUSIVE.**
 
@@ -1253,7 +1257,7 @@ completion. Added shard/run-offset metadata before launch (`IRIS_BENCH_SHARD`,
 the same log file. Total: 6 workloads x 2 arms x 50 = 600 live sessions. All 10
 processes exited 0 in ~1826s wall clock.
 
-Artifacts: chained-suite-sonnet46-low-n50-2026-07-05.{md,jsonl}.
+Artifacts: docs/benchmarks/campaigns/legacy-chained-suite/2026-07-05/chained-suite-sonnet46-low-n50-2026-07-05.{md,jsonl}.
 
 Summary: 600 valid rows, 0 invalid/noncompliant, 0 process errors, 590/600 task
 success. The only failures were `chained-ampi-private-docs-fix`, split evenly
@@ -1338,7 +1342,7 @@ driver is the number of model round-trips.
 Full high-N run of the four real-PR chained workloads after the Entry 28 harness
 fixes. 5 shards x N=10 x 2 arms = 10 parallel processes, N=50 per workload/arm,
 max round-trips 40. Artifact:
-`docs/benchmarks/chained-suite-sonnet46-low-n50-2026-07-06.{md,jsonl}` (400 rows).
+`docs/benchmarks/campaigns/legacy-chained-suite/2026-07-06/chained-suite-sonnet46-low-n50-2026-07-06.{md,jsonl}` (400 rows).
 
 Safety: 400/400 success, 400/400 valid, identical median turns/calls per workload
 across arms. The bounded round-trips and the model-independent validity bracket
@@ -1379,7 +1383,7 @@ nushell -> dayjs in order, each in its own subdir of one workspace (subprojects
 assembled by build_chained_all_tree, reusing the committed single-bug fixtures;
 Rust via `--manifest-path`, dayjs via `--prefix`). Deterministic replay + gate
 green before the live run. Run: 5 shards/arm x N=2 = 10 processes, cap 80.
-Artifact: docs/benchmarks/chained-all-four-sonnet46-low-n10-2026-07-06.{md,jsonl}.
+Artifact: docs/benchmarks/campaigns/legacy-chained-suite/2026-07-06/chained-all-four-sonnet46-low-n10-2026-07-06.{md,jsonl}.
 
 - 20/20 success, 20/20 valid. The model reliably fixes all four in order, both
   arms. Reduction shrank tool output -15.5% (60,138 vs 71,168 B).
