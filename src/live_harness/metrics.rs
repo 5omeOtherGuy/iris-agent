@@ -102,6 +102,31 @@ pub(crate) struct Row {
     pub(crate) error: Option<String>,
 }
 
+/// Max chars of assistant text recorded per transcript entry. The text is a
+/// diagnostic sidecar, not a metric, so it is truncated to keep artifacts
+/// bounded; a real early-stop reply is far shorter than this.
+pub(crate) const TRANSCRIPT_TEXT_CAP: usize = 4_000;
+
+/// The assistant's final text for one provider request, written to the sidecar
+/// `<campaign>.transcripts.jsonl` beside the row JSONL. Keyed by the same
+/// `cell_id` + `run_seq` + `request_seq` as the matching `Row`, so an early-stop
+/// turn is diagnosable after the fact (why the model quit) without changing the
+/// stable Row schema. `text` is `None` on a pure tool-call round-trip (the
+/// request produced no assistant text) and truncated to `TRANSCRIPT_TEXT_CAP`
+/// chars otherwise, with `truncated` recording whether the cap was hit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Transcript {
+    pub(crate) campaign: String,
+    pub(crate) cell_id: String,
+    pub(crate) lane: String,
+    pub(crate) scenario: String,
+    pub(crate) run_seq: u32,
+    pub(crate) request_seq: u32,
+    pub(crate) kind: RowKind,
+    pub(crate) text: Option<String>,
+    pub(crate) truncated: bool,
+}
+
 impl Row {
     /// Signed estimator error for a measured/estimate pair. Saturates into the
     /// `i64` domain so an absurd estimate never panics the row builder.

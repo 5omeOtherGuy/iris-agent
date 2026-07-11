@@ -69,6 +69,11 @@ fn live_campaign() {
         eprintln!("live_campaign: skipped (set IRIS_BENCH_LIVE=1 to run)");
         return;
     }
+    // Install the global tracing subscriber (idempotent `try_init`) so the
+    // provider-internal `iris::usage_raw` diagnostics surface when the operator
+    // sets `RUST_LOG=iris::usage_raw=debug`. No-op without the env directive.
+    // See the Diagnostics section of docs/benchmarks/HARNESS.md.
+    crate::telemetry::init();
     let spec = match select_campaign() {
         Ok(spec) => spec,
         Err(error) => {

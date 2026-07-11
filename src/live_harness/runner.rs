@@ -35,6 +35,9 @@ fn now_secs() -> u64 {
 /// One run's rows plus its mechanical outcome.
 struct RunResult {
     rows: Vec<Row>,
+    /// The assistant's final text per request, written to the transcript
+    /// sidecar so an early-stop turn is diagnosable after the run.
+    transcripts: Vec<Transcript>,
     outcome: TaskOutcome,
     probe_score: Option<f64>,
     /// The scenario's own failure reason when its post-run success criteria did
@@ -132,6 +135,7 @@ fn execute_run(spec: &CampaignSpec, planned: &PlannedRun) -> Result<RunResult> {
     let events = observer.events.lock().expect("events lock");
     let fingerprint = planned.settings.fingerprint(posture);
     let rows = assemble_rows(spec, planned, &captured, &events, &fingerprint);
+    let transcripts = assemble_transcripts(spec, planned, &captured);
     drop(events);
 
     // The run completed every turn without a provider error, but "completed" is
@@ -149,10 +153,43 @@ fn execute_run(spec: &CampaignSpec, planned: &PlannedRun) -> Result<RunResult> {
     // fabricated.
     Ok(RunResult {
         rows,
+        transcripts,
         outcome,
         probe_score: None,
         fail_reason,
     })
+}
+
+/// Build one transcript entry per captured request, carrying the assistant's
+/// final text (already truncated to `TRANSCRIPT_TEXT_CAP` at capture). Keyed by
+/// the same `cell_id` + `run_seq` + `request_seq` as the matching row, so a row
+/// and its transcript join cleanly; the text is `None` on a pure tool-call
+/// round-trip. This is the sidecar that makes a behavioral early-stop
+/// diagnosable after the fact without changing the stable Row schema.
+fn assemble_transcripts(
+    spec: &CampaignSpec,
+    planned: &PlannedRun,
+    captured: &[CapturedUsage],
+) -> Vec<Transcript> {
+    captured
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| Transcript {
+            campaign: spec.name.clone(),
+            cell_id: planned.cell_id.clone(),
+            lane: planned.lane.label(),
+            scenario: planned.scenario_id.clone(),
+            run_seq: planned.run_seq,
+            request_seq: index as u32,
+            kind: if sample.is_summary {
+                RowKind::Summary
+            } else {
+                RowKind::Turn
+            },
+            text: sample.assistant_text.clone(),
+            truncated: sample.assistant_text_truncated,
+        })
+        .collect()
 }
 
 /// Assemble one row per captured provider request. Boundary/tier/lifecycle
@@ -332,6 +369,7 @@ pub(crate) fn run_campaign(spec: &CampaignSpec) -> Result<()> {
         match execute_run(spec, run) {
             Ok(result) => {
                 append_rows(&artifacts.jsonl, &result.rows)?;
+                append_transcripts(&artifacts.transcripts, &result.transcripts)?;
                 let price = spec.prices.price_for(&run.lane.model_id);
                 derived.push((
                     run.cell_id.clone(),
@@ -409,6 +447,117 @@ mod tests {
         }
     }
 
+    /// A provider that answers with one fixed assistant text turn (plus usage),
+    /// so the recording wrapper's text capture/truncation is exercised without
+    /// live traffic.
+    struct FixedTextProvider {
+        text: String,
+    }
+
+    impl ChatProvider for FixedTextProvider {
+        fn respond_stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _tools: &'a Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<ProviderStream<'a>> {
+            let mut turn = AssistantTurn::text(&self.text);
+            turn.usage = Some(usage(10, 5));
+            Ok(Box::pin(futures::stream::once(async move {
+                Ok(ProviderEvent::Completed(turn))
+            })))
+        }
+    }
+
+    /// Goal 1 (capture): the recording provider records the assistant's final
+    /// text and truncates it at `TRANSCRIPT_TEXT_CAP`, setting the truncated
+    /// flag. Deterministic -- a fake provider, no live traffic.
+    #[test]
+    fn recording_provider_captures_and_truncates_assistant_text_at_cap() {
+        use futures::StreamExt;
+        let long = "x".repeat(TRANSCRIPT_TEXT_CAP + 500);
+        let provider = RecordingProvider::new(FixedTextProvider { text: long });
+        let usages = provider.log();
+        let tools = Tools::new(Vec::new());
+        let token = CancellationToken::new();
+        let messages = vec![Message::user("trigger the turn")];
+        block_on(async {
+            let mut stream = provider
+                .respond_stream(&messages, &tools, &token)
+                .expect("stream");
+            while stream.next().await.is_some() {}
+        });
+        let captured = usages.lock().expect("usages").clone();
+        assert_eq!(captured.len(), 1);
+        let text = captured[0].assistant_text.as_ref().expect("text captured");
+        assert_eq!(
+            text.chars().count(),
+            TRANSCRIPT_TEXT_CAP,
+            "captured text truncated to the cap"
+        );
+        assert!(captured[0].assistant_text_truncated);
+    }
+
+    /// Goal 1 (assemble + write): the runner builds one transcript per request,
+    /// keyed by cell_id + run_seq + request_seq to the matching row, with the
+    /// final text preserved (truncation flag carried) and `None` on a pure
+    /// tool-call round-trip. The sidecar is written one JSON object per line.
+    /// Deterministic -- assemble/append only, no live traffic.
+    #[test]
+    fn assemble_transcripts_keys_by_request_and_writes_sidecar() {
+        let (spec, planned, _fingerprint) = spec_and_planned();
+        let at = Instant::now();
+        let long_text: String = "y".repeat(TRANSCRIPT_TEXT_CAP);
+        let captured = vec![
+            // Pure tool-call round-trip: no assistant text.
+            CapturedUsage {
+                is_summary: false,
+                tag: "read".to_string(),
+                started_at: at,
+                usage: Some(usage(2_100, 90)),
+                estimate_tokens: 2_000,
+                assistant_text: None,
+                assistant_text_truncated: false,
+            },
+            // Turn-ending text (recorded as already truncated at capture).
+            CapturedUsage {
+                is_summary: false,
+                tag: "reply".to_string(),
+                started_at: at + Duration::from_millis(1),
+                usage: Some(usage(6_100, 150)),
+                estimate_tokens: 6_000,
+                assistant_text: Some(long_text.clone()),
+                assistant_text_truncated: true,
+            },
+        ];
+        let transcripts = assemble_transcripts(&spec, &planned, &captured);
+        assert_eq!(transcripts.len(), 2);
+        // Keyed positionally to the rows: request_seq matches the index, and the
+        // cell_id/run_seq/lane/scenario mirror the planned run.
+        assert_eq!(transcripts[0].request_seq, 0);
+        assert_eq!(transcripts[1].request_seq, 1);
+        assert_eq!(transcripts[0].cell_id, planned.cell_id);
+        assert_eq!(transcripts[0].run_seq, planned.run_seq);
+        assert_eq!(transcripts[0].lane, planned.lane.label());
+        // A pure tool-call round-trip records no assistant text.
+        assert_eq!(transcripts[0].text, None);
+        assert!(!transcripts[0].truncated);
+        // The turn-ending text is preserved with its truncation flag.
+        assert_eq!(transcripts[1].text.as_deref(), Some(long_text.as_str()));
+        assert!(transcripts[1].truncated);
+
+        // Written to the sidecar one JSON object per line, round-tripping.
+        let dir = TempDir::new("transcripts-sidecar");
+        let path = dir.path.join("c.transcripts.jsonl");
+        append_transcripts(&path, &transcripts).expect("append");
+        assert!(path.exists(), "sidecar file exists");
+        let body = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "one object per line");
+        let back: Transcript = serde_json::from_str(lines[1]).expect("deserialize");
+        assert_eq!(back, transcripts[1]);
+    }
+
     /// Finding 2: `context_estimate_tokens` is a per-request estimator value, so
     /// `estimate_error` is a genuine like-for-like delta. The pilot-a bug
     /// broadcast the turn-end measurement across every request, so the opening
@@ -426,6 +575,8 @@ mod tests {
                 started_at: at,
                 usage: Some(usage(2_100, 90)),
                 estimate_tokens: 2_000,
+                assistant_text: None,
+                assistant_text_truncated: false,
             },
             CapturedUsage {
                 is_summary: false,
@@ -433,6 +584,8 @@ mod tests {
                 started_at: at + Duration::from_millis(1),
                 usage: Some(usage(6_100, 150)),
                 estimate_tokens: 6_000,
+                assistant_text: None,
+                assistant_text_truncated: false,
             },
         ];
         let rows = assemble_rows(&spec, &planned, &captured, &[], &fingerprint);
@@ -479,6 +632,8 @@ mod tests {
                 started_at: at,
                 usage: Some(usage(5_000, 40)),
                 estimate_tokens: 5_000,
+                assistant_text: None,
+                assistant_text_truncated: false,
             },
             CapturedUsage {
                 is_summary: false,
@@ -486,6 +641,8 @@ mod tests {
                 started_at: at + Duration::from_millis(1),
                 usage: Some(wrote),
                 estimate_tokens: 5_000,
+                assistant_text: None,
+                assistant_text_truncated: false,
             },
         ];
         let rows = assemble_rows(&spec, &codex, &captured, &[], &fingerprint);

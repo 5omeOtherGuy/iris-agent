@@ -1904,6 +1904,16 @@ impl AnthropicStreamParser {
 
     fn merge_usage(&mut self, usage: &Value) {
         self.usage_seen = true;
+        // Diagnostics only: the verbatim `usage` object this endpoint sent (a
+        // message_start baseline then message_delta finals). Off unless RUST_LOG
+        // enables the `iris::usage_raw` target; never a reported metric. See
+        // HARNESS.md.
+        tracing::debug!(
+            target: "iris::usage_raw",
+            model = %self.usage.model,
+            usage = %usage,
+            "anthropic messages raw usage"
+        );
         if let Some(tokens) = usage.get("input_tokens").and_then(Value::as_u64) {
             self.raw_input_tokens = tokens;
         }

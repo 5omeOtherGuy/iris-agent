@@ -247,6 +247,53 @@ completed without a provider error but did not exercise its target behavior is a
 **hard failure**, recorded verbatim, not a silent green. `notional_usd` prints
 `null` for any lane whose model has no price.
 
+## Diagnostics
+
+Two provider-behavior questions the token columns alone cannot answer -- *why*
+did a turn end, and *what raw usage* did the endpoint send -- are covered by
+opt-in diagnostics. Neither is a metric and neither adds config; both are inert
+on a normal run.
+
+### Assistant transcripts (why a turn ended)
+
+Every run writes a sidecar beside the row JSONL:
+
+- `docs/benchmarks/campaigns/<name>/<date>/<name>.transcripts.jsonl`
+
+One JSON object per provider request, keyed by the same `cell_id` + `run_seq` +
+`request_seq` as the matching `Row`, so a row and its transcript join without a
+side table. Fields: `campaign`, `cell_id`, `lane`, `scenario`, `run_seq`,
+`request_seq`, `kind`, `text`, `truncated`. `text` is the assistant's final text
+for that request (truncated to 4000 chars, `truncated` flags whether the cap was
+hit) and is `null` on a pure tool-call round-trip. This makes a behavioral
+early-stop -- e.g. a model that ends an S1 turn after one read -- diagnosable
+after the fact: read the last transcript entry for the run to see what the model
+said before it quit. The `Row` schema is unchanged; the text lives only in the
+sidecar.
+
+### Raw usage logging (what the endpoint reported)
+
+To settle whether a lane surfaces a field at all (e.g. the codex lane's
+`cache_write_tokens`), the OpenAI Codex, OpenAI-compatible, and Anthropic
+adapters log the verbatim serialized `usage` JSON object plus the model id at the
+point of extraction, under the tracing target `iris::usage_raw`. It is off unless
+you enable that target via `RUST_LOG`:
+
+```bash
+RUST_LOG=iris::usage_raw=debug \
+IRIS_BENCH_LIVE=1 \
+IRIS_BENCH_CAMPAIGN_FILE=docs/benchmarks/campaigns/my-run.toml \
+  cargo test --release -- --ignored live_campaign --nocapture
+```
+
+The lines appear on **stderr** (the live entry point installs the tracing
+subscriber; `--nocapture` lets the test binary's stderr through), one per
+provider request, e.g. `... iris::usage_raw: codex responses raw usage
+model=... usage={...}`. The Anthropic lane logs one baseline line at
+`message_start` and the finals at `message_delta`, so expect two lines per
+request there. This is provider-internal diagnostics: it feeds no row column and
+never gates a result.
+
 ## Resume semantics
 
 The manifest records each completed run key and is persisted per run, so an
