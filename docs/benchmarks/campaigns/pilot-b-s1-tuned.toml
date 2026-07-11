@@ -1,0 +1,14 @@
+# S1 re-run tuned for terra's lighter tokenizer (~25% below sonnet on the same
+# payload): budget lowered so the live run crosses hard with margin. One-line
+# config fix -- no code change (the point of the config-file system).
+schema = 1
+[campaign]
+name = "pilot-b-s1-tuned"
+runs = 2
+[[lanes]]
+provider = "codex"
+model = "gpt-5.6-terra"
+effort = "low"
+[[cells]]
+scenario = "S1"
+budget = 24576

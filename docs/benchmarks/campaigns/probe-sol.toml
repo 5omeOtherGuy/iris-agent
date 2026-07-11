@@ -1,0 +1,10 @@
+schema = 1
+[campaign]
+name = "probe-sol"
+runs = 1
+[[lanes]]
+provider = "codex"
+model = "gpt-5.6-sol"
+effort = "low"
+[[cells]]
+scenario = "S3"
