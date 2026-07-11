@@ -4362,6 +4362,7 @@ mod tests {
         }));
         screen.apply(UiEvent::SessionStarted);
         screen.show_start_page(0, true);
+        screen.start_page.as_mut().expect("start page").skip_boot();
 
         let height = 24u16;
         let lines = rendered_lines(&mut screen, 80, height);
