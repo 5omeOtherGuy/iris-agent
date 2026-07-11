@@ -363,12 +363,22 @@ pub(crate) struct CacheChurn {
 }
 
 impl CacheChurn {
-    /// The small pilot cell (S4-small).
+    /// The small pilot cell (S4-small): few cycles at a small budget.
     pub(crate) fn small() -> Self {
         Self {
             cycles: 2,
             filler_repeat: 20,
             budget: 32_768,
+        }
+    }
+
+    /// The full cache-churn cell (S4): more cycles at a larger budget, for the
+    /// dedicated break-even campaigns once the small pilot has validated plumbing.
+    pub(crate) fn full() -> Self {
+        Self {
+            cycles: 4,
+            filler_repeat: 30,
+            budget: 131_072,
         }
     }
 }
@@ -412,17 +422,91 @@ impl Scenario for CacheChurn {
     }
 }
 
-/// Resolve a scenario id to its pilot-sized instance. Unknown ids return `None`
-/// so a campaign definition fails loudly rather than silently skipping a cell.
-pub(crate) fn pilot_scenario(id: &str) -> Option<Box<dyn Scenario>> {
+/// Optional per-cell size-knob overrides. Each field, when set, replaces the
+/// scenario's pilot default for that knob; unset fields keep the shipped pilot
+/// size. A knob that a scenario does not carry is ignored by that scenario's
+/// arm of [`build_scenario`] (documented per scenario). Config validation
+/// bounds these values before they reach here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ScenarioKnobs {
+    pub(crate) budget: Option<u64>,
+    pub(crate) round_trips: Option<usize>,
+    pub(crate) seed_repeat: Option<usize>,
+    pub(crate) result_repeat: Option<usize>,
+}
+
+/// The one place scenario ids map to constructed scenarios. Adding a scenario is
+/// a new arm here plus its generator; the runner and config loader stay
+/// unchanged. Unknown ids return `None` so a campaign definition fails loudly
+/// rather than silently skipping a cell.
+///
+/// Knob application per scenario (only meaningful knobs are consumed):
+/// - S1 (aggressive-fill): round_trips, seed_repeat, result_repeat, budget.
+/// - S2 (multi-turn grind): budget.
+/// - S3 (fold-dominant): result_repeat, budget.
+/// - S4-small (cache-churn): budget.
+pub(crate) fn build_scenario(id: &str, knobs: &ScenarioKnobs) -> Option<Box<dyn Scenario>> {
     match id {
-        "S1" => Some(Box::new(AggressiveFill::pilot())),
-        "S2" => Some(Box::new(MultiTurnGrind::pilot())),
-        "S3" => Some(Box::new(FoldDominant::pilot())),
-        "S4-small" => Some(Box::new(CacheChurn::small())),
+        "S1" => {
+            let mut s = AggressiveFill::pilot();
+            if let Some(v) = knobs.round_trips {
+                s.round_trips = v;
+            }
+            if let Some(v) = knobs.seed_repeat {
+                s.seed_repeat = v;
+            }
+            if let Some(v) = knobs.result_repeat {
+                s.result_repeat = v;
+            }
+            if let Some(v) = knobs.budget {
+                s.budget = v;
+            }
+            Some(Box::new(s))
+        }
+        "S2" => {
+            let mut s = MultiTurnGrind::pilot();
+            if let Some(v) = knobs.budget {
+                s.budget = v;
+            }
+            Some(Box::new(s))
+        }
+        "S3" => {
+            let mut s = FoldDominant::pilot();
+            if let Some(v) = knobs.result_repeat {
+                s.result_repeat = v;
+            }
+            if let Some(v) = knobs.budget {
+                s.budget = v;
+            }
+            Some(Box::new(s))
+        }
+        "S4" => {
+            let mut s = CacheChurn::full();
+            if let Some(v) = knobs.budget {
+                s.budget = v;
+            }
+            Some(Box::new(s))
+        }
+        "S4-small" => {
+            let mut s = CacheChurn::small();
+            if let Some(v) = knobs.budget {
+                s.budget = v;
+            }
+            Some(Box::new(s))
+        }
         _ => None,
     }
 }
+
+/// Resolve a scenario id to its pilot-sized instance (no knob overrides). A thin
+/// wrapper over [`build_scenario`] kept for the runner's default path and tests.
+pub(crate) fn pilot_scenario(id: &str) -> Option<Box<dyn Scenario>> {
+    build_scenario(id, &ScenarioKnobs::default())
+}
+
+/// The scenario ids a campaign cell may name, listed in error messages so a bad
+/// `scenario = "..."` in a config file names the accepted set.
+pub(crate) const ACCEPTED_SCENARIO_IDS: [&str; 5] = ["S1", "S2", "S3", "S4", "S4-small"];
 
 #[cfg(test)]
 mod tests {
@@ -578,6 +662,26 @@ mod tests {
     fn pilot_scenario_resolves_known_ids_only() {
         assert_eq!(pilot_scenario("S1").expect("S1").id(), "S1");
         assert_eq!(pilot_scenario("S4-small").expect("S4-small").id(), "S4");
+        assert_eq!(pilot_scenario("S4").expect("S4").id(), "S4");
         assert!(pilot_scenario("nope").is_none());
+    }
+
+    #[test]
+    fn build_scenario_applies_knob_overrides_to_s1() {
+        // No knobs: the pilot default.
+        let default = build_scenario("S1", &ScenarioKnobs::default()).expect("S1");
+        assert_eq!(default.budget(), AggressiveFill::pilot().budget);
+
+        // Overrides replace the pilot size knob-for-knob.
+        let knobs = ScenarioKnobs {
+            budget: Some(65_536),
+            round_trips: Some(9),
+            seed_repeat: Some(1_000),
+            result_repeat: Some(400),
+        };
+        let tuned = build_scenario("S1", &knobs).expect("S1");
+        assert_eq!(tuned.budget(), 65_536);
+        // Round-trips flow into the turn's read list length.
+        assert_eq!(tuned.turns().len(), 1);
     }
 }

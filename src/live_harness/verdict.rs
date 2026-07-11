@@ -90,6 +90,16 @@ pub(crate) struct LiveRunVerdict {
 /// occurred and the exclusion count stays within budget; a second exclusion of
 /// either kind therefore fails the run.
 pub(crate) fn live_run_verdict(outcomes: &[LiveSessionOutcome]) -> LiveRunVerdict {
+    live_run_verdict_with_budget(outcomes, LIVE_EXCLUSION_BUDGET)
+}
+
+/// As [`live_run_verdict`], but with a caller-supplied exclusion budget so a
+/// config campaign can widen or tighten the flaky tolerance. The default budget
+/// (`LIVE_EXCLUSION_BUDGET`) is used when a config omits it.
+pub(crate) fn live_run_verdict_with_budget(
+    outcomes: &[LiveSessionOutcome],
+    budget: usize,
+) -> LiveRunVerdict {
     let mut exclusions = 0usize;
     let mut hard_failures = 0usize;
     for outcome in outcomes {
@@ -102,7 +112,7 @@ pub(crate) fn live_run_verdict(outcomes: &[LiveSessionOutcome]) -> LiveRunVerdic
         }
     }
     LiveRunVerdict {
-        passed: hard_failures == 0 && exclusions <= LIVE_EXCLUSION_BUDGET,
+        passed: hard_failures == 0 && exclusions <= budget,
         exclusions,
     }
 }

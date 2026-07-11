@@ -1,0 +1,38 @@
+# Pilot A -- the first live compaction-measurement campaign, as a config file.
+#
+# This is the config-file equivalent of the built-in `pilot_a()` plan: a test
+# (`live_harness::config::tests`) asserts this file expands to exactly that
+# built-in plan, so it doubles as executable documentation of the schema.
+#
+# Run it (double-gated; consumes real subscription rate limits -- see
+# docs/benchmarks/HARNESS.md):
+#   IRIS_BENCH_LIVE=1 IRIS_BENCH_CAMPAIGN_FILE=docs/benchmarks/campaigns/pilot-a.toml \
+#     cargo test --release -- --ignored live_campaign --nocapture
+#
+# To bench a different model, copy this file, change the lane `model` (and
+# `provider`/`effort` if needed), and add a `[prices.<model-id>]` block so the
+# report can price it. Full field/default/range reference: HARNESS.md.
+
+schema = 1
+
+[campaign]
+name = "pilot-a"
+runs = 2
+
+# Anthropic-only, low effort. The Claude Code subscription OAuth lane is the
+# only lane that reports cache writes and native compaction.
+[[lanes]]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+effort = "low"
+
+# Three cells at the shipped compaction defaults (no knob or settings overrides):
+# S1 aggressive-fill, S3 fold-dominant, S4-small cache-churn.
+[[cells]]
+scenario = "S1"
+
+[[cells]]
+scenario = "S3"
+
+[[cells]]
+scenario = "S4-small"

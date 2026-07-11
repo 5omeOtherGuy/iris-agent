@@ -347,7 +347,7 @@ pub(crate) const DEFAULT_COMPACTION_WARN: f64 = 0.60;
 pub(crate) const DEFAULT_COMPACTION_START: f64 = 0.72;
 pub(crate) const DEFAULT_COMPACTION_HARD: f64 = 0.90;
 pub(crate) const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 8_000;
-const DEFAULT_COMPACTION_HARD_WAIT_MS: u64 = 120_000;
+pub(crate) const DEFAULT_COMPACTION_HARD_WAIT_MS: u64 = 120_000;
 const MAX_COMPACTION_HARD_WAIT_MS: u64 = 300_000;
 const DEFAULT_COMPACTION_MAX_FAILURES: u32 = 3;
 /// Default independent microcompaction flush threshold. This matches the old

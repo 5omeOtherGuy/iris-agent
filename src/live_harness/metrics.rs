@@ -138,7 +138,10 @@ pub(crate) struct DerivedRun {
     pub(crate) cache_read_total: u64,
     /// Sum of reported cache writes; `None` when every row was write-blind.
     pub(crate) cache_write_total: Option<u64>,
-    pub(crate) notional_usd: f64,
+    /// Notional cost from the (dated) price table. `None` when the lane's model
+    /// has no price entry -- the report prints `null` and notes it rather than
+    /// inventing a figure.
+    pub(crate) notional_usd: Option<f64>,
     pub(crate) cache_hit_ratio: f64,
     /// Cache-write mass on the first request after each compaction boundary --
     /// the realized cost of breaking the warm prefix.
@@ -157,7 +160,7 @@ impl DerivedRun {
     pub(crate) fn from_rows(
         run_seq: u32,
         rows: &[Row],
-        price: &LanePrice,
+        price: Option<&LanePrice>,
         outcome: TaskOutcome,
         probe_score: Option<f64>,
     ) -> Self {
@@ -192,12 +195,14 @@ impl DerivedRun {
             output_total,
             cache_read_total,
             cache_write_total,
-            notional_usd: price.cost_usd(
-                input_total,
-                output_total,
-                cache_read_total,
-                cache_write_total.unwrap_or(0),
-            ),
+            notional_usd: price.map(|p| {
+                p.cost_usd(
+                    input_total,
+                    output_total,
+                    cache_read_total,
+                    cache_write_total.unwrap_or(0),
+                )
+            }),
             cache_hit_ratio,
             post_apply_rewrite_mass,
             wall_ms_total,
@@ -281,6 +286,40 @@ impl PriceTable {
             ProviderLane::Anthropic => &self.anthropic_sonnet,
             ProviderLane::Codex => &self.codex_luna,
         }
+    }
+}
+
+/// A model-id-keyed price book: the built-in table seeded by model id, extended
+/// by a campaign's optional `[prices.<model-id>]` overrides. Pricing is by model
+/// id (not lane) so a config that names any model can supply its own numbers; an
+/// unpriced model resolves to `None` -> `notional_usd` null + a report note,
+/// never an error or an invented figure.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct PriceBook {
+    prices: std::collections::BTreeMap<String, LanePrice>,
+}
+
+impl PriceBook {
+    /// The built-in table keyed by the model ids it prices: the public Anthropic
+    /// Sonnet list price and the flagged Luna placeholder.
+    pub(crate) fn builtin() -> Self {
+        let mut prices = std::collections::BTreeMap::new();
+        prices.insert(
+            "claude-sonnet-4-6".to_string(),
+            PRICE_TABLE.anthropic_sonnet,
+        );
+        prices.insert("gpt-5.6-luna".to_string(), PRICE_TABLE.codex_luna);
+        Self { prices }
+    }
+
+    /// Add or replace one model's price (a config `[prices.<model-id>]` block).
+    pub(crate) fn insert(&mut self, model_id: impl Into<String>, price: LanePrice) {
+        self.prices.insert(model_id.into(), price);
+    }
+
+    /// The notional price for a model id, or `None` when it is unpriced.
+    pub(crate) fn price_for(&self, model_id: &str) -> Option<&LanePrice> {
+        self.prices.get(model_id)
     }
 }
 
@@ -368,7 +407,7 @@ mod tests {
         let derived = DerivedRun::from_rows(
             0,
             &rows,
-            &PRICE_TABLE.anthropic_sonnet,
+            Some(&PRICE_TABLE.anthropic_sonnet),
             TaskOutcome::Pass,
             Some(1.0),
         );
@@ -377,8 +416,41 @@ mod tests {
         assert_eq!(derived.cache_write_total, Some(4_000));
         // boundary_index > 0 on both rows, so both writes count as re-write mass.
         assert_eq!(derived.post_apply_rewrite_mass, 4_000);
-        assert!(derived.notional_usd > 0.0);
+        assert!(derived.notional_usd.unwrap() > 0.0);
         assert!((derived.cache_hit_ratio - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unpriced_model_yields_null_notional_not_a_fabricated_figure() {
+        let rows = vec![sample_row(1, RowKind::Turn)];
+        let derived = DerivedRun::from_rows(0, &rows, None, TaskOutcome::Pass, None);
+        assert_eq!(
+            derived.notional_usd, None,
+            "an unpriced model prices to null"
+        );
+    }
+
+    #[test]
+    fn price_book_extends_the_builtin_table_by_model_id_and_arithmetic_matches() {
+        let mut book = PriceBook::builtin();
+        // Built-in model resolves to the shipped Anthropic price.
+        assert_eq!(
+            book.price_for("claude-sonnet-4-6"),
+            Some(&PRICE_TABLE.anthropic_sonnet)
+        );
+        // An unknown model is unpriced until an override is supplied.
+        assert_eq!(book.price_for("claude-opus-9"), None);
+        let override_price = LanePrice {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+            cache_read_per_mtok: 0.5,
+            cache_write_per_mtok: 6.25,
+            placeholder: false,
+        };
+        book.insert("claude-opus-9", override_price);
+        let price = book.price_for("claude-opus-9").expect("overridden");
+        // 1M fresh input at 5.0/Mtok == $5.00 exactly.
+        assert!((price.cost_usd(1_000_000, 0, 0, 0) - 5.0).abs() < 1e-9);
     }
 
     #[test]
