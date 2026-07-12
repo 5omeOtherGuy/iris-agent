@@ -7602,12 +7602,17 @@ mod tests {
             semantic_retain_per_path: 1,
             tool_clearing_keep_recent: 8,
             prompt_cache_retention: "short".to_string(),
+            web_search_backend: "off".to_string(),
+            read_web_page_backend: "off".to_string(),
             verify_command: None,
             verify_max_attempts: 3,
             theme: "terminal".to_string(),
             alt_screen: "auto".to_string(),
             scroll_speed: 3,
             reduced_motion: false,
+            mutation_safety: true,
+            native_jj_available: true,
+            native_jj_enabled: false,
             worktree_root: None,
         }
     }
@@ -7621,7 +7626,7 @@ mod tests {
         screen.open_modal(Modal::Settings(Box::new(SettingsPanel::new(
             faceplate_snapshot(),
         ))));
-        let rendered = rendered_text(&mut screen, 100, 60);
+        let rendered = rendered_text(&mut screen, 100, 66);
         // Masthead silkscreen + every section printed at once.
         assert!(rendered.contains("SETTINGS"), "{rendered}");
         assert!(
@@ -7633,6 +7638,7 @@ mod tests {
             "SAFETY",
             "AUTO COMPACT",
             "MEMORY",
+            "WEB",
             "CHECKS",
             "PANEL",
             "GIT",
@@ -7645,7 +7651,7 @@ mod tests {
         assert!(rendered.contains("●●●●●●○○○○  232k tokens"), "{rendered}");
         assert!(rendered.contains("▸ gpt-5.5 ┊ openai-codex"), "{rendered}");
         // Nothing windowed: no position row on a tall viewport.
-        assert!(!rendered.contains("(1/30)"), "{rendered}");
+        assert!(!rendered.contains("(1/35)"), "{rendered}");
         // The composer stays protected below the panel.
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }
@@ -7664,7 +7670,7 @@ mod tests {
         // session bar) and the window scrolls with the house position row.
         assert!(rendered.contains("SETTINGS"), "{rendered}");
         assert!(rendered.contains("ENGINE"), "{rendered}");
-        assert!(rendered.contains("(1/31)"), "{rendered}");
+        assert!(rendered.contains("(1/35)"), "{rendered}");
         assert!(!rendered.contains("worktree root"), "windowed:\n{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }

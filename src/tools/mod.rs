@@ -36,11 +36,14 @@ mod observe;
 pub(crate) mod path;
 mod read;
 mod read_output;
+mod read_web_page;
 pub(crate) mod recall;
 mod registry;
 mod request_compaction;
 mod skim;
 mod text;
+pub(crate) mod web;
+mod web_search;
 mod write;
 
 // The result contract lives in Tier-1 Nexus; tools produce it and re-export it
@@ -48,7 +51,9 @@ mod write;
 pub(crate) use crate::nexus::ToolOutput;
 pub(crate) use bash::platform_can_sandbox;
 pub(crate) use observe::ObservedFiles;
-pub(crate) use registry::{built_in_tools, built_in_tools_for};
+#[cfg(test)]
+pub(crate) use registry::built_in_tools_for;
+pub(crate) use registry::{ToolsConfig, built_in_tools, built_in_tools_with};
 
 const MAX_DIFF_PREVIEW_BYTES: usize = 1024 * 1024;
 

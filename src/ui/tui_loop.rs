@@ -186,20 +186,7 @@ pub(crate) fn run<P: ChatProvider>(
     swap: &SessionLoader<'_>,
     startup: StartupUi,
 ) -> Result<()> {
-    let StartupUi {
-        modal: startup_modal,
-        start_page,
-        resumed_session,
-    } = startup;
-    let result = runtime.block_on(session_loop(
-        harness,
-        &mut tui,
-        switch,
-        swap,
-        startup_modal,
-        start_page,
-        resumed_session.as_deref(),
-    ));
+    let result = runtime.block_on(session_loop(harness, &mut tui, switch, swap, startup));
     let receipt = tui.screen.session_receipt();
     tui.shutdown();
     // The exit receipt: one dim, measured line printed AFTER teardown so it
@@ -328,10 +315,14 @@ async fn session_loop<P: ChatProvider>(
     tui: &mut TuiUi,
     switch: &mut Option<ModelSwitch<'_, P>>,
     swap: &SessionLoader<'_>,
-    startup_modal: Option<Modal>,
-    start_page: bool,
-    startup_resumed_session: Option<&str>,
+    startup: StartupUi,
 ) -> Result<()> {
+    let StartupUi {
+        modal: startup_modal,
+        mut followup_modal,
+        start_page,
+        resumed_session,
+    } = startup;
     let (input_tx, mut input_rx) = unbounded_channel::<Event>();
     let current_turn: CurrentTurn = Arc::new(Mutex::new(None));
 
@@ -360,7 +351,7 @@ async fn session_loop<P: ChatProvider>(
     // (notice) or note the >1/legacy case (#288, ADR-0031). The recoverable
     // count feeds the start page's `Tasks` badge; a picker is never forced over
     // the home menu -- the user opens Tasks (or `/tasks`) to review or adopt.
-    let recovery = startup_resumed_session.map_or_else(
+    let recovery = resumed_session.as_deref().map_or_else(
         || harness.recover_checkpoints(),
         |session_id| harness.recover_checkpoints_for_resumed_session(session_id),
     );
@@ -417,6 +408,11 @@ async fn session_loop<P: ChatProvider>(
             .await?;
             if let Some(source) = requested {
                 perform_swap(&source, swap, harness, tui, switch)?;
+            }
+            if tui.screen.focus() != FocusTarget::Modal
+                && let Some(modal) = followup_modal.take()
+            {
+                tui.screen.open_modal(modal);
             }
             refresh_footer(harness, tui, switch);
             tui.draw()?;
@@ -1077,6 +1073,12 @@ fn open_session_at<P: ChatProvider>(
     // Arriving in a worktree tells you what Iris left unsettled there.
     apply_recovery(harness.recover_checkpoints(), tui);
     tui.screen.close_session_menu();
+    if harness.mutation_safety_enabled()
+        && harness.native_jj_available()
+        && crate::wayland::trust::native_jj(harness.workspace()).is_none()
+    {
+        tui.screen.open_modal(crate::ui::modal::jj_setup());
+    }
     true
 }
 
@@ -2486,16 +2488,21 @@ async fn run_modal_phase<P: ChatProvider>(
 
 /// Whether a faceplate action hands off to a dialog-guard that overlays the
 /// panel, so the modal phase should stash the view and reopen the faceplate when
-/// the guard resolves (§2.5). Model select/cycle only leave when they trip the
-/// large-context advisory; otherwise they refresh the panel in place (a Keep or
-/// a Replace that is still the faceplate), and the "panel in front" check clears
-/// the stash harmlessly.
+/// the guard resolves (§2.5). Mutation-safety saves are included because enabling
+/// can conditionally open the jj consent guard. Model select/cycle only leave when
+/// they trip the large-context advisory; otherwise they refresh the panel in place
+/// (a Keep or a Replace that is still the faceplate), and the "panel in front"
+/// check clears the stash harmlessly.
 fn leaves_faceplate_for_guard(action: &ModalAction) -> bool {
     matches!(
         action,
         ModalAction::SelectModel { .. }
             | ModalAction::ConfirmModelSwitch { .. }
             | ModalAction::CycleModel { .. }
+            | ModalAction::SaveSetting {
+                field: crate::ui::settings_menu::Field::MutationSafety,
+                ..
+            }
             | ModalAction::BeginLogin(_)
             | ModalAction::OpenApiKeyDialog(_)
     )
@@ -2618,6 +2625,27 @@ async fn dispatch_action<P: ChatProvider>(
                 }
             }
             open_deferred_settings(harness, tui, switch, steering);
+        }
+        ModalAction::SetNativeJj(enabled) => {
+            let previous = harness.native_jj_enabled();
+            let master = harness.mutation_safety_enabled();
+            let lines = match harness.configure_mutation_safety(master, enabled) {
+                Err(error) => vec![error.to_string()],
+                Ok(()) => {
+                    match crate::wayland::trust::set_native_jj(harness.workspace(), enabled) {
+                        Ok(()) => vec![format!(
+                            "native jj integration {} for this workspace",
+                            if enabled { "enabled" } else { "disabled" }
+                        )],
+                        Err(error) => {
+                            let _ = harness.configure_mutation_safety(master, previous);
+                            vec![format!("could not save native jj preference: {error:#}")]
+                        }
+                    }
+                }
+            };
+            tui.screen.close_modal();
+            apply_notices(tui, lines);
         }
         ModalAction::ResumeSession(id) => {
             // Close the picker and hand the chosen session up to the loop, which
@@ -5934,12 +5962,17 @@ mod tests {
             semantic_retain_per_path: 1,
             tool_clearing_keep_recent: 8,
             prompt_cache_retention: "short".to_string(),
+            web_search_backend: "off".to_string(),
+            read_web_page_backend: "off".to_string(),
             verify_command: None,
             verify_max_attempts: 3,
             theme: "terminal".to_string(),
             alt_screen: "auto".to_string(),
             scroll_speed: 3,
             reduced_motion: false,
+            mutation_safety: true,
+            native_jj_available: true,
+            native_jj_enabled: false,
             worktree_root: None,
         }
     }
@@ -5960,10 +5993,10 @@ mod tests {
     // --- criterion 7: the stash is armed for exactly the guard handoffs ---
     #[test]
     fn guard_handoffs_arm_the_faceplate_stash_but_inline_refreshes_do_not() {
-        // The reopen-before-draw stash must be armed exactly for the three
-        // genuine dialog-guards' handoff actions. Inline refreshes (scope,
-        // effort, policy, settings, logout) never leave the faceplate, so they
-        // must not arm it — logout in particular refreshes in place (§2.5).
+        // The reopen-before-draw stash must be armed for every conditional
+        // dialog-guard handoff. Inline refreshes (scope, effort, ordinary
+        // settings, policy, logout) never leave the faceplate, so they must not
+        // arm it — logout in particular refreshes in place (§2.5).
         let guards = [
             ModalAction::SelectModel {
                 id: "anthropic/claude-sonnet-4-6".to_string(),
@@ -5977,6 +6010,10 @@ mod tests {
                 compact_first: false,
             },
             ModalAction::CycleModel { forward: true },
+            ModalAction::SaveSetting {
+                field: crate::ui::settings_menu::Field::MutationSafety,
+                value: Some("true".to_string()),
+            },
             ModalAction::BeginLogin(ProviderId::Anthropic),
             ModalAction::OpenApiKeyDialog("openai".to_string()),
         ];
@@ -5990,6 +6027,10 @@ mod tests {
             ModalAction::ApplyScoped(None),
             ModalAction::SaveScoped(None),
             ModalAction::AdjustEffort(ReasoningEffort::High),
+            ModalAction::SaveSetting {
+                field: crate::ui::settings_menu::Field::ReducedMotion,
+                value: Some("true".to_string()),
+            },
             ModalAction::EditPolicy(crate::wayland::trust::ProjectPolicyEdit::GrantTool(
                 "write".to_string(),
             )),
@@ -6010,9 +6051,8 @@ mod tests {
         // Models run_modal_phase's draw ordering (~L2170–2185) over a real Screen
         // and the production `refresh_settings_panel` reopen: the guard's own
         // handler closes the panel (no draw in that window), then the loop reopens
-        // the faceplate BEFORE the next draw. Covers all three guards — the OAuth
-        // login dialog (whose run_login no longer draws after closing), the
-        // API-key dialog, and the large-context switch prompt.
+        // the faceplate BEFORE the next draw. Covers OAuth, API-key, large-context,
+        // and native-jj consent guards.
         let (mut harness, _dir) = harness_with_context(80_000, Some(40_000));
         let build = |_s: &ModelSelection, _p: &str| Ok(NullChat);
         let mut switch = ModelSwitch::new(null_selection(), "P".to_string(), &build, None);
@@ -6045,6 +6085,10 @@ mod tests {
                 login::open_api_key_dialog("openai"),
             ),
             (settings_menu::HatchTarget::Model, switch_prompt),
+            (
+                settings_menu::HatchTarget::Model,
+                crate::ui::modal::jj_setup(),
+            ),
         ];
 
         for (target, guard) in cases {

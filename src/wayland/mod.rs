@@ -293,6 +293,11 @@ pub(crate) enum ReanchorWorkspaceError {
     ActiveTask,
 }
 
+pub(crate) struct MutationSafetyConfig {
+    pub(crate) enabled: bool,
+    pub(crate) native_jj: bool,
+}
+
 /// Wraps a bare [`Agent`] with the execution env it runs against and the
 /// optional transcript log it persists to.
 pub(crate) struct Harness<P> {
@@ -326,9 +331,13 @@ pub(crate) struct Harness<P> {
     // Spans turns like the session (a task continues across turns), so it lives
     // on the harness rather than being rebuilt each turn.
     git_safety: git_safety::GitSafety,
-    // Durable task workflow (ADR-0052, issue #444). When false the dirty-tree
-    // guard still runs, but records, checkpoint refs, recovery, badges, diffs,
-    // and lifecycle entries are disabled.
+    /// Master switch for the entire mutation-safety integration. When false no
+    /// guard is injected and no guard/task lifecycle hook runs.
+    mutation_safety_enabled: bool,
+    native_jj_enabled: bool,
+    // Durable task workflow (ADR-0052, issue #444). When configured false,
+    // records, checkpoint refs, recovery, badges, diffs, and lifecycle entries
+    // are disabled. It is also ineffective while the mutation master is off.
     task_workflow_enabled: bool,
     // Post-change verification config (issue #265). `None` = feature off: the
     // harness runs no post-change checks and emits nothing (the default, so
@@ -349,7 +358,39 @@ impl<P: ChatProvider> Harness<P> {
         session: Option<SessionLog>,
         budget: Option<u64>,
     ) -> Self {
-        Self::build(agent, workspace, state, session, 0, Vec::new(), budget)
+        Self::build(
+            agent,
+            workspace,
+            state,
+            session,
+            (0, Vec::new()),
+            budget,
+            MutationSafetyConfig {
+                enabled: true,
+                native_jj: true,
+            },
+        )
+    }
+
+    /// Construct with the mutation master already resolved, avoiding any Git/jj
+    /// discovery when the feature is disabled at startup.
+    pub(crate) fn new_configured(
+        agent: Agent<P>,
+        workspace: PathBuf,
+        state: ToolState,
+        session: Option<SessionLog>,
+        budget: Option<u64>,
+        safety: MutationSafetyConfig,
+    ) -> Self {
+        Self::build(
+            agent,
+            workspace,
+            state,
+            session,
+            (0, Vec::new()),
+            budget,
+            safety,
+        )
     }
 
     /// Wrap a resumed agent whose first `persisted` messages are already on
@@ -364,6 +405,7 @@ impl<P: ChatProvider> Harness<P> {
     /// store's read-time rebuild already applied any prior compaction entries,
     /// so resumed context is summary-aware on arrival; summary positions arrive
     /// as `None` so `plan_compaction` stops at them (no summary-of-summaries).
+    #[cfg(test)]
     pub(crate) fn resumed(
         agent: Agent<P>,
         workspace: PathBuf,
@@ -377,7 +419,37 @@ impl<P: ChatProvider> Harness<P> {
         // near-budget resumed prefix is compactable (#377).
         let persisted = entry_ids.len();
         Self::build(
-            agent, workspace, state, session, persisted, entry_ids, budget,
+            agent,
+            workspace,
+            state,
+            session,
+            (persisted, entry_ids),
+            budget,
+            MutationSafetyConfig {
+                enabled: true,
+                native_jj: true,
+            },
+        )
+    }
+
+    pub(crate) fn resumed_configured(
+        agent: Agent<P>,
+        workspace: PathBuf,
+        state: ToolState,
+        session: Option<SessionLog>,
+        entry_ids: Vec<Option<String>>,
+        budget: Option<u64>,
+        safety: MutationSafetyConfig,
+    ) -> Self {
+        let persisted = entry_ids.len();
+        Self::build(
+            agent,
+            workspace,
+            state,
+            session,
+            (persisted, entry_ids),
+            budget,
+            safety,
         )
     }
 
@@ -386,16 +458,21 @@ impl<P: ChatProvider> Harness<P> {
         workspace: PathBuf,
         state: ToolState,
         session: Option<SessionLog>,
-        persisted: usize,
-        entry_ids: Vec<Option<String>>,
+        prefix: (usize, Vec<Option<String>>),
         budget: Option<u64>,
+        safety: MutationSafetyConfig,
     ) -> Self {
+        let (persisted, entry_ids) = prefix;
         // Derive the handle store from the session file so oversized outputs are
         // stored beside the transcript that references them.
         let output_store = session
             .as_ref()
             .map(|log| HandleStore::for_session(log.path()));
-        let git_safety = git_safety::GitSafety::new(&workspace);
+        let git_safety = if safety.enabled {
+            git_safety::GitSafety::new_configured(&workspace, true, safety.native_jj)
+        } else {
+            git_safety::GitSafety::new_inactive(&workspace, true)
+        };
         let skills = skills::SkillCatalog::load(&workspace, budget);
         let mut state = state;
         state.skill_read_roots = skills.resource_roots();
@@ -404,7 +481,9 @@ impl<P: ChatProvider> Harness<P> {
         // Stamp the current session id onto the guard up front (ADR-0031), so a
         // task adopted during startup recovery (before the first turn) records
         // this session in its opaque `sessions` join.
-        if let Some(log) = session.as_ref() {
+        if safety.enabled
+            && let Some(log) = session.as_ref()
+        {
             git_safety.set_session_id(log.id().to_string());
         }
         Self {
@@ -424,6 +503,8 @@ impl<P: ChatProvider> Harness<P> {
             output_store,
             steering: None,
             git_safety,
+            mutation_safety_enabled: safety.enabled,
+            native_jj_enabled: safety.native_jj,
             task_workflow_enabled: true,
             verify: None,
         }
@@ -548,15 +629,65 @@ impl<P: ChatProvider> Harness<P> {
         self.compaction.tool_result_policy = policy;
     }
 
+    pub(crate) fn mutation_safety_enabled(&self) -> bool {
+        self.mutation_safety_enabled
+    }
+
+    pub(crate) fn native_jj_enabled(&self) -> bool {
+        self.native_jj_enabled
+    }
+
+    pub(crate) fn native_jj_available(&self) -> bool {
+        git_safety::native_jj_available(&self.workspace)
+    }
+
+    /// Reconfigure the master gate and jj backend at an inter-turn boundary.
+    /// An active durable task must be settled first so no owned state is hidden
+    /// or orphaned by disabling/replacing its guard.
+    pub(crate) fn configure_mutation_safety(
+        &mut self,
+        enabled: bool,
+        native_jj: bool,
+    ) -> std::result::Result<(), &'static str> {
+        if self.git_safety.has_task()
+            && (!enabled
+                || enabled != self.mutation_safety_enabled
+                || native_jj != self.native_jj_enabled)
+        {
+            return Err("finish the current task before changing mutation safety");
+        }
+        if enabled == self.mutation_safety_enabled && native_jj == self.native_jj_enabled {
+            return Ok(());
+        }
+        if !enabled {
+            self.mutation_safety_enabled = false;
+            self.native_jj_enabled = native_jj;
+            return Ok(());
+        }
+        self.git_safety = git_safety::GitSafety::new_configured(
+            &self.workspace,
+            self.task_workflow_enabled,
+            native_jj,
+        );
+        if let Some(log) = self.compaction.session.as_ref() {
+            self.git_safety.set_session_id(log.id().to_string());
+        }
+        self.mutation_safety_enabled = enabled;
+        self.native_jj_enabled = native_jj;
+        Ok(())
+    }
+
     pub(crate) fn task_workflow_enabled(&self) -> bool {
-        self.task_workflow_enabled
+        self.mutation_safety_enabled && self.task_workflow_enabled
     }
 
     pub(crate) fn set_task_workflow_enabled(
         &mut self,
         enabled: bool,
     ) -> std::result::Result<(), &'static str> {
-        self.git_safety.set_workflow_enabled(enabled)?;
+        if self.mutation_safety_enabled {
+            self.git_safety.set_workflow_enabled(enabled)?;
+        }
         self.task_workflow_enabled = enabled;
         Ok(())
     }
@@ -702,10 +833,12 @@ impl<P: ChatProvider> Harness<P> {
         // arrive as `None` (mirroring live `compact_range`), so
         // `plan_compaction` still stops at them (no summary-of-summaries).
         self.compaction.entry_ids = entry_ids;
-        // Re-stamp the guard with the swapped-in session id (ADR-0031) so a task
-        // adopted or continued after the swap records the new session.
-        if let Some(log) = self.compaction.session.as_ref() {
-            self.git_safety.set_session_id(log.id().to_string());
+        if self.mutation_safety_enabled {
+            // Re-stamp the guard with the swapped-in session id (ADR-0031) so a task
+            // adopted or continued after the swap records the new session.
+            if let Some(log) = self.compaction.session.as_ref() {
+                self.git_safety.set_session_id(log.id().to_string());
+            }
         }
         self.last_skills_instructions = last_skills_instructions(&messages);
         self.agent.reset_session(messages);
@@ -716,13 +849,15 @@ impl<P: ChatProvider> Harness<P> {
         // per-file approvals (judged against the prior conversation) so the
         // next touch of a still-dirty file re-prompts. The resume/recovery
         // notice is #263.
-        self.git_safety.discard_approvals();
+        if self.mutation_safety_enabled {
+            self.git_safety.discard_approvals();
+        }
     }
 
     /// Restore points offered for `/rollback` (Tier 3 renders them). Base first,
     /// then each auto-checkpoint. Empty when no unsettled Iris task is active.
     pub(crate) fn checkpoint_restore_points(&self) -> Vec<git_safety::RestorePoint> {
-        if !self.task_workflow_enabled {
+        if !self.task_workflow_enabled() {
             return Vec::new();
         }
         self.git_safety.restore_points()
@@ -733,7 +868,7 @@ impl<P: ChatProvider> Harness<P> {
     /// append a `TaskSettled` audit entry to the transcript so the task<->session
     /// join survives record deletion (ADR-0031, display only).
     pub(crate) fn accept_checkpoint(&mut self) -> Option<String> {
-        if !self.task_workflow_enabled {
+        if !self.task_workflow_enabled() {
             return None;
         }
         let settled = self.git_safety.accept()?;
@@ -745,7 +880,7 @@ impl<P: ChatProvider> Harness<P> {
     /// mutating print run is the operator's explicit "do this" action, so it
     /// accepts the current workflow task with a distinct audit disposition.
     pub(crate) fn accept_print_checkpoint(&mut self) -> Option<String> {
-        if !self.task_workflow_enabled || !self.agent.mutated_this_turn() {
+        if !self.task_workflow_enabled() || !self.agent.mutated_this_turn() {
             return None;
         }
         let settled = self.git_safety.accept()?;
@@ -764,7 +899,7 @@ impl<P: ChatProvider> Harness<P> {
     /// Record an explicit checkpoint (`/checkpoint`) without finishing the
     /// task. Keeps rollback depth, approvals, and recovery record alive.
     pub(crate) fn save_checkpoint(&mut self) -> Option<String> {
-        if !self.task_workflow_enabled {
+        if !self.task_workflow_enabled() {
             return None;
         }
         self.git_safety.checkpoint_now()
@@ -774,7 +909,7 @@ impl<P: ChatProvider> Harness<P> {
     /// Iris-authored ledger paths and the user's index are affected. On a
     /// settling rollback, append a `TaskSettled` audit entry (ADR-0031).
     pub(crate) fn rollback_checkpoint(&mut self, seq: u64) -> Result<git_safety::RollbackOutcome> {
-        if !self.task_workflow_enabled {
+        if !self.task_workflow_enabled() {
             return Ok(git_safety::RollbackOutcome {
                 summary: "no active Iris task to roll back".to_string(),
                 settled_task_id: None,
@@ -795,7 +930,7 @@ impl<P: ChatProvider> Harness<P> {
     /// so Tier 3 prints the single-orphan auto-adopt notice (unchanged UX) or
     /// opens the resume-task picker for the >1/legacy case (#288, ADR-0031).
     pub(crate) fn recover_checkpoints(&self) -> git_safety::RecoveryOutcome {
-        if !self.task_workflow_enabled {
+        if !self.task_workflow_enabled() {
             return git_safety::RecoveryOutcome::None;
         }
         self.git_safety.recover_and_expire()
@@ -809,7 +944,7 @@ impl<P: ChatProvider> Harness<P> {
         &self,
         session_id: &str,
     ) -> git_safety::RecoveryOutcome {
-        if !self.task_workflow_enabled {
+        if !self.task_workflow_enabled() {
             return git_safety::RecoveryOutcome::None;
         }
         self.git_safety.recover_and_expire_for_session(session_id)
@@ -820,14 +955,14 @@ impl<P: ChatProvider> Harness<P> {
     /// are already excluded by the git-safety seam. `body`/`sessions` on each row
     /// are opaque display payload -- the picker only renders them.
     pub(crate) fn recoverable_tasks(&self) -> Vec<git_safety::RecoverableTask> {
-        if !self.task_workflow_enabled {
+        if !self.task_workflow_enabled() {
             return Vec::new();
         }
         self.git_safety.recoverable_tasks()
     }
 
     fn compaction_task_state(&self) -> Option<CompactionTaskState> {
-        if !self.task_workflow_enabled {
+        if !self.task_workflow_enabled() {
             return None;
         }
         self.git_safety
@@ -848,7 +983,7 @@ impl<P: ChatProvider> Harness<P> {
         &self,
         task_id: &str,
     ) -> Result<git_safety::AdoptedTask, git_safety::AdoptError> {
-        if !self.task_workflow_enabled {
+        if !self.task_workflow_enabled() {
             return Err(git_safety::AdoptError::Unavailable);
         }
         self.git_safety.adopt(task_id)
@@ -857,7 +992,7 @@ impl<P: ChatProvider> Harness<P> {
     /// Whether an active durable task must be settled or explicitly carried
     /// before the session can move to another worktree (ADR-0052 / issue #451).
     pub(crate) fn reanchor_requires_task_decision(&self) -> bool {
-        self.task_workflow_enabled && self.git_safety.current_task_id().is_some()
+        self.task_workflow_enabled() && self.git_safety.current_task_id().is_some()
     }
 
     /// Re-anchor the session in another worktree (the git dropdown's
@@ -888,12 +1023,18 @@ impl<P: ChatProvider> Harness<P> {
         self.skills = skills::SkillCatalog::load(&self.workspace, self.compaction.budget);
         self.state.get_mut().skill_read_roots = self.skills.resource_roots();
         self.last_skills_instructions = None;
-        self.git_safety =
-            git_safety::GitSafety::new_with_workflow(&self.workspace, self.task_workflow_enabled);
-        // The rebuilt guard starts with no session id; re-stamp it (ADR-0031) so
-        // recovery in the new worktree records this session on any task it adopts.
-        if let Some(log) = self.compaction.session.as_ref() {
-            self.git_safety.set_session_id(log.id().to_string());
+        self.native_jj_enabled = trust::native_jj(&self.workspace).unwrap_or(false);
+        if self.mutation_safety_enabled {
+            self.git_safety = git_safety::GitSafety::new_configured(
+                &self.workspace,
+                self.task_workflow_enabled,
+                self.native_jj_enabled,
+            );
+            // The rebuilt guard starts with no session id; re-stamp it (ADR-0031) so
+            // recovery in the new worktree records this session on any task it adopts.
+            if let Some(log) = self.compaction.session.as_ref() {
+                self.git_safety.set_session_id(log.id().to_string());
+            }
         }
     }
 
@@ -907,7 +1048,7 @@ impl<P: ChatProvider> Harness<P> {
     /// returned, never swallowed into an empty diff, so callers surface an honest
     /// error instead of a misleading "no changes".
     pub(crate) fn task_diff(&self) -> Result<git_safety::TaskNetDiff> {
-        if !self.task_workflow_enabled {
+        if !self.task_workflow_enabled() {
             return Ok(git_safety::TaskNetDiff::default());
         }
         self.git_safety.task_diff(None)
@@ -955,7 +1096,7 @@ impl<P: ChatProvider> Harness<P> {
     /// `/sessions` route default to the current task when the user gives no id.
     /// Display-only observation; never an enforcement or recovery input.
     pub(crate) fn current_task_id(&self) -> Option<String> {
-        if !self.task_workflow_enabled {
+        if !self.task_workflow_enabled() {
             return None;
         }
         self.git_safety.current_task_id()
@@ -967,7 +1108,7 @@ impl<P: ChatProvider> Harness<P> {
     /// snapshot (file counts, age) it already holds. Display-only; never an
     /// enforcement or recovery input.
     pub(crate) fn active_task(&self) -> Option<git_safety::ActiveTaskDisplay> {
-        if !self.task_workflow_enabled {
+        if !self.task_workflow_enabled() {
             return None;
         }
         self.git_safety.active_task_display()
@@ -1097,7 +1238,9 @@ impl<P: ChatProvider> Harness<P> {
         gate: &dyn ApprovalGate,
         token: &CancellationToken,
     ) -> Result<TurnOutcome> {
-        self.emit_external_task_settlements(obs)?;
+        if self.mutation_safety_enabled {
+            self.emit_external_task_settlements(obs)?;
+        }
         // Safe turn boundary: before the provider request, first fold spent
         // tool results (opt-in microcompaction, ADR-0048), then compact if the
         // current context still exceeds the configured budget. Folding runs
@@ -1157,10 +1300,15 @@ impl<P: ChatProvider> Harness<P> {
         // follow-up turn joining an unsettled task discards the preview (body is
         // captured once). `prior_task` lets the post-turn poll observe a task
         // opened this turn.
-        let prior_task = self.git_safety.current_task_id();
-        self.git_safety.set_turn_context(Some(preview_line(prompt)));
-        if let Some(id) = self.session_id().map(str::to_string) {
-            self.git_safety.set_session_id(id);
+        let prior_task = self
+            .mutation_safety_enabled
+            .then(|| self.git_safety.current_task_id())
+            .flatten();
+        if self.mutation_safety_enabled {
+            self.git_safety.set_turn_context(Some(preview_line(prompt)));
+            if let Some(id) = self.session_id().map(str::to_string) {
+                self.git_safety.set_session_id(id);
+            }
         }
         let span_source = self.span_source();
         let env = ToolEnv {
@@ -1177,19 +1325,22 @@ impl<P: ChatProvider> Harness<P> {
             output_sink: None,
             // Dirty-tree safety (issue #262): the loop consults this seam around
             // every mutating call; git knowledge stays behind it.
-            mutation_guard: Some(&self.git_safety),
+            mutation_guard: self
+                .mutation_safety_enabled
+                .then_some(&self.git_safety as &dyn crate::nexus::MutationGuard),
         };
         // The turn span covers the loop; `Instrument` carries it across awaits
         // (a held `enter()` guard does not).
         self.compaction.begin_turn();
         let result = {
+            let task_workflow_enabled = self.task_workflow_enabled();
             let controller = TurnContextController {
                 inner: obs,
                 compaction: RefCell::new(Some(&mut self.compaction)),
                 workspace: &self.workspace,
                 output_store: self.output_store.as_ref(),
                 git_safety: &self.git_safety,
-                task_workflow_enabled: self.task_workflow_enabled,
+                task_workflow_enabled,
                 token,
             };
             self.agent
@@ -1218,7 +1369,8 @@ impl<P: ChatProvider> Harness<P> {
         // command), so a `current_task_id` that differs from `prior_task` and is
         // non-`None` is a task this turn opened. Its captured body equals this
         // turn's prompt preview (the guard took exactly that).
-        if let Some(task_id) = self.git_safety.current_task_id()
+        if self.mutation_safety_enabled
+            && let Some(task_id) = self.git_safety.current_task_id()
             && prior_task.as_deref() != Some(task_id.as_str())
         {
             let body = preview_line(prompt);
@@ -1233,7 +1385,8 @@ impl<P: ChatProvider> Harness<P> {
             self.maybe_emit_task_workflow_discovery(obs)?;
             verification = self.run_verification_loop(obs, gate, token).await?;
         }
-        if changed_in_model_turn || self.agent.mutated_this_turn() {
+        if self.mutation_safety_enabled && (changed_in_model_turn || self.agent.mutated_this_turn())
+        {
             self.git_safety.observe_iris_execution_boundary();
         }
         if result.is_ok()
@@ -1256,7 +1409,7 @@ impl<P: ChatProvider> Harness<P> {
     }
 
     fn maybe_emit_task_workflow_discovery(&self, obs: &dyn AgentObserver) -> Result<()> {
-        if self.task_workflow_enabled || !self.git_safety.has_ledger_entries() {
+        if self.task_workflow_enabled() || !self.git_safety.has_ledger_entries() {
             return Ok(());
         }
         match trust::mark_task_workflow_notice_shown(&self.workspace) {
@@ -1320,7 +1473,9 @@ impl<P: ChatProvider> Harness<P> {
                         .map(|store| store as &dyn crate::nexus::ToolOutputStore),
                     session_span: Some(&span_source),
                     output_sink: None,
-                    mutation_guard: Some(&self.git_safety),
+                    mutation_guard: self
+                        .mutation_safety_enabled
+                        .then_some(&self.git_safety as &dyn crate::nexus::MutationGuard),
                 };
                 self.agent
                     .run_verification_command(&command, obs, gate, &env, token)
@@ -1370,15 +1525,18 @@ impl<P: ChatProvider> Harness<P> {
                                 .map(|store| store as &dyn crate::nexus::ToolOutputStore),
                             session_span: Some(&span_source),
                             output_sink: None,
-                            mutation_guard: Some(&self.git_safety),
+                            mutation_guard: self
+                                .mutation_safety_enabled
+                                .then_some(&self.git_safety as &dyn crate::nexus::MutationGuard),
                         };
+                        let task_workflow_enabled = self.task_workflow_enabled();
                         let controller = TurnContextController {
                             inner: obs,
                             compaction: RefCell::new(Some(&mut self.compaction)),
                             workspace: &self.workspace,
                             output_store: self.output_store.as_ref(),
                             git_safety: &self.git_safety,
-                            task_workflow_enabled: self.task_workflow_enabled,
+                            task_workflow_enabled,
                             token,
                         };
                         self.agent

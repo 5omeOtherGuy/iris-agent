@@ -58,6 +58,10 @@ pub(crate) struct ProjectPolicyRecord {
     /// is an explicit user action, never automatic -- invariant 3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sandbox: Option<String>,
+    /// Per-canonical-workspace native-jj decision. `None` means not yet asked;
+    /// `Some(true)` accepted; `Some(false)` declined or later disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) native_jj: Option<bool>,
     /// One-time discovery marker for ADR-0052's opt-in task workflow notice.
     /// It grants no permission and is written only after Iris has locally
     /// changed files while the durable workflow is disabled.
@@ -93,6 +97,7 @@ impl ProjectPolicyRecord {
             && self.allow_bash.is_empty()
             && self.allow_bash_prefix.is_empty()
             && self.sandbox.is_none()
+            && self.native_jj.is_none()
             && !self.task_workflow_notice_shown
     }
 
@@ -155,6 +160,21 @@ pub(crate) fn apply_grant(dir: &Path, grant: &PolicyGrant) -> Result<()> {
 pub(crate) fn set_policy(dir: &Path, record: &ProjectPolicyRecord) -> Result<()> {
     let store = resolve_store(dir)?;
     write_record(&store, dir, record)
+}
+
+/// Persist this canonical workspace's explicit native-jj decision in the
+/// HOME-owned policy store. It grants no tool permission.
+pub(crate) fn set_native_jj(dir: &Path, enabled: bool) -> Result<()> {
+    let store = resolve_store(dir)?;
+    let mut record = read_record(&store, dir);
+    record.native_jj = Some(enabled);
+    write_record(&store, dir, &record)
+}
+
+/// The native-jj decision for this canonical workspace. `None` is first
+/// discovery; false is a remembered decline or later opt-out.
+pub(crate) fn native_jj(dir: &Path) -> Option<bool> {
+    policy_for(dir).native_jj
 }
 
 /// Mark ADR-0052's task-workflow discovery notice as shown for this project.
@@ -617,6 +637,25 @@ mod tests {
     }
 
     // ---- ADR-0027 invariant 3: grants never touch the sandbox posture ---------
+
+    #[test]
+    fn native_jj_decision_is_per_canonical_workspace_and_persists() {
+        let _env = EnvGuard::new();
+        let home = temp_dir();
+        let a = temp_dir();
+        let b = temp_dir();
+        unsafe {
+            env::set_var("HOME", &home.path);
+            env::remove_var("IRIS_TRUST_PATH");
+        }
+
+        assert_eq!(native_jj(&a.path), None);
+        set_native_jj(&a.path, true).unwrap();
+        assert_eq!(native_jj(&a.path), Some(true));
+        assert_eq!(native_jj(&b.path), None);
+        set_native_jj(&a.path, false).unwrap();
+        assert_eq!(policy_for(&a.path).native_jj, Some(false));
+    }
 
     #[test]
     fn invariant_3_grant_writes_preserve_and_never_create_sandbox_posture() {

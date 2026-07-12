@@ -436,6 +436,52 @@ fn persist_cli_skip_permissions(cli_skip_permissions: bool) {
     }
 }
 
+/// Resolve the full tool-surface configuration from settings: bash-tool-mode,
+/// the model-compaction tool, and the web-tool backends + keys. An unknown
+/// web-backend value fails loudly here (matching `default_provider`).
+fn resolve_tools_config(settings: &config::Settings) -> Result<tools::ToolsConfig> {
+    Ok(tools::ToolsConfig {
+        bash_tool_mode: settings.bash_tool_mode(),
+        model_compaction_tool: settings.compaction_model_tool(),
+        web: resolve_web_tools_config(settings)?,
+    })
+}
+
+/// Build the [`tools::web::WebToolsConfig`] from settings + the auth store.
+/// Keys are resolved once here (store wins over env); the auth store is only
+/// consulted when a backend is actually enabled, so a fully-off config never
+/// touches the auth file. A missing HOME degrades to env-only key resolution
+/// rather than failing startup.
+fn resolve_web_tools_config(settings: &config::Settings) -> Result<tools::web::WebToolsConfig> {
+    use mimir::auth::storage::{
+        AuthStore, BRAVE_ENV_VAR, BRAVE_SERVICE_ID, JINA_ENV_VAR, JINA_SERVICE_ID,
+    };
+
+    let web_search = settings.web_search_backend()?;
+    let read_web_page = settings.read_web_page_backend()?;
+    if web_search.is_none() && read_web_page.is_none() {
+        return Ok(tools::web::WebToolsConfig::default());
+    }
+
+    let auth = AuthStore::from_env().ok();
+    let key = |service_id: &str, env_var: &str| -> Option<String> {
+        match &auth {
+            Some(store) => store.service_api_key(service_id, env_var),
+            None => std::env::var(env_var)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+        }
+    };
+
+    Ok(tools::web::WebToolsConfig {
+        web_search,
+        read_web_page,
+        brave_key: key(BRAVE_SERVICE_ID, BRAVE_ENV_VAR),
+        jina_key: key(JINA_SERVICE_ID, JINA_ENV_VAR),
+    })
+}
+
 fn persist_session_permission_override(
     persisted_skip_permissions: Option<bool>,
     effective_skip_permissions: bool,
@@ -464,8 +510,7 @@ fn run_agent_inner(
     // from the in-binary shipped fragments plus dynamic context (project docs,
     // date, cwd) and the live tool registry (ADR-0026). Fresh and resume call
     // the same function.
-    let tools =
-        tools::built_in_tools_for(settings.bash_tool_mode(), settings.compaction_model_tool());
+    let tools = tools::built_in_tools_with(&resolve_tools_config(&settings)?);
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     // One resolution point owns provider/model/reasoning precedence; capability
     // validation then rejects a configured reasoning level the model cannot do.
@@ -504,8 +549,18 @@ fn run_agent_inner(
     // boundary, the harness compacts before the provider request.
     let (context_budget, compaction_trigger) = resolved_compaction_trigger(&settings, &selection)?;
     let budget = Some(context_budget.resolved);
-    let mut harness =
-        wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
+    let native_jj = wayland::trust::native_jj(&cwd).unwrap_or(false);
+    let mut harness = wayland::Harness::new_configured(
+        agent,
+        cwd.clone(),
+        tools::ToolState::new(),
+        session,
+        budget,
+        wayland::MutationSafetyConfig {
+            enabled: settings.mutation_safety(),
+            native_jj,
+        },
+    );
     harness.set_compaction_trigger(context_budget, compaction_trigger);
     // Post-change verification (issue #265): engaged only when a `verify` block
     // is present; the command runs under the unchanged approval gate.
@@ -574,6 +629,11 @@ fn run_agent_inner(
     // The start page (IrisMark + launcher) shows only when Iris launches
     // interactively with no task and no resume target; a bare `iris resume`
     // opens the resume picker instead.
+    let jj_modal = native_jj_discovery_modal(force_plain, &cwd, &settings, &harness);
+    let (startup_modal, followup_modal) = match (startup_modal, jj_modal) {
+        (Some(first), followup) => (Some(first), followup),
+        (None, first) => (first, None),
+    };
     let start_page = startup_modal.is_none();
     cli::run_interactive(
         &mut harness,
@@ -583,6 +643,7 @@ fn run_agent_inner(
         &swap,
         cli::StartupUi {
             modal: startup_modal,
+            followup_modal,
             start_page,
             resumed_session: None,
         },
@@ -681,8 +742,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     let permission_defaults =
         startup_permission_defaults(settings.default_approval.as_deref(), skip_permissions);
     persist_cli_skip_permissions(skip_permissions);
-    let tools =
-        tools::built_in_tools_for(settings.bash_tool_mode(), settings.compaction_model_tool());
+    let tools = tools::built_in_tools_with(&resolve_tools_config(&settings)?);
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
@@ -710,8 +770,18 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     announce_skip_permissions(permission_defaults.skip_permissions, session.as_mut());
     let (context_budget, compaction_trigger) = resolved_compaction_trigger(&settings, &selection)?;
     let budget = Some(context_budget.resolved);
-    let mut harness =
-        wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
+    let native_jj = wayland::trust::native_jj(&cwd).unwrap_or(false);
+    let mut harness = wayland::Harness::new_configured(
+        agent,
+        cwd.clone(),
+        tools::ToolState::new(),
+        session,
+        budget,
+        wayland::MutationSafetyConfig {
+            enabled: settings.mutation_safety(),
+            native_jj,
+        },
+    );
     harness.set_compaction_trigger(context_budget, compaction_trigger);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
@@ -798,6 +868,19 @@ fn announce_skip_permissions(skip_permissions: bool, session: Option<&mut sessio
     }
     eprintln!("WARNING: {}", nexus::SKIP_PERMISSIONS_BANNER);
     record_skip_permissions(skip_permissions, session);
+}
+
+fn native_jj_discovery_modal<P: ChatProvider>(
+    force_plain: bool,
+    cwd: &Path,
+    settings: &config::Settings,
+    harness: &wayland::Harness<P>,
+) -> Option<ui::modal::Modal> {
+    (!cli::prefers_text_ui(force_plain)
+        && settings.mutation_safety()
+        && harness.native_jj_available()
+        && wayland::trust::native_jj(cwd).is_none())
+    .then(ui::modal::jj_setup)
 }
 
 /// The persisted per-project permission policy for `cwd` (ADR-0027), loaded
@@ -911,8 +994,7 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
     // a fresh session, so a resumed turn gets identical fragment/context output.
     // Onboarding must run first so a newly written ~/.iris/AGENTS.md is picked up.
     wayland::system_prompt::onboarding::maybe_onboard();
-    let tools =
-        tools::built_in_tools_for(settings.bash_tool_mode(), settings.compaction_model_tool());
+    let tools = tools::built_in_tools_with(&resolve_tools_config(&settings)?);
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
@@ -940,13 +1022,18 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
     announce_skip_permissions(skip_permissions, session.as_mut());
     tracing::info!(id = %meta.id, messages = resumed, context_tokens, "resumed session");
 
-    let mut harness = wayland::Harness::resumed(
+    let native_jj = wayland::trust::native_jj(&cwd).unwrap_or(false);
+    let mut harness = wayland::Harness::resumed_configured(
         agent,
         cwd.clone(),
         tools::ToolState::new(),
         session,
         entry_ids,
         budget,
+        wayland::MutationSafetyConfig {
+            enabled: settings.mutation_safety(),
+            native_jj,
+        },
     );
     harness.set_compaction_trigger(context_budget, compaction_trigger);
     harness.set_verification(settings.verification());
@@ -1006,6 +1093,7 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
             source,
         )
     };
+    let jj_modal = native_jj_discovery_modal(force_plain, &cwd, &settings, &harness);
     cli::run_interactive(
         &mut harness,
         &mut switch,
@@ -1013,7 +1101,8 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
         settings.tui_settings(),
         &swap,
         cli::StartupUi {
-            modal: None,
+            modal: jj_modal,
+            followup_modal: None,
             start_page: false,
             resumed_session: Some(session_id.clone()),
         },

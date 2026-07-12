@@ -71,7 +71,7 @@ const DEFAULT_LINE_BUDGET: usize = 14;
 /// The per-tool grants the permissions hatch can toggle. Matches the ADR-0027
 /// per-tool approval defaults; `bash` is intentionally absent (bash grants are
 /// per-command, minted at the approval prompt).
-const POLICY_TOOLS: &[&str] = &["write", "edit"];
+const POLICY_TOOLS: &[&str] = &["write", "edit", "web_search", "read_web_page"];
 
 /// A persisted setting adjusted in place on the panel. Pruned relative to the
 /// full `Settings` struct — see the module doc for the service-hatch list.
@@ -99,8 +99,12 @@ pub(crate) enum Field {
     SemanticRetainPerPath,
     ToolClearingKeepRecent,
     PromptCacheRetention,
+    WebSearchBackend,
+    ReadWebPageBackend,
     VerifyCommand,
     VerifyMaxAttempts,
+    MutationSafety,
+    NativeJj,
     WorktreeRoot,
 }
 
@@ -238,6 +242,13 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        title: "WEB",
+        rows: &[
+            RowId::Field(Field::WebSearchBackend),
+            RowId::Field(Field::ReadWebPageBackend),
+        ],
+    },
+    Section {
         title: "CHECKS",
         rows: &[
             RowId::Field(Field::VerifyCommand),
@@ -255,7 +266,11 @@ const SECTIONS: &[Section] = &[
     },
     Section {
         title: "GIT",
-        rows: &[RowId::Field(Field::WorktreeRoot)],
+        rows: &[
+            RowId::Field(Field::MutationSafety),
+            RowId::Field(Field::NativeJj),
+            RowId::Field(Field::WorktreeRoot),
+        ],
     },
 ];
 
@@ -438,12 +453,21 @@ pub(crate) struct Snapshot {
     pub(crate) semantic_retain_per_path: u64,
     pub(crate) tool_clearing_keep_recent: u64,
     pub(crate) prompt_cache_retention: String,
+    /// Web search tool backend (`off|native|brave|jina`). GLOBAL-ONLY; takes
+    /// effect next session. `off` withholds the tool from the model.
+    pub(crate) web_search_backend: String,
+    /// Read-web-page tool backend (`off|native|jina`). GLOBAL-ONLY; Brave has no
+    /// reader. Takes effect next session.
+    pub(crate) read_web_page_backend: String,
     pub(crate) verify_command: Option<String>,
     pub(crate) verify_max_attempts: u32,
     pub(crate) theme: String,
     pub(crate) alt_screen: String,
     pub(crate) scroll_speed: u16,
     pub(crate) reduced_motion: bool,
+    pub(crate) mutation_safety: bool,
+    pub(crate) native_jj_available: bool,
+    pub(crate) native_jj_enabled: bool,
     pub(crate) worktree_root: Option<String>,
 }
 
@@ -453,6 +477,8 @@ impl Snapshot {
             Field::AltScreen => &["auto", "always", "never"],
             Field::DefaultApproval => &["strict", "auto", "never"],
             Field::PromptCacheRetention => &["none", "short", "long"],
+            Field::WebSearchBackend => &["off", "native", "brave", "jina"],
+            Field::ReadWebPageBackend => &["off", "native", "jina"],
             Field::CompactionSummarizer => &["excerpts", "provider", "subagent"],
             Field::CompactionAggressiveness => {
                 &["conservative", "balanced", "aggressive", "custom"]
@@ -464,7 +490,9 @@ impl Snapshot {
             Field::Microcompaction
             | Field::CompactionEnabled
             | Field::CompactionReactive
-            | Field::ReducedMotion => &["off", "on"],
+            | Field::ReducedMotion
+            | Field::MutationSafety
+            | Field::NativeJj => &["off", "on"],
             Field::CompactionWorkerInput => &["transcript", "investigator"],
             _ => &[],
         }
@@ -475,6 +503,8 @@ impl Snapshot {
             Field::AltScreen => self.alt_screen.clone(),
             Field::DefaultApproval => self.default_approval.clone(),
             Field::PromptCacheRetention => self.prompt_cache_retention.clone(),
+            Field::WebSearchBackend => self.web_search_backend.clone(),
+            Field::ReadWebPageBackend => self.read_web_page_backend.clone(),
             Field::CompactionSummarizer => self.compaction_summarizer.clone(),
             Field::CompactionAggressiveness => self.compaction_aggressiveness.clone(),
             Field::CompactionCacheTiming => self.compaction_cache_timing.clone(),
@@ -484,6 +514,8 @@ impl Snapshot {
             Field::CompactionReactive => on_off(self.compaction_reactive),
             Field::CompactionWorkerInput => self.compaction_worker_input.clone(),
             Field::ReducedMotion => on_off(self.reduced_motion),
+            Field::MutationSafety => on_off(self.mutation_safety),
+            Field::NativeJj => on_off(self.native_jj_enabled),
             _ => String::new(),
         }
     }
@@ -493,6 +525,8 @@ impl Snapshot {
             Field::AltScreen => self.alt_screen = value.to_string(),
             Field::DefaultApproval => self.default_approval = value.to_string(),
             Field::PromptCacheRetention => self.prompt_cache_retention = value.to_string(),
+            Field::WebSearchBackend => self.web_search_backend = value.to_string(),
+            Field::ReadWebPageBackend => self.read_web_page_backend = value.to_string(),
             Field::CompactionSummarizer => self.compaction_summarizer = value.to_string(),
             Field::CompactionAggressiveness => self.compaction_aggressiveness = value.to_string(),
             Field::CompactionCacheTiming => self.compaction_cache_timing = value.to_string(),
@@ -502,6 +536,8 @@ impl Snapshot {
             Field::CompactionReactive => self.compaction_reactive = value == "on",
             Field::CompactionWorkerInput => self.compaction_worker_input = value.to_string(),
             Field::ReducedMotion => self.reduced_motion = value == "on",
+            Field::MutationSafety => self.mutation_safety = value == "on",
+            Field::NativeJj => self.native_jj_enabled = value == "on",
             _ => {}
         }
     }
@@ -581,6 +617,8 @@ fn archetype(row: RowId) -> Archetype {
             Field::AltScreen
             | Field::DefaultApproval
             | Field::PromptCacheRetention
+            | Field::WebSearchBackend
+            | Field::ReadWebPageBackend
             | Field::CompactionSummarizer
             | Field::CompactionAggressiveness
             | Field::CompactionCacheTiming
@@ -589,7 +627,9 @@ fn archetype(row: RowId) -> Archetype {
             | Field::CompactionWorkerInput
             | Field::Theme
             | Field::Microcompaction
-            | Field::ReducedMotion => Archetype::Switch,
+            | Field::ReducedMotion
+            | Field::MutationSafety
+            | Field::NativeJj => Archetype::Switch,
             Field::ContextTokenBudget
             | Field::MicrocompactionWatermark
             | Field::CompactionWarn
@@ -642,8 +682,12 @@ fn label(row: RowId) -> &'static str {
             Field::SemanticRetainPerPath => "retain/path",
             Field::ToolClearingKeepRecent => "keep tool uses",
             Field::PromptCacheRetention => "prompt cache",
+            Field::WebSearchBackend => "web search",
+            Field::ReadWebPageBackend => "read page",
             Field::VerifyCommand => "verify",
             Field::VerifyMaxAttempts => "attempts",
+            Field::MutationSafety => "mutation safety gates",
+            Field::NativeJj => "native jj",
             Field::WorktreeRoot => "worktree root",
         },
     }
@@ -1079,6 +1123,11 @@ impl SettingsPanel {
     }
 
     fn adjust_field(&mut self, field: Field, forward: bool) -> ModalOutcome {
+        if field == Field::NativeJj
+            && (!self.snap.mutation_safety || !self.snap.native_jj_available)
+        {
+            return ModalOutcome::Ignore;
+        }
         match archetype(RowId::Field(field)) {
             Archetype::Switch => {
                 let options = self.snap.switch_options(field);
@@ -1878,6 +1927,9 @@ impl SettingsPanel {
                 | Field::SemanticRetainPerPath
                 | Field::ToolClearingKeepRecent,
             ) => !self.snap.microcompaction,
+            RowId::Field(Field::NativeJj) => {
+                !self.snap.mutation_safety || !self.snap.native_jj_available
+            }
             _ => false,
         }
     }
@@ -2591,7 +2643,9 @@ fn save_token(field: Field, value: &str) -> String {
         Field::Microcompaction
         | Field::CompactionEnabled
         | Field::CompactionReactive
-        | Field::ReducedMotion => (value == "on").to_string(),
+        | Field::ReducedMotion
+        | Field::MutationSafety
+        | Field::NativeJj => (value == "on").to_string(),
         _ => value.to_string(),
     }
 }
@@ -2718,12 +2772,17 @@ mod tests {
             semantic_retain_per_path: 1,
             tool_clearing_keep_recent: 8,
             prompt_cache_retention: "short".to_string(),
+            web_search_backend: "off".to_string(),
+            read_web_page_backend: "off".to_string(),
             verify_command: None,
             verify_max_attempts: 3,
             theme: "terminal".to_string(),
             alt_screen: "auto".to_string(),
             scroll_speed: 3,
             reduced_motion: false,
+            mutation_safety: true,
+            native_jj_available: true,
+            native_jj_enabled: false,
             worktree_root: None,
         }
     }
@@ -2864,6 +2923,31 @@ mod tests {
     }
 
     #[test]
+    fn native_jj_switch_is_disabled_until_discovered_and_master_enabled() {
+        let mut snap = snapshot();
+        snap.native_jj_available = false;
+        let mut panel = SettingsPanel::new(snap);
+        assert_eq!(
+            panel.adjust_field(Field::NativeJj, true),
+            ModalOutcome::Ignore
+        );
+
+        panel.snap.native_jj_available = true;
+        assert_eq!(
+            panel.adjust_field(Field::NativeJj, true),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::NativeJj,
+                value: Some("true".to_string()),
+            })
+        );
+        panel.snap.mutation_safety = false;
+        assert_eq!(
+            panel.adjust_field(Field::NativeJj, false),
+            ModalOutcome::Ignore
+        );
+    }
+
+    #[test]
     fn auto_compact_knobs_go_dark_while_automatic_is_off() {
         let mut snap = snapshot();
         snap.compaction_enabled = false;
@@ -2918,6 +3002,43 @@ mod tests {
             ModalOutcome::Emit(ModalAction::SaveSetting {
                 field: Field::DefaultApproval,
                 value: Some("auto".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn web_backend_switches_cycle_through_their_options() {
+        let mut panel = panel();
+        select_top(&mut panel, RowId::Field(Field::WebSearchBackend));
+        for expected in ["native", "brave", "jina"] {
+            assert_eq!(
+                panel.handle_key(ModalKey::Right),
+                ModalOutcome::Emit(ModalAction::SaveSetting {
+                    field: Field::WebSearchBackend,
+                    value: Some(expected.to_string()),
+                })
+            );
+        }
+        // Clamps at the last option.
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+
+        select_top(&mut panel, RowId::Field(Field::ReadWebPageBackend));
+        for expected in ["native", "jina"] {
+            assert_eq!(
+                panel.handle_key(ModalKey::Right),
+                ModalOutcome::Emit(ModalAction::SaveSetting {
+                    field: Field::ReadWebPageBackend,
+                    value: Some(expected.to_string()),
+                })
+            );
+        }
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+        // Reverses back down toward `off`.
+        assert_eq!(
+            panel.handle_key(ModalKey::Left),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::ReadWebPageBackend,
+                value: Some("native".to_string()),
             })
         );
     }

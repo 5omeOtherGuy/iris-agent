@@ -33,15 +33,28 @@ use tokio_util::sync::CancellationToken;
 use crate::nexus::{Tool, ToolEnv, ToolFuture, ToolOutput, Tools};
 
 use super::{
-    Preview, ToolState, bash, edit, find, grep, ls, path, read, read_output, recall,
-    render_preview, request_compaction, write,
+    Preview, ToolState, bash, edit, find, grep, ls, path, read, read_output, read_web_page, recall,
+    render_preview, request_compaction, web, web_search, write,
 };
+use web::WebToolsConfig;
 
 /// Construct the workspace tools the CLI injects into the agent. The order is
 /// the provider-declaration order (`read, bash, edit, write, grep, find, ls`),
 /// with the Iris-specific `read_output` (issue #205) appended last.
 pub(crate) fn built_in_tools() -> Tools {
     built_in_tools_for(false, false)
+}
+
+/// Resolved tool-surface configuration built once from `Settings` (+ the auth
+/// store for web-tool keys). Replaces the growing positional-bool signature of
+/// [`built_in_tools_for`]: new opt-in tools add a field here instead of another
+/// parameter at every call site.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ToolsConfig {
+    pub(crate) bash_tool_mode: bool,
+    pub(crate) model_compaction_tool: bool,
+    /// Resolved web-tool backends + keys. Default = both tools off.
+    pub(crate) web: WebToolsConfig,
 }
 
 /// Construct the tool set for the configured bash-tool-mode setting
@@ -56,6 +69,19 @@ pub(crate) fn built_in_tools() -> Tools {
 /// The system prompt's generated tool blocks adapt automatically (the
 /// guidelines fall back to the bash-only file-operations bullet).
 pub(crate) fn built_in_tools_for(bash_tool_mode: bool, model_compaction_tool: bool) -> Tools {
+    built_in_tools_with(&ToolsConfig {
+        bash_tool_mode,
+        model_compaction_tool,
+        web: WebToolsConfig::default(),
+    })
+}
+
+/// Construct the tool set from a resolved [`ToolsConfig`]. Web tools are pushed
+/// only when their backend is configured (not off), so a disabled tool is
+/// invisible to the model (no prompt bloat).
+pub(crate) fn built_in_tools_with(config: &ToolsConfig) -> Tools {
+    let bash_tool_mode = config.bash_tool_mode;
+    let model_compaction_tool = config.model_compaction_tool;
     let mut tools: Vec<Box<dyn Tool>> = if bash_tool_mode {
         vec![
             Box::new(BashTool),
@@ -78,6 +104,21 @@ pub(crate) fn built_in_tools_for(bash_tool_mode: bool, model_compaction_tool: bo
     };
     if model_compaction_tool {
         tools.push(Box::new(RequestCompactionTool));
+    }
+    // Web tools: registered only when a backend is selected (plan §2: off = not
+    // registered at all). They stay available in bash-tool-mode too -- the
+    // shell cannot reach the network under the SSRF-gated pinned client.
+    if let Some(backend) = config.web.web_search {
+        tools.push(Box::new(web_search::WebSearchTool::new(
+            config.web.clone(),
+            backend,
+        )));
+    }
+    if let Some(backend) = config.web.read_web_page {
+        tools.push(Box::new(read_web_page::ReadWebPageTool::new(
+            config.web.clone(),
+            backend,
+        )));
     }
     Tools::new(tools)
 }

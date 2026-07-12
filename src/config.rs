@@ -107,10 +107,12 @@ pub(crate) struct Settings {
     /// `microcompaction` + `microcompactionWatermark` pair resolves to the
     /// conservative policy unchanged.
     pub(crate) tool_result_compaction: Option<ToolResultCompactionSettings>,
+    /// Master mutation-safety switch. Global-only: a cloned project cannot
+    /// disable host-owned dirty-tree protection. Absent defaults on.
+    pub(crate) mutation_safety: Option<bool>,
     /// Opt-in durable task workflow (ADR-0052, issue #444): checkpoint refs,
     /// recovery/adoption, task lifecycle entries, badges, task diffs, and
-    /// rollback across restarts. Absent/false -> off; the dirty-tree guard
-    /// remains always on and non-configurable.
+    /// rollback across restarts. Effective only while mutation safety is on.
     pub(crate) tasks: Option<bool>,
     /// Opt-in bash tool mode: the model-visible tool set shrinks to `bash` and
     /// `edit` (plus the session-plumbing `read_output`/`recall`), so the model
@@ -120,6 +122,16 @@ pub(crate) struct Settings {
     /// approval-per-call (ADR-0010), so a project file may tune it like
     /// [`Settings::microcompaction`].
     pub(crate) bash_tool_mode: Option<bool>,
+    /// Backend for the `web_search` tool: `off` (default) | `native` | `brave` |
+    /// `jina`. GLOBAL-ONLY (excluded from the project merge): enabling it opens
+    /// network egress and selects which third party receives query text, so an
+    /// untrusted project file must not flip it (same class as `default_provider`
+    /// / `base_url`). `off`/absent -> the tool is not registered at all.
+    pub(crate) web_search_backend: Option<String>,
+    /// Backend for the `read_web_page` tool: `off` (default) | `native` |
+    /// `jina`. GLOBAL-ONLY for the same reason as `web_search_backend`; Brave has
+    /// no reader endpoint so it is intentionally not an option here.
+    pub(crate) read_web_page_backend: Option<String>,
     /// Optional graceful soft cap on tool round-trips per turn. Absent (the
     /// default) leaves the agent loop unbounded: it runs while the model emits
     /// tool calls and stops naturally, with cancellation as the runaway guard.
@@ -413,6 +425,9 @@ impl Settings {
             // request), so a project may tune it; project value wins, else global.
             microcompaction: project.microcompaction.or(self.microcompaction),
             tool_result_compaction,
+            // Mutation safety is host posture and therefore global-only. Repo
+            // config can never turn the guard off.
+            mutation_safety: self.mutation_safety,
             // Durable task workflow is opt-in product surface, not the safety
             // floor. Project config may enable it for a repo; absent defaults
             // off via the accessor.
@@ -421,6 +436,11 @@ impl Settings {
             // and bash stays approval-per-call, so a project may tune it;
             // project value wins, else global.
             bash_tool_mode: project.bash_tool_mode.or(self.bash_tool_mode),
+            // Web-tool backends open network egress and pick which third party
+            // receives queries/URLs, so they are GLOBAL-ONLY like
+            // provider/base-url: never taken from untrusted project config.
+            web_search_backend: self.web_search_backend,
+            read_web_page_backend: self.read_web_page_backend,
             // Prompt cache retention can affect privacy/cost, so keep it
             // global-only like provider/base-url and scoped model sets.
             prompt_cache_retention: self.prompt_cache_retention,
@@ -601,6 +621,29 @@ impl Settings {
     /// is the portable fallback for unsupported selections.
     /// An unknown value falls back to the default rather than erroring, matching
     /// how other tuning knobs degrade.
+    /// Resolve the configured `web_search` backend. `off`/absent -> `None` (the
+    /// tool is not registered). An unknown value fails LOUDLY (like
+    /// `default_provider`), so a typo never silently disables the tool.
+    pub(crate) fn web_search_backend(&self) -> Result<Option<crate::tools::web::SearchBackend>> {
+        match self.web_search_backend.as_deref() {
+            None | Some("off") => Ok(None),
+            Some(value) => crate::tools::web::SearchBackend::parse(value)
+                .map(Some)
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    /// Resolve the configured `read_web_page` backend. `off`/absent -> `None`.
+    /// Unknown value fails loudly.
+    pub(crate) fn read_web_page_backend(&self) -> Result<Option<crate::tools::web::ReadBackend>> {
+        match self.read_web_page_backend.as_deref() {
+            None | Some("off") => Ok(None),
+            Some(value) => crate::tools::web::ReadBackend::parse(value)
+                .map(Some)
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
     pub(crate) fn compaction_summarizer(&self) -> crate::wayland::SummarizerKind {
         match self.compaction_summarizer.as_deref() {
             Some("excerpts") => crate::wayland::SummarizerKind::Excerpts,
@@ -705,8 +748,15 @@ impl Settings {
         )
     }
 
-    /// Whether the durable task workflow is enabled. Default off; the dirty-tree
-    /// guard still runs regardless of this value.
+    /// Whether mutation safety gates are enabled. Default on. This global-only
+    /// master controls dirty-file approval, snapshots, attribution, restoration,
+    /// and task settlement integration.
+    pub(crate) fn mutation_safety(&self) -> bool {
+        self.mutation_safety.unwrap_or(true)
+    }
+
+    /// Whether the durable task workflow is enabled. Default off and meaningful
+    /// only while mutation safety is enabled.
     pub(crate) fn tasks(&self) -> bool {
         self.tasks.unwrap_or(false)
     }
@@ -775,10 +825,39 @@ pub(crate) fn save_default_approval(mode: &str) -> Result<()> {
     update_global(&[("defaultApproval", Value::String(mode.to_string()))])
 }
 
+/// Persist the global mutation-safety master switch. This never writes project
+/// config, so repository-controlled settings cannot weaken host protection.
+pub(crate) fn save_mutation_safety(enabled: bool) -> Result<()> {
+    update_global(&[("mutationSafety", Value::Bool(enabled))])
+}
+
 /// Persist the prompt-cache retention preset (`none|short|long`) in the global
 /// settings file. GLOBAL-ONLY, matching where the field is trusted on load.
 pub(crate) fn save_prompt_cache_retention(preset: &str) -> Result<()> {
     update_global(&[("promptCacheRetention", Value::String(preset.to_string()))])
+}
+
+/// Persist the `web_search` backend (`off|native|brave|jina`) in the global
+/// settings file. GLOBAL-ONLY (network egress + third-party selection), so this
+/// always writes the user-global file and a project file can never enable it.
+/// Unknown values normalize to `off` rather than erroring.
+pub(crate) fn save_web_search_backend(backend: &str) -> Result<()> {
+    let backend = match backend {
+        "native" | "brave" | "jina" => backend,
+        _ => "off",
+    };
+    update_global(&[("webSearchBackend", Value::String(backend.to_string()))])
+}
+
+/// Persist the `read_web_page` backend (`off|native|jina`) in the global
+/// settings file. GLOBAL-ONLY like [`save_web_search_backend`]. Brave has no
+/// reader endpoint, so it is not an accepted value here; unknowns -> `off`.
+pub(crate) fn save_read_web_page_backend(backend: &str) -> Result<()> {
+    let backend = match backend {
+        "native" | "jina" => backend,
+        _ => "off",
+    };
+    update_global(&[("readWebPageBackend", Value::String(backend.to_string()))])
 }
 
 /// Persist the compaction summarizer mode (`excerpts|provider|subagent`) in the
@@ -999,8 +1078,8 @@ pub(crate) fn save_compaction_worker_input(input: &str) -> Result<()> {
 
 /// Persist the durable task workflow toggle in the project settings file for
 /// `cwd`. This is intentionally project-scoped: teams may opt a repository into
-/// the review/rollback workflow, while the dirty-tree safety floor stays
-/// non-configurable.
+/// the review/rollback workflow. The separate mutation-safety master remains
+/// global-only.
 pub(crate) fn save_project_tasks(cwd: &Path, enabled: bool) -> Result<()> {
     update_project(cwd, &[("tasks", Value::Bool(enabled))])
 }
@@ -1962,6 +2041,56 @@ mod tests {
     }
 
     #[test]
+    fn project_cannot_enable_web_tool_backends() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        // Global leaves web tools off; a cloned project tries to turn them on.
+        fs::write(&global, r#"{ "defaultProvider": "openai-codex" }"#).unwrap();
+        fs::write(
+            &project,
+            r#"{ "webSearchBackend": "brave", "readWebPageBackend": "jina" }"#,
+        )
+        .unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        // GLOBAL-ONLY: the project values are dropped, so both stay off.
+        assert_eq!(settings.web_search_backend, None);
+        assert_eq!(settings.read_web_page_backend, None);
+        assert!(settings.web_search_backend().unwrap().is_none());
+        assert!(settings.read_web_page_backend().unwrap().is_none());
+    }
+
+    #[test]
+    fn web_backend_accessors_parse_and_reject() {
+        let ok = Settings {
+            web_search_backend: Some("brave".into()),
+            read_web_page_backend: Some("native".into()),
+            ..Settings::default()
+        };
+        assert!(ok.web_search_backend().unwrap().is_some());
+        assert!(ok.read_web_page_backend().unwrap().is_some());
+
+        let off = Settings {
+            web_search_backend: Some("off".into()),
+            ..Settings::default()
+        };
+        assert!(off.web_search_backend().unwrap().is_none());
+
+        // Unknown value fails loudly.
+        let bad = Settings {
+            web_search_backend: Some("bing".into()),
+            ..Settings::default()
+        };
+        assert!(bad.web_search_backend().is_err());
+        // Brave is not a valid reader (no reader endpoint).
+        let bad_reader = Settings {
+            read_web_page_backend: Some("brave".into()),
+            ..Settings::default()
+        };
+        assert!(bad_reader.read_web_page_backend().is_err());
+    }
+
+    #[test]
     fn project_may_override_reasoning_but_not_provider_or_base_url() {
         let dir = temp_dir();
         let global = dir.path.join("global.json");
@@ -2746,6 +2875,31 @@ mod tests {
             Some("high".to_string()),
             "persisted defaultReasoning must be reapplied at startup"
         );
+    }
+
+    #[test]
+    fn mutation_safety_defaults_on_and_project_cannot_disable_it() {
+        assert!(Settings::default().mutation_safety());
+        let global: Settings =
+            serde_json::from_str(r#"{"mutationSafety":true,"tasks":true}"#).unwrap();
+        let project: Settings = serde_json::from_str(r#"{"mutationSafety":false}"#).unwrap();
+        let merged = global.merged_with(project);
+        assert!(merged.mutation_safety());
+        assert!(merged.tasks());
+
+        let global = Settings::default();
+        let project: Settings = serde_json::from_str(r#"{"mutationSafety":false}"#).unwrap();
+        assert!(global.merged_with(project).mutation_safety());
+    }
+
+    #[test]
+    fn save_mutation_safety_round_trips() {
+        let dir = temp_dir();
+        let path = dir.path.join("settings.json");
+        let _guard = ConfigPathGuard::set(&path);
+        save_mutation_safety(false).unwrap();
+        let loaded = Settings::load_from(Some(&path), &dir.path.join("none.json")).unwrap();
+        assert!(!loaded.mutation_safety());
     }
 
     #[test]

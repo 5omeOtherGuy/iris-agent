@@ -26,5 +26,7 @@ extend-exclude = [
 [default.extend-words]
 # Streaming test fixtures split a word across deltas ("Hel" + "lo").
 Hel = "Hel"
+# Charset-decoding tests split "caf\u{e9}" (cafe) across raw bytes.
+caf = "caf"
 # Rust TUI crate name.
 ratatui = "ratatui"

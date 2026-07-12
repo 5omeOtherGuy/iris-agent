@@ -255,6 +255,7 @@ pub(crate) fn apply_permission_mode<P: ChatProvider>(
 /// this process already resumed a transcript before entering the loop.
 pub(crate) struct StartupUi {
     pub(crate) modal: Option<crate::ui::modal::Modal>,
+    pub(crate) followup_modal: Option<crate::ui::modal::Modal>,
     pub(crate) start_page: bool,
     pub(crate) resumed_session: Option<String>,
 }
@@ -1860,6 +1861,19 @@ mod tests {
             handle_checkpoint_command("/checkpoint", &mut harness).unwrap(),
             vec!["no Iris changes to checkpoint".to_string()]
         );
+    }
+
+    #[test]
+    fn mutation_safety_master_controls_effective_task_workflow() {
+        let (mut harness, _dir) = fake_harness();
+        harness.set_task_workflow_enabled(true).unwrap();
+        harness.configure_mutation_safety(false, false).unwrap();
+        assert!(!harness.mutation_safety_enabled());
+        assert!(!harness.task_workflow_enabled());
+
+        harness.configure_mutation_safety(true, false).unwrap();
+        assert!(harness.mutation_safety_enabled());
+        assert!(harness.task_workflow_enabled());
     }
 
     #[test]
