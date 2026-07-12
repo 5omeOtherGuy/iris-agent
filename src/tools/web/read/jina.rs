@@ -14,13 +14,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::fetch::{self, FetchError};
 use super::super::policy;
-use super::super::{MAX_BODY_BYTES, PageResult};
+use super::super::{PageResult, WebToolsConfig};
 use super::ReadRequest;
 
 /// Fetch `request.url` through Jina Reader as Markdown. The key, when present,
 /// lifts the anonymous throttle; its absence is a documented degraded tier, not
 /// an error.
 pub(super) async fn read(
+    config: &WebToolsConfig,
     key: Option<&str>,
     request: &ReadRequest,
     cancel: &CancellationToken,
@@ -41,9 +42,14 @@ pub(super) async fn read(
         req = req.header(AUTHORIZATION, format!("Bearer {k}"));
     }
 
-    let (status, bytes, truncated) = fetch::send_api(req, MAX_BODY_BYTES, cancel)
-        .await
-        .map_err(map_fetch_error)?;
+    let (status, bytes, truncated) = fetch::send_api_with(
+        req,
+        config.max_read_response_bytes,
+        config.read_timeout,
+        cancel,
+    )
+    .await
+    .map_err(map_fetch_error)?;
 
     if status != 200 {
         bail!(
@@ -88,9 +94,14 @@ mod tests {
             url: "http://169.254.169.254/latest/meta-data".to_string(),
             objective: None,
         };
-        let err = read(None, &req, &CancellationToken::new())
-            .await
-            .unwrap_err();
+        let err = read(
+            &WebToolsConfig::default(),
+            None,
+            &req,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("reserved or private"), "{err}");
     }
 
@@ -100,6 +111,15 @@ mod tests {
             url: "file:///etc/passwd".to_string(),
             objective: None,
         };
-        assert!(read(None, &req, &CancellationToken::new()).await.is_err());
+        assert!(
+            read(
+                &WebToolsConfig::default(),
+                None,
+                &req,
+                &CancellationToken::new()
+            )
+            .await
+            .is_err()
+        );
     }
 }

@@ -22,8 +22,8 @@
 use tokio_util::sync::CancellationToken;
 
 use super::super::extract::{Extraction, extract_markdown};
-use super::super::fetch::{FetchError, FetchedPage, Resolver, fetch_pinned};
-use super::super::{MAX_BODY_BYTES, PageResult};
+use super::super::fetch::{FetchError, FetchLimits, FetchedPage, Resolver, fetch_pinned_with};
+use super::super::{PageResult, WebToolsConfig};
 use super::ReadRequest;
 
 /// Fetch `request.url` through the pinned SSRF-safe path, then extract locally.
@@ -31,11 +31,19 @@ use super::ReadRequest;
 /// diagnostics (unsupported content types, JS shells); only genuine fetch
 /// failures bail. Never panics.
 pub(super) async fn read(
+    config: &WebToolsConfig,
     request: &ReadRequest,
     resolver: &dyn Resolver,
     cancel: &CancellationToken,
 ) -> anyhow::Result<PageResult> {
-    let page = match fetch_pinned(resolver, &request.url, cancel).await {
+    // Native reader bounds: configured deadline + body cap, and reject a
+    // non-2xx status / attachment disposition before reading any body.
+    let limits = FetchLimits {
+        deadline: config.read_timeout,
+        body_cap: config.max_read_response_bytes,
+        reject_unreadable_response: true,
+    };
+    let page = match fetch_pinned_with(resolver, &request.url, limits, cancel).await {
         Ok(page) => page,
         // A content type we cannot parse is guidance, not a hard error: point
         // the model at the Jina backend rather than failing the read.
@@ -57,8 +65,11 @@ pub(super) async fn read(
     // owned Strings the blocking task needs so it borrows nothing from `page`.
     let html = page.text.clone();
     let base_url = page.final_url.clone();
+    // Bound the extracted content by the configured body cap (chars <= bytes);
+    // the final tool-output cap in `tool.rs` enforces the hard output bound.
+    let max_chars = config.max_read_response_bytes;
     let extraction =
-        tokio::task::spawn_blocking(move || extract_markdown(&html, &base_url, MAX_BODY_BYTES))
+        tokio::task::spawn_blocking(move || extract_markdown(&html, &base_url, max_chars))
             .await
             .map_err(|e| anyhow::anyhow!("extraction task failed: {e}"))?;
 

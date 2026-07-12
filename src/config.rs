@@ -29,6 +29,7 @@
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -123,15 +124,50 @@ pub(crate) struct Settings {
     /// [`Settings::microcompaction`].
     pub(crate) bash_tool_mode: Option<bool>,
     /// Backend for the `web_search` tool: `off` (default) | `native` | `brave` |
-    /// `jina`. GLOBAL-ONLY (excluded from the project merge): enabling it opens
-    /// network egress and selects which third party receives query text, so an
-    /// untrusted project file must not flip it (same class as `default_provider`
-    /// / `base_url`). `off`/absent -> the tool is not registered at all.
+    /// `jina` | `searxng`. GLOBAL-ONLY (excluded from the project merge):
+    /// enabling it opens network egress and selects which third party receives
+    /// query text, so an untrusted project file must not flip it (same class as
+    /// `default_provider` / `base_url`). `off`/absent -> the tool is not
+    /// registered at all. `searxng` additionally requires a trusted
+    /// `searxng_url`.
     pub(crate) web_search_backend: Option<String>,
     /// Backend for the `read_web_page` tool: `off` (default) | `native` |
     /// `jina`. GLOBAL-ONLY for the same reason as `web_search_backend`; Brave has
     /// no reader endpoint so it is intentionally not an option here.
     pub(crate) read_web_page_backend: Option<String>,
+    /// Base URL of a self-hosted SearXNG instance for the `searxng`
+    /// `web_search` backend (e.g. `https://searx.example`). GLOBAL-ONLY and
+    /// trusted: it selects where query text is sent, exactly like
+    /// `base_url`/`web_search_backend`, so an untrusted project file must never
+    /// set or redirect it. Validated as an absolute http(s) URL by
+    /// [`Settings::searxng_url`]; required when `web_search_backend` is
+    /// `searxng`.
+    pub(crate) searxng_url: Option<String>,
+    /// Per-call wall-clock deadline for a `web_search` request, in
+    /// milliseconds. Absent -> [`DEFAULT_WEB_TIMEOUT_MS`]; validated to
+    /// `[MIN_WEB_TIMEOUT_MS, MAX_WEB_TIMEOUT_MS]` by [`Settings::web_bounds`].
+    /// GLOBAL-ONLY: a longer deadline holds a network connection open, so a
+    /// cloned project must not raise it (same egress class as the backends).
+    pub(crate) search_timeout_ms: Option<u64>,
+    /// Per-call wall-clock deadline for a `read_web_page` request, in
+    /// milliseconds. Same default/bounds and GLOBAL-ONLY rationale as
+    /// [`Settings::search_timeout_ms`].
+    pub(crate) read_timeout_ms: Option<u64>,
+    /// Hard ceiling on `web_search` results per call. Absent ->
+    /// [`DEFAULT_MAX_SEARCH_RESULTS`]; validated to
+    /// `[1, MAX_MAX_SEARCH_RESULTS]`. GLOBAL-ONLY: result volume bounds token
+    /// cost and egress, so a project file must not raise it.
+    pub(crate) max_search_results: Option<u64>,
+    /// Cap on a search backend response body before parsing. GLOBAL-ONLY.
+    /// Absent -> [`DEFAULT_WEB_MAX_BYTES`].
+    pub(crate) max_search_response_bytes: Option<u64>,
+    /// Cap on a read backend response body before extraction. GLOBAL-ONLY.
+    /// Absent -> [`DEFAULT_WEB_MAX_BYTES`].
+    pub(crate) max_read_response_bytes: Option<u64>,
+    /// Cap on the final tool output (bytes) returned to the model after
+    /// extraction/framing. Absent -> [`DEFAULT_WEB_MAX_BYTES`]; same bounds and
+    /// GLOBAL-ONLY rationale as [`Settings::max_read_response_bytes`].
+    pub(crate) max_read_output_bytes: Option<u64>,
     /// Optional graceful soft cap on tool round-trips per turn. Absent (the
     /// default) leaves the agent loop unbounded: it runs while the model emits
     /// tool calls and stops naturally, with cancellation as the runaway guard.
@@ -375,6 +411,41 @@ const DEFAULT_VERIFY_MAX_ATTEMPTS: u32 = 3;
 /// unbounded retry chain of effectful shell runs.
 const MAX_VERIFY_MAX_ATTEMPTS: u32 = 10;
 
+/// Default per-call web-tool deadline (30s) when unset.
+pub(crate) const DEFAULT_WEB_TIMEOUT_MS: u64 = 30_000;
+/// Floor on a web-tool deadline: a sub-second budget cannot complete a real
+/// DNS + TLS + fetch, so it is rejected rather than silently failing calls.
+const MIN_WEB_TIMEOUT_MS: u64 = 1_000;
+/// Ceiling on a web-tool deadline, so a hand-edited value cannot pin a network
+/// connection open indefinitely.
+const MAX_WEB_TIMEOUT_MS: u64 = 120_000;
+/// Default hard ceiling on `web_search` results per call when unset.
+pub(crate) const DEFAULT_MAX_SEARCH_RESULTS: u64 = 10;
+/// Absolute ceiling on requested results, bounding token cost regardless of
+/// config.
+const MAX_MAX_SEARCH_RESULTS: u64 = 10;
+/// Default response/output byte cap (200 KiB) when unset.
+pub(crate) const DEFAULT_WEB_MAX_BYTES: u64 = 200 * 1024;
+/// Floor on a byte cap: below 1 KiB no useful page/output survives, so a value
+/// this small is treated as a mistake.
+const MIN_WEB_MAX_BYTES: u64 = 1_024;
+/// Ceiling on a byte cap (5 MiB), bounding memory and token cost.
+const MAX_WEB_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Resolved, validated web-tool bounds. Built by [`Settings::web_bounds`] from
+/// the GLOBAL-ONLY dials and consumed by the registry to configure the web
+/// tools; every field is already range-checked here so the tool bodies trust
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WebBounds {
+    pub(crate) search_timeout: Duration,
+    pub(crate) read_timeout: Duration,
+    pub(crate) max_search_results: usize,
+    pub(crate) max_search_response_bytes: usize,
+    pub(crate) max_read_response_bytes: usize,
+    pub(crate) max_read_output_bytes: usize,
+}
+
 impl Settings {
     /// Load and merge the global and project settings files for `cwd`.
     pub(crate) fn load(cwd: &Path) -> Result<Self> {
@@ -441,6 +512,17 @@ impl Settings {
             // provider/base-url: never taken from untrusted project config.
             web_search_backend: self.web_search_backend,
             read_web_page_backend: self.read_web_page_backend,
+            // The SearXNG endpoint and the bounded web dials pick where queries
+            // go and how much egress/latency/token cost a call may incur, so
+            // they ride the same GLOBAL-ONLY rule as the backends: never taken
+            // from untrusted project config.
+            searxng_url: self.searxng_url,
+            search_timeout_ms: self.search_timeout_ms,
+            read_timeout_ms: self.read_timeout_ms,
+            max_search_results: self.max_search_results,
+            max_search_response_bytes: self.max_search_response_bytes,
+            max_read_response_bytes: self.max_read_response_bytes,
+            max_read_output_bytes: self.max_read_output_bytes,
             // Prompt cache retention can affect privacy/cost, so keep it
             // global-only like provider/base-url and scoped model sets.
             prompt_cache_retention: self.prompt_cache_retention,
@@ -644,6 +726,68 @@ impl Settings {
         }
     }
 
+    /// Validated SearXNG base URL, or `None` when unset. The value must be an
+    /// absolute `http`/`https` URL (the endpoint that receives query text); any
+    /// other value fails LOUDLY so a typo never silently disables the backend.
+    /// GLOBAL-ONLY, mirroring where `searxng_url` is trusted on load. Full
+    /// SSRF/IP policy still applies at fetch time; this is the config-boundary
+    /// shape check.
+    pub(crate) fn searxng_url(&self) -> Result<Option<String>> {
+        match self.searxng_url.as_deref().map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(url) => {
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    bail!("searxngUrl must be an absolute http(s) URL, got {url:?}");
+                }
+                Ok(Some(url.to_string()))
+            }
+        }
+    }
+
+    /// Validated, resolved web-tool bounds (timeouts, result ceiling, byte
+    /// caps). Absent dials fall back to the built-in defaults; a configured
+    /// value outside its hard range fails LOUDLY rather than being silently
+    /// clamped, so a mistake surfaces at startup instead of at call time.
+    pub(crate) fn web_bounds(&self) -> Result<WebBounds> {
+        let timeout = |name: &str, value: Option<u64>| -> Result<Duration> {
+            let ms = value.unwrap_or(DEFAULT_WEB_TIMEOUT_MS);
+            if !(MIN_WEB_TIMEOUT_MS..=MAX_WEB_TIMEOUT_MS).contains(&ms) {
+                bail!(
+                    "{name} must be between {MIN_WEB_TIMEOUT_MS} and {MAX_WEB_TIMEOUT_MS} milliseconds, got {ms}"
+                );
+            }
+            Ok(Duration::from_millis(ms))
+        };
+        let bytes = |name: &str, value: Option<u64>| -> Result<usize> {
+            let n = value.unwrap_or(DEFAULT_WEB_MAX_BYTES);
+            if !(MIN_WEB_MAX_BYTES..=MAX_WEB_MAX_BYTES).contains(&n) {
+                bail!(
+                    "{name} must be between {MIN_WEB_MAX_BYTES} and {MAX_WEB_MAX_BYTES} bytes, got {n}"
+                );
+            }
+            Ok(n as usize)
+        };
+        let max_search_results = self
+            .max_search_results
+            .unwrap_or(DEFAULT_MAX_SEARCH_RESULTS);
+        if !(1..=MAX_MAX_SEARCH_RESULTS).contains(&max_search_results) {
+            bail!(
+                "maxSearchResults must be between 1 and {MAX_MAX_SEARCH_RESULTS}, got {max_search_results}"
+            );
+        }
+        Ok(WebBounds {
+            search_timeout: timeout("searchTimeoutMs", self.search_timeout_ms)?,
+            read_timeout: timeout("readTimeoutMs", self.read_timeout_ms)?,
+            max_search_results: max_search_results as usize,
+            max_search_response_bytes: bytes(
+                "maxSearchResponseBytes",
+                self.max_search_response_bytes,
+            )?,
+            max_read_response_bytes: bytes("maxReadResponseBytes", self.max_read_response_bytes)?,
+            max_read_output_bytes: bytes("maxReadOutputBytes", self.max_read_output_bytes)?,
+        })
+    }
+
     pub(crate) fn compaction_summarizer(&self) -> crate::wayland::SummarizerKind {
         match self.compaction_summarizer.as_deref() {
             Some("excerpts") => crate::wayland::SummarizerKind::Excerpts,
@@ -837,13 +981,13 @@ pub(crate) fn save_prompt_cache_retention(preset: &str) -> Result<()> {
     update_global(&[("promptCacheRetention", Value::String(preset.to_string()))])
 }
 
-/// Persist the `web_search` backend (`off|native|brave|jina`) in the global
-/// settings file. GLOBAL-ONLY (network egress + third-party selection), so this
-/// always writes the user-global file and a project file can never enable it.
-/// Unknown values normalize to `off` rather than erroring.
+/// Persist the `web_search` backend (`off|native|brave|jina|searxng`) in the
+/// global settings file. GLOBAL-ONLY (network egress + third-party selection),
+/// so this always writes the user-global file and a project file can never
+/// enable it. Unknown values normalize to `off` rather than erroring.
 pub(crate) fn save_web_search_backend(backend: &str) -> Result<()> {
     let backend = match backend {
-        "native" | "brave" | "jina" => backend,
+        "native" | "brave" | "jina" | "searxng" => backend,
         _ => "off",
     };
     update_global(&[("webSearchBackend", Value::String(backend.to_string()))])
@@ -2088,6 +2232,183 @@ mod tests {
             ..Settings::default()
         };
         assert!(bad_reader.read_web_page_backend().is_err());
+
+        // SearXNG is a valid search backend value.
+        let searxng = Settings {
+            web_search_backend: Some("searxng".into()),
+            ..Settings::default()
+        };
+        assert_eq!(
+            searxng.web_search_backend().unwrap(),
+            Some(crate::tools::web::SearchBackend::Searxng)
+        );
+    }
+
+    #[test]
+    fn web_bounds_default_when_unset() {
+        let bounds = Settings::default().web_bounds().unwrap();
+        assert_eq!(
+            bounds.search_timeout,
+            Duration::from_millis(DEFAULT_WEB_TIMEOUT_MS)
+        );
+        assert_eq!(
+            bounds.read_timeout,
+            Duration::from_millis(DEFAULT_WEB_TIMEOUT_MS)
+        );
+        assert_eq!(
+            bounds.max_search_results,
+            DEFAULT_MAX_SEARCH_RESULTS as usize
+        );
+        assert_eq!(
+            bounds.max_search_response_bytes,
+            DEFAULT_WEB_MAX_BYTES as usize
+        );
+        assert_eq!(
+            bounds.max_read_response_bytes,
+            DEFAULT_WEB_MAX_BYTES as usize
+        );
+        assert_eq!(bounds.max_read_output_bytes, DEFAULT_WEB_MAX_BYTES as usize);
+        // Documented defaults: 30s / 10 results / 200 KiB.
+        assert_eq!(bounds.search_timeout, Duration::from_secs(30));
+        assert_eq!(bounds.max_search_results, 10);
+        assert_eq!(bounds.max_read_response_bytes, 200 * 1024);
+    }
+
+    #[test]
+    fn web_bounds_parse_valid_values() {
+        let bounds = Settings {
+            search_timeout_ms: Some(5_000),
+            read_timeout_ms: Some(60_000),
+            max_search_results: Some(8),
+            max_search_response_bytes: Some(32 * 1024),
+            max_read_response_bytes: Some(64 * 1024),
+            max_read_output_bytes: Some(128 * 1024),
+            ..Settings::default()
+        }
+        .web_bounds()
+        .unwrap();
+        assert_eq!(bounds.search_timeout, Duration::from_millis(5_000));
+        assert_eq!(bounds.read_timeout, Duration::from_millis(60_000));
+        assert_eq!(bounds.max_search_results, 8);
+        assert_eq!(bounds.max_search_response_bytes, 32 * 1024);
+        assert_eq!(bounds.max_read_response_bytes, 64 * 1024);
+        assert_eq!(bounds.max_read_output_bytes, 128 * 1024);
+    }
+
+    #[test]
+    fn web_bounds_reject_out_of_range() {
+        // Timeout too small / too large.
+        assert!(
+            Settings {
+                search_timeout_ms: Some(0),
+                ..Settings::default()
+            }
+            .web_bounds()
+            .is_err()
+        );
+        assert!(
+            Settings {
+                read_timeout_ms: Some(600_000),
+                ..Settings::default()
+            }
+            .web_bounds()
+            .is_err()
+        );
+        // Result ceiling out of range.
+        assert!(
+            Settings {
+                max_search_results: Some(0),
+                ..Settings::default()
+            }
+            .web_bounds()
+            .is_err()
+        );
+        assert!(
+            Settings {
+                max_search_results: Some(1_000),
+                ..Settings::default()
+            }
+            .web_bounds()
+            .is_err()
+        );
+        // Byte caps out of range.
+        assert!(
+            Settings {
+                max_read_response_bytes: Some(10),
+                ..Settings::default()
+            }
+            .web_bounds()
+            .is_err()
+        );
+        assert!(
+            Settings {
+                max_read_output_bytes: Some(100 * 1024 * 1024),
+                ..Settings::default()
+            }
+            .web_bounds()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn searxng_url_validates_scheme() {
+        assert_eq!(Settings::default().searxng_url().unwrap(), None);
+        // Whitespace-only is treated as absent.
+        assert_eq!(
+            Settings {
+                searxng_url: Some("   ".into()),
+                ..Settings::default()
+            }
+            .searxng_url()
+            .unwrap(),
+            None
+        );
+        // Valid http(s) URLs are trimmed and accepted.
+        assert_eq!(
+            Settings {
+                searxng_url: Some("  https://searx.example  ".into()),
+                ..Settings::default()
+            }
+            .searxng_url()
+            .unwrap(),
+            Some("https://searx.example".to_string())
+        );
+        // A non-URL value fails loudly.
+        assert!(
+            Settings {
+                searxng_url: Some("searx.example".into()),
+                ..Settings::default()
+            }
+            .searxng_url()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn project_cannot_override_web_bounds_or_searxng_url() {
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(
+            &global,
+            r#"{ "searxngUrl": "https://global.searx", "searchTimeoutMs": 5000, "maxSearchResults": 3 }"#,
+        )
+        .unwrap();
+        // A cloned project tries to redirect the endpoint and widen the dials.
+        fs::write(
+            &project,
+            r#"{ "searxngUrl": "https://evil.searx", "searchTimeoutMs": 120000, "maxSearchResults": 50, "maxSearchResponseBytes": 1024 }"#,
+        )
+        .unwrap();
+        let settings = Settings::load_from(Some(&global), &project).unwrap();
+        // GLOBAL-ONLY: only the global values survive the merge.
+        assert_eq!(
+            settings.searxng_url.as_deref(),
+            Some("https://global.searx")
+        );
+        assert_eq!(settings.search_timeout_ms, Some(5000));
+        assert_eq!(settings.max_search_results, Some(3));
+        assert_eq!(settings.max_search_response_bytes, None);
     }
 
     #[test]

@@ -27,7 +27,8 @@ use dom_query::Document;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use super::super::{FilterEnforcement, SearchResult};
+use super::super::fetch::{FetchLimits, fetch_pinned_with};
+use super::super::{FilterEnforcement, SearchResult, WebToolsConfig};
 use super::filters::{apply_domain_filter, report};
 use super::{SearchOutcome, SearchQuery};
 
@@ -82,6 +83,7 @@ enum ScrapeOutcome {
 }
 
 pub(super) async fn search(
+    config: &WebToolsConfig,
     query: &SearchQuery,
     cancel: &CancellationToken,
 ) -> anyhow::Result<SearchOutcome> {
@@ -95,7 +97,7 @@ pub(super) async fn search(
     let candidates = if let Some(cached) = cache_lookup(&key)? {
         cached
     } else {
-        let results = fetch_candidates(q, cancel).await?;
+        let results = fetch_candidates(config, q, cancel).await?;
         cache_store(key, &results);
         results
     };
@@ -107,14 +109,15 @@ pub(super) async fn search(
 /// endpoint on throttle/empty, and fail with an actionable error (opening the
 /// backoff window on a real throttle) when neither yields rows.
 async fn fetch_candidates(
+    config: &WebToolsConfig,
     q: &str,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Vec<SearchResult>> {
-    let html = scrape(HTML_ENDPOINT, q, cancel, false).await?;
+    let html = scrape(config, HTML_ENDPOINT, q, cancel, false).await?;
     match html {
         ScrapeOutcome::Results(rows) => Ok(rows),
         _ => {
-            let lite = scrape(LITE_ENDPOINT, q, cancel, true).await?;
+            let lite = scrape(config, LITE_ENDPOINT, q, cancel, true).await?;
             match lite {
                 ScrapeOutcome::Results(rows) => Ok(rows),
                 lite_other => {
@@ -136,6 +139,7 @@ async fn fetch_candidates(
 
 /// Fetch one endpoint through the pinned SSRF-safe path and classify the result.
 async fn scrape(
+    config: &WebToolsConfig,
     endpoint: &str,
     q: &str,
     cancel: &CancellationToken,
@@ -146,9 +150,18 @@ async fn scrape(
         .context("failed to build the DuckDuckGo query URL")?;
 
     let resolver = super::super::fetch::SystemResolver;
-    let page = super::super::fetch::fetch_pinned(&resolver, url.as_str(), cancel)
-        .await
-        .map_err(|e| anyhow::anyhow!("DuckDuckGo fetch failed: {e}"))?;
+    let page = fetch_pinned_with(
+        &resolver,
+        url.as_str(),
+        FetchLimits {
+            deadline: config.search_timeout,
+            body_cap: config.max_search_response_bytes,
+            reject_unreadable_response: false,
+        },
+        cancel,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("DuckDuckGo fetch failed: {e}"))?;
 
     if is_throttled(page.status, &page.text) {
         return Ok(ScrapeOutcome::Throttled);
