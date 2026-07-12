@@ -304,9 +304,7 @@ fn dial_bounds(field: Field) -> (u64, u64) {
         // The config save rejects a cap below the summary reserve; mirror it so
         // an inline-typed value never round-trips into a save error.
         Field::ContextTokenBudget => (8_192, 100_000_000),
-        Field::MicrocompactionWatermark | Field::CompactionKeepRecentTokens => {
-            (1_000, 100_000_000)
-        }
+        Field::MicrocompactionWatermark | Field::CompactionKeepRecentTokens => (1_000, 100_000_000),
         Field::SemanticRetainPerPath | Field::ToolClearingKeepRecent => (1, 1_000),
         // Thresholds are whole percents; ordering (`warn < start < hard`) is
         // enforced by the config save, which restores the persisted value on a
@@ -445,9 +443,9 @@ pub(crate) struct Snapshot {
     /// resolved-value line. `None` when the harness has no live diagnostics.
     pub(crate) resolved_ladder: Option<ResolvedLadder>,
     /// Provider-native compaction routing (`compaction.providerNative`,
-    /// `off|auto`). GLOBAL-ONLY. `auto` routes background compaction through the
-    /// provider's opaque compaction blocks (currently Codex only) instead of the
-    /// configured summarizer/worker input.
+    /// `off|auto`). GLOBAL-ONLY. `auto` prefers the provider's opaque compaction
+    /// blocks (currently Codex) and falls back to the configured summarizer when
+    /// native compaction is unavailable.
     pub(crate) compaction_provider_native: String,
     pub(crate) compaction_summarizer: String,
     /// The resolved tool-result-compaction master switch (`toolResultCompaction
@@ -568,7 +566,11 @@ impl Snapshot {
 
     fn dial_value(&self, field: Field) -> u64 {
         match field {
-            Field::ContextTokenBudget => self.context_token_budget,
+            Field::ContextTokenBudget => self
+                .model_context_window
+                .map_or(self.context_token_budget, |cap| {
+                    self.context_token_budget.min(cap)
+                }),
             Field::MicrocompactionWatermark => self.microcompaction_watermark,
             Field::CompactionWarn => self.compaction_warn_pct,
             Field::CompactionStart => self.compaction_start_pct,
@@ -692,12 +694,22 @@ fn is_port(row: RowId) -> bool {
 /// verified against their implementations, not aspirational.
 fn describe(row: RowId) -> &'static str {
     match row {
-        RowId::Model => "the session's active model; \u{2190}\u{2192} cycles scoped models, \u{21b5} opens the catalog",
-        RowId::Reasoning => "how much the active model reasons before answering; levels vary by model",
-        RowId::Scope => "which models cycling and the catalog offer; reorder to set the cycle order",
+        RowId::Model => {
+            "the session's active model; \u{2190}\u{2192} cycles scoped models, \u{21b5} opens the catalog"
+        }
+        RowId::Reasoning => {
+            "how much the active model reasons before answering; levels vary by model"
+        }
+        RowId::Scope => {
+            "which models cycling and the catalog offer; reorder to set the cycle order"
+        }
         RowId::Providers => "provider credentials: oauth login, api keys, logout",
-        RowId::SkipApprovals => "run every tool call without asking; persists as the startup default",
-        RowId::Permissions => "always-allow grants per tool, plus this project's stored bash grants",
+        RowId::SkipApprovals => {
+            "run every tool call without asking; persists as the startup default"
+        }
+        RowId::Permissions => {
+            "always-allow grants per tool, plus this project's stored bash grants"
+        }
         RowId::Field(field) => match field {
             Field::PromptCacheRetention => {
                 "provider cache hints: short = default ephemeral, long = 1h/24h, none = no hints"
@@ -726,7 +738,7 @@ fn describe(row: RowId) -> &'static str {
                 "after a provider context overflow, compact deterministically and resend"
             }
             Field::CompactionProviderNative => {
-                "auto lets capable models (codex) compact provider-side instead of the summarizer"
+                "auto prefers capable Codex compaction; unavailable routes fall back to the summarizer"
             }
             Field::CompactionSummarizer => {
                 "excerpts = no model; provider = single summary call; subagent = read-only worker"
@@ -764,16 +776,15 @@ fn describe(row: RowId) -> &'static str {
             Field::AltScreen => "run in the terminal's alternate screen: auto, always, or never",
             Field::ScrollSpeed => "lines scrolled per wheel tick",
             Field::ReducedMotion => "settle animations instantly (flashes, spinners)",
-            Field::MutationSafety => {
-                "git snapshot + dirty-tree guard around model file mutations"
-            }
+            Field::MutationSafety => "git snapshot + dirty-tree guard around model file mutations",
             Field::NativeJj => "back mutation snapshots with jj when the workspace has a jj repo",
             Field::WorktreeRoot => "where new worktrees are created; empty = ../wt",
         },
     }
 }
 
-fn label(row: RowId) -> &'static str {    match row {
+fn label(row: RowId) -> &'static str {
+    match row {
         RowId::Model => "model",
         RowId::Reasoning => "reasoning",
         RowId::Scope => "model scope",
@@ -1996,9 +2007,9 @@ impl SettingsPanel {
             PanelRow::ModelChild(_) => RowId::Model,
             PanelRow::ScopeChild(_) => RowId::Scope,
             PanelRow::ProviderChild(_) => RowId::Providers,
-            PanelRow::PolicyTool(_) | PanelRow::PolicyBashExact(_) | PanelRow::PolicyBashPrefix(_) => {
-                RowId::Permissions
-            }
+            PanelRow::PolicyTool(_)
+            | PanelRow::PolicyBashExact(_)
+            | PanelRow::PolicyBashPrefix(_) => RowId::Permissions,
         };
         let text =
             crate::ui::textengine::truncate_chars(describe(row), avail.saturating_sub(2).max(8));
@@ -2081,9 +2092,9 @@ impl SettingsPanel {
             RowId::Field(Field::CompactionWorkerInput) => {
                 !self.snap.compaction_enabled || self.snap.compaction_summarizer == "excerpts"
             }
-            RowId::Field(
-                Field::CompactionAggressiveness | Field::CompactionCacheTiming,
-            ) => !self.snap.microcompaction,
+            RowId::Field(Field::CompactionAggressiveness | Field::CompactionCacheTiming) => {
+                !self.snap.microcompaction
+            }
             RowId::Field(Field::MicrocompactionWatermark) => {
                 !self.snap.microcompaction
                     || matches!(
@@ -3073,8 +3084,9 @@ mod tests {
         // A large window: tail is unclamped, so no configured->effective note.
         let rendered = text(&panel().render_budgeted(120, 80));
         assert!(
-            rendered
-                .contains("active model: window 232k / warn 139k / start 167k / hard 208k / tail 8k"),
+            rendered.contains(
+                "active model: window 232k / warn 139k / start 167k / hard 208k / tail 8k"
+            ),
             "{rendered}"
         );
         assert!(!rendered.contains("configured tail"), "{rendered}");
@@ -4210,6 +4222,37 @@ mod tests {
         assert_eq!(compact_value(1_000_000), "1m");
         assert_eq!(compact_value(3), "3");
         assert_eq!(compact_value(12_500), "12.5k");
+    }
+
+    #[test]
+    fn context_cap_never_displays_or_edits_above_the_model_window() {
+        let mut panel = panel();
+        panel.snap.context_token_budget = 1_000_000;
+        panel.snap.model_context_window = Some(127_808);
+        assert_eq!(panel.snap.dial_value(Field::ContextTokenBudget), 127_808);
+        let rendered = text(&[panel.control_line(
+            &PanelRow::Top(RowId::Field(Field::ContextTokenBudget)),
+            false,
+            100,
+        )]);
+        assert!(rendered.contains("127k tokens"), "{rendered}");
+        assert!(!rendered.contains("1m tokens"), "{rendered}");
+
+        select_top(&mut panel, RowId::Field(Field::ContextTokenBudget));
+        panel.handle_key(ModalKey::Enter);
+        panel.edit.as_mut().expect("numeric edit").buffer = "1000000".to_string();
+        assert_eq!(
+            panel.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::ContextTokenBudget,
+                value: Some("127808".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn native_compaction_description_discloses_the_portable_fallback() {
+        assert!(describe(RowId::Field(Field::CompactionProviderNative)).contains("fall back"),);
     }
 
     // --- entry cursors (§4.1) ---
