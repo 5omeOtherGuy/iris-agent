@@ -809,7 +809,7 @@ fn fifth_compaction_generation_emits_one_degradation_notice() {
         .collect::<Vec<_>>();
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(notices[0].contains("/new"));
-    assert!(notices[0].contains("/compact"));
+    assert!(notices[0].contains("fresh context"));
     assert!(notices[0].contains("recall"));
 }
 
@@ -2445,6 +2445,128 @@ fn provider_native_origin_timeout_falls_straight_to_excerpts_without_a_second_re
             .iter()
             .any(|entry| entry["origin"] == "providerNative"),
         "a timed-out native job must not apply a provider-native entry: {entries:?}"
+    );
+}
+
+#[test]
+fn planner_prefers_the_largest_pair_safe_run_across_summary_gaps() {
+    let workspace = temp_dir();
+    let messages = vec![
+        Message::user("tiny old fragment"),
+        Message::assistant("tiny answer"),
+        Message::user("[prior compacted summary]"),
+        Message::user(&"large later history ".repeat(500)),
+        Message::assistant(&"large later answer ".repeat(500)),
+    ];
+    let ids = vec![
+        Some("tiny_user".to_string()),
+        Some("tiny_assistant".to_string()),
+        None,
+        Some("large_user".to_string()),
+        Some("large_assistant".to_string()),
+    ];
+    let agent = Agent::resumed(SilentProvider, built_in_tools(), messages.clone());
+    let harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        None,
+        ids,
+        None,
+    );
+
+    let plan = harness
+        .compaction
+        .plan_manual(&messages, 0)
+        .expect("the later durable run is coverable");
+
+    assert_eq!((plan.start, plan.end), (3, 5));
+    assert_eq!(plan.from_id, "large_user");
+    assert_eq!(plan.to_id, "large_assistant");
+}
+
+#[test]
+fn manual_compact_degrades_when_native_probe_finds_no_worker() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut seeded = seed_harness(&root.path, &workspace.path);
+    seeded.harness.set_summarizer(SummarizerKind::Excerpts);
+    seeded.harness.set_provider_native(true);
+    seeded
+        .harness
+        .set_provider_compaction_factory(Arc::new(|| Ok(Box::new(SilentProvider))));
+    let before = super::context_tokens(seeded.harness.messages());
+    let obs = Recorder::default();
+
+    block_on(seeded.harness.compact_now(&obs, &CancellationToken::new()))
+        .expect("manual compaction must use excerpts when no native worker exists");
+
+    assert!(super::context_tokens(seeded.harness.messages()) < before);
+    let entries = compaction_entries(&seeded.path);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["origin"], "excerpts");
+}
+
+struct FailOnContextEvent;
+
+impl AgentObserver for FailOnContextEvent {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        if matches!(
+            event,
+            AgentEvent::ContextPressure { .. }
+                | AgentEvent::CompactionApplied { .. }
+                | AgentEvent::CompactionLifecycle { .. }
+                | AgentEvent::FoldApplied { .. }
+        ) {
+            anyhow::bail!("context-management display channel closed");
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn context_event_failure_cannot_block_or_drop_a_durable_replacement() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let (mut harness, path, messages) = single_turn_hard_harness(&root.path, &workspace.path);
+    harness.set_summarizer(SummarizerKind::Excerpts);
+    let token = CancellationToken::new();
+
+    let directive = block_on(harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 1,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: harness.output_store.as_ref(),
+            task_state: None,
+            observer: &FailOnContextEvent,
+        },
+        &token,
+    ))
+    .expect("observer telemetry failure must not roll back a durable compaction");
+    let ContextDirective::Replace {
+        messages: compacted,
+    } = directive
+    else {
+        panic!("durable compaction was not returned to Nexus");
+    };
+
+    harness.compaction.persist_messages(&compacted);
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .unwrap();
+    assert_eq!(
+        store.open(&meta).unwrap().messages,
+        compacted,
+        "live replacement and resume rebuild must stay identical"
     );
 }
 

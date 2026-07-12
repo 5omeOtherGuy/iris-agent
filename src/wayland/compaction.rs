@@ -110,6 +110,24 @@ pub(super) type SummarizerFactory =
 type SummaryResult = (String, Option<ProviderUsage>);
 type SummaryFuture<'a> = Pin<Box<dyn Future<Output = Result<SummaryResult>> + 'a>>;
 
+/// Context-management notifications are telemetry, never part of the rewrite
+/// transaction. Once a durable mutation exists, propagating a renderer failure
+/// would make live state disagree with resume; before a mutation, it would let a
+/// diagnostic channel prevent required pressure relief.
+pub(super) fn emit_context_event(
+    observer: &dyn AgentObserver,
+    event: AgentEvent,
+    label: &'static str,
+) {
+    if let Err(error) = observer.on_event(event) {
+        tracing::warn!(
+            error = %format!("{error:#}"),
+            event = label,
+            "context-management event could not be delivered"
+        );
+    }
+}
+
 pub(super) struct BackgroundCompaction {
     pub(super) job_id: String,
     pub(super) session_id: Option<String>,
@@ -424,25 +442,33 @@ impl CompactionEngine {
         self.persisted = new_entry_ids.len();
         self.entry_ids = new_entry_ids;
 
-        cx.observer.on_event(AgentEvent::CompactionApplied {
-            compaction_id,
-            covered_from: plan.from_id,
-            covered_to: plan.to_id,
-            covered_messages: covered,
-            original_tokens_estimate: original_tokens,
-            summary_tokens_estimate: body_tokens,
-            context_tokens_after_apply,
-            budget: self.budget.unwrap_or(0),
-            generation,
-            carried_paths: carry_paths.len(),
-            origin: summary.origin,
-            worker_usage: summary.worker_usage,
-        })?;
+        emit_context_event(
+            cx.observer,
+            AgentEvent::CompactionApplied {
+                compaction_id,
+                covered_from: plan.from_id,
+                covered_to: plan.to_id,
+                covered_messages: covered,
+                original_tokens_estimate: original_tokens,
+                summary_tokens_estimate: body_tokens,
+                context_tokens_after_apply,
+                budget: self.budget.unwrap_or(0),
+                generation,
+                carried_paths: carry_paths.len(),
+                origin: summary.origin,
+                worker_usage: summary.worker_usage,
+            },
+            "compaction applied",
+        );
         if generation == 5 {
-            cx.observer.on_event(AgentEvent::Notice(
-                "this session has reached compaction generation 5; consider `/new` or `/compact` for a deeper handoff, and use `recall` for covered originals."
-                    .to_string(),
-            ))?;
+            emit_context_event(
+                cx.observer,
+                AgentEvent::Notice(
+                    "this session has reached compaction generation 5; consider `/new` for a fresh context, and use `recall` for covered originals."
+                        .to_string(),
+                ),
+                "compaction generation notice",
+            );
         }
         if self.in_turn
             && matches!(

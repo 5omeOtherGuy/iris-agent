@@ -44,16 +44,21 @@ impl CompactionEngine {
         worker_usage: Option<ProviderUsage>,
         message: Option<String>,
     ) -> Result<()> {
-        obs.on_event(AgentEvent::CompactionLifecycle {
-            job_id: job.job_id.clone(),
-            state,
-            covered_messages: job.covered_messages,
-            original_tokens_estimate: job.original_tokens,
-            origin: job.origin,
-            worker_usage,
-            trigger_tier: job.trigger_tier,
-            message,
-        })
+        emit_context_event(
+            obs,
+            AgentEvent::CompactionLifecycle {
+                job_id: job.job_id.clone(),
+                state,
+                covered_messages: job.covered_messages,
+                original_tokens_estimate: job.original_tokens,
+                origin: job.origin,
+                worker_usage,
+                trigger_tier: job.trigger_tier,
+                message,
+            },
+            "compaction lifecycle",
+        );
+        Ok(())
     }
 
     pub(super) fn emit_breaker_notice(&mut self, obs: &dyn AgentObserver) -> Result<()> {
@@ -62,10 +67,15 @@ impl CompactionEngine {
             return Ok(());
         }
         self.breaker_notice_emitted = true;
-        obs.on_event(AgentEvent::Notice(format!(
-            "background compaction disabled after {} consecutive failures; deterministic compaction remains active.",
-            self.consecutive_failures
-        )))
+        emit_context_event(
+            obs,
+            AgentEvent::Notice(format!(
+                "background compaction disabled after {} consecutive failures; deterministic compaction remains active.",
+                self.consecutive_failures
+            )),
+            "compaction breaker notice",
+        );
+        Ok(())
     }
 
     pub(super) fn start_background(
@@ -258,16 +268,20 @@ impl CompactionEngine {
             biased;
             _ = token.cancelled() => {
                 worker_token.cancel();
-                cx.observer.on_event(AgentEvent::CompactionLifecycle {
-                    job_id,
-                    state: CompactionLifecycleState::Cancelled,
-                    covered_messages,
-                    original_tokens_estimate: original_tokens,
-                    origin,
-                    worker_usage: None,
-                    trigger_tier,
-                    message: Some("background compaction cancelled with the turn".to_string()),
-                })?;
+                emit_context_event(
+                    cx.observer,
+                    AgentEvent::CompactionLifecycle {
+                        job_id,
+                        state: CompactionLifecycleState::Cancelled,
+                        covered_messages,
+                        original_tokens_estimate: original_tokens,
+                        origin,
+                        worker_usage: None,
+                        trigger_tier,
+                        message: Some("background compaction cancelled with the turn".to_string()),
+                    },
+                    "compaction lifecycle",
+                );
                 return Ok(None);
             }
             joined = waiter => joined,
@@ -276,16 +290,20 @@ impl CompactionEngine {
             Ok(joined) => joined,
             Err(error) => {
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-                cx.observer.on_event(AgentEvent::CompactionLifecycle {
-                    job_id,
-                    state: CompactionLifecycleState::Failed,
-                    covered_messages,
-                    original_tokens_estimate: original_tokens,
-                    origin,
-                    worker_usage: None,
-                    trigger_tier,
-                    message: Some(format!("background hard-wait task failed: {error}")),
-                })?;
+                emit_context_event(
+                    cx.observer,
+                    AgentEvent::CompactionLifecycle {
+                        job_id,
+                        state: CompactionLifecycleState::Failed,
+                        covered_messages,
+                        original_tokens_estimate: original_tokens,
+                        origin,
+                        worker_usage: None,
+                        trigger_tier,
+                        message: Some(format!("background hard-wait task failed: {error}")),
+                    },
+                    "compaction lifecycle",
+                );
                 return Ok(None);
             }
         };
@@ -754,9 +772,10 @@ impl CompactionEngine {
         };
 
         // Summaries (`None` ids) divide history into independently coverable
-        // runs. Keep scanning when an older run contains only orphaned tool
-        // fragments; a prior hard compaction can legitimately leave exactly
-        // that shape before a later, substantial assistant-only run.
+        // runs. Rank every pair-safe run by token mass instead of returning the
+        // oldest one: a tiny but valid fragment before an existing summary must
+        // not repeatedly block a later run that can reclaim meaningful context.
+        let mut best: Option<(u64, CompactionPlan)> = None;
         let mut cursor = 0;
         while cursor < end_limit {
             let Some(mut start) = (cursor..end_limit)
@@ -783,15 +802,24 @@ impl CompactionEngine {
                 end -= 1;
             }
             if start < end {
-                return Some(CompactionPlan {
-                    start,
-                    end,
-                    from_id: self.entry_ids[start].clone()?,
-                    to_id: self.entry_ids[end - 1].clone()?,
-                });
+                let tokens = context_tokens(&messages[start..end]);
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_tokens, _)| tokens > *best_tokens)
+                {
+                    best = Some((
+                        tokens,
+                        CompactionPlan {
+                            start,
+                            end,
+                            from_id: self.entry_ids[start].clone()?,
+                            to_id: self.entry_ids[end - 1].clone()?,
+                        },
+                    ));
+                }
             }
             cursor = next_cursor;
         }
-        None
+        best.map(|(_, plan)| plan)
     }
 }
