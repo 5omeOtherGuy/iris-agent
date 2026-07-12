@@ -47,8 +47,9 @@ pub(super) async fn read(
         Err(err) => anyhow::bail!("failed to read {}: {err}", request.url),
     };
 
-    // Plain text passes through verbatim -- no extraction (and no title).
-    if page.is_plain_text {
+    // Passthrough content (plain text, JSON, markdown) ships verbatim -- no
+    // HTML extraction (and no title). Only markup is extracted below.
+    if page.passthrough {
         return Ok(page_from_fetched(page, None));
     }
 
@@ -137,11 +138,11 @@ mod tests {
     /// Construct a fetched page for the pure-helper tests. `fetch_pinned` itself
     /// is never called here -- it needs the network and the SSRF gate denies the
     /// loopback a local server would use.
-    fn fetched(is_plain_text: bool, text: &str, truncated: bool) -> FetchedPage {
+    fn fetched(passthrough: bool, text: &str, truncated: bool) -> FetchedPage {
         FetchedPage {
             final_url: "https://example.com/page".to_string(),
             status: 200,
-            is_plain_text,
+            passthrough,
             text: text.to_string(),
             truncated,
             redirects: 1,

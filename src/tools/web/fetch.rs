@@ -128,8 +128,10 @@ pub(super) struct FetchedPage {
     pub(super) final_url: String,
     /// Final HTTP status.
     pub(super) status: u16,
-    /// Whether the body is `text/plain` (the reader passes it through verbatim).
-    pub(super) is_plain_text: bool,
+    /// Whether the body is verbatim passthrough (plain text, JSON, or markdown)
+    /// rather than markup: the reader ships it as-is instead of running HTML
+    /// extraction. Markup (`false`) is the only class that gets extracted.
+    pub(super) passthrough: bool,
     /// Charset-decoded body text (capped).
     pub(super) text: String,
     /// Whether the body hit the size cap.
@@ -224,14 +226,23 @@ async fn fetch_pinned_inner(
         }
 
         // Terminal response: gate the content type before reading the body.
-        let content_type = header_content_type(response.headers().get(CONTENT_TYPE));
+        // Keep the RAW header (params intact) so the body is decoded with the
+        // declared charset; classification uses the param-stripped form.
         check_content_encoding(response.headers().get_all(CONTENT_ENCODING).iter())?;
-        let class = classify_content_type(&content_type);
-        if class == ContentClass::Unsupported {
-            let ct = if content_type.is_empty() {
+        let raw_content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if classify_content_type(&strip_content_type_params(&raw_content_type))
+            == ContentClass::Unsupported
+        {
+            let stripped = strip_content_type_params(&raw_content_type);
+            let ct = if stripped.is_empty() {
                 "application/octet-stream".to_string()
             } else {
-                content_type
+                stripped
             };
             return Err(FetchError::UnsupportedContentType(ct));
         }
@@ -246,16 +257,44 @@ async fn fetch_pinned_inner(
             &CancellationToken::new(),
         )
         .await?;
-        let text = decode_body(&bytes, &content_type);
 
-        return Ok(FetchedPage {
+        return Ok(finalize_page(
+            &raw_content_type,
+            &bytes,
+            status.as_u16(),
             final_url,
-            status: status.as_u16(),
-            is_plain_text: class == ContentClass::PlainText,
-            text,
             truncated,
             redirects,
-        });
+        ));
+    }
+}
+
+/// Assemble a terminal (non-redirect) response into a [`FetchedPage`]: classify
+/// on the param-stripped Content-Type but decode the body with the RAW header so
+/// the declared charset is honored, and mark whether the class is verbatim
+/// passthrough (plain/JSON/markdown) rather than markup. Pure, so the
+/// classify+decode seam is unit-testable without a network. Callers must reject
+/// `Unsupported` before reading the body; this treats a stray Unsupported as
+/// markup rather than panicking.
+fn finalize_page(
+    raw_content_type: &str,
+    bytes: &[u8],
+    status: u16,
+    final_url: String,
+    truncated: bool,
+    redirects: u32,
+) -> FetchedPage {
+    let class = classify_content_type(&strip_content_type_params(raw_content_type));
+    FetchedPage {
+        final_url,
+        status,
+        passthrough: matches!(
+            class,
+            ContentClass::PlainText | ContentClass::StructuredText
+        ),
+        text: decode_body(bytes, raw_content_type),
+        truncated,
+        redirects,
     }
 }
 
@@ -404,18 +443,14 @@ pub(super) fn check_content_encoding<'a>(
     Ok(())
 }
 
-/// Extract a lowercased, param-stripped Content-Type from the header.
-fn header_content_type(header: Option<&reqwest::header::HeaderValue>) -> String {
-    header
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase()
-        })
-        .unwrap_or_default()
+/// Lowercase and drop the parameters (`; charset=...`) from a raw Content-Type
+/// value, leaving just the bare media type used for classification.
+fn strip_content_type_params(raw: &str) -> String {
+    raw.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// Classify a (lowercased, param-stripped) Content-Type for the native reader.
@@ -611,9 +646,49 @@ mod tests {
     }
 
     #[test]
-    fn header_content_type_strips_params() {
-        let hv = HeaderValue::from_static("text/HTML; charset=UTF-8");
-        assert_eq!(header_content_type(Some(&hv)), "text/html");
+    fn strip_content_type_params_lowercases_and_drops_charset() {
+        assert_eq!(
+            strip_content_type_params("text/HTML; charset=UTF-8"),
+            "text/html"
+        );
+        assert_eq!(
+            strip_content_type_params("application/JSON"),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn finalize_page_decodes_with_the_raw_headers_charset() {
+        // Regression: the terminal path must hand decode_body the RAW header so a
+        // non-UTF-8 page is decoded correctly. Latin-1 0xE9 -> é.
+        let page = finalize_page(
+            "text/html; charset=iso-8859-1",
+            &[b'c', b'a', b'f', 0xe9],
+            200,
+            "https://example.com/".to_string(),
+            false,
+            0,
+        );
+        assert_eq!(page.text, "caf\u{e9}");
+        assert!(!page.passthrough, "html is markup, not passthrough");
+    }
+
+    #[test]
+    fn finalize_page_marks_structured_text_as_passthrough() {
+        // Regression: JSON/markdown are verbatim passthrough, NOT markup to
+        // extract. Both must set passthrough = true so native.rs ships them as-is.
+        for ct in ["application/json", "application/ld+json", "text/markdown"] {
+            let page = finalize_page(ct, b"{}", 200, "https://x/".to_string(), false, 0);
+            assert!(page.passthrough, "{ct} must be passthrough");
+        }
+        // Plain text stays passthrough; HTML stays markup.
+        assert!(
+            finalize_page("text/plain", b"hi", 200, "https://x/".to_string(), false, 0).passthrough
+        );
+        assert!(
+            !finalize_page("text/html", b"<p>", 200, "https://x/".to_string(), false, 0)
+                .passthrough
+        );
     }
 
     #[test]
