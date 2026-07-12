@@ -569,6 +569,20 @@ fn parse_model_target(rest: &str, current: &ModelSelection) -> Result<ModelSelec
     Ok(candidate_for(current, provider, &model))
 }
 
+fn carried_reasoning(
+    current: &ModelSelection,
+    provider: ProviderId,
+    model: &str,
+) -> Option<ReasoningEffort> {
+    if provider == ProviderId::OpenAiCompatible && !current.open_ai_compatible.reasoning {
+        None
+    } else {
+        current
+            .reasoning
+            .map(|level| model_capabilities::clamp(provider, model, level))
+    }
+}
+
 /// Build a candidate selection for a (provider, model), carrying base-url and
 /// reasoning forward the same way `/model` does: a model-only switch keeps the
 /// resolved base url (which respected the global settings value); a provider
@@ -587,14 +601,7 @@ pub(crate) fn candidate_for(
         let settings_base_url = settings_base_url_for_switch(provider);
         selection::base_url_for(provider, settings_base_url.as_deref())
     };
-    let reasoning =
-        if provider == ProviderId::OpenAiCompatible && !current.open_ai_compatible.reasoning {
-            None
-        } else {
-            current
-                .reasoning
-                .map(|level| model_capabilities::clamp(provider, model, level))
-        };
+    let reasoning = carried_reasoning(current, provider, model);
     ModelSelection {
         provider,
         model: model.to_string(),
@@ -697,8 +704,10 @@ pub(crate) fn apply_selection<P: ChatProvider>(
     switch: &mut ModelSwitch<'_, P>,
 ) -> Vec<String> {
     let scope = switch_scope(&switch.selection, &candidate);
+    let carried = carried_reasoning(&switch.selection, candidate.provider, &candidate.model);
     let reasoning_fallback = if scope != SwitchScope::ReasoningOnly
         && switch.selection.reasoning != candidate.reasoning
+        && candidate.reasoning == carried
     {
         switch.selection.reasoning.map(|previous| {
             let requested = model_capabilities::display_level(
@@ -2019,6 +2028,34 @@ mod tests {
                 line.contains("reasoning 'max' is not supported") && line.contains("using 'xhigh'")
             }),
             "the clamp must be visible: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_model_effort_does_not_report_a_carried_fallback() {
+        let (mut harness, _dir) = fake_harness();
+        let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
+        let mut active = selection(ProviderId::OpenAiCodex, "gpt-5.5");
+        active.reasoning = Some(ReasoningEffort::High);
+        let mut switch = ModelSwitch::new(active, "PROMPT".to_string(), &build, None);
+        let mut candidate = candidate_for(
+            switch.selection(),
+            ProviderId::Anthropic,
+            "claude-sonnet-4-6",
+        );
+        candidate.reasoning = Some(ReasoningEffort::Medium);
+
+        let lines = apply_selection(candidate, &mut harness, &mut switch);
+
+        assert!(
+            lines.iter().all(|line| !line.contains("is not supported")),
+            "an explicit supported effort is not a fallback: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("reasoning: 10,240 tokens")),
+            "the selected effort is applied: {lines:?}"
         );
     }
 
