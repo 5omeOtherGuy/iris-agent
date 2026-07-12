@@ -14,7 +14,10 @@ use super::{PageResult, ReadBackend, WebToolsConfig};
 /// Character budget for objective-based excerpts. Keeps a focused read well
 /// under the oversized-output threshold; a full read (no objective) is bounded
 /// by the fetch body cap instead and offloaded if still large.
-const EXCERPT_BUDGET_CHARS: usize = 8_000;
+///
+/// `pub(super)` so the token-efficiency corpus (`web::corpus`) measures
+/// `select_excerpts` with the exact production budget (ADR-0036 rule 5).
+pub(super) const EXCERPT_BUDGET_CHARS: usize = 8_000;
 
 /// A parsed read request (from the tool arguments).
 #[derive(Debug, Clone)]

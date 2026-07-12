@@ -356,9 +356,14 @@ policy (IANA special-purpose deny tables, ports 80/443, no userinfo) applied to
 user and Jina target URLs, a pinned redirect-walking client with a fail-closed
 resolver that closes the DNS-rebinding TOCTOU, decompressed-byte caps, and
 untrusted-content framing. Keys are user-configured service credentials
-(`brave-search`/`jina`) with env fallback. Deferred: concurrency-safe
-classification + fetch semaphore, SearXNG backend, short-TTL read cache, local
-render engine.
+(`brave-search`/`jina`) with env fallback. Output reduction is measured and
+test-enforced over real captured fixtures (ADR-0036 rule 5): HTML→Markdown
+extraction, objective excerpting, and search render, with the snippet-rich
+result shape recorded in ADR-0059
+([web tools benchmark](benchmarks/web-tools-token-efficiency.md)). Deferred:
+concurrency-safe classification + fetch semaphore, SearXNG backend, short-TTL
+read cache, local render engine, and a real-response benchmark for the
+key-gated Brave/Jina search backends.
 
 Execution order (by impact/effort, independent of the milestone sequence):
 

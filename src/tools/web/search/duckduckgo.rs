@@ -218,7 +218,11 @@ fn is_throttled(status: u16, body: &str) -> bool {
 /// `dom_query` already yields entity-decoded text/attrs, so we only collapse
 /// whitespace and decode the `uddg` click-tracker wrapper. Never panics on
 /// malformed HTML: unmatched selectors simply yield empty selections.
-fn parse_html_results(html: &str) -> Vec<SearchResult> {
+///
+/// `pub(in crate::tools::web)` so the token-efficiency corpus (`web::corpus`) can
+/// drive the real raw-HTML -> `SearchResult` seam (ADR-0036 rule 5); re-exported
+/// for the corpus from `search::mod` under `cfg(test)`.
+pub(in crate::tools::web) fn parse_html_results(html: &str) -> Vec<SearchResult> {
     let doc = Document::from(html);
     let mut out = Vec::new();
     for row in doc.select("div.result").iter() {

@@ -160,7 +160,10 @@ fn parse_string_array(args: &Value, key: &str) -> Result<Vec<String>> {
 }
 
 /// Render ranked results as a compact `title / url / snippet` list.
-fn render_results(results: &[SearchResult]) -> String {
+///
+/// `pub(super)` so the token-efficiency corpus (`web::corpus`) measures the real
+/// search-render seam rather than a reimplementation (ADR-0036 rule 5).
+pub(super) fn render_results(results: &[SearchResult]) -> String {
     if results.is_empty() {
         return "No results.".to_string();
     }
