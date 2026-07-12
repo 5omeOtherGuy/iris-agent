@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use super::super::fetch::{build_api_client, send_api};
-use super::super::{FilterEnforcement, MAX_API_BYTES, SearchResult};
+use super::super::fetch::{build_api_client, send_api_with};
+use super::super::{FilterEnforcement, SearchResult, WebToolsConfig};
 use super::filters::{apply_domain_filter, brave_freshness, report};
 use super::{SearchOutcome, SearchQuery};
 
@@ -42,11 +42,13 @@ static LAST_CALL: Mutex<Option<Instant>> = Mutex::new(None);
 /// normalizes `web.results[]` into [`SearchResult`]s, then applies domain
 /// post-filters and records native country/recency enforcement.
 pub(super) async fn search(
-    key: Option<&str>,
+    config: &WebToolsConfig,
     query: &SearchQuery,
     cancel: &CancellationToken,
 ) -> anyhow::Result<SearchOutcome> {
-    let key = key
+    let key = config
+        .brave_key
+        .as_deref()
         .map(str::trim)
         .filter(|k| !k.is_empty())
         .ok_or_else(|| {
@@ -85,9 +87,14 @@ pub(super) async fn search(
         request = request.query(&[("freshness", brave_freshness(recency))]);
     }
 
-    let (status, body, _truncated) = send_api(request, MAX_API_BYTES, cancel)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (status, body, _truncated) = send_api_with(
+        request,
+        config.max_search_response_bytes,
+        config.search_timeout,
+        cancel,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if status != 200 {
         let hint = match status {
@@ -244,17 +251,28 @@ mod tests {
 
     #[tokio::test]
     async fn no_key_is_an_actionable_error() {
-        let err = search(None, &query(), &CancellationToken::new())
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = search(
+            &WebToolsConfig::default(),
+            &query(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("BRAVE_API_KEY"), "message was: {err}");
 
         // An all-whitespace key is treated as absent.
-        let err = search(Some("  "), &query(), &CancellationToken::new())
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = search(
+            &WebToolsConfig {
+                brave_key: Some("  ".into()),
+                ..WebToolsConfig::default()
+            },
+            &query(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("BRAVE_API_KEY"), "message was: {err}");
     }
 

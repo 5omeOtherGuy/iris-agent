@@ -1024,6 +1024,21 @@ fn reasoning_level_adds_effort_and_off_omits() {
         "GPT-5.6 native max must reach the Codex Responses request unchanged"
     );
 
+    let unsupported_max = build_codex_request(
+        "gpt-5.5",
+        &instructions,
+        &messages,
+        &tools,
+        Some(ReasoningEffort::Max),
+        Some("session-1"),
+        None,
+        PromptCacheRetention::Short,
+    );
+    assert!(
+        unsupported_max.get("reasoning").is_none(),
+        "provider adapters must not silently send unsupported wire levels"
+    );
+
     // Off has no disable field on gpt-5.5, so it omits reasoning entirely.
     let off = build_codex_request(
         "gpt-test",

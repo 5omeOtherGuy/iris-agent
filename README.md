@@ -67,13 +67,18 @@ tool-heavy sessions stay readable and stay within their window.
 
 - **Opt-in web tools, off by default.** `web_search` and `read_web_page` are
   independently configurable in settings (`webSearchBackend`:
-  off/native/brave/jina; `readWebPageBackend`: off/native/jina) and are not
-  offered to the model until enabled. Native mode needs no API key; Brave and
-  Jina keys are user-configured (settings or `BRAVE_API_KEY`/`JINA_API_KEY`).
+  off/native/brave/jina/searxng; `readWebPageBackend`: off/native/jina) and are
+  not offered to the model until enabled. Native mode needs no API key; Brave
+  and Jina keys are user-configured (settings or `BRAVE_API_KEY`/`JINA_API_KEY`);
+  `searxng` targets a self-hosted instance via the trusted `searxngUrl`. Bounded
+  by global-only dials: `searchTimeoutMs`/`readTimeoutMs` (default 30000),
+  `maxSearchResults` (default and hard maximum 10), and
+  `maxSearchResponseBytes`/`maxReadResponseBytes`/`maxReadOutputBytes` (default
+  200 KiB); out-of-range values are rejected at load.
   Every call is approval-gated, private/localhost/internal targets are refused
   by an SSRF policy with connection pinning, and fetched content is framed as
-  untrusted external data. The backend settings are global-only, so a cloned
-  repo can never enable network egress (see ADR-0058).
+  untrusted external data. These settings are global-only, so a cloned repo can
+  never enable network egress or redirect where queries go (see ADR-0058).
 
 ## Install
 
@@ -115,7 +120,7 @@ From a source checkout, replace `iris` with `cargo run --`.
 Useful commands at the prompt:
 
 - `/model` — view or switch provider/model at a turn boundary.
-- `/reasoning off|minimal|low|medium|high|xhigh` — change thinking effort.
+- `/reasoning <level>` — change thinking effort; accepted levels and wire behavior are model-specific and shown by `/model`.
 - `/settings` — compaction policy, thresholds, summariser, and worker input.
 - `/context` — itemise the current window (system + tools, raw vs summarised
   conversation, folded-reclaimed tokens, pending folds).
@@ -152,6 +157,29 @@ iris resume <session-id>   # resume a specific session by id
 | `openai-codex` | OpenAI Codex OAuth (browser or `--device-code`) | Default provider when no setting is present. |
 | `anthropic` | Claude Code OAuth (browser PKCE, manual-paste fallback) | Can bootstrap from an existing Claude Code token at `~/.claude/.credentials.json`. |
 | `antigravity` | Google OAuth for Gemini Code Assist | Needs `ANTIGRAVITY_CLIENT_SECRET` at login/refresh time. |
+
+### Native reasoning capabilities
+
+Reasoning support is resolved per provider **and model**, not by provider-wide
+assumption. The model picker shows only supported provider-native labels;
+`/model` reports the current level, supported levels, and active wire behavior.
+On a model switch Iris preserves the level when supported, otherwise clamps it
+and reports the fallback. Unsupported fields are omitted from provider requests.
+
+| Route/model family | Selectable levels | Provider request behavior |
+| --- | --- | --- |
+| OpenAI Codex Responses, GPT-5.6 `sol`/`terra`/`luna` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | `reasoning.effort` (`minimal` maps to `low`) plus `summary: auto`; `off` omits the object. |
+| Other OpenAI Codex Responses models | `off` through `xhigh` | Same mapping; `max` is unsupported. |
+| Anthropic manual models (Haiku 4.5, Sonnet 4.6, Opus 4.6) | `off`, 1,024 / 4,096 / 10,240 / 20,480 / 32,768 tokens | `thinking.type=enabled` with the selected `budget_tokens`; `off` omits thinking. |
+| Anthropic adaptive models (Sonnet 5, Opus 4.7/4.8, Fable 5) | `off`, `low`, `medium`, `high`, `xhigh`, `max` | Adaptive thinking plus `output_config.effort`; `off` omits thinking. |
+| Older/unknown Anthropic ids | `off` through 20,480 tokens | Conservative manual-budget fallback; no 32,768-token tier. |
+| Antigravity Gemini Flash | `off`, `minimal`, `low`, `medium`, `high` | `generationConfig.thinkingConfig` with matching `thinkingLevel`. |
+| Antigravity Gemini Pro | `off`, `minimal`, `low`, `medium`, `high` | Gemini wire levels collapse to `low` (`minimal`/`low`) or `high` (`medium`/`high`). |
+| OpenAI Chat Completions | Built-in non-reasoning models: `off`; allowlisted reasoning models: `off`, `low`, `medium`, `high` | `reasoning_effort` only for allowlisted models. |
+| Custom OpenAI-compatible Chat Completions | `off`, `low`, `medium`, `high` when `openAiCompatible.reasoning=true`; otherwise `off` | `reasoning_effort` only when explicitly enabled. |
+
+The typed source of truth is `src/mimir/model_capabilities.rs`; provider adapters,
+validation, switching, the model picker, and CLI status all consume that map.
 
 Choose the default with `defaultProvider`/`defaultModel` in
 `~/.iris/settings.json`, or switch live with `/model`. The full set of provider

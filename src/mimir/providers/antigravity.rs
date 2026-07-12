@@ -232,35 +232,23 @@ fn build_inner_request(
     request
 }
 
-/// Map a normalized reasoning level to the Gemini `thinkingConfig`, or `None` to
-/// omit it. Flash tiers accept `minimal|low|medium|high`; Pro tiers reject
-/// `minimal` on the wire, so their semantic levels collapse to `low|high`
-/// (`minimal|low -> low`, `medium|high -> high`) like gemini-pi's
-/// `PRO_THINKING`. `xhigh` is not exposed for Antigravity and defensively clamps
-/// to `high` if a carried value reaches the sender.
+/// Render the typed Gemini capability for an exactly supported level.
 fn antigravity_thinking(model: &str, reasoning: Option<ReasoningEffort>) -> Option<Value> {
-    let level = antigravity_thinking_level(model, reasoning?)?;
-    Some(json!({ "includeThoughts": true, "thinkingLevel": level }))
-}
-
-fn antigravity_thinking_level(model: &str, reasoning: ReasoningEffort) -> Option<&'static str> {
-    if crate::mimir::model_capabilities::is_antigravity_pro_model(model) {
-        return match reasoning {
-            ReasoningEffort::Off => None,
-            ReasoningEffort::Minimal | ReasoningEffort::Low => Some("low"),
-            ReasoningEffort::Medium
-            | ReasoningEffort::High
-            | ReasoningEffort::XHigh
-            | ReasoningEffort::Max => Some("high"),
-        };
-    }
-    match reasoning {
-        ReasoningEffort::Off => None,
-        ReasoningEffort::Minimal => Some("minimal"),
-        ReasoningEffort::Low => Some("low"),
-        ReasoningEffort::Medium => Some("medium"),
-        ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => Some("high"),
-    }
+    let crate::mimir::model_capabilities::ReasoningWire::Gemini {
+        thinking_level,
+        include_thoughts,
+    } = crate::mimir::model_capabilities::wire_config(
+        crate::mimir::selection::ProviderId::Antigravity,
+        model,
+        reasoning?,
+    )?
+    else {
+        return None;
+    };
+    Some(json!({
+        "includeThoughts": include_thoughts,
+        "thinkingLevel": thinking_level,
+    }))
 }
 
 fn tool_declarations(tools: &Tools) -> Vec<Value> {
@@ -724,7 +712,8 @@ data: {\"error\":{\"message\":\"quota exceeded\"}}
             json!({ "includeThoughts": true, "thinkingLevel": "medium" })
         );
 
-        // xhigh clamps to high on the Flash tier.
+        // xhigh is unsupported on Flash and is therefore omitted. Runtime model
+        // transitions clamp it with user-visible feedback before construction.
         let xhigh = build_inner_request(
             "gemini-3.5-flash",
             "P",
@@ -732,9 +721,9 @@ data: {\"error\":{\"message\":\"quota exceeded\"}}
             &tools,
             Some(ReasoningEffort::XHigh),
         );
-        assert_eq!(
-            xhigh["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            json!("high")
+        assert!(
+            xhigh.get("generationConfig").is_none(),
+            "unsupported xhigh must not be silently sent as high"
         );
 
         // Off omits generationConfig entirely.

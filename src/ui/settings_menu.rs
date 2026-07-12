@@ -106,6 +106,13 @@ pub(crate) enum Field {
     PromptCacheRetention,
     WebSearchBackend,
     ReadWebPageBackend,
+    SearxngUrl,
+    SearchTimeout,
+    ReadTimeout,
+    MaxSearchResults,
+    MaxSearchResponseBytes,
+    MaxReadResponseBytes,
+    MaxReadOutputBytes,
     VerifyCommand,
     VerifyMaxAttempts,
     MutationSafety,
@@ -247,6 +254,13 @@ const SECTIONS: &[Section] = &[
         rows: &[
             RowId::Field(Field::WebSearchBackend),
             RowId::Field(Field::ReadWebPageBackend),
+            RowId::Field(Field::SearxngUrl),
+            RowId::Field(Field::SearchTimeout),
+            RowId::Field(Field::ReadTimeout),
+            RowId::Field(Field::MaxSearchResults),
+            RowId::Field(Field::MaxSearchResponseBytes),
+            RowId::Field(Field::MaxReadResponseBytes),
+            RowId::Field(Field::MaxReadOutputBytes),
         ],
     },
     Section {
@@ -297,6 +311,21 @@ const HARD_WAIT_LADDER: [u64; 10] = [
 /// the neighbouring-detent step.
 const PERCENT_LADDER: [u64; 10] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 99];
 const UNIT_LADDER: [u64; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+const WEB_TIMEOUT_LADDER: [u64; 10] = [
+    1_000, 5_000, 10_000, 15_000, 30_000, 45_000, 60_000, 75_000, 90_000, 120_000,
+];
+const WEB_BYTES_LADDER: [u64; 10] = [
+    1_024,
+    16 * 1_024,
+    32 * 1_024,
+    64 * 1_024,
+    128 * 1_024,
+    200 * 1_024,
+    512 * 1_024,
+    1024 * 1_024,
+    2 * 1024 * 1_024,
+    5 * 1024 * 1_024,
+];
 
 /// Hard bounds for typed dial entry, matching the `config::save_*` clamps.
 fn dial_bounds(field: Field) -> (u64, u64) {
@@ -314,7 +343,11 @@ fn dial_bounds(field: Field) -> (u64, u64) {
         // same 300000 ms cap independently.
         Field::CompactionHardWait => (30_000, 300_000),
         Field::ScrollSpeed => (1, 100),
-        Field::VerifyMaxAttempts => (1, 10),
+        Field::VerifyMaxAttempts | Field::MaxSearchResults => (1, 10),
+        Field::SearchTimeout | Field::ReadTimeout => (1_000, 120_000),
+        Field::MaxSearchResponseBytes | Field::MaxReadResponseBytes | Field::MaxReadOutputBytes => {
+            (1_024, 5 * 1024 * 1024)
+        }
         _ => (0, u64::MAX),
     }
 }
@@ -326,6 +359,10 @@ fn ladder(field: Field) -> &'static [u64] {
         Field::CompactionKeepRecentTokens => &TAIL_LADDER,
         Field::CompactionWarn | Field::CompactionStart | Field::CompactionHard => &PERCENT_LADDER,
         Field::CompactionHardWait => &HARD_WAIT_LADDER,
+        Field::SearchTimeout | Field::ReadTimeout => &WEB_TIMEOUT_LADDER,
+        Field::MaxSearchResponseBytes | Field::MaxReadResponseBytes | Field::MaxReadOutputBytes => {
+            &WEB_BYTES_LADDER
+        }
         _ => &UNIT_LADDER,
     }
 }
@@ -472,12 +509,19 @@ pub(crate) struct Snapshot {
     /// can never claim more window than the model really has.
     pub(crate) model_context_window: Option<u64>,
     pub(crate) prompt_cache_retention: String,
-    /// Web search tool backend (`off|native|brave|jina`). GLOBAL-ONLY; takes
-    /// effect next session. `off` withholds the tool from the model.
+    /// Web search tool backend (`off|native|brave|jina|searxng`). GLOBAL-ONLY;
+    /// takes effect next session. `off` withholds the tool from the model.
     pub(crate) web_search_backend: String,
     /// Read-web-page tool backend (`off|native|jina`). GLOBAL-ONLY; Brave has no
     /// reader. Takes effect next session.
     pub(crate) read_web_page_backend: String,
+    pub(crate) searxng_url: Option<String>,
+    pub(crate) search_timeout_ms: u64,
+    pub(crate) read_timeout_ms: u64,
+    pub(crate) max_search_results: u64,
+    pub(crate) max_search_response_bytes: u64,
+    pub(crate) max_read_response_bytes: u64,
+    pub(crate) max_read_output_bytes: u64,
     pub(crate) verify_command: Option<String>,
     pub(crate) verify_max_attempts: u32,
     pub(crate) theme: String,
@@ -496,7 +540,7 @@ impl Snapshot {
             Field::AltScreen => &["auto", "always", "never"],
             Field::DefaultApproval => &["strict", "auto", "never"],
             Field::PromptCacheRetention => &["none", "short", "long"],
-            Field::WebSearchBackend => &["off", "native", "brave", "jina"],
+            Field::WebSearchBackend => &["off", "native", "brave", "jina", "searxng"],
             Field::ReadWebPageBackend => &["off", "native", "jina"],
             Field::CompactionSummarizer => &["excerpts", "provider", "subagent"],
             Field::CompactionProviderNative => &["off", "auto"],
@@ -581,6 +625,12 @@ impl Snapshot {
             Field::ToolClearingKeepRecent => self.tool_clearing_keep_recent,
             Field::ScrollSpeed => u64::from(self.scroll_speed),
             Field::VerifyMaxAttempts => u64::from(self.verify_max_attempts),
+            Field::SearchTimeout => self.search_timeout_ms,
+            Field::ReadTimeout => self.read_timeout_ms,
+            Field::MaxSearchResults => self.max_search_results,
+            Field::MaxSearchResponseBytes => self.max_search_response_bytes,
+            Field::MaxReadResponseBytes => self.max_read_response_bytes,
+            Field::MaxReadOutputBytes => self.max_read_output_bytes,
             _ => 0,
         }
     }
@@ -600,6 +650,12 @@ impl Snapshot {
             Field::ToolClearingKeepRecent => self.tool_clearing_keep_recent = value.max(1),
             Field::ScrollSpeed => self.scroll_speed = value.min(u64::from(u16::MAX)) as u16,
             Field::VerifyMaxAttempts => self.verify_max_attempts = value.min(10) as u32,
+            Field::SearchTimeout => self.search_timeout_ms = value,
+            Field::ReadTimeout => self.read_timeout_ms = value,
+            Field::MaxSearchResults => self.max_search_results = value,
+            Field::MaxSearchResponseBytes => self.max_search_response_bytes = value,
+            Field::MaxReadResponseBytes => self.max_read_response_bytes = value,
+            Field::MaxReadOutputBytes => self.max_read_output_bytes = value,
             _ => {}
         }
     }
@@ -608,6 +664,7 @@ impl Snapshot {
         match field {
             Field::VerifyCommand => self.verify_command.clone(),
             Field::WorktreeRoot => self.worktree_root.clone(),
+            Field::SearxngUrl => self.searxng_url.clone(),
             _ => None,
         }
     }
@@ -626,6 +683,7 @@ impl Snapshot {
         match field {
             Field::VerifyCommand => self.verify_command = value,
             Field::WorktreeRoot => self.worktree_root = value,
+            Field::SearxngUrl => self.searxng_url = value,
             _ => {}
         }
     }
@@ -677,8 +735,14 @@ fn archetype(row: RowId) -> Archetype {
             | Field::SemanticRetainPerPath
             | Field::ToolClearingKeepRecent
             | Field::ScrollSpeed
-            | Field::VerifyMaxAttempts => Archetype::Dial,
-            Field::VerifyCommand | Field::WorktreeRoot => Archetype::Register,
+            | Field::VerifyMaxAttempts
+            | Field::SearchTimeout
+            | Field::ReadTimeout
+            | Field::MaxSearchResults
+            | Field::MaxSearchResponseBytes
+            | Field::MaxReadResponseBytes
+            | Field::MaxReadOutputBytes => Archetype::Dial,
+            Field::VerifyCommand | Field::WorktreeRoot | Field::SearxngUrl => Archetype::Register,
         },
     }
 }
@@ -768,6 +832,15 @@ fn describe(row: RowId) -> &'static str {
             Field::ReadWebPageBackend => {
                 "read_web_page backend; off withholds the tool; applies to new sessions"
             }
+            Field::SearxngUrl => "base URL for the SearXNG backend that receives search queries",
+            Field::SearchTimeout => "wall-clock deadline for each web search request",
+            Field::ReadTimeout => "wall-clock deadline for each read_web_page request",
+            Field::MaxSearchResults => "maximum results returned by each web search",
+            Field::MaxSearchResponseBytes => "maximum search response body accepted before parsing",
+            Field::MaxReadResponseBytes => "maximum page response body accepted before extraction",
+            Field::MaxReadOutputBytes => {
+                "maximum extracted read_web_page output returned to the model"
+            }
             Field::VerifyCommand => {
                 "post-change verification command, run under the normal approval gate"
             }
@@ -817,6 +890,13 @@ fn label(row: RowId) -> &'static str {
             Field::PromptCacheRetention => "prompt cache",
             Field::WebSearchBackend => "web search",
             Field::ReadWebPageBackend => "read page",
+            Field::SearxngUrl => "searxng url",
+            Field::SearchTimeout => "search timeout",
+            Field::ReadTimeout => "read timeout",
+            Field::MaxSearchResults => "search results",
+            Field::MaxSearchResponseBytes => "search response",
+            Field::MaxReadResponseBytes => "read response",
+            Field::MaxReadOutputBytes => "read output",
             Field::VerifyCommand => "verify",
             Field::VerifyMaxAttempts => "attempts",
             Field::MutationSafety => "mutation safety gates",
@@ -832,6 +912,7 @@ fn label(row: RowId) -> &'static str {
 fn dial_value_label(field: Field, value: u64) -> String {
     match field {
         Field::CompactionHardWait => hard_wait_label(value),
+        Field::SearchTimeout | Field::ReadTimeout => hard_wait_label(value),
         _ => compact_value(value),
     }
 }
@@ -855,6 +936,9 @@ fn dial_unit(field: Field) -> &'static str {
         | Field::CompactionKeepRecentTokens => " tokens",
         Field::CompactionWarn | Field::CompactionStart | Field::CompactionHard => "%",
         Field::ScrollSpeed => " lines",
+        Field::MaxSearchResponseBytes | Field::MaxReadResponseBytes | Field::MaxReadOutputBytes => {
+            " bytes"
+        }
         _ => "",
     }
 }
@@ -2329,9 +2413,11 @@ impl SettingsPanel {
     /// The reasoning row IS the model hatch's effort track: while a candidate is
     /// highlighted it live-renders that candidate's levels with the target
     /// clamped to them; otherwise it prints the active model's real track (§3.1).
+    /// When room permits, the active provider request shape follows the track so
+    /// the picker exposes both the selected level and its wire behavior.
     fn push_reasoning_spans(&self, spans: &mut Vec<Span<'static>>, flashing: bool, avail: usize) {
         let track_avail = avail.saturating_sub(LABEL_W + 2);
-        if let Some(model) = self.highlighted_model() {
+        let wire = if let Some(model) = self.highlighted_model() {
             let effort =
                 model_capabilities::clamp(model.provider, &model.model_id, self.model_target);
             let options: Vec<&str> = model.levels.iter().map(|(_, label)| *label).collect();
@@ -2346,6 +2432,11 @@ impl SettingsPanel {
                 false,
                 track_avail,
             ));
+            Some(model_capabilities::wire_behavior(
+                model.provider,
+                &model.model_id,
+                effort,
+            ))
         } else {
             let options: Vec<&str> = self
                 .snap
@@ -2368,6 +2459,24 @@ impl SettingsPanel {
                 false,
                 track_avail,
             ));
+            self.snap
+                .catalog
+                .iter()
+                .find(|model| model.is_current)
+                .map(|model| {
+                    model_capabilities::wire_behavior(
+                        model.provider,
+                        &model.model_id,
+                        self.snap.reasoning,
+                    )
+                })
+        };
+        if let Some(wire) = wire {
+            let detail = format!("  {} {wire}", crate::ui::symbols::SEP);
+            let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+            if used + detail.chars().count() <= avail {
+                spans.push(Span::styled(detail, dim()));
+            }
         }
     }
 
@@ -2959,6 +3068,13 @@ mod tests {
             prompt_cache_retention: "short".to_string(),
             web_search_backend: "off".to_string(),
             read_web_page_backend: "off".to_string(),
+            searxng_url: None,
+            search_timeout_ms: 30_000,
+            read_timeout_ms: 30_000,
+            max_search_results: 10,
+            max_search_response_bytes: 200 * 1024,
+            max_read_response_bytes: 200 * 1024,
+            max_read_output_bytes: 200 * 1024,
             verify_command: None,
             verify_max_attempts: 3,
             theme: "terminal".to_string(),
@@ -2970,6 +3086,38 @@ mod tests {
             native_jj_enabled: false,
             worktree_root: None,
         }
+    }
+
+    #[test]
+    fn web_section_exposes_all_global_controls_and_searxng_backend() {
+        let mut panel = panel();
+        assert_eq!(
+            panel.snap.switch_options(Field::WebSearchBackend),
+            &["off", "native", "brave", "jina", "searxng"]
+        );
+        let rows = panel.selectable();
+        for field in [
+            Field::WebSearchBackend,
+            Field::ReadWebPageBackend,
+            Field::SearxngUrl,
+            Field::SearchTimeout,
+            Field::ReadTimeout,
+            Field::MaxSearchResults,
+            Field::MaxSearchResponseBytes,
+            Field::MaxReadResponseBytes,
+            Field::MaxReadOutputBytes,
+        ] {
+            assert!(
+                rows.contains(&PanelRow::Top(RowId::Field(field))),
+                "{field:?}"
+            );
+        }
+
+        select_top(&mut panel, RowId::Field(Field::WebSearchBackend));
+        for _ in 0..4 {
+            let _ = panel.adjust_field(Field::WebSearchBackend, true);
+        }
+        assert_eq!(panel.snap.web_search_backend, "searxng");
     }
 
     fn panel() -> SettingsPanel {
@@ -3198,7 +3346,7 @@ mod tests {
     fn web_backend_switches_cycle_through_their_options() {
         let mut panel = panel();
         select_top(&mut panel, RowId::Field(Field::WebSearchBackend));
-        for expected in ["native", "brave", "jina"] {
+        for expected in ["native", "brave", "jina", "searxng"] {
             assert_eq!(
                 panel.handle_key(ModalKey::Right),
                 ModalOutcome::Emit(ModalAction::SaveSetting {
@@ -3752,6 +3900,27 @@ mod tests {
         assert!(panel.highlighted_model().is_none());
         let rendered = text(&panel.render_budgeted(120, 60));
         assert!(rendered.contains("medium"), "active truth:\n{rendered}");
+    }
+
+    #[test]
+    fn reasoning_row_exposes_active_and_highlighted_wire_behavior() {
+        let mut panel = panel();
+        let active = text(&[panel.control_line(&PanelRow::Top(RowId::Reasoning), false, 200)]);
+        assert!(
+            active.contains("OpenAI reasoning.effort medium"),
+            "active wire behavior: {active}"
+        );
+
+        expand(&mut panel, RowId::Model);
+        select(
+            &mut panel,
+            PanelRow::ModelChild("anthropic/claude-sonnet-4-6".to_string()),
+        );
+        let highlighted = text(&[panel.control_line(&PanelRow::Top(RowId::Reasoning), false, 200)]);
+        assert!(
+            highlighted.contains("Anthropic budget_tokens 10,240"),
+            "highlighted model wire behavior: {highlighted}"
+        );
     }
 
     // --- reasoning row (top-level switch) still clicks ---

@@ -7608,6 +7608,13 @@ mod tests {
             prompt_cache_retention: "short".to_string(),
             web_search_backend: "off".to_string(),
             read_web_page_backend: "off".to_string(),
+            searxng_url: None,
+            search_timeout_ms: 30_000,
+            read_timeout_ms: 30_000,
+            max_search_results: 10,
+            max_search_response_bytes: 200 * 1024,
+            max_read_response_bytes: 200 * 1024,
+            max_read_output_bytes: 200 * 1024,
             verify_command: None,
             verify_max_attempts: 3,
             theme: "terminal".to_string(),
@@ -7630,7 +7637,7 @@ mod tests {
         screen.open_modal(Modal::Settings(Box::new(SettingsPanel::new(
             faceplate_snapshot(),
         ))));
-        let rendered = rendered_text(&mut screen, 100, 66);
+        let rendered = rendered_text(&mut screen, 100, 80);
         // Masthead silkscreen + every section printed at once.
         assert!(rendered.contains("SETTINGS"), "{rendered}");
         assert!(
@@ -7654,7 +7661,7 @@ mod tests {
         assert!(rendered.contains("●●●●●●○○○○  232k tokens"), "{rendered}");
         assert!(rendered.contains("▸ gpt-5.5 ┊ openai-codex"), "{rendered}");
         // Nothing windowed: no position row on a tall viewport.
-        assert!(!rendered.contains("(1/36)"), "{rendered}");
+        assert!(!rendered.contains("(1/42)"), "{rendered}");
         // The composer stays protected below the panel.
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }
@@ -7673,7 +7680,7 @@ mod tests {
         // session bar) and the window scrolls with the house position row.
         assert!(rendered.contains("SETTINGS"), "{rendered}");
         assert!(rendered.contains("ENGINE"), "{rendered}");
-        assert!(rendered.contains("(1/36)"), "{rendered}");
+        assert!(rendered.contains("(1/43)"), "{rendered}");
         assert!(!rendered.contains("worktree root"), "windowed:\n{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }

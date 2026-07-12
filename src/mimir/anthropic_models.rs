@@ -5,8 +5,9 @@
 //! lane), implemented in Iris's Rust selection layer.
 //!
 //! Ownership is split so each fact has one home:
-//! - wire facts (model id, output cap, thinking mode, fallback) live here and
-//!   drive `providers::anthropic_messages` request construction;
+//! - Anthropic model facts (model id, output cap, thinking mode, fallback) live
+//!   here; `model_capabilities` turns the thinking mode into selectable levels
+//!   and typed request mappings consumed by `providers::anthropic_messages`;
 //! - display facts (picker name, context-window label) live in `model_catalog`;
 //! - supported reasoning levels are derived from [`ThinkingMode`] /
 //!   subscription-model membership in `model_capabilities`.
@@ -101,6 +102,7 @@ pub(crate) fn find(ui_id: &str) -> Option<&'static AnthropicModel> {
 }
 
 /// Whether `ui_id` is a known Claude Code subscription model.
+#[cfg(test)]
 pub(crate) fn is_subscription_model(ui_id: &str) -> bool {
     find(ui_id).is_some()
 }

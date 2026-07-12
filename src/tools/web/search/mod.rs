@@ -9,6 +9,8 @@ mod brave;
 mod duckduckgo;
 mod filters;
 mod jina;
+mod normalize;
+mod searxng;
 
 // Backends reach the shared filter helpers via `super::filters::{...}`.
 
@@ -66,15 +68,41 @@ pub(super) struct SearchOutcome {
 /// Dispatch a search to the resolved backend. Backends surface actionable
 /// errors (missing key, throttle, markup drift) as `anyhow::Error`; there is no
 /// silent cross-backend fallback (plan §4: fail with a named cause instead).
+///
+/// Domain filters are canonicalized ONCE here (before dispatch) so every backend
+/// -- native or API -- filters/expresses on the same bare registrable hosts, an
+/// unsatisfiable include/exclude conflict is rejected up front, and the
+/// normalization reasons ride along in the outcome's filter reports.
 pub(super) async fn run_search(
     backend: SearchBackend,
     config: &WebToolsConfig,
     query: &SearchQuery,
     cancel: &CancellationToken,
 ) -> anyhow::Result<SearchOutcome> {
-    match backend {
-        SearchBackend::Native => duckduckgo::search(query, cancel).await,
-        SearchBackend::Brave => brave::search(config.brave_key.as_deref(), query, cancel).await,
-        SearchBackend::Jina => jina::search(config.jina_key.as_deref(), query, cancel).await,
+    let normalized = normalize::normalize_filters(&query.include_domains, &query.exclude_domains)
+        .map_err(anyhow::Error::msg)?;
+    let query = SearchQuery {
+        query: query.query.clone(),
+        max_results: query.max_results,
+        include_domains: normalized.include,
+        exclude_domains: normalized.exclude,
+        recency: query.recency,
+        country: query.country.clone(),
+    };
+
+    let mut outcome = match backend {
+        SearchBackend::Native => duckduckgo::search(config, &query, cancel).await,
+        SearchBackend::Brave => brave::search(config, &query, cancel).await,
+        SearchBackend::Jina => jina::search(config, &query, cancel).await,
+        SearchBackend::Searxng => searxng::search(config, &query, cancel).await,
+    }?;
+
+    // Prepend the normalization reasons so `metadata.filters` reports what was
+    // canonicalized/ignored/capped ahead of the backend's own enforcement.
+    if !normalized.reports.is_empty() {
+        let mut reports = normalized.reports;
+        reports.append(&mut outcome.filters);
+        outcome.filters = reports;
     }
+    Ok(outcome)
 }

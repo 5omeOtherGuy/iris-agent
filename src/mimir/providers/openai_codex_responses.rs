@@ -970,7 +970,7 @@ fn build_codex_request(
     // is requested whenever reasoning is active or same-origin continuity is
     // replayed, matching Responses' include contract without adopting Codex's
     // websocket/session machinery.
-    if let Some(reasoning) = codex_reasoning(reasoning) {
+    if let Some(reasoning) = codex_reasoning(model, reasoning) {
         body["reasoning"] = reasoning;
         body["include"] = json!(["reasoning.encrypted_content"]);
     } else if input
@@ -1092,26 +1092,18 @@ fn parse_codex_compaction_probe_reader(
     }
 }
 
-/// Map a normalized reasoning level to the Codex Responses `reasoning` object,
-/// or `None` to omit it. The ChatGPT Codex model metadata maps Iris/pi
-/// `minimal` to the API's `low` effort for every shipped Codex model; `xhigh`
-/// remains native. `Off` maps to omitted because gpt-5.5 cannot disable
-/// reasoning (`thinkingLevelMap.off == null`), so there is no disable field to
-/// send. The `summary: "auto"` field asks the Responses API to stream
-/// `response.reasoning_summary_text.delta` events. If the API also emits raw
-/// `response.reasoning_text.delta` events, Iris forwards them on an explicit raw
-/// display-only channel; persisted continuity still comes from
-/// `reasoning.encrypted_content` (ADR-0016).
-fn codex_reasoning(reasoning: Option<ReasoningEffort>) -> Option<Value> {
-    let effort = match reasoning? {
-        ReasoningEffort::Off => return None,
-        ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-        ReasoningEffort::XHigh => "xhigh",
-        ReasoningEffort::Max => "max",
+/// Render the model capability's typed OpenAI Responses reasoning shape.
+fn codex_reasoning(model: &str, reasoning: Option<ReasoningEffort>) -> Option<Value> {
+    let crate::mimir::model_capabilities::ReasoningWire::OpenAiResponses { effort, summary } =
+        crate::mimir::model_capabilities::wire_config(
+            crate::mimir::selection::ProviderId::OpenAiCodex,
+            model,
+            reasoning?,
+        )?
+    else {
+        return None;
     };
-    Some(json!({ "effort": effort, "summary": "auto" }))
+    Some(json!({ "effort": effort, "summary": summary }))
 }
 
 /// Build the Codex `tools` declaration array from the injected tool set: one

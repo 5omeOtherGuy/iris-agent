@@ -14,8 +14,8 @@
 
 use tokio_util::sync::CancellationToken;
 
-use super::super::fetch::{build_api_client, send_api};
-use super::super::{FilterEnforcement, MAX_API_BYTES, SearchResult};
+use super::super::fetch::{build_api_client, send_api_with};
+use super::super::{FilterEnforcement, SearchResult, WebToolsConfig};
 use super::filters::{apply_domain_filter, report};
 use super::{SearchOutcome, SearchQuery};
 
@@ -31,7 +31,7 @@ const SNIPPET_CHARS: usize = 300;
 /// include_domains), fetch capped JSON, parse + truncate content to snippets,
 /// then apply exclude_domains and collect the truthful filter reports.
 pub(super) async fn search(
-    key: Option<&str>,
+    config: &WebToolsConfig,
     query: &SearchQuery,
     cancel: &CancellationToken,
 ) -> anyhow::Result<SearchOutcome> {
@@ -51,14 +51,23 @@ pub(super) async fn search(
         .get(JINA_SEARCH_URL)
         .header("Accept", "application/json")
         .query(&[("q", &effective_query)]);
-    let has_key = key.map(|k| !k.trim().is_empty()).unwrap_or(false);
-    if let Some(key) = key.filter(|k| !k.trim().is_empty()) {
+    let has_key = config
+        .jina_key
+        .as_deref()
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false);
+    if let Some(key) = config.jina_key.as_deref().filter(|k| !k.trim().is_empty()) {
         request = request.header("Authorization", format!("Bearer {key}"));
     }
 
-    let (status, body, _truncated) = send_api(request, MAX_API_BYTES, cancel)
-        .await
-        .map_err(|e| anyhow::anyhow!("Jina search request failed: {e}"))?;
+    let (status, body, _truncated) = send_api_with(
+        request,
+        config.max_search_response_bytes,
+        config.search_timeout,
+        cancel,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Jina search request failed: {e}"))?;
 
     if status != 200 {
         let hint = if has_key {

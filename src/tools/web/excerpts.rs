@@ -1119,6 +1119,43 @@ Today it is sunny with a gentle breeze over the coastal town.";
         }
     }
 
+    // ------------------------------------------------------------------
+    // Fixture-driven objective excerpting over a real Markdown document
+    // containing headings, a table, and a fenced code block.
+    // ------------------------------------------------------------------
+
+    const FIXTURE_DOC: &str = include_str!("testdata/excerpts_doc.md");
+
+    #[test]
+    fn fixture_objective_selects_the_code_migration_section() {
+        let out = select_excerpts(FIXTURE_DOC, "how do I run database migrations", 4000);
+        // The fenced code command is returned verbatim under its heading.
+        assert!(
+            out.contains("widgetctl migrate --database"),
+            "expected the migration code block, got: {out:?}"
+        );
+        assert!(
+            out.contains("## Running Migrations"),
+            "expected the section heading carried, got: {out:?}"
+        );
+        // Unrelated sections do not leak in.
+        assert!(
+            !out.contains("scrape the metrics endpoint"),
+            "monitoring section leaked: {out:?}"
+        );
+    }
+
+    #[test]
+    fn fixture_objective_selects_the_config_table_section() {
+        let out = select_excerpts(FIXTURE_DOC, "configuration environment variables", 4000);
+        // The Markdown table rows survive verbatim in the excerpt.
+        assert!(
+            out.contains("| PORT | 8080 |") || out.contains("CACHE_TTL"),
+            "expected the configuration table, got: {out:?}"
+        );
+        assert!(out.contains("## Configuration"), "{out:?}");
+    }
+
     #[test]
     fn phrase_match_outscores_scattered_tokens() {
         let md = "\

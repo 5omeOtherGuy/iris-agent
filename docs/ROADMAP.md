@@ -348,22 +348,23 @@ CLI, and oh-my-pi (omp). Each tool has a tracking issue.
 
 **Web tools [SHIPPED 2026-07-12].** `web_search` and `read_web_page` ship as an
 opt-in, off-by-default egress class (ADR-0058). Per-tool backends
-(`webSearchBackend`: native DuckDuckGo / Brave API / Jina Search;
-`readWebPageBackend`: native pinned-fetch+extraction / Jina Reader) resolve once
-at registry build; a tool is registered only when its backend is not `off`.
-Containment: global-only config, per-call approval with allow-always, one SSRF
-policy (IANA special-purpose deny tables, ports 80/443, no userinfo) applied to
-user and Jina target URLs, a pinned redirect-walking client with a fail-closed
-resolver that closes the DNS-rebinding TOCTOU, decompressed-byte caps, and
-untrusted-content framing. Keys are user-configured service credentials
-(`brave-search`/`jina`) with env fallback. Output reduction is measured and
-test-enforced over real captured fixtures (ADR-0036 rule 5): HTML→Markdown
-extraction, objective excerpting, and search render, with the snippet-rich
-result shape recorded in ADR-0059
+(`webSearchBackend`: native DuckDuckGo / Brave API / Jina Search / trusted
+SearXNG; `readWebPageBackend`: native pinned-fetch+extraction / Jina Reader)
+resolve once at registry build; a tool is registered only when its backend is not
+`off`. Global-only timeout, result, response, and final-read-output limits bound
+all paths. Containment: global-only config, per-call approval with allow-always,
+one SSRF policy (IANA special-purpose deny tables, ports 80/443, no userinfo)
+applied to user and Jina target URLs, a pinned redirect-walking client with a
+fail-closed resolver that closes the DNS-rebinding TOCTOU, decompressed-byte
+caps, validated search-result URLs, and untrusted-content framing. Keys are
+user-configured service credentials (`brave-search`/`jina`) with env fallback.
+Output reduction is measured and test-enforced over real captured fixtures
+(ADR-0036 rule 5): HTML→Markdown extraction, objective excerpting, and search
+render, with the snippet-rich result shape recorded in ADR-0059
 ([web tools benchmark](benchmarks/web-tools-token-efficiency.md)). Deferred:
-concurrency-safe classification + fetch semaphore, SearXNG backend, short-TTL
-read cache, local render engine, and a real-response benchmark for the
-key-gated Brave/Jina search backends.
+concurrency-safe classification + fetch semaphore, short-TTL read cache, local
+render engine, and a real-response benchmark for the key-gated Brave/Jina search
+backends.
 
 Execution order (by impact/effort, independent of the milestone sequence):
 
