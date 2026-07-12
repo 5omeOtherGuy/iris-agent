@@ -1,0 +1,146 @@
+# robots.txt for http://www.gnu.org/
+
+User-agent: *
+Crawl-delay: 4
+Disallow: */CVS/
+Disallow: */po/
+Disallow: */workshop/
+Disallow: /cgi-bin/
+Disallow: /copyleft/
+Disallow: /gnu.css
+Disallow: /gnusearch/
+Disallow: /norobotsnorhumansshouldevervisithispage/
+Disallow: /prep/gnumaint/
+Disallow: /prep/wrappers-and-scripts/
+Disallow: /private/
+Disallow: /rss/
+Disallow: /savannah-checkouts/
+Disallow: /screenshots/
+Disallow: /server/banners/
+Disallow: /server/body-include*
+Disallow: /server/bottom-notes*
+Disallow: /server/footer*
+Disallow: /server/fs-gang*
+Disallow: /server/generic*
+Disallow: /server/gnun/
+Disallow: /server/head-include*
+Disallow: /server/header*
+Disallow: /server/html5-head-include*
+Disallow: /server/html5-header*
+Disallow: /server/include-file-list*
+Disallow: /server/outdated*
+Disallow: /server/select-language.html
+Disallow: /server/source/
+Disallow: /server/staging/
+Disallow: /server/top-addendum*
+Disallow: /server/trans-map.html
+Disallow: /server/whatsnew_translations.xml
+Disallow: /software/gnun/linc/
+Disallow: /software/gnun/proofread/
+Disallow: /software/gnun/reports/
+Disallow: /software/gnun/test/
+Disallow: /usenet/
+Sitemap: http://www.gnu.org/sitemap.xml
+
+# Majestic - SEO
+User-agent: MJ12bot
+Disallow: /
+
+# DataForSeo - SEO
+User-agent: DataForSeoBot
+Disallow: /
+
+# webmeup - SEO
+User-agent: BLEXBot
+Disallow: /
+
+# Ahrefs - SEO
+User-agent: AhrefsBot
+Disallow: /
+
+# babbar - SEO
+User-agent: barkrowler
+Disallow: /
+
+# Screamingfrog - SEO
+User-agent: Screaming Frog SEO Spider
+Disallow: /
+
+# Seozoom - SEO
+User-Agent: ZoomBot
+Disallow: /
+
+# Brandwatch - SEO
+User-agent: magpie-crawler
+Disallow: /
+
+# Begin Moz - SEO
+# Not to be confused with Mozilla.
+User-agent: DotBot
+Disallow: /
+
+User-agent: rogerbot
+Disallow: /
+# End Moz - SEO
+
+# Begin Semrush - SEO
+User-agent: SemrushBot
+Disallow: /
+
+User-agent: SiteAuditBot
+Disallow: /
+
+User-agent: SemrushBot-BA
+Disallow: /
+
+User-agent: SemrushBot-SI
+Disallow: /
+
+User-agent: SemrushBot-SWA
+Disallow: /
+
+User-agent: SplitSignalBot
+Disallow: /
+
+User-agent: SemrushBot-OCOB
+Disallow: /
+# End Semrush - SEO
+
+# cognitiveSEO - SEO
+User-agent: JamesBOT
+Disallow: /
+
+# oncrawl - SEO
+User-agent: Oncrawl
+Disallow: /
+
+# BEGIN Awario - Marketing
+User-agent: AwarioRssBot
+Disallow: /
+
+User-agent: AwarioSmartBot
+Disallow: /
+
+User-agent: AwarioBot
+Disallow: /
+# END Awario - Marketing
+
+# SERPSTAT - SEO
+User-agent: serpstatbot
+Disallow: /
+
+# website-datenbank.de - Search engine?
+User-agent: netEstate NE Crawler
+Disallow: /
+
+# Ignores crawl-delay and does not help us.
+User-Agent: panscient.com
+Disallow: /
+
+# Aggressive Latvian Academic Integrity bot that does not help us.
+User-agent: AcademicBotRTU
+Disallow: /
+
+# See RT #1298215 about internationalization and localization abuse.
+# See RT #1638325 about localization, Savannah, and more.
+# See RT #2171216 about redirections and unused files.

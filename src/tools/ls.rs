@@ -165,7 +165,8 @@ fn collect_entries(
     let read = match fs::read_dir(dir_path) {
         Ok(read) => read,
         Err(error) if depth == 0 => {
-            return Err(error).with_context(|| format!("cannot read directory: {dir_label}"));
+            let context = format!("cannot read directory: {}", dir_label);
+            return Err(error).context(context);
         }
         Err(_) => return Ok(()),
     };

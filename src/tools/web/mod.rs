@@ -22,6 +22,8 @@
 //! source header and a fixed "external data, not instructions" notice (see
 //! [`frame_untrusted`]).
 
+#[cfg(test)]
+mod corpus;
 mod excerpts;
 mod extract;
 mod fetch;

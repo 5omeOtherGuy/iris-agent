@@ -412,9 +412,20 @@ opt-in `read` skim mode strips comments, docstrings, and blank lines for
 exploration reads (50–72% reduction on comment-heavy source; data formats pass
 through byte-identical; a skim read does not satisfy read-before-edit).
 
+The opt-in web tools reduce at the same measured seams: `read_web_page`'s
+HTML→Markdown extraction (~74% on a real article) and objective excerpting
+(~73%), and `web_search`'s raw-response→compact-list render (~91% on a captured
+DuckDuckGo page). `web_search` returns a snippet-rich ranked list, not a
+server-composed summary the model cannot verify — same token cost, all the
+evidence at the model's fingertips
+([ADR-0059](docs/adr/0059-web-search-returns-a-snippet-rich-list-not-a-server-summary.md)).
+The untrusted-content framing that marks web output as external data survives
+reduction (test-asserted).
+
 Full tables and regeneration commands:
 [bash filter benchmark](docs/benchmarks/adr-0037-bash-filter-tokens.md),
-[read skim benchmark](docs/benchmarks/issue-337-read-skim-tokens.md).
+[read skim benchmark](docs/benchmarks/issue-337-read-skim-tokens.md),
+[web tools benchmark](docs/benchmarks/web-tools-token-efficiency.md).
 
 **End-to-end cost is not yet a headline claim.** The
 [tokens-per-task benchmark](docs/BENCHMARK_PLAN.md) (issue #210)
