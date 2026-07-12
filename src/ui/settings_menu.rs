@@ -2148,9 +2148,11 @@ impl SettingsPanel {
     /// The reasoning row IS the model hatch's effort track: while a candidate is
     /// highlighted it live-renders that candidate's levels with the target
     /// clamped to them; otherwise it prints the active model's real track (§3.1).
+    /// When room permits, the active provider request shape follows the track so
+    /// the picker exposes both the selected level and its wire behavior.
     fn push_reasoning_spans(&self, spans: &mut Vec<Span<'static>>, flashing: bool, avail: usize) {
         let track_avail = avail.saturating_sub(LABEL_W + 2);
-        if let Some(model) = self.highlighted_model() {
+        let wire = if let Some(model) = self.highlighted_model() {
             let effort =
                 model_capabilities::clamp(model.provider, &model.model_id, self.model_target);
             let options: Vec<&str> = model.levels.iter().map(|(_, label)| *label).collect();
@@ -2165,6 +2167,11 @@ impl SettingsPanel {
                 false,
                 track_avail,
             ));
+            Some(model_capabilities::wire_behavior(
+                model.provider,
+                &model.model_id,
+                effort,
+            ))
         } else {
             let options: Vec<&str> = self
                 .snap
@@ -2187,6 +2194,24 @@ impl SettingsPanel {
                 false,
                 track_avail,
             ));
+            self.snap
+                .catalog
+                .iter()
+                .find(|model| model.is_current)
+                .map(|model| {
+                    model_capabilities::wire_behavior(
+                        model.provider,
+                        &model.model_id,
+                        self.snap.reasoning,
+                    )
+                })
+        };
+        if let Some(wire) = wire {
+            let detail = format!("  {} {wire}", crate::ui::symbols::SEP);
+            let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+            if used + detail.chars().count() <= avail {
+                spans.push(Span::styled(detail, dim()));
+            }
         }
     }
 
@@ -3559,6 +3584,27 @@ mod tests {
         assert!(panel.highlighted_model().is_none());
         let rendered = text(&panel.render_budgeted(120, 60));
         assert!(rendered.contains("medium"), "active truth:\n{rendered}");
+    }
+
+    #[test]
+    fn reasoning_row_exposes_active_and_highlighted_wire_behavior() {
+        let mut panel = panel();
+        let active = text(&[panel.control_line(&PanelRow::Top(RowId::Reasoning), false, 200)]);
+        assert!(
+            active.contains("OpenAI reasoning.effort medium"),
+            "active wire behavior: {active}"
+        );
+
+        expand(&mut panel, RowId::Model);
+        select(
+            &mut panel,
+            PanelRow::ModelChild("anthropic/claude-sonnet-4-6".to_string()),
+        );
+        let highlighted = text(&[panel.control_line(&PanelRow::Top(RowId::Reasoning), false, 200)]);
+        assert!(
+            highlighted.contains("Anthropic budget_tokens 10,240"),
+            "highlighted model wire behavior: {highlighted}"
+        );
     }
 
     // --- reasoning row (top-level switch) still clicks ---

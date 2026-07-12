@@ -157,7 +157,7 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
             messages,
             tools,
             self.reasoning,
-            self.supports_reasoning,
+            self.supports_reasoning.then_some(self.provider),
             ChatPromptCache {
                 key: self.prompt_cache_key.as_deref(),
                 retention: self.cache_retention,
@@ -541,7 +541,7 @@ fn build_chat_request(
     messages: &[Message],
     tools: &Tools,
     reasoning: Option<ReasoningEffort>,
-    supports_reasoning: bool,
+    reasoning_provider: Option<ProviderId>,
     prompt_cache: ChatPromptCache<'_>,
 ) -> Value {
     let mut body = json!({
@@ -558,7 +558,10 @@ fn build_chat_request(
     if !declarations.is_empty() {
         body["tools"] = Value::Array(declarations);
     }
-    if supports_reasoning && let Some(level) = reasoning.and_then(openai_reasoning_effort) {
+    if let Some(provider) = reasoning_provider
+        && let Some(level) =
+            reasoning.and_then(|level| openai_reasoning_effort(provider, model, level))
+    {
         body["reasoning_effort"] = json!(level);
     }
     if prompt_cache.retention.caching_enabled() {
@@ -575,13 +578,17 @@ fn build_chat_request(
     body
 }
 
-fn openai_reasoning_effort(level: ReasoningEffort) -> Option<&'static str> {
-    match level {
-        ReasoningEffort::Off => None,
-        ReasoningEffort::Minimal | ReasoningEffort::Low => Some("low"),
-        ReasoningEffort::Medium => Some("medium"),
-        ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => Some("high"),
-    }
+fn openai_reasoning_effort(
+    provider: ProviderId,
+    model: &str,
+    level: ReasoningEffort,
+) -> Option<&'static str> {
+    let crate::mimir::model_capabilities::ReasoningWire::OpenAiChatCompletions { effort } =
+        crate::mimir::model_capabilities::wire_config(provider, model, level)?
+    else {
+        return None;
+    };
+    Some(effort)
 }
 
 fn build_chat_messages(system_prompt: &str, messages: &[Message]) -> Vec<Value> {
@@ -788,7 +795,7 @@ mod tests {
             &messages,
             &crate::tools::built_in_tools(),
             Some(ReasoningEffort::High),
-            true,
+            Some(ProviderId::OpenAiCompatible),
             ChatPromptCache {
                 key: None,
                 retention: PromptCacheRetention::None,
@@ -834,7 +841,7 @@ mod tests {
             &messages,
             &Tools::new(Vec::new()),
             None,
-            true,
+            Some(ProviderId::OpenAiCompatible),
             ChatPromptCache {
                 key: Some(" session-1 "),
                 retention: PromptCacheRetention::Short,
@@ -849,7 +856,7 @@ mod tests {
             &messages,
             &Tools::new(Vec::new()),
             None,
-            true,
+            Some(ProviderId::OpenAiCompatible),
             ChatPromptCache {
                 key: Some("session-1"),
                 retention: PromptCacheRetention::Long,
@@ -864,7 +871,7 @@ mod tests {
             &messages,
             &Tools::new(Vec::new()),
             None,
-            true,
+            Some(ProviderId::OpenAiCompatible),
             ChatPromptCache {
                 key: Some("session-1"),
                 retention: PromptCacheRetention::None,
@@ -884,7 +891,7 @@ mod tests {
             &messages,
             &Tools::new(Vec::new()),
             None,
-            true,
+            Some(ProviderId::OpenAiCompatible),
             ChatPromptCache {
                 key: Some(&long_key),
                 retention: PromptCacheRetention::Short,
@@ -931,7 +938,7 @@ mod tests {
             &messages,
             &Tools::new(Vec::new()),
             Some(ReasoningEffort::High),
-            false,
+            None,
             ChatPromptCache {
                 key: None,
                 retention: PromptCacheRetention::None,
@@ -945,7 +952,7 @@ mod tests {
             &messages,
             &Tools::new(Vec::new()),
             Some(ReasoningEffort::Off),
-            true,
+            Some(ProviderId::OpenAiCompatible),
             ChatPromptCache {
                 key: None,
                 retention: PromptCacheRetention::None,
@@ -959,13 +966,49 @@ mod tests {
             &messages,
             &Tools::new(Vec::new()),
             Some(ReasoningEffort::XHigh),
-            true,
+            Some(ProviderId::OpenAiCompatible),
             ChatPromptCache {
                 key: None,
                 retention: PromptCacheRetention::None,
             },
         );
-        assert_eq!(request["reasoning_effort"], json!("high"));
+        assert!(
+            request.get("reasoning_effort").is_none(),
+            "unsupported xhigh must be omitted rather than silently downgraded"
+        );
+    }
+
+    #[test]
+    fn standard_openai_chat_uses_model_specific_reasoning_capability() {
+        let messages = [Message::user("hi")];
+        let cache = ChatPromptCache {
+            key: None,
+            retention: PromptCacheRetention::None,
+        };
+        let reasoning = build_chat_request(
+            "o3",
+            "P",
+            &messages,
+            &Tools::new(Vec::new()),
+            Some(ReasoningEffort::Medium),
+            Some(ProviderId::OpenAi),
+            cache,
+        );
+        assert_eq!(reasoning["reasoning_effort"], json!("medium"));
+
+        let unsupported = build_chat_request(
+            "gpt-4.1",
+            "P",
+            &messages,
+            &Tools::new(Vec::new()),
+            Some(ReasoningEffort::Medium),
+            Some(ProviderId::OpenAi),
+            cache,
+        );
+        assert!(
+            unsupported.get("reasoning_effort").is_none(),
+            "the standard OpenAI route must honor the model allowlist even if its outer gate is true"
+        );
     }
 
     #[test]

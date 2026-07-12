@@ -696,6 +696,31 @@ pub(crate) fn apply_selection<P: ChatProvider>(
     harness: &mut Harness<P>,
     switch: &mut ModelSwitch<'_, P>,
 ) -> Vec<String> {
+    let scope = switch_scope(&switch.selection, &candidate);
+    let reasoning_fallback = if scope != SwitchScope::ReasoningOnly
+        && switch.selection.reasoning != candidate.reasoning
+    {
+        switch.selection.reasoning.map(|previous| {
+            let requested = model_capabilities::display_level(
+                switch.selection.provider,
+                &switch.selection.model,
+                previous,
+            );
+            let fallback = candidate
+                .reasoning
+                .map(|level| {
+                    model_capabilities::display_level(candidate.provider, &candidate.model, level)
+                })
+                .unwrap_or("none");
+            format!(
+                "reasoning '{requested}' is not supported by {}/{}; using '{fallback}'",
+                candidate.provider.as_str(),
+                candidate.model,
+            )
+        })
+    } else {
+        None
+    };
     if let Err(error) = candidate.resolve_context_management_for_provider() {
         return vec![format!("{error:#}")];
     }
@@ -706,7 +731,6 @@ pub(crate) fn apply_selection<P: ChatProvider>(
         Ok(provider) => provider,
         Err(error) => return vec![format!("could not switch: {error:#}")],
     };
-    let scope = switch_scope(&switch.selection, &candidate);
     harness.replace_provider(provider);
     if let Some(settings) = switch.compaction_settings.as_ref()
         && let Ok((budget, trigger)) = crate::resolved_compaction_trigger(settings, &candidate)
@@ -744,7 +768,9 @@ pub(crate) fn apply_selection<P: ChatProvider>(
         *cell.lock().unwrap_or_else(|poison| poison.into_inner()) = candidate.clone();
     }
     switch.selection = candidate;
-    let mut lines = vec![confirm];
+    let mut lines = Vec::new();
+    lines.extend(reasoning_fallback);
+    lines.push(confirm);
     lines.extend(advisory);
     lines
 }
@@ -1118,11 +1144,23 @@ fn render_extract_item(item: &session::ExtractItem) -> String {
 
 /// Read-only `/model` view: current provider/model/reasoning + supported levels.
 fn current_selection_lines(selection: &ModelSelection) -> Vec<String> {
-    let levels = model_capabilities::join_display_levels(selection.provider, &selection.model);
+    let levels = model_capabilities::selectable_options(
+        selection.provider,
+        &selection.model,
+        selection.open_ai_compatible.reasoning,
+    )
+    .iter()
+    .map(|option| option.label)
+    .collect::<Vec<_>>()
+    .join(", ");
     let reasoning = selection
         .reasoning
         .map(|level| model_capabilities::display_level(selection.provider, &selection.model, level))
         .unwrap_or("none");
+    let wire = selection
+        .reasoning
+        .map(|level| model_capabilities::wire_behavior(selection.provider, &selection.model, level))
+        .unwrap_or("provider default (reasoning omitted)");
     vec![
         format!(
             "{}/{} (reasoning: {})",
@@ -1131,6 +1169,7 @@ fn current_selection_lines(selection: &ModelSelection) -> Vec<String> {
             reasoning,
         ),
         format!("supported reasoning levels: {levels}"),
+        format!("wire behavior: {wire}"),
     ]
 }
 
@@ -1949,6 +1988,41 @@ mod tests {
     }
 
     #[test]
+    fn model_transition_preserves_supported_effort_and_clamps_unsupported_effort() {
+        let mut current = selection(ProviderId::OpenAiCodex, "gpt-5.5");
+        current.reasoning = Some(ReasoningEffort::High);
+        let preserved = candidate_for(&current, ProviderId::Anthropic, "claude-sonnet-4-6");
+        assert_eq!(preserved.reasoning, Some(ReasoningEffort::High));
+
+        current.model = "gpt-5.6-sol".to_string();
+        current.reasoning = Some(ReasoningEffort::Max);
+        let clamped = candidate_for(&current, ProviderId::OpenAiCodex, "gpt-5.5");
+        assert_eq!(
+            clamped.reasoning,
+            Some(ReasoningEffort::XHigh),
+            "pre-5.6 Codex models must not receive max"
+        );
+    }
+
+    #[test]
+    fn model_transition_reports_reasoning_fallback() {
+        let (mut harness, _dir) = fake_harness();
+        let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
+        let mut active = selection(ProviderId::OpenAiCodex, "gpt-5.6-sol");
+        active.reasoning = Some(ReasoningEffort::Max);
+        let mut switch = Some(ModelSwitch::new(active, "PROMPT".to_string(), &build, None));
+
+        let lines = handle_model_command("/model openai-codex/gpt-5.5", &mut harness, &mut switch)
+            .expect("handled");
+        assert!(
+            lines.iter().any(|line| {
+                line.contains("reasoning 'max' is not supported") && line.contains("using 'xhigh'")
+            }),
+            "the clamp must be visible: {lines:?}"
+        );
+    }
+
+    #[test]
     fn model_command_shows_current_selection_and_supported_levels() {
         let (mut harness, _dir) = fake_harness();
         let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
@@ -1964,6 +2038,24 @@ mod tests {
         assert!(
             lines[1].contains("off, minimal, low, medium, high, xhigh"),
             "{lines:?}"
+        );
+        assert_eq!(
+            lines[2], "wire behavior: provider default (reasoning omitted)",
+            "CLI status exposes the active capability's wire behavior"
+        );
+    }
+
+    #[test]
+    fn model_status_honors_openai_compatible_reasoning_gate() {
+        let mut selected = selection(ProviderId::OpenAiCompatible, "custom-model");
+        let disabled = current_selection_lines(&selected);
+        assert_eq!(disabled[1], "supported reasoning levels: off");
+
+        selected.open_ai_compatible.reasoning = true;
+        let enabled = current_selection_lines(&selected);
+        assert_eq!(
+            enabled[1],
+            "supported reasoning levels: off, low, medium, high"
         );
     }
 
