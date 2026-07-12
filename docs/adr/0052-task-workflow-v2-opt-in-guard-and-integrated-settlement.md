@@ -1,7 +1,7 @@
 # ADR-0052: Task workflow v2 - opt-in workflow, always-on guard, and integrated settlement
 
 **Date**: 2026-07-07
-**Status**: accepted
+**Status**: accepted; guard configurability superseded by ADR-0058
 **Deciders**: operator + agent design review
 
 ## Context

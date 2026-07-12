@@ -1036,11 +1036,13 @@ boundaries (settlement-based), checkpoint storage (op-log-shaped chain under
 blocking/async performance split, session-end/crash recovery, and the tiered
 guarantee language.
 [ADR-0052](adr/0052-task-workflow-v2-opt-in-guard-and-integrated-settlement.md)
-amends that design: the dirty-tree guard stays always on, while the durable
-task workflow becomes opt-in; commits and successful print runs can close tasks;
-`/checkpoint` becomes a non-settling save point; accepted tasks destroy their
-checkpoint refs; task state is carried across compaction; and the future
-subagent feature must not be named `task`. The pre-automation gate below is
+splits the durable task workflow from the mutation guard; commits and successful
+print runs can close tasks; `/checkpoint` becomes a non-settling save point;
+accepted tasks destroy their checkpoint refs; task state is carried across
+compaction; and the future subagent feature must not be named `task`.
+[ADR-0058](adr/0058-configure-mutation-safety-and-require-native-jj-consent.md)
+adds the global master switch and requires per-workspace consent before native
+jj operation tracking is activated. The pre-automation gate below is
 satisfied for the #261 slice; deviations require a superseding ADR, not a fresh
 discussion.
 

@@ -58,6 +58,7 @@
 | [0055](0055-govern-context-between-provider-round-trips.md) | Govern context between provider round trips | accepted | 2026-07-10 |
 | [0056](0056-persist-portable-summaries-beside-provider-compaction-blocks.md) | Persist portable summaries beside provider compaction blocks | accepted | 2026-07-10 |
 | [0057](0057-cover-the-current-turn-under-hard-pressure-and-escalate-fallback.md) | Cover the current turn under hard pressure and escalate the fallback ladder | accepted | 2026-07-10 |
+| [0058](0058-configure-mutation-safety-and-require-native-jj-consent.md) | Configure mutation safety and require native jj consent | accepted | 2026-07-11 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
 ADR-0019 to preserve existing file names and cross-references.

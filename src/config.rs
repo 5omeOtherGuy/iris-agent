@@ -107,10 +107,12 @@ pub(crate) struct Settings {
     /// `microcompaction` + `microcompactionWatermark` pair resolves to the
     /// conservative policy unchanged.
     pub(crate) tool_result_compaction: Option<ToolResultCompactionSettings>,
+    /// Master mutation-safety switch. Global-only: a cloned project cannot
+    /// disable host-owned dirty-tree protection. Absent defaults on.
+    pub(crate) mutation_safety: Option<bool>,
     /// Opt-in durable task workflow (ADR-0052, issue #444): checkpoint refs,
     /// recovery/adoption, task lifecycle entries, badges, task diffs, and
-    /// rollback across restarts. Absent/false -> off; the dirty-tree guard
-    /// remains always on and non-configurable.
+    /// rollback across restarts. Effective only while mutation safety is on.
     pub(crate) tasks: Option<bool>,
     /// Opt-in bash tool mode: the model-visible tool set shrinks to `bash` and
     /// `edit` (plus the session-plumbing `read_output`/`recall`), so the model
@@ -413,6 +415,9 @@ impl Settings {
             // request), so a project may tune it; project value wins, else global.
             microcompaction: project.microcompaction.or(self.microcompaction),
             tool_result_compaction,
+            // Mutation safety is host posture and therefore global-only. Repo
+            // config can never turn the guard off.
+            mutation_safety: self.mutation_safety,
             // Durable task workflow is opt-in product surface, not the safety
             // floor. Project config may enable it for a repo; absent defaults
             // off via the accessor.
@@ -705,8 +710,15 @@ impl Settings {
         )
     }
 
-    /// Whether the durable task workflow is enabled. Default off; the dirty-tree
-    /// guard still runs regardless of this value.
+    /// Whether mutation safety gates are enabled. Default on. This global-only
+    /// master controls dirty-file approval, snapshots, attribution, restoration,
+    /// and task settlement integration.
+    pub(crate) fn mutation_safety(&self) -> bool {
+        self.mutation_safety.unwrap_or(true)
+    }
+
+    /// Whether the durable task workflow is enabled. Default off and meaningful
+    /// only while mutation safety is enabled.
     pub(crate) fn tasks(&self) -> bool {
         self.tasks.unwrap_or(false)
     }
@@ -773,6 +785,12 @@ pub(crate) fn save_enabled_models(ids: Option<&[String]>) -> Result<()> {
 /// file.
 pub(crate) fn save_default_approval(mode: &str) -> Result<()> {
     update_global(&[("defaultApproval", Value::String(mode.to_string()))])
+}
+
+/// Persist the global mutation-safety master switch. This never writes project
+/// config, so repository-controlled settings cannot weaken host protection.
+pub(crate) fn save_mutation_safety(enabled: bool) -> Result<()> {
+    update_global(&[("mutationSafety", Value::Bool(enabled))])
 }
 
 /// Persist the prompt-cache retention preset (`none|short|long`) in the global
@@ -999,8 +1017,8 @@ pub(crate) fn save_compaction_worker_input(input: &str) -> Result<()> {
 
 /// Persist the durable task workflow toggle in the project settings file for
 /// `cwd`. This is intentionally project-scoped: teams may opt a repository into
-/// the review/rollback workflow, while the dirty-tree safety floor stays
-/// non-configurable.
+/// the review/rollback workflow. The separate mutation-safety master remains
+/// global-only.
 pub(crate) fn save_project_tasks(cwd: &Path, enabled: bool) -> Result<()> {
     update_project(cwd, &[("tasks", Value::Bool(enabled))])
 }
@@ -2746,6 +2764,31 @@ mod tests {
             Some("high".to_string()),
             "persisted defaultReasoning must be reapplied at startup"
         );
+    }
+
+    #[test]
+    fn mutation_safety_defaults_on_and_project_cannot_disable_it() {
+        assert!(Settings::default().mutation_safety());
+        let global: Settings =
+            serde_json::from_str(r#"{"mutationSafety":true,"tasks":true}"#).unwrap();
+        let project: Settings = serde_json::from_str(r#"{"mutationSafety":false}"#).unwrap();
+        let merged = global.merged_with(project);
+        assert!(merged.mutation_safety());
+        assert!(merged.tasks());
+
+        let global = Settings::default();
+        let project: Settings = serde_json::from_str(r#"{"mutationSafety":false}"#).unwrap();
+        assert!(global.merged_with(project).mutation_safety());
+    }
+
+    #[test]
+    fn save_mutation_safety_round_trips() {
+        let dir = temp_dir();
+        let path = dir.path.join("settings.json");
+        let _guard = ConfigPathGuard::set(&path);
+        save_mutation_safety(false).unwrap();
+        let loaded = Settings::load_from(Some(&path), &dir.path.join("none.json")).unwrap();
+        assert!(!loaded.mutation_safety());
     }
 
     #[test]
