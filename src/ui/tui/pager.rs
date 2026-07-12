@@ -812,7 +812,7 @@ mod tests {
         screen.set_footer_with_context(
             "gpt-5.5".to_string(),
             Some("high".to_string()),
-            Some("300k".to_string()),
+            Some(300_000),
             "~/repo (main)".to_string(),
         );
         screen

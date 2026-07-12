@@ -804,7 +804,16 @@ Potential scope:
   memory (`session::context_tokens`). A `contextTokenBudget` setting is
   parsed/defaulted. Deferred (outside #54): pricing/cost accounting, and exact
   provider-reported usage (the `tokenEstimate` field is the swap-in point once
-  providers surface it).]
+  providers surface it). Metrics single-home shipped (2026-07-12): all
+  token/usage arithmetic lives in `src/metrics.rs` (`TokenFlows`,
+  `TimingStats`, `ratio_percent`, `tokens_per_second`,
+  `ResolvedContextBudget`); Nexus measures per-provider-turn timing
+  (duration + time-to-first-output) on `ProviderTurnCompleted`; the session
+  bar meter, trigger ladder, and `/context` divide by the same resolved
+  budget installed via `set_compaction_trigger` and disclosed through
+  `ContextDiagnostics::budget_facts`; `/context` gained window-derivation and
+  measured session-usage sections; the `/debug` snapshot carries a
+  collect-only per-turn usage+timing ledger.]
   Auto Compaction Foundation
   ([#55](https://github.com/5omeOtherGuy/iris-agent/issues/55), shipped
   2026-06-17) makes `contextTokenBudget` trigger runtime behavior: the Tier-2

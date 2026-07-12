@@ -35,7 +35,6 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::{LoadedSource, ModelSwitch, SessionLoader, SessionSource, StartupUi};
 use crate::git::status::{GitStatusCache, VcsStatus};
 use crate::mimir::auth::storage::AuthStore;
-use crate::mimir::model_catalog;
 use crate::mimir::selection::ModelSelection;
 use crate::nexus::{
     AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, PermissionMode,
@@ -372,7 +371,7 @@ async fn session_loop<P: ChatProvider>(
         let punctuation_chords = tui.keyboard_enhanced();
         tui.screen.show_start_page(recoverable, punctuation_chords);
     }
-    refresh_footer(tui, switch);
+    refresh_footer(harness, tui, switch);
     apply_recovery(recovery, tui);
     // `iris resume` (no id) on a rich TTY opens the resume picker on start by
     // handing a pre-built modal here. Open it before the first draw and before
@@ -397,7 +396,7 @@ async fn session_loop<P: ChatProvider>(
         // Keep the status footer current: a model/effort change handled in the
         // previous iteration (chord, picker, or modal) is reflected before the
         // next idle draw.
-        refresh_footer(tui, switch);
+        refresh_footer(harness, tui, switch);
         sync_git_status(tui, &git_cache, &mut git_generation);
         // Run any open picker/dialog first: the startup resume picker, or one a
         // command/keybinding opened in the previous iteration. A `/resume`
@@ -419,7 +418,7 @@ async fn session_loop<P: ChatProvider>(
             if let Some(source) = requested {
                 perform_swap(&source, swap, harness, tui, switch)?;
             }
-            refresh_footer(tui, switch);
+            refresh_footer(harness, tui, switch);
             tui.draw()?;
             continue;
         }
@@ -546,7 +545,7 @@ async fn session_loop<P: ChatProvider>(
                     } else {
                         toggle_tree_menu(&mut tui.screen, &git_cache, false);
                     }
-                    refresh_footer(tui, switch);
+                    refresh_footer(harness, tui, switch);
                     tui.draw()?;
                     continue;
                 }
@@ -608,7 +607,7 @@ async fn session_loop<P: ChatProvider>(
         // A model/effort switch (Ctrl+P, Shift+Tab, or a `/model` `/reasoning`
         // command) lands in this iteration; refresh the footer so the trailing
         // draw reflects the new selection immediately, not on the next keypress.
-        refresh_footer(tui, switch);
+        refresh_footer(harness, tui, switch);
         tui.draw()?;
     }
     Ok(())
@@ -819,7 +818,11 @@ fn switch_cache_status(
 /// Refresh the idle status footer from the live model selection. A no-op when
 /// no model switch is wired (the footer then stays unset and the keybind hint
 /// shows instead).
-fn refresh_footer<P: ChatProvider>(tui: &mut TuiUi, switch: &Option<ModelSwitch<'_, P>>) {
+fn refresh_footer<P: ChatProvider>(
+    harness: &Harness<P>,
+    tui: &mut TuiUi,
+    switch: &Option<ModelSwitch<'_, P>>,
+) {
     let Some(sw) = switch.as_ref() else {
         return;
     };
@@ -832,15 +835,10 @@ fn refresh_footer<P: ChatProvider>(tui: &mut TuiUi, switch: &Option<ModelSwitch<
         )
         .to_string()
     });
-    let qualified_model = format!("{}/{}", selection.provider.as_str(), selection.model);
-    let context = if selection.provider == crate::mimir::selection::ProviderId::OpenAiCompatible {
-        selection
-            .open_ai_compatible
-            .context_window
-            .map(model_catalog::context_window_label)
-    } else {
-        model_catalog::ctx_label(&qualified_model).map(str::to_string)
-    };
+    // The footer's denominator is the harness's enforced budget — the same
+    // resolved number the compaction trigger divides by — never a separately
+    // derived catalog label, so every "how full" surface agrees.
+    let context = harness.context_budget();
     tui.screen
         .set_footer_with_context(selection.model.clone(), effort, context, footer_cwd());
 }
@@ -1311,6 +1309,7 @@ fn context_breakdown_lines<P: ChatProvider>(
     harness: &crate::wayland::Harness<P>,
     switch: Option<&ModelSwitch<'_, P>>,
     accounting: &super::tui::ContextAccounting,
+    meter: &super::tui::SessionMeter,
 ) -> Vec<String> {
     use crate::session::estimate_tokens;
     let local_total = harness.context_token_estimate();
@@ -1333,6 +1332,40 @@ fn context_breakdown_lines<P: ChatProvider>(
                 "  free headroom      ~{} tokens",
                 budget.saturating_sub(total)
             ));
+            // Where the denominator comes from: the same resolved budget the
+            // session bar's CTX meter and the trigger ladder divide by. Facts
+            // are display-only provenance; enforcement always uses `budget`.
+            match diagnostics.budget_facts {
+                Some(facts) => {
+                    if let Some(window) = facts.window {
+                        lines.push(format!(
+                            "  window derivation  {} raw - {} max-output reserve - {} summary reserve = {} effective",
+                            window.raw,
+                            window.max_output_reserve,
+                            window.summary_reserve,
+                            window.effective
+                        ));
+                    }
+                    match (facts.clamp, facts.clamped()) {
+                        (Some(clamp), true) => lines.push(format!(
+                            "  budget clamp       contextTokenBudget {clamp} binds (below the model window)"
+                        )),
+                        (Some(clamp), false) if facts.window.is_none() => lines.push(format!(
+                            "  budget source      contextTokenBudget {clamp} (no catalog window for this model)"
+                        )),
+                        _ => {}
+                    }
+                    if facts.window.is_none() && facts.clamp.is_none() {
+                        lines.push(format!(
+                            "  budget source      built-in default {} (no catalog window, no contextTokenBudget)",
+                            facts.resolved
+                        ));
+                    }
+                }
+                None => lines.push(
+                    "  budget source      installed directly (no derivation recorded)".to_string(),
+                ),
+            }
             let state = if diagnostics.automatic_enabled {
                 "on"
             } else {
@@ -1456,6 +1489,55 @@ fn context_breakdown_lines<P: ChatProvider>(
         lines.push(format!(
             "  frozen folds       {frozen} under active compaction job, ~{frozen_reclaimable} tokens reclaimable after apply"
         ));
+    }
+    // Session usage: measured provider accounting for this run (the same
+    // accumulator behind the exit receipt — provider-reported usage and
+    // timing only, never estimates, hence no `~` prefixes).
+    let flows = meter.flows();
+    if !flows.is_empty() {
+        lines.push("session usage (this run):".to_string());
+        lines.push(format!(
+            "  provider turns     {} across {} user turn(s)",
+            flows.provider_turns,
+            meter.user_turns()
+        ));
+        let mut sent = format!("  sent               {} tokens", flows.input_tokens);
+        if let Some(percent) = flows.cache_read_percent() {
+            sent.push_str(&format!(" (cache read {percent}%"));
+            if flows.cache_write_input_tokens > 0 {
+                sent.push_str(&format!(", cache write {}", flows.cache_write_input_tokens));
+            }
+            sent.push(')');
+        }
+        lines.push(sent);
+        if flows.cache_creation_reported {
+            lines.push(format!(
+                "  cache write tiers  5m {} / 1h {}",
+                flows.cache_creation_5m_input_tokens, flows.cache_creation_1h_input_tokens
+            ));
+        }
+        let mut received = format!("  received           {} tokens", flows.output_tokens);
+        if flows.reasoning_output_tokens > 0 {
+            received.push_str(&format!(" ({} reasoning)", flows.reasoning_output_tokens));
+        }
+        lines.push(received);
+        let timing = meter.timing();
+        if !timing.generation.is_zero() {
+            let mut line = format!(
+                "  provider time      {:.1}s generating",
+                timing.generation.as_secs_f64()
+            );
+            if let Some(ttft) = timing.avg_ttft() {
+                line.push_str(&format!("; first output avg {:.2}s", ttft.as_secs_f64()));
+            }
+            if let Some(rate) =
+                crate::metrics::tokens_per_second(flows.output_tokens, timing.generation)
+                && flows.output_tokens > 0
+            {
+                line.push_str(&format!("; {} tok/s", rate.round() as u64));
+            }
+            lines.push(line);
+        }
     }
     lines
 }
@@ -1664,8 +1746,12 @@ fn route_command<P: ChatProvider>(
             // its trigger tag. Display-only; all numbers come from the harness
             // estimates and the session's runtime events, never fabricated.
             tui.screen.commit_user(prompt);
-            let lines =
-                context_breakdown_lines(harness, switch.as_ref(), &tui.screen.context_accounting);
+            let lines = context_breakdown_lines(
+                harness,
+                switch.as_ref(),
+                &tui.screen.context_accounting,
+                tui.screen.session_meter(),
+            );
             apply_notices(tui, lines);
             Ok(RouteOutcome::Consumed)
         }
@@ -1852,11 +1938,13 @@ fn write_debug_snapshot<P: ChatProvider>(
         .context("cannot resolve the debug log path: HOME is not set")?;
     let (size, rendered) = tui.debug_render_lines()?;
     let frame_stats = tui.frame_stats_lines();
+    let turn_ledger = provider_turn_ledger_lines(tui.screen.session_meter());
     let contents = debug_snapshot_contents(
         size.width,
         size.height,
         &rendered,
         &frame_stats,
+        &turn_ledger,
         harness.messages(),
     );
     if let Some(parent) = path.parent() {
@@ -1868,12 +1956,43 @@ fn write_debug_snapshot<P: ChatProvider>(
     Ok(path)
 }
 
+/// The collect-only per-provider-turn ledger for the `/debug` snapshot: one
+/// line per completed provider turn with its measured usage and timing, for
+/// offline debugging/benchmarking. Never rendered in the live TUI.
+fn provider_turn_ledger_lines(meter: &super::tui::SessionMeter) -> Vec<String> {
+    meter
+        .records()
+        .iter()
+        .enumerate()
+        .map(|(index, (usage, timing))| {
+            let ttft = match timing.time_to_first_output {
+                Some(ttft) => format!("{}ms", ttft.as_millis()),
+                None => "none".to_string(),
+            };
+            format!(
+                "{:>4}. {}/{} in {} (cache r{} w{}) out {} (reasoning {}) total {}; duration {}ms ttft {ttft}",
+                index + 1,
+                usage.provider,
+                usage.model,
+                usage.input_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_write_input_tokens,
+                usage.output_tokens,
+                usage.reasoning_output_tokens,
+                usage.total_tokens,
+                timing.duration.as_millis(),
+            )
+        })
+        .collect()
+}
+
 /// Assemble the `/debug` snapshot body. Pure so the shape is unit-testable.
 fn debug_snapshot_contents(
     width: u16,
     height: u16,
     rendered: &[String],
     frame_stats: &[String],
+    turn_ledger: &[String],
     messages: &[crate::nexus::Message],
 ) -> String {
     let unix_ms = std::time::SystemTime::now()
@@ -1897,6 +2016,13 @@ fn debug_snapshot_contents(
     out.push(String::new());
     out.push("=== Rendered lines with visible widths ===".to_string());
     out.extend(rendered.iter().cloned());
+    out.push(String::new());
+    out.push("=== Provider turn ledger (measured usage + timing) ===".to_string());
+    if turn_ledger.is_empty() {
+        out.push("(no completed provider turns)".to_string());
+    } else {
+        out.extend(turn_ledger.iter().cloned());
+    }
     out.push(String::new());
     out.push("=== Context messages (JSONL) ===".to_string());
     out.extend(
@@ -2342,7 +2468,7 @@ async fn run_modal_phase<P: ChatProvider>(
                 }
                 // The picker may have switched model/effort; refresh the
                 // footer before drawing so it never shows a stale model.
-                refresh_footer(tui, switch);
+                refresh_footer(harness, tui, switch);
                 tui.draw()?;
             }
             _ = tick.tick() => {
@@ -3936,7 +4062,13 @@ mod tests {
         accounting.fold_batches.push(("A4", 1, 700));
         accounting.compactions.push((4000, 400));
 
-        let lines = context_breakdown_lines(&harness, None, &accounting).join("\n");
+        let lines = context_breakdown_lines(
+            &harness,
+            None,
+            &accounting,
+            &crate::ui::tui::SessionMeter::default(),
+        )
+        .join("\n");
         let total = harness.context_token_estimate();
         let summarized = estimate_tokens(summary);
         assert!(
@@ -3969,6 +4101,160 @@ mod tests {
         assert!(
             lines.contains("reclaimed ~700 tokens [A4]"),
             "fold line carries its trigger tag: {lines}"
+        );
+    }
+
+    #[test]
+    fn context_breakdown_discloses_budget_derivation_and_session_usage() {
+        use crate::mimir::model_catalog::{ContextWindowSource, EffectiveContextWindow};
+        use crate::nexus::{Agent, CacheCreation, Message, ProviderTurnTiming, ProviderUsage};
+        let agent = Agent::resumed(
+            NullChat,
+            crate::tools::built_in_tools(),
+            vec![Message::user("hello")],
+        );
+        let mut harness = crate::wayland::Harness::new(
+            agent,
+            std::env::temp_dir(),
+            crate::tools::ToolState::new(),
+            None,
+            Some(127_808),
+        );
+        let trigger = crate::config::Settings::default()
+            .compaction_trigger()
+            .unwrap();
+        let window = EffectiveContextWindow {
+            raw: 200_000,
+            max_output_reserve: 64_000,
+            summary_reserve: 8_192,
+            effective: 127_808,
+            source: ContextWindowSource::Catalog,
+        };
+        harness.set_compaction_trigger(
+            crate::metrics::ResolvedContextBudget::resolve(Some(window), None, 64_000),
+            trigger,
+        );
+
+        // One completed provider turn observed by the screen's session meter:
+        // every number below is that measured usage/timing, never an estimate.
+        let mut screen = crate::ui::tui::Screen::new();
+        screen.start_turn();
+        screen.apply(crate::ui::UiEvent::ProviderTurnCompleted {
+            turn_id: "t1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "anthropic".to_string(),
+                model: "opus-4.8".to_string(),
+                input_tokens: 10_000,
+                output_tokens: 1_000,
+                cache_read_input_tokens: 8_000,
+                cache_write_input_tokens: 700,
+                reasoning_output_tokens: 250,
+                total_tokens: 11_000,
+                cache_creation: Some(CacheCreation {
+                    ephemeral_5m_input_tokens: 500,
+                    ephemeral_1h_input_tokens: 200,
+                }),
+            }),
+            timing: ProviderTurnTiming {
+                duration: Duration::from_millis(1_000),
+                time_to_first_output: Some(Duration::from_millis(400)),
+            },
+        });
+        screen.end_turn();
+
+        let lines = context_breakdown_lines(
+            &harness,
+            None,
+            &crate::ui::tui::ContextAccounting::default(),
+            screen.session_meter(),
+        )
+        .join("\n");
+        assert!(
+            lines.contains(
+                "window derivation  200000 raw - 64000 max-output reserve - 8192 summary reserve = 127808 effective"
+            ),
+            "{lines}"
+        );
+        assert!(lines.contains("session usage (this run):"), "{lines}");
+        assert!(
+            lines.contains("provider turns     1 across 1 user turn(s)"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("sent               10000 tokens (cache read 80%, cache write 700)"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("cache write tiers  5m 500 / 1h 200"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("received           1000 tokens (250 reasoning)"),
+            "{lines}"
+        );
+        // Generation window = 1.0s - 0.4s TTFT = 0.6s; 1000 tokens over it.
+        assert!(
+            lines
+                .contains("provider time      0.6s generating; first output avg 0.40s; 1667 tok/s"),
+            "{lines}"
+        );
+
+        // A binding legacy clamp is disclosed as the governing constraint.
+        let trigger = crate::config::Settings::default()
+            .compaction_trigger()
+            .unwrap();
+        harness.set_compaction_trigger(
+            crate::metrics::ResolvedContextBudget::resolve(Some(window), Some(64_000), 64_000),
+            trigger,
+        );
+        let lines = context_breakdown_lines(
+            &harness,
+            None,
+            &crate::ui::tui::ContextAccounting::default(),
+            screen.session_meter(),
+        )
+        .join("\n");
+        assert!(
+            lines.contains(
+                "budget clamp       contextTokenBudget 64000 binds (below the model window)"
+            ),
+            "{lines}"
+        );
+        assert!(lines.contains("of 64000 tokens"), "{lines}");
+    }
+
+    #[test]
+    fn provider_turn_ledger_lines_render_measured_usage_and_timing() {
+        use crate::nexus::{ProviderTurnTiming, ProviderUsage};
+        let mut screen = crate::ui::tui::Screen::new();
+        screen.start_turn();
+        screen.apply(crate::ui::UiEvent::ProviderTurnCompleted {
+            turn_id: "t1".to_string(),
+            response_id: None,
+            usage: Some(ProviderUsage {
+                provider: "openai-codex".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 5_000,
+                output_tokens: 300,
+                cache_read_input_tokens: 4_000,
+                cache_write_input_tokens: 0,
+                reasoning_output_tokens: 120,
+                total_tokens: 5_300,
+                cache_creation: None,
+            }),
+            timing: ProviderTurnTiming {
+                duration: Duration::from_millis(2_500),
+                time_to_first_output: None,
+            },
+        });
+        screen.end_turn();
+
+        let ledger = provider_turn_ledger_lines(screen.session_meter());
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(
+            ledger[0],
+            "   1. openai-codex/gpt-5.5 in 5000 (cache r4000 w0) out 300 (reasoning 120) total 5300; duration 2500ms ttft none"
         );
     }
 
@@ -4016,7 +4302,7 @@ mod tests {
             "Frames sampled: 3 (ring holds last 512)".to_string(),
             "  total   p50=1.000ms p99=2.000ms max=2.000ms".to_string(),
         ];
-        let contents = debug_snapshot_contents(80, 24, &rendered, &frame_stats, &messages);
+        let contents = debug_snapshot_contents(80, 24, &rendered, &frame_stats, &[], &messages);
         assert!(contents.contains("Iris "), "{contents}");
         assert!(contents.contains("Terminal: 80x24"), "{contents}");
         assert!(contents.contains("Total lines: 2"), "{contents}");
@@ -4042,7 +4328,7 @@ mod tests {
 
     #[test]
     fn debug_snapshot_notes_when_no_frames_have_been_drawn() {
-        let contents = debug_snapshot_contents(80, 24, &[], &[], &[]);
+        let contents = debug_snapshot_contents(80, 24, &[], &[], &[], &[]);
         assert!(
             contents.contains("=== Frame timing (compose vs flush) ==="),
             "{contents}"

@@ -253,6 +253,10 @@ pub(crate) struct ContextDiagnostics {
     pub(crate) measured: u64,
     pub(crate) source: ContextMeasurementSource,
     pub(crate) ladder: TriggerLadder,
+    /// Provenance of the ladder's effective window (raw catalog window,
+    /// reserves, legacy clamp), when the Tier-3 app resolved it. `None` for
+    /// bare-number installs; display falls back to the enforced number alone.
+    pub(crate) budget_facts: Option<crate::metrics::ResolvedContextBudget>,
     pub(crate) automatic_enabled: bool,
     pub(crate) background_running: bool,
     pub(crate) background_job: Option<BackgroundJobDiagnostics>,
@@ -441,10 +445,16 @@ impl<P: ChatProvider> Harness<P> {
 
     pub(crate) fn set_compaction_trigger(
         &mut self,
-        effective_window: u64,
+        budget: crate::metrics::ResolvedContextBudget,
         config: CompactionTriggerConfig,
     ) {
+        // One install point for the governing denominator: the enforced
+        // number and its provenance (catalog window, reserves, legacy clamp)
+        // arrive together, so diagnostics can never disclose facts that
+        // disagree with what the trigger actually enforces.
+        let effective_window = budget.resolved;
         self.compaction.budget = Some(effective_window);
+        self.compaction.budget_facts = Some(budget);
         self.compaction.automatic_enabled = config.enabled;
         self.compaction.trigger_v2 = true;
         self.compaction.pressure = PressureTracker::default();
@@ -994,6 +1004,7 @@ impl<P: ChatProvider> Harness<P> {
             measured: measured.tokens,
             source: measured.source,
             ladder,
+            budget_facts: self.compaction.budget_facts,
             automatic_enabled: self.compaction.automatic_enabled,
             background_running: self.compaction.background.is_some(),
             background_job: self.compaction.background.as_ref().map(|job| {

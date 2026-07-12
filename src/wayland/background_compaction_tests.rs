@@ -714,7 +714,7 @@ fn reactive_overflow_runs_deterministic_relief_and_returns_a_resend() {
         mut harness, path, ..
     } = seeded;
     harness.set_compaction_trigger(
-        32_768,
+        32_768.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: 0.55,
@@ -822,7 +822,7 @@ fn reactive_off_surfaces_overflow_without_mutating_context() {
         mut harness, path, ..
     } = seeded;
     harness.set_compaction_trigger(
-        32_768,
+        32_768.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: 0.55,
@@ -869,7 +869,7 @@ fn per_turn_model_compaction_cap_uses_deterministic_relief() {
         ..
     } = seeded;
     harness.set_compaction_trigger(
-        131_072,
+        131_072.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: 0.55,
@@ -934,7 +934,7 @@ fn reactive_overflow_deep_cuts_when_the_retained_tail_stays_hard() {
         Some(32_768),
     );
     harness.set_compaction_trigger(
-        32_768,
+        32_768.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: 0.55,
@@ -1271,7 +1271,7 @@ fn ready_summary_applies_mid_turn_before_queued_steering_is_injected_verbatim() 
         Some(131_072),
     );
     harness.set_compaction_trigger(
-        131_072,
+        131_072.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: 0.55,
@@ -1675,7 +1675,7 @@ fn hard_tier_bounds_wait_then_cancels_and_applies_deterministic_fallback() {
         std::thread::sleep(Duration::from_millis(2));
     }
     seeded.harness.set_compaction_trigger(
-        300,
+        300.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: 0.55,
@@ -1726,7 +1726,7 @@ fn model_request_compacts_at_the_next_boundary_even_when_automatic_is_off() {
     let mut seeded = seed_harness(&root.path, &workspace.path);
     seeded.harness.set_summarizer(SummarizerKind::Excerpts);
     seeded.harness.set_compaction_trigger(
-        32_768,
+        32_768.into(),
         CompactionTriggerConfig {
             enabled: false,
             warn: 0.55,
@@ -1815,7 +1815,7 @@ fn turn_cancellation_preempts_the_governor_hard_wait_without_applying() {
         std::thread::sleep(Duration::from_millis(2));
     }
     seeded.harness.set_compaction_trigger(
-        300,
+        300.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: 0.55,
@@ -1875,7 +1875,7 @@ fn v2_off_switch_leaves_automatic_rewrites_disabled() {
     let workspace = temp_dir();
     let mut seeded = seed_harness(&root.path, &workspace.path);
     seeded.harness.set_compaction_trigger(
-        300,
+        300.into(),
         CompactionTriggerConfig {
             enabled: false,
             warn: 0.55,
@@ -1904,7 +1904,7 @@ fn breaker_disables_model_jobs_but_keeps_deterministic_compaction() {
     let workspace = temp_dir();
     let mut seeded = seed_harness(&root.path, &workspace.path);
     seeded.harness.set_compaction_trigger(
-        300,
+        300.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: 0.1,
@@ -2023,7 +2023,7 @@ fn hard_tier_covers_current_turn_and_bounds_runaway_within_one_turn() {
     // false, so relief comes purely from the hard-tier excerpts ladder.
     harness.set_summarizer(SummarizerKind::Excerpts);
     harness.set_compaction_trigger(
-        131_072,
+        131_072.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: 0.55,
@@ -2134,7 +2134,7 @@ fn single_turn_hard_harness(
         Some(131_072),
     );
     harness.set_compaction_trigger(
-        131_072,
+        131_072.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: 0.55,

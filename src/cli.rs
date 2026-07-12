@@ -697,9 +697,9 @@ pub(crate) fn apply_selection<P: ChatProvider>(
     let scope = switch_scope(&switch.selection, &candidate);
     harness.replace_provider(provider);
     if let Some(settings) = switch.compaction_settings.as_ref()
-        && let Ok((window, trigger)) = crate::resolved_compaction_trigger(settings, &candidate)
+        && let Ok((budget, trigger)) = crate::resolved_compaction_trigger(settings, &candidate)
     {
-        harness.set_compaction_trigger(window, trigger);
+        harness.set_compaction_trigger(budget, trigger);
     }
     // Install the new lane's cache profile for the fold scheduler (issue
     // #400) before recording the switch, so the A2/A3 break is scheduled

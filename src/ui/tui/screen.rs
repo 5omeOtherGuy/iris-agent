@@ -57,7 +57,8 @@ struct Spinner {
 struct TurnDivider {
     had_work: bool,
     elapsed: Option<Duration>,
-    usage: Option<ProviderUsage>,
+    flows: crate::metrics::TokenFlows,
+    timing: crate::metrics::TimingStats,
 }
 
 impl TurnDivider {
@@ -80,30 +81,21 @@ impl TurnDivider {
             self.had_work = true;
         }
         if let UiEvent::ProviderTurnCompleted {
-            usage: Some(usage), ..
+            usage: Some(usage),
+            timing,
+            ..
         } = event
         {
             // A task can span several provider turns (the tool loop); the
-            // divider's ↑/↓ must be the TASK's cost, so token flows are
-            // summed. `total_tokens` is a level (conversation size after the
-            // latest turn), not a flow — keep the latest, never a sum.
-            match &mut self.usage {
-                Some(sum) => {
-                    sum.input_tokens = sum.input_tokens.saturating_add(usage.input_tokens);
-                    sum.output_tokens = sum.output_tokens.saturating_add(usage.output_tokens);
-                    sum.cache_read_input_tokens = sum
-                        .cache_read_input_tokens
-                        .saturating_add(usage.cache_read_input_tokens);
-                    sum.cache_write_input_tokens = sum
-                        .cache_write_input_tokens
-                        .saturating_add(usage.cache_write_input_tokens);
-                    sum.reasoning_output_tokens = sum
-                        .reasoning_output_tokens
-                        .saturating_add(usage.reasoning_output_tokens);
-                    sum.total_tokens = usage.total_tokens;
-                }
-                None => self.usage = Some(usage.clone()),
-            }
+            // divider's ↑/↓ must be the TASK's cost. `TokenFlows` owns the
+            // flow-vs-level arithmetic (sums flows, keeps the latest total)
+            // and `TimingStats` the provider-time sums, so this accumulator
+            // and the session meter can never disagree on the math. Timing is
+            // folded in ONLY alongside its usage: a usage-less completion must
+            // not stretch the tok/s denominator under a numerator that never
+            // counted its tokens.
+            self.flows.observe(usage);
+            self.timing.observe(timing);
         }
     }
 }
@@ -115,9 +107,12 @@ impl TurnDivider {
 pub(crate) struct SessionMeter {
     started: Instant,
     turns: u32,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
+    flows: crate::metrics::TokenFlows,
+    timing: crate::metrics::TimingStats,
+    /// Per-provider-turn ledger (usage + timing as reported), collect-only:
+    /// surfaced by the `/debug` snapshot for debugging/benchmarking, never
+    /// rendered live. Bounded by session length (two small structs per turn).
+    records: Vec<(ProviderUsage, crate::nexus::ProviderTurnTiming)>,
 }
 
 impl Default for SessionMeter {
@@ -125,9 +120,9 @@ impl Default for SessionMeter {
         Self {
             started: Instant::now(),
             turns: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
+            flows: crate::metrics::TokenFlows::default(),
+            timing: crate::metrics::TimingStats::default(),
+            records: Vec::new(),
         }
     }
 }
@@ -135,21 +130,45 @@ impl Default for SessionMeter {
 impl SessionMeter {
     fn observe(&mut self, event: &UiEvent) {
         if let UiEvent::ProviderTurnCompleted {
-            usage: Some(usage), ..
+            usage: Some(usage),
+            timing,
+            ..
         } = event
         {
-            self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
-            self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
-            self.cache_read_tokens = self
-                .cache_read_tokens
-                .saturating_add(usage.cache_read_input_tokens);
+            // Usage and timing are folded in together (and only together):
+            // rates divide measured tokens by the generation time of exactly
+            // the turns that reported them.
+            self.flows.observe(usage);
+            self.timing.observe(timing);
+            self.records.push((usage.clone(), timing.clone()));
         }
+    }
+
+    /// Session-scoped token flows (measured provider usage only).
+    pub(crate) fn flows(&self) -> &crate::metrics::TokenFlows {
+        &self.flows
+    }
+
+    /// Session-scoped provider timing sums.
+    pub(crate) fn timing(&self) -> &crate::metrics::TimingStats {
+        &self.timing
+    }
+
+    /// User turns observed (the receipt's turn count, not provider rounds).
+    pub(crate) fn user_turns(&self) -> u32 {
+        self.turns
+    }
+
+    /// The collect-only per-provider-turn ledger for `/debug`.
+    pub(crate) fn records(&self) -> &[(ProviderUsage, crate::nexus::ProviderTurnTiming)] {
+        &self.records
     }
 
     /// The one-line exit receipt, or `None` for a session with no turns (a
     /// receipt for nothing is noise). Every field is measured: wall time, turn
     /// count, tokens sent/received across all provider turns, and — only when
-    /// cache reads were reported — the share of sent tokens served from cache.
+    /// the underlying data was reported — cache share, reasoning tokens, and
+    /// the mean output rate over provider generation time.
     fn receipt(&self) -> Option<String> {
         if self.turns == 0 {
             return None;
@@ -164,22 +183,29 @@ impl SessionMeter {
                 format!("{} turns", self.turns)
             },
         ];
-        if self.input_tokens > 0 || self.output_tokens > 0 {
+        if self.flows.input_tokens > 0 || self.flows.output_tokens > 0 {
             fields.push(format!(
                 "↑{} ↓{}",
-                compact_count(self.input_tokens),
-                compact_count(self.output_tokens)
+                compact_count(self.flows.input_tokens),
+                compact_count(self.flows.output_tokens)
             ));
         }
-        if self.cache_read_tokens > 0 && self.input_tokens > 0 {
-            // Same rounding as `cache_read_percent`: integer half-up, capped.
-            let percent = (self
-                .cache_read_tokens
-                .saturating_mul(100)
-                .saturating_add(self.input_tokens / 2)
-                / self.input_tokens)
-                .min(100);
+        if self.flows.cache_read_input_tokens > 0
+            && let Some(percent) = self.flows.cache_read_percent()
+        {
             fields.push(format!("cache {percent}%"));
+        }
+        if self.flows.reasoning_output_tokens > 0 {
+            fields.push(format!(
+                "reasoning {}",
+                compact_count(self.flows.reasoning_output_tokens)
+            ));
+        }
+        if let Some(rate) =
+            crate::metrics::tokens_per_second(self.flows.output_tokens, self.timing.generation)
+            && self.flows.output_tokens > 0
+        {
+            fields.push(format!("{} tok/s", rate.round() as u64));
         }
         Some(fields.join(&format!(" {sep} ")))
     }
@@ -523,8 +549,11 @@ struct Footer {
     model: String,
     /// Reasoning effort display token, when configured.
     effort: Option<String>,
-    /// Context-window label sourced from the model catalog, when known.
-    context: Option<String>,
+    /// The governing context budget in tokens — the same resolved number the
+    /// compaction trigger enforces — when known. The session bar derives its
+    /// display label from this value, so the meter's denominator and the cap
+    /// label can never disagree.
+    context_window: Option<u64>,
     /// Working directory, home-relativized to `~` where possible.
     cwd: String,
     /// Last-known VCS status snapshot for the session bar's VCS segment and
@@ -532,13 +561,11 @@ struct Footer {
     /// last-known; the loop refreshes it from the async [`crate::git::status`]
     /// cache.
     vcs: Option<VcsStatus>,
-    /// Latest provider-reported usage, if the provider surfaced it. Cleared at
-    /// turn start so the working indicator's per-turn token readout resets.
-    usage: Option<ProviderUsage>,
     /// Most recent total context tokens, used to drive the top-frame context
-    /// meter. Unlike `usage` this persists across turns (so the meter does not
-    /// drop to empty at every turn start) and is cleared only when the model or
-    /// context window changes.
+    /// meter. Persists across turns (so the meter does not drop to empty at
+    /// every turn start) and is cleared only when the model or context window
+    /// changes. Live token telemetry itself lives in the turn divider's and
+    /// session meter's [`crate::metrics::TokenFlows`] — the one home.
     context_used_tokens: Option<u64>,
     context_pressure: ContextPressureTier,
 }
@@ -712,11 +739,14 @@ impl SwitchStatus {
                 ),
                 dim_style(),
             ));
-            Self::push_sep(&mut spans);
-            spans.push(Span::styled(
-                format!("cache read {}%", cache_read_percent(usage)),
-                dim_style(),
-            ));
+            // A ratio over zero input is unknowable, not 0%: the segment is
+            // omitted rather than claiming a number no data backs.
+            if let Some(percent) =
+                crate::metrics::ratio_percent(usage.cache_read_input_tokens, usage.input_tokens)
+            {
+                Self::push_sep(&mut spans);
+                spans.push(Span::styled(format!("cache read {percent}%"), dim_style()));
+            }
         } else {
             spans.push(Span::styled("usage unavailable".to_string(), dim_style()));
         }
@@ -744,18 +774,6 @@ impl SwitchStatus {
         ));
         spans
     }
-}
-
-fn cache_read_percent(usage: &ProviderUsage) -> u64 {
-    if usage.input_tokens == 0 {
-        return 0;
-    }
-    (usage
-        .cache_read_input_tokens
-        .saturating_mul(100)
-        .saturating_add(usage.input_tokens / 2)
-        / usage.input_tokens)
-        .min(100)
 }
 
 fn content_width(width: usize) -> usize {
@@ -808,7 +826,7 @@ pub(super) fn working_indicator_line(
     frame: &str,
     elapsed: Duration,
     can_interrupt: bool,
-    usage: Option<&ProviderUsage>,
+    flows: &crate::metrics::TokenFlows,
     queued: usize,
     width: usize,
 ) -> Line<'static> {
@@ -817,7 +835,7 @@ pub(super) fn working_indicator_line(
         elapsed,
         can_interrupt,
         None,
-        usage,
+        flows,
         queued,
         None,
         width,
@@ -830,7 +848,7 @@ fn working_indicator_line_with_activity(
     elapsed: Duration,
     _can_interrupt: bool,
     activity: Option<&str>,
-    usage: Option<&ProviderUsage>,
+    flows: &crate::metrics::TokenFlows,
     queued: usize,
     flow: Option<&FlowMeter>,
     width: usize,
@@ -857,13 +875,13 @@ fn working_indicator_line_with_activity(
         };
         spans.push(Span::styled(label, dim_style()));
     }
-    if let Some(usage) = usage {
+    if !flows.is_empty() {
         spans.push(working_sep());
         spans.push(Span::styled(
             format!(
                 "↑{} ↓{}",
-                compact_count(usage.input_tokens),
-                compact_count(usage.output_tokens)
+                compact_count(flows.input_tokens),
+                compact_count(flows.output_tokens)
             ),
             dim_style(),
         ));
@@ -881,7 +899,7 @@ fn working_indicator_line_with_activity(
 fn working_lines(
     frame: &str,
     elapsed: Option<Duration>,
-    usage: Option<&ProviderUsage>,
+    flows: &crate::metrics::TokenFlows,
     activity: Option<&str>,
     queued: usize,
     flow: Option<&FlowMeter>,
@@ -892,7 +910,7 @@ fn working_lines(
         elapsed.unwrap_or_default(),
         true,
         activity,
-        usage,
+        flows,
         queued,
         flow,
         width,
@@ -1409,6 +1427,11 @@ impl Screen {
     /// receipt's scope is the whole PROCESS run, not one logical session, so
     /// `/new`/resume swaps carry the meter into the fresh screen instead of
     /// restarting the clock and undercounting the printed record.
+    /// Read access for `/context`'s session-usage section and `/debug`.
+    pub(crate) fn session_meter(&self) -> &SessionMeter {
+        &self.session_meter
+    }
+
     pub(crate) fn take_session_meter(&mut self) -> SessionMeter {
         std::mem::take(&mut self.session_meter)
     }
@@ -1446,7 +1469,7 @@ impl Screen {
         let Some(footer) = &mut self.footer else {
             return;
         };
-        let cap = footer.context.as_deref().and_then(parse_context_window);
+        let cap = footer.context_window;
         let filled = |tokens: u64| cap.map_or(0, |cap| context_meter_filled(tokens, cap));
         let before = footer.context_used_tokens.map_or(0, filled);
         let after = filled(used);
@@ -1682,9 +1705,6 @@ impl Screen {
             // total. A newly lit LED flashes, a darkened one exhales — both
             // acknowledged inside `update_context_meter`.
             self.update_context_meter(usage.total_tokens);
-            if let Some(footer) = &mut self.footer {
-                footer.usage = Some(usage.clone());
-            }
         }
         if let UiEvent::ContextPressure { tier, measured, .. } = &event
             && let Some(footer) = &mut self.footer
@@ -1976,31 +1996,29 @@ impl Screen {
                     ),
                 )
             });
-        let context = model_catalog::ctx_label(&lookup_model).map(str::to_string);
-        self.set_footer_with_context(display_model, effort, context, cwd);
+        // Tests stand in the raw catalog window for the resolved budget; the
+        // live loop installs the harness's enforced number instead.
+        let window = model_catalog::catalog_context_window(&lookup_model);
+        self.set_footer_with_context(display_model, effort, window, cwd);
     }
 
     pub(crate) fn set_footer_with_context(
         &mut self,
         model: String,
         effort: Option<String>,
-        context: Option<String>,
+        context_window: Option<u64>,
         cwd: String,
     ) {
         let prev = self.footer.as_ref();
-        // Model ids and catalog context labels are ASCII; compare case-
-        // insensitively so a differently-cased model id (e.g. from a future
-        // caller) does not needlessly reset the persisted context meter.
+        // Model ids are ASCII; compare case-insensitively so a differently-
+        // cased model id (e.g. from a future caller) does not needlessly reset
+        // the persisted context meter.
         let same_context = prev.is_some_and(|footer| {
-            footer.model.eq_ignore_ascii_case(&model)
-                && label_eq_ignore_case(footer.context.as_deref(), context.as_deref())
+            footer.model.eq_ignore_ascii_case(&model) && footer.context_window == context_window
         });
-        // Carry usage and the meter value across an unchanged model/context;
-        // reset both when the model or context window changes so a prior model's
-        // usage cannot be shown against a new context window.
-        let usage = same_context
-            .then(|| prev.and_then(|footer| footer.usage.clone()))
-            .flatten();
+        // Carry the meter value across an unchanged model/context; reset it
+        // when the model or context window changes so a prior model's usage
+        // cannot be shown against a new context window.
         let context_used_tokens = same_context
             .then(|| prev.and_then(|footer| footer.context_used_tokens))
             .flatten();
@@ -2030,15 +2048,13 @@ impl Screen {
         let vcs = self.footer.as_mut().and_then(|footer| footer.vcs.take());
         // Mirror the meter's context cap into the transcript so tool-footer
         // diagnostics can scale their `ctx` growth delta against it.
-        self.transcript
-            .set_context_cap(context.as_deref().and_then(parse_context_window));
+        self.transcript.set_context_cap(context_window);
         self.footer = Some(Footer {
             model,
             effort,
-            context,
+            context_window,
             cwd,
             vcs,
-            usage,
             context_used_tokens,
             context_pressure: ContextPressureTier::Normal,
         });
@@ -2069,9 +2085,6 @@ impl Screen {
         self.awaiting_approval = false;
         self.review_offer = ReviewOffer::default();
         self.queued = 0;
-        if let Some(footer) = &mut self.footer {
-            footer.usage = None;
-        }
     }
 
     pub(crate) fn end_turn(&mut self) {
@@ -2091,7 +2104,8 @@ impl Screen {
         self.transcript.push_turn_divider(
             self.turn_divider.had_work,
             self.turn_divider.elapsed,
-            self.turn_divider.usage.as_ref(),
+            &self.turn_divider.flows,
+            &self.turn_divider.timing,
         );
         self.spinner.stop();
         self.awaiting_approval = false;
@@ -2242,7 +2256,7 @@ impl Screen {
                 // Task-so-far sums (the divider's accumulator), so the live
                 // ↑/↓ matches the elapsed's whole-task scope — never just the
                 // last completed provider round.
-                self.turn_divider.usage.as_ref(),
+                &self.turn_divider.flows,
                 Some(self.phase.label()),
                 self.queued,
                 // The flow meter renders ONLY on this live line: it vanishes
@@ -2452,23 +2466,6 @@ pub(super) fn filler_lines(screen: &Screen, filler_rows: usize, width: u16) -> V
 
 /// Number of dots in the top-frame context meter; each dot is ~10% usage.
 const CONTEXT_METER_DOTS: u64 = 10;
-
-/// Parse a catalog context-window label (`"300k"`, `"200k"`, `"1M"`) into a
-/// token count. Returns `None` for labels that are not a number with an optional
-/// `k`/`m` suffix.
-fn parse_context_window(label: &str) -> Option<u64> {
-    let trimmed = label.trim();
-    let (digits, multiplier) = match trimmed.chars().last() {
-        Some('k' | 'K') => (&trimmed[..trimmed.len() - 1], 1_000.0),
-        Some('m' | 'M') => (&trimmed[..trimmed.len() - 1], 1_000_000.0),
-        _ => (trimmed, 1.0),
-    };
-    let value: f64 = digits.trim().parse().ok()?;
-    if value < 0.0 {
-        return None;
-    }
-    Some((value * multiplier) as u64)
-}
 
 /// Number of lit dots for `used`/`window` tokens: each dot is ~10% usage, the
 /// last lit dot is the current edge. `0` means no usage (all dots empty).
@@ -2752,14 +2749,14 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
     }
     let used = footer.context_used_tokens.unwrap_or(0);
     let used_text = compact_count(used);
+    // Label and meter derive from the SAME resolved number the compaction
+    // trigger enforces (installed by the loop), so the "how full" claim and
+    // the cap label share one denominator by construction.
     let cap = footer
-        .context
-        .as_ref()
-        .map(|context| strip_ansi_for_text(context))
-        .filter(|context| !context.is_empty());
-    let meter_filled = cap
-        .as_deref()
-        .and_then(parse_context_window)
+        .context_window
+        .map(crate::mimir::model_catalog::context_window_label);
+    let meter_filled = footer
+        .context_window
         .map(|window| context_meter_filled(used, window));
 
     // The context readout, fullest form first: used/cap + meter, then used/cap,
@@ -3539,7 +3536,7 @@ mod tests {
         ApprovalPolicy, CONTEXT_METER_DOTS, FLASH_TICKS, FLOW_FULL_SCALE, FLOW_PEAK_HOLD_TICKS,
         FLOW_QUANTA, FlowMeter, Screen, Spinner, SwitchCacheStatus, SwitchStatus,
         composer_statusline, context_meter_filled, dim_style, display_width, flow_level, line_text,
-        parse_context_window, prompt_style, session_bar, switch_status_line, truncate_cwd_middle,
+        prompt_style, session_bar, switch_status_line, truncate_cwd_middle,
         working_indicator_line_with_activity,
     };
     use crate::nexus::{ContextPressureTier, ToolCall};
@@ -3553,7 +3550,7 @@ mod tests {
         screen.set_footer_with_context(
             "gpt-5.5".to_string(),
             Some("high".to_string()),
-            Some("300k".to_string()),
+            Some(300_000),
             cwd.to_string(),
         );
         screen
@@ -3638,6 +3635,7 @@ mod tests {
                 total_tokens: total,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         }
     }
 
@@ -3969,7 +3967,7 @@ mod tests {
         screen.set_footer_with_context(
             "gpt-5.5".to_string(),
             Some("high".to_string()),
-            Some("300k".to_string()),
+            Some(300_000),
             "~/repo".to_string(),
         );
         assert!(
@@ -3983,7 +3981,7 @@ mod tests {
         screen.set_footer_with_context(
             "opus-4.8".to_string(),
             Some("xhigh".to_string()),
-            Some("200k".to_string()),
+            Some(200_000),
             "~/repo".to_string(),
         );
         assert!(
@@ -4021,7 +4019,7 @@ mod tests {
         screen.set_footer_with_context(
             "opus-4.8".to_string(),
             Some("xhigh".to_string()),
-            Some("200k".to_string()),
+            Some(200_000),
             "~/repo".to_string(),
         );
         screen.set_approval_policy(ApprovalPolicy::ReadOnly);
@@ -4460,7 +4458,7 @@ mod tests {
                 Duration::from_secs(87),
                 true,
                 None,
-                Some(&usage),
+                &crate::metrics::TokenFlows::from(&usage),
                 0,
                 Some(&flow),
                 width,
@@ -4509,7 +4507,7 @@ mod tests {
             Duration::from_secs(87),
             true,
             Some("Responding"),
-            Some(&usage),
+            &crate::metrics::TokenFlows::from(&usage),
             0,
             Some(&flow),
             80,
@@ -4536,6 +4534,7 @@ mod tests {
                 total_tokens: 90_000,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         let bar = session_bar(&screen, 80)
             .map(|l| line_text(&l))
@@ -5239,6 +5238,7 @@ mod tests {
                 total_tokens: 48_846,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
 
         let realized = switch_status_line(&screen, 100)
@@ -5342,6 +5342,7 @@ mod tests {
             turn_id: "turn_0".to_string(),
             response_id: None,
             usage: None,
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         let text = line_text(&screen.working_lines(80).remove(0));
         assert!(
@@ -5419,6 +5420,7 @@ mod tests {
             turn_id: "t1".to_string(),
             response_id: None,
             usage: None,
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         assert_eq!(screen.work_phase_label(), "Finishing");
     }
@@ -5498,18 +5500,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_context_window_handles_k_m_and_plain() {
-        assert_eq!(parse_context_window("300k"), Some(300_000));
-        assert_eq!(parse_context_window("300K"), Some(300_000));
-        assert_eq!(parse_context_window("200k"), Some(200_000));
-        assert_eq!(parse_context_window("1M"), Some(1_000_000));
-        assert_eq!(parse_context_window("1m"), Some(1_000_000));
-        assert_eq!(parse_context_window("4096"), Some(4_096));
-        assert_eq!(parse_context_window("unknown"), None);
-        assert_eq!(parse_context_window(""), None);
-    }
-
-    #[test]
     fn context_meter_filled_is_one_dot_per_ten_percent() {
         let window = 300_000;
         assert_eq!(context_meter_filled(0, window), 0);
@@ -5575,7 +5565,7 @@ mod tests {
         screen.set_footer_with_context(
             "gpt-5.5".to_string(),
             Some("high".to_string()),
-            Some("300k".to_string()),
+            Some(300_000),
             "~/repo".to_string(),
         );
         screen.set_footer_git(Some(git_status("main")));
@@ -5639,7 +5629,7 @@ mod tests {
         screen.set_footer_with_context(
             "gpt-5.5".to_string(),
             None,
-            Some("300k".to_string()),
+            Some(300_000),
             "~/repo".to_string(),
         );
         screen.set_focus_mode(true);
@@ -5674,7 +5664,7 @@ mod tests {
         screen.set_footer_with_context(
             "gpt-5.5".to_string(),
             None,
-            Some("300k".to_string()),
+            Some(300_000),
             "~/repo".to_string(),
         );
 

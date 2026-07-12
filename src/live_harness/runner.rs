@@ -116,7 +116,7 @@ fn execute_run(spec: &CampaignSpec, planned: &PlannedRun) -> Result<RunResult> {
 
     // Settings through the real surfaces (no backdoors).
     let trigger: CompactionTriggerConfig = planned.settings.trigger_config(posture, budget);
-    harness.set_compaction_trigger(budget, trigger);
+    harness.set_compaction_trigger(budget.into(), trigger);
     harness.set_summarizer(summarizer_kind(&planned.settings.summarizer));
     let worker_lane = planned.lane.clone();
     harness.set_compaction_summarizer_factory(Arc::new(move || {
@@ -749,7 +749,7 @@ mod tests {
             Some(s1.budget()),
         );
         harness.set_compaction_trigger(
-            s1.budget(),
+            s1.budget().into(),
             CompactionTriggerConfig {
                 enabled: true,
                 warn: 0.62,

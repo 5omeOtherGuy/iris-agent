@@ -319,7 +319,7 @@ pub(crate) fn effective_context_window(
     })
 }
 
-fn catalog_context_window(qualified: &str) -> Option<u64> {
+pub(crate) fn catalog_context_window(qualified: &str) -> Option<u64> {
     ctx_label(qualified).and_then(|label| match label {
         "128k" => Some(128_000),
         "200k" => Some(200_000),

@@ -823,7 +823,8 @@ impl Transcript {
         &mut self,
         had_work: bool,
         elapsed: Option<Duration>,
-        usage: Option<&ProviderUsage>,
+        flows: &crate::metrics::TokenFlows,
+        timing: &crate::metrics::TimingStats,
     ) {
         if !had_work {
             return;
@@ -832,7 +833,7 @@ impl Transcript {
         self.push_blank();
         self.mark_append_dirty();
         self.rows.push(TranscriptRow {
-            text: turn_divider_label(elapsed, usage),
+            text: turn_divider_label(elapsed, flows, timing),
             style: dim_style(),
             continuation_prefix: None,
             line: None,
