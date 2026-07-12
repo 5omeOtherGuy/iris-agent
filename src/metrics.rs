@@ -6,7 +6,6 @@
 //! no provider names, no terminal/UI types, no I/O. Formatting (compact
 //! counts, labels) stays in the UI; this module owns the numbers.
 
-use crate::mimir::model_catalog::EffectiveContextWindow;
 use crate::nexus::{ProviderTurnTiming, ProviderUsage};
 
 /// Accumulated token *flows* across provider turns, plus the latest
@@ -121,17 +120,32 @@ impl TimingStats {
     }
 }
 
+/// Integer percentage of `part` in `whole`, rounded half-up, UNCAPPED: a
+/// fullness ratio may honestly exceed 100% (an overflowing context), and
+/// clamping it would hide exactly the condition worth showing. `None` when
+/// `whole` is zero. Use [`ratio_percent`] for shares of a whole, where >100%
+/// is impossible by definition and capping is defensive.
+pub(crate) fn percent_of(part: u64, whole: u64) -> Option<u64> {
+    if whole == 0 {
+        return None;
+    }
+    // Widened to u128: `part * 100` can overflow u64 for large valid counts.
+    let percent = (u128::from(part) * 100 + u128::from(whole) / 2) / u128::from(whole);
+    Some(u64::try_from(percent).unwrap_or(u64::MAX))
+}
+
 /// Integer percentage of `part` in `whole`, rounded half-up and capped at
 /// 100. `None` when `whole` is zero: a ratio of nothing is not 0%, it is
 /// unknowable, and callers must hide it rather than claim it.
 pub(crate) fn ratio_percent(part: u64, whole: u64) -> Option<u64> {
-    if whole == 0 {
-        return None;
-    }
-    // Widened to u128: `part * 100` can overflow u64 for large (valid) token
-    // counts, and a saturated intermediate would silently misreport the share.
-    let percent = (u128::from(part) * 100 + u128::from(whole) / 2) / u128::from(whole);
-    Some(u64::try_from(percent.min(100)).expect("percent <= 100 fits in u64"))
+    percent_of(part, whole).map(|percent| percent.min(100))
+}
+
+/// Signed fractional percentage of `delta` in `whole` (e.g. a context-growth
+/// delta against the window). `None` when `whole` is zero. Callers format the
+/// float; this owns the arithmetic.
+pub(crate) fn signed_percent_of(delta: i64, whole: u64) -> Option<f64> {
+    (whole > 0).then(|| delta as f64 / whole as f64 * 100.0)
 }
 
 /// Output rate over a measured generation window. `None` when the window is
@@ -146,6 +160,18 @@ pub(crate) fn tokens_per_second(
     Some(output_tokens as f64 / generation.as_secs_f64())
 }
 
+/// Provider-neutral context-window facts: the raw window and the reserves
+/// subtracted from it. A plain-number contract so runtime tiers can carry
+/// budget provenance without depending on the catalog that resolved it
+/// (Tier-3 Mimir converts its catalog type into this).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContextWindowFacts {
+    pub(crate) raw: u64,
+    pub(crate) max_output_reserve: u64,
+    pub(crate) summary_reserve: u64,
+    pub(crate) effective: u64,
+}
+
 /// The one resolved "how full am I" denominator: the context budget that
 /// actually governs behavior (compaction trigger ladder, overflow recovery,
 /// `/context`, and the session-bar meter all divide by this number).
@@ -156,7 +182,7 @@ pub(crate) fn tokens_per_second(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResolvedContextBudget {
     /// Catalog-derived window facts (raw, reserves, effective), when known.
-    pub(crate) window: Option<EffectiveContextWindow>,
+    pub(crate) window: Option<ContextWindowFacts>,
     /// The explicit legacy `contextTokenBudget` setting, when configured.
     pub(crate) clamp: Option<u64>,
     /// The governing budget in tokens: `min(clamp, window.effective)` when
@@ -166,7 +192,7 @@ pub(crate) struct ResolvedContextBudget {
 
 impl ResolvedContextBudget {
     pub(crate) fn resolve(
-        window: Option<EffectiveContextWindow>,
+        window: Option<ContextWindowFacts>,
         clamp: Option<u64>,
         fallback: u64,
     ) -> Self {
@@ -210,7 +236,6 @@ impl From<u64> for ResolvedContextBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mimir::model_catalog::ContextWindowSource;
     use crate::nexus::CacheCreation;
     use std::time::Duration;
 
@@ -228,13 +253,12 @@ mod tests {
         }
     }
 
-    fn window(raw: u64, max_output: u64, summary: u64) -> EffectiveContextWindow {
-        EffectiveContextWindow {
+    fn window(raw: u64, max_output: u64, summary: u64) -> ContextWindowFacts {
+        ContextWindowFacts {
             raw,
             max_output_reserve: max_output,
             summary_reserve: summary,
             effective: raw - max_output - summary,
-            source: ContextWindowSource::Catalog,
         }
     }
 
@@ -291,6 +315,17 @@ mod tests {
         // Large valid inputs must not overflow the intermediate multiply.
         assert_eq!(ratio_percent(u64::MAX, u64::MAX), Some(100));
         assert_eq!(ratio_percent(u64::MAX / 2, u64::MAX), Some(50));
+    }
+
+    #[test]
+    fn percent_of_is_uncapped_so_overflow_shows_as_over_100() {
+        assert_eq!(percent_of(1, 0), None);
+        assert_eq!(percent_of(105, 100), Some(105));
+        assert_eq!(percent_of(1, 3), Some(33));
+        // Signed growth: arithmetic here, formatting at the caller.
+        assert_eq!(signed_percent_of(-500, 0), None);
+        let pct = signed_percent_of(-500, 100_000).unwrap();
+        assert!((pct - -0.5).abs() < f64::EPSILON);
     }
 
     #[test]

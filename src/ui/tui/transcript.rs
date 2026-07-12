@@ -1297,7 +1297,7 @@ impl Transcript {
         let prev = self.last_turn_input_tokens?;
         let cap = self.context_cap.filter(|&cap| cap > 0)?;
         let delta = input_tokens as i64 - prev as i64;
-        let pct = delta as f64 / cap as f64 * 100.0;
+        let pct = crate::metrics::signed_percent_of(delta, cap)?;
         Some(format!("{pct:+.1}%"))
     }
 

@@ -1318,7 +1318,7 @@ fn context_breakdown_lines<P: ChatProvider>(
         Some(diagnostics) => {
             let total = diagnostics.measured;
             let budget = diagnostics.ladder.effective_window;
-            let pct = (total.saturating_mul(100)).checked_div(budget).unwrap_or(0);
+            let pct = crate::metrics::percent_of(total, budget).unwrap_or(0);
             let source = match diagnostics.source {
                 crate::nexus::ContextMeasurementSource::ProviderReportedPlusLocal => {
                     "provider-reported + local"
@@ -4106,7 +4106,7 @@ mod tests {
 
     #[test]
     fn context_breakdown_discloses_budget_derivation_and_session_usage() {
-        use crate::mimir::model_catalog::{ContextWindowSource, EffectiveContextWindow};
+        use crate::metrics::ContextWindowFacts;
         use crate::nexus::{Agent, CacheCreation, Message, ProviderTurnTiming, ProviderUsage};
         let agent = Agent::resumed(
             NullChat,
@@ -4123,12 +4123,11 @@ mod tests {
         let trigger = crate::config::Settings::default()
             .compaction_trigger()
             .unwrap();
-        let window = EffectiveContextWindow {
+        let window = ContextWindowFacts {
             raw: 200_000,
             max_output_reserve: 64_000,
             summary_reserve: 8_192,
             effective: 127_808,
-            source: ContextWindowSource::Catalog,
         };
         harness.set_compaction_trigger(
             crate::metrics::ResolvedContextBudget::resolve(Some(window), None, 64_000),

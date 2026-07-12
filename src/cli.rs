@@ -1011,12 +1011,12 @@ pub(crate) fn compaction_panel_parts(
     lines.push(format!("  provider blocks    {}", entry.provider_blocks));
     match &entry.worker_usage {
         Some(usage) => {
-            let cache = usage
-                .cache_read_input_tokens
-                .saturating_mul(100)
-                .checked_div(usage.input_tokens)
-                .map(|percent| format!("{percent}%"))
-                .unwrap_or_else(|| "unknown".to_string());
+            // Shared share arithmetic (half-up, capped, overflow-safe); a
+            // zero-input ratio stays "unknown" rather than a fabricated 0%.
+            let cache =
+                crate::metrics::ratio_percent(usage.cache_read_input_tokens, usage.input_tokens)
+                    .map(|percent| format!("{percent}%"))
+                    .unwrap_or_else(|| "unknown".to_string());
             lines.push(format!(
                 "  worker             {}/{}; input {} / output {} / reasoning {} / total {}; cache read {} ({cache}) / write {}",
                 usage.provider,

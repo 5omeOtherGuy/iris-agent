@@ -861,7 +861,8 @@ fn resolved_compaction_trigger(
     // ladder, /context, and the session-bar meter all receive this same
     // number, so no two surfaces can disagree on the denominator.
     let budget = metrics::ResolvedContextBudget::resolve(
-        mimir::model_catalog::effective_context_window(selection, config::DEFAULT_SUMMARY_RESERVE),
+        mimir::model_catalog::effective_context_window(selection, config::DEFAULT_SUMMARY_RESERVE)
+            .map(Into::into),
         settings.context_token_budget,
         settings.context_token_budget(),
     );
