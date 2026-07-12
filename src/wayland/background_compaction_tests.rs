@@ -684,7 +684,7 @@ fn seed_harness(root: &Path, workspace: &Path) -> SeededHarness {
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let visible_tools = Arc::new(Mutex::new(Vec::new()));
     harness.set_compaction_summarizer_factory(SummaryProvider::factory(
-        replies.clone(),
+        replies,
         prompts.clone(),
         visible_tools.clone(),
     ));

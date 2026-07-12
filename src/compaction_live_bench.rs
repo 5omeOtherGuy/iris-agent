@@ -977,7 +977,7 @@ fn auto_compaction_native_live_anthropic() -> Result<()> {
     let window = 80_000;
     let mut harness = Harness::resumed(
         agent,
-        workspace.clone(),
+        workspace,
         ToolState::new(),
         Some(log),
         entry_ids,

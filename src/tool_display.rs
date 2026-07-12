@@ -269,9 +269,11 @@ pub(crate) fn display_path(raw: &str) -> String {
 /// are rendered relative when useful, then with `~` as the fallback so the UI
 /// never shows `/home/<user>`.
 pub(crate) fn shorten_paths_in_text(text: &str) -> String {
-    let Ok(re) = Regex::new(r#"/[A-Za-z0-9._~+%:@=,/-]+"#) else {
-        return text.to_string();
-    };
+    // Compiled once: this runs on every tool-line render, and `Regex::new` is
+    // far more expensive than the match itself.
+    static PATH_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = PATH_RE
+        .get_or_init(|| Regex::new(r#"/[A-Za-z0-9._~+%:@=,/-]+"#).expect("static path regex"));
     re.replace_all(text, |caps: &regex::Captures<'_>| {
         shorten_absolute_path(Path::new(&caps[0]))
     })
@@ -635,7 +637,7 @@ mod tests {
     #[test]
     fn summarize_file_tool_missing_path_redacts_content() {
         let big = "x".repeat(5000);
-        let summary = summarize(&call("write", json!({ "content": big.clone() })));
+        let summary = summarize(&call("write", json!({ "content": big })));
         assert!(summary.starts_with("write "));
         assert!(!summary.contains(&big), "must not echo full content");
         assert!(

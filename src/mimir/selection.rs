@@ -841,7 +841,7 @@ mod tests {
         micro_only.microcompaction = Some(true);
         assert!(ModelSelection::resolve(&micro_only).is_ok());
 
-        let mut disjoint = micro_only.clone();
+        let mut disjoint = micro_only;
         disjoint.anthropic_context_management = Some(serde_json::json!({
             "clearToolUses": {"excludeTools": ["read", "ls"]}
         }));

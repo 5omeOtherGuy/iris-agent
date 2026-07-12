@@ -79,7 +79,7 @@ pub(super) fn execute(
     reduce_output: bool,
 ) -> Result<super::ToolOutput> {
     let parsed: BashArgs =
-        serde_json::from_value(args.clone()).context("bash tool arguments must include command")?;
+        Deserialize::deserialize(args).context("bash tool arguments must include command")?;
     // Destructure into owned fields so each arm can move what it needs without
     // cloning the session id to escape a borrow of `parsed`.
     let BashArgs {

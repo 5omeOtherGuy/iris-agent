@@ -38,14 +38,14 @@ pub(super) fn execute(
     args: &Value,
     observed: &mut ObservedFiles,
 ) -> Result<super::ToolOutput> {
-    let input: EditInput = serde_json::from_value(args.clone())
+    let input: EditInput = Deserialize::deserialize(args)
         .context("edit tool arguments must include file_path, old_string, new_string")?;
     // Record the edited file for the compaction carry (ADR-0044).
     Ok(edit(root, &input, observed)?.with_workspace_target(root, &input.file_path))
 }
 
 pub(super) fn preview(root: &Path, args: &Value) -> Preview {
-    let input: EditInput = match serde_json::from_value(args.clone()) {
+    let input: EditInput = match Deserialize::deserialize(args) {
         Ok(input) => input,
         Err(_) => return Preview::Malformed,
     };

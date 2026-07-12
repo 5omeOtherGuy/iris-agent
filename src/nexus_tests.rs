@@ -3978,10 +3978,7 @@ fn small_tool_output_stays_inline_unchanged() -> Result<()> {
         Ok(single_call_turn("big", json!({}))),
         Ok(AssistantTurn::text("done")),
     ]);
-    let agent = Agent::new(
-        provider,
-        Tools::new(vec![Box::new(BigTool { body: body.clone() })]),
-    );
+    let agent = Agent::new(provider, Tools::new(vec![Box::new(BigTool { body })]));
     let log = crate::session::SessionLog::create_in(&root.path, &workspace.path)?;
     let mut harness = Harness::new(
         agent,
@@ -4014,10 +4011,7 @@ fn oversized_output_without_a_store_is_kept_inline_not_discarded() -> Result<()>
         Ok(single_call_turn("big", json!({}))),
         Ok(AssistantTurn::text("done")),
     ]);
-    let agent = Agent::new(
-        provider,
-        Tools::new(vec![Box::new(BigTool { body: body.clone() })]),
-    );
+    let agent = Agent::new(provider, Tools::new(vec![Box::new(BigTool { body })]));
     // No session log -> no handle store. The full output must stay inline rather
     // than be truncated and lost.
     let mut harness = Harness::new(agent, workspace.path.clone(), ToolState::new(), None, None);
@@ -4130,7 +4124,7 @@ fn read_output_pages_an_offloaded_handle_and_reoffloads_a_large_dereference() ->
     let agent = Agent::new(
         provider,
         Tools::new(vec![
-            Box::new(BigTool { body: body.clone() }),
+            Box::new(BigTool { body }),
             crate::tools::read_output_tool(),
         ]),
     );
@@ -6880,7 +6874,7 @@ fn steering_injected_after_tool_round_reaches_next_provider_context() -> Result<
         vec![vec![Enqueue::Steer("also check config".to_string())]],
     );
     let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
-    harness.set_steering_source(queue.clone());
+    harness.set_steering_source(queue);
     let frontend = RecordingFrontend::new(ApprovalDecision::Allow);
 
     block_on(harness.submit_turn("read note", &frontend, &frontend, &CancellationToken::new()))?;
@@ -6921,7 +6915,7 @@ fn follow_up_injected_when_agent_would_stop() -> Result<()> {
         vec![vec![Enqueue::Follow("now write tests".to_string())]],
     );
     let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
-    harness.set_steering_source(queue.clone());
+    harness.set_steering_source(queue);
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
     block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
@@ -6962,7 +6956,7 @@ fn no_queued_messages_ends_the_turn_without_a_second_call() -> Result<()> {
         Vec::new(),
     );
     let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
-    harness.set_steering_source(queue.clone());
+    harness.set_steering_source(queue);
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
     block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
@@ -7001,7 +6995,7 @@ fn would_stop_injects_steering_before_follow_up() -> Result<()> {
         ]],
     );
     let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
-    harness.set_steering_source(queue.clone());
+    harness.set_steering_source(queue);
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
     block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
@@ -7045,7 +7039,7 @@ fn batched_steering_merges_into_one_user_message() -> Result<()> {
         ]],
     );
     let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
-    harness.set_steering_source(queue.clone());
+    harness.set_steering_source(queue);
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
     block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
@@ -7115,7 +7109,7 @@ fn cancellation_after_injection_drops_unanswered_user_message() -> Result<()> {
         call: Cell::new(0),
     };
     let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
-    harness.set_steering_source(queue.clone());
+    harness.set_steering_source(queue);
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
     block_on(harness.submit_turn("hi", &frontend, &frontend, &token))?;
@@ -7151,7 +7145,7 @@ fn steering_queued_before_first_request_coalesces_into_prompt() -> Result<()> {
         Vec::new(),
     );
     let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
-    harness.set_steering_source(queue.clone());
+    harness.set_steering_source(queue);
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
     block_on(harness.submit_turn(
@@ -7196,7 +7190,7 @@ fn empty_completion_then_follow_up_does_not_make_consecutive_user_messages() -> 
         vec![vec![Enqueue::Follow("please continue".to_string())]],
     );
     let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
-    harness.set_steering_source(queue.clone());
+    harness.set_steering_source(queue);
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
     block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
@@ -7245,7 +7239,7 @@ fn soft_cap_does_not_strand_an_injected_follow_up() -> Result<()> {
         None,
         None,
     );
-    harness.set_steering_source(queue.clone());
+    harness.set_steering_source(queue);
     let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
 
     block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;

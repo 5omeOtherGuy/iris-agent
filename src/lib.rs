@@ -613,7 +613,7 @@ fn run_agent_inner(
         &build,
         settings.enabled_models.clone(),
     );
-    switch_state.set_background_selection_cell(background_selection.clone());
+    switch_state.set_background_selection_cell(background_selection);
     switch_state.set_compaction_settings(settings.clone());
     let mut switch = Some(switch_state);
     let swap_cwd = cwd.clone();
@@ -717,7 +717,7 @@ fn load_session_source(
                 session_id: cli::SessionIdGuard::swap_with_background(
                     cell.clone(),
                     background_cell.clone(),
-                    meta.id.clone(),
+                    meta.id,
                 ),
                 session_log,
                 messages: stored.messages,
@@ -774,7 +774,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     let native_jj = wayland::trust::native_jj(&cwd).unwrap_or(false);
     let mut harness = wayland::Harness::new_configured(
         agent,
-        cwd.clone(),
+        cwd,
         tools::ToolState::new(),
         session,
         budget,
@@ -792,7 +792,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     );
     install_compaction_summarizer_factory(
         &mut harness,
-        background_selection.clone(),
+        background_selection,
         settings
             .compaction_worker_model()
             .map(|model| {
@@ -800,7 +800,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
             })
             .transpose()?,
         system_prompt.clone(),
-        background_session_id.clone(),
+        background_session_id,
     );
     harness.set_tool_result_compaction(selection.tool_result_compaction.clone());
     let _ = harness.set_task_workflow_enabled(settings.tasks());
@@ -1079,7 +1079,7 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
         &build,
         settings.enabled_models.clone(),
     );
-    switch_state.set_background_selection_cell(background_selection.clone());
+    switch_state.set_background_selection_cell(background_selection);
     switch_state.set_compaction_settings(settings.clone());
     let mut switch = Some(switch_state);
     let swap_cwd = cwd.clone();

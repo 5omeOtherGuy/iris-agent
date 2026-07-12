@@ -29,7 +29,7 @@ pub(super) fn execute(
     args: &Value,
     observed: &mut ObservedFiles,
 ) -> Result<super::ToolOutput> {
-    let input: WriteInput = serde_json::from_value(args.clone())
+    let input: WriteInput = Deserialize::deserialize(args)
         .context("write tool arguments must include path and content")?;
     let message = write_file(root, &input, observed)?;
     // Report the exact bytes written so the dirty-tree guard can confirm an
@@ -46,7 +46,7 @@ pub(super) fn execute(
 }
 
 pub(super) fn preview(root: &Path, args: &Value) -> Preview {
-    let input: WriteInput = match serde_json::from_value(args.clone()) {
+    let input: WriteInput = match Deserialize::deserialize(args) {
         Ok(input) => input,
         Err(_) => return Preview::Malformed,
     };

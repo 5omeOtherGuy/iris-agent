@@ -28,7 +28,7 @@ use std::sync::OnceLock;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::ScopeRegionIterator;
-use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
+use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 use crate::ui::markdown::HighlightFn;
@@ -135,20 +135,61 @@ pub(crate) fn code_highlighter(base: Style, fallback: Style) -> HighlightFn {
 /// ANSI-named palette roles so highlighting inherits the user's terminal theme.
 fn scope_style(stack: &ScopeStack) -> Style {
     for scope in stack.as_slice().iter().rev() {
-        if let Some(style) = scope_name_style(&scope.build_string()) {
+        if let Some(style) = scope_name_style(*scope) {
             return style;
         }
     }
     Style::default()
 }
 
+/// The scope-atom prefixes the mapper recognizes, parsed once. Prefix matching
+/// via [`Scope::is_prefix_of`] compares packed atom ids, so the per-token hot
+/// loop in [`scope_style`] allocates nothing (`build_string` allocated a
+/// `String` per scope per token).
+struct ScopePrefixes {
+    comment: Scope,
+    string: Scope,
+    constant_character: Scope,
+    constant: Scope,
+    keyword: Scope,
+    storage: Scope,
+    entity_name_function: Scope,
+    support_function: Scope,
+    variable_function: Scope,
+    entity_name: Scope,
+    support_type: Scope,
+    support_class: Scope,
+}
+
+fn scope_prefixes() -> &'static ScopePrefixes {
+    static PREFIXES: OnceLock<ScopePrefixes> = OnceLock::new();
+    PREFIXES.get_or_init(|| {
+        let s = |name: &str| Scope::new(name).expect("static scope atom");
+        ScopePrefixes {
+            comment: s("comment"),
+            string: s("string"),
+            constant_character: s("constant.character"),
+            constant: s("constant"),
+            keyword: s("keyword"),
+            storage: s("storage"),
+            entity_name_function: s("entity.name.function"),
+            support_function: s("support.function"),
+            variable_function: s("variable.function"),
+            entity_name: s("entity.name"),
+            support_type: s("support.type"),
+            support_class: s("support.class"),
+        }
+    })
+}
+
 /// Fixed scope-atom -> palette mapping. Keyed on the leading dotted atoms of a
 /// TextMate/Sublime scope name. Intentionally coarse: a handful of roles reads as
 /// a muted IDE theme without chasing full theme fidelity.
-fn scope_name_style(scope: &str) -> Option<Style> {
+fn scope_name_style(scope: Scope) -> Option<Style> {
+    let p = scope_prefixes();
     // Order matters: check the more specific `constant`/`entity` prefixes before
     // falling through to their broader atoms.
-    if scope.starts_with("comment") {
+    if p.comment.is_prefix_of(scope) {
         // Comments are the one muted role: gray + dim so code reads first.
         return Some(
             Style::default()
@@ -156,26 +197,26 @@ fn scope_name_style(scope: &str) -> Option<Style> {
                 .add_modifier(Modifier::DIM),
         );
     }
-    if scope.starts_with("string") || scope.starts_with("constant.character") {
+    if p.string.is_prefix_of(scope) || p.constant_character.is_prefix_of(scope) {
         return Some(Style::default().fg(palette::green()));
     }
-    if scope.starts_with("constant") {
+    if p.constant.is_prefix_of(scope) {
         // Numeric / language literals (numbers, true/false/nil).
         return Some(Style::default().fg(palette::red()));
     }
-    if scope.starts_with("keyword") || scope.starts_with("storage") {
+    if p.keyword.is_prefix_of(scope) || p.storage.is_prefix_of(scope) {
         // Keywords and storage keywords (`fn`, `let`, `struct`, `class`).
         return Some(Style::default().fg(palette::orange()));
     }
-    if scope.starts_with("entity.name.function")
-        || scope.starts_with("support.function")
-        || scope.starts_with("variable.function")
+    if p.entity_name_function.is_prefix_of(scope)
+        || p.support_function.is_prefix_of(scope)
+        || p.variable_function.is_prefix_of(scope)
     {
         return Some(Style::default().fg(palette::cyan()));
     }
-    if scope.starts_with("entity.name")
-        || scope.starts_with("support.type")
-        || scope.starts_with("support.class")
+    if p.entity_name.is_prefix_of(scope)
+        || p.support_type.is_prefix_of(scope)
+        || p.support_class.is_prefix_of(scope)
     {
         // Type / class / trait names.
         return Some(Style::default().fg(palette::cyan()));

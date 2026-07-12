@@ -2265,7 +2265,7 @@ impl<P: ChatProvider> Harness<P> {
                         obs,
                         &job,
                         CompactionLifecycleState::Discarded,
-                        summary.worker_usage.clone(),
+                        summary.worker_usage,
                         Some(
                             "background compaction result was stale; keeping current context"
                                 .to_string(),

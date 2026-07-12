@@ -281,7 +281,7 @@ fn standalone_span_recalls_originals_from_this_session_read_path() {
     // The reader is built over THIS session's transcript path only, so the span
     // read is scoped to this session and cannot address another session's data.
     let reader = super::SessionSpanSource {
-        transcript: Some(path.clone()),
+        transcript: Some(path),
     };
     let out = recall::execute_for_test(
         None,

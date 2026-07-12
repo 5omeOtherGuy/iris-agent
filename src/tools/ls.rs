@@ -46,8 +46,7 @@ pub(super) fn parameters() -> Value {
 // reduction (issue #339 is not started), so the switch is accepted for a
 // uniform `run_off_thread` body signature and ignored.
 pub(super) fn execute(root: &Path, args: &Value, _reduce: bool) -> Result<super::ToolOutput> {
-    let input: LsInput =
-        serde_json::from_value(args.clone()).context("ls tool arguments are invalid")?;
+    let input: LsInput = Deserialize::deserialize(args).context("ls tool arguments are invalid")?;
     // Record the listed directory for the compaction carry (ADR-0044); the
     // workspace root itself renders empty and is not carried.
     let target = input.path.clone().unwrap_or_else(|| ".".to_string());

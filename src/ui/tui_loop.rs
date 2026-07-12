@@ -3952,7 +3952,7 @@ mod tests {
             Message::user("continue"),
             Message::assistant("ok"),
         ];
-        let agent = Agent::resumed(NullChat, crate::tools::built_in_tools(), messages.clone());
+        let agent = Agent::resumed(NullChat, crate::tools::built_in_tools(), messages);
         let harness = crate::wayland::Harness::new(
             agent,
             std::env::temp_dir(),

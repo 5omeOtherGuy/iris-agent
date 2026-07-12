@@ -646,7 +646,7 @@ mod tests {
         );
 
         // Three boundaries with a compaction event on one row: success.
-        let mut compacted = none_compacted.clone();
+        let mut compacted = none_compacted;
         compacted[2].lifecycle.compaction_generation_applied = Some(1);
         compacted[2].lifecycle.origin = Some("subagent".to_string());
         assert!(s1.verify_run(&compacted).is_ok());
