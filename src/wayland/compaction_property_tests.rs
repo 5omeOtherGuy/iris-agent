@@ -581,6 +581,74 @@ fn plan_hard_mode_skips_turn_walk_back_and_covers_current_turn() {
     assert!(context_tokens(&messages[hard.end..]) <= keep);
 }
 
+#[test]
+fn respect_plan_skips_orphan_only_run_before_later_turn() {
+    let orphan_call = ToolCall {
+        id: "orphaned_by_prior_summary".to_string(),
+        name: "read".to_string(),
+        arguments: json!({ "path": "old.rs" }),
+        thought_signature: None,
+    };
+    let messages = vec![
+        Message::user("[older compacted summary]"),
+        Message::assistant_tool_call(&orphan_call),
+        Message::tool_result(&orphan_call.id, "read", "old output"),
+        Message::user("[newer compacted summary]"),
+        Message::user(&"older complete request ".repeat(400)),
+        Message::assistant(&"older complete answer ".repeat(400)),
+        Message::user("recent request"),
+        Message::assistant("recent answer"),
+    ];
+    let (mut engine, _sessions, _ws) = persisted_engine(&messages);
+    engine.entry_ids[0] = None;
+    engine.entry_ids[3] = None;
+    let keep = context_tokens(&messages[6..]);
+
+    let plan = engine
+        .plan(&messages, keep)
+        .expect("turn-respecting planning must skip the orphan-only run");
+    assert_eq!((plan.start, plan.end), (4, 6));
+    assert!(valid_compaction_range(&messages, plan.start, plan.end));
+}
+
+#[test]
+fn manual_plan_skips_orphan_run_and_covers_post_summary_suffix() {
+    let orphan_call = ToolCall {
+        id: "orphaned_by_prior_summary".to_string(),
+        name: "read".to_string(),
+        arguments: json!({ "path": "old.rs" }),
+        thought_signature: None,
+    };
+    let messages = vec![
+        Message::user("[older compacted summary]"),
+        Message::assistant_tool_call(&orphan_call),
+        Message::tool_result(&orphan_call.id, "read", "old output"),
+        Message::user("[compacted summary containing this turn's opener]"),
+        Message::assistant(&"older completed work ".repeat(400)),
+        Message::assistant(&"recent retained work ".repeat(400)),
+    ];
+    let (mut engine, _sessions, _ws) = persisted_engine(&messages);
+    // Rebuilt summaries have no durable message ids and cannot be covered. The
+    // first coverable run is only tool fragments whose preceding assistant
+    // content was absorbed by a summary; the substantial assistant-only run
+    // follows another summary.
+    engine.entry_ids[0] = None;
+    engine.entry_ids[3] = None;
+    let keep = context_tokens(&messages[5..]);
+
+    assert!(
+        engine
+            .plan_with_mode(&messages, keep, PlanTurnMode::Respect)
+            .is_none(),
+        "turn-respecting planning reproduces the /compact no-op"
+    );
+    let plan = engine
+        .plan_manual(&messages, keep)
+        .expect("manual compaction must skip the orphan run and cover later history");
+    assert_eq!((plan.start, plan.end), (4, 5));
+    assert!(valid_compaction_range(&messages, plan.start, plan.end));
+}
+
 /// Hard mode still backs the covered range off a tool-call/result pair: even
 /// when the raw keep-tail cut would sever a pair, the end trim preserves it.
 #[test]

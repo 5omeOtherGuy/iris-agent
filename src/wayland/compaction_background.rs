@@ -705,6 +705,18 @@ impl CompactionEngine {
         self.plan_with_mode(messages, keep_target, PlanTurnMode::Respect)
     }
 
+    /// Manual compaction is an explicit inter-turn rewrite, so it may cover
+    /// completed current-turn content. This is required after a hard compaction
+    /// has already absorbed the turn's opening user message: the remaining
+    /// assistant-only suffix has no user boundary for `Respect` mode to find.
+    pub(super) fn plan_manual(
+        &self,
+        messages: &[Message],
+        keep_target: u64,
+    ) -> Option<CompactionPlan> {
+        self.plan_with_mode(messages, keep_target, PlanTurnMode::HardCurrentTurn)
+    }
+
     /// Plan a coverable range. `mode` decides whether the current (in-flight)
     /// assistant turn is protected. `Respect` keeps today's turn-respecting
     /// walk-back (Start/Warn and model-requested compaction). `HardCurrentTurn`
@@ -731,35 +743,55 @@ impl CompactionEngine {
             tail = tail.saturating_add(tokens);
             k -= 1;
         }
-        let mut end = k.min(n);
-        if mode == PlanTurnMode::Respect && end < messages.len() && messages[end].role != Role::User
+        let end_limit = k.min(n);
+        let end_limit = if mode == PlanTurnMode::Respect
+            && end_limit < messages.len()
+            && messages[end_limit].role != Role::User
         {
-            end = assistant_turn_start(messages, end);
+            assistant_turn_start(messages, end_limit)
+        } else {
+            end_limit
+        };
+
+        // Summaries (`None` ids) divide history into independently coverable
+        // runs. Keep scanning when an older run contains only orphaned tool
+        // fragments; a prior hard compaction can legitimately leave exactly
+        // that shape before a later, substantial assistant-only run.
+        let mut cursor = 0;
+        while cursor < end_limit {
+            let Some(mut start) = (cursor..end_limit)
+                .find(|&index| self.entry_ids.get(index).is_some_and(Option::is_some))
+            else {
+                break;
+            };
+            let mut end = (start..end_limit)
+                .find(|&index| self.entry_ids[index].is_none())
+                .unwrap_or(end_limit);
+            let next_cursor = end.saturating_add(1);
+
+            while start < end
+                && matches!(messages[start].role, Role::Tool | Role::AssistantToolCall)
+            {
+                start += 1;
+            }
+            while end > start
+                && (messages[end - 1].role == Role::AssistantToolCall
+                    || messages
+                        .get(end)
+                        .is_some_and(|message| message.role == Role::Tool))
+            {
+                end -= 1;
+            }
+            if start < end {
+                return Some(CompactionPlan {
+                    start,
+                    end,
+                    from_id: self.entry_ids[start].clone()?,
+                    to_id: self.entry_ids[end - 1].clone()?,
+                });
+            }
+            cursor = next_cursor;
         }
-        let mut start =
-            (0..end).find(|&index| self.entry_ids.get(index).is_some_and(Option::is_some))?;
-        if let Some(none_at) = (start..end).find(|&index| self.entry_ids[index].is_none()) {
-            end = none_at;
-        }
-        while start < end && matches!(messages[start].role, Role::Tool | Role::AssistantToolCall) {
-            start += 1;
-        }
-        while end > start
-            && (messages[end - 1].role == Role::AssistantToolCall
-                || messages
-                    .get(end)
-                    .is_some_and(|message| message.role == Role::Tool))
-        {
-            end -= 1;
-        }
-        if start >= end {
-            return None;
-        }
-        Some(CompactionPlan {
-            start,
-            end,
-            from_id: self.entry_ids[start].clone()?,
-            to_id: self.entry_ids[end - 1].clone()?,
-        })
+        None
     }
 }

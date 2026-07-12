@@ -2144,7 +2144,10 @@ impl<P: ChatProvider> Harness<P> {
             self.flush_folds(&pending, FoldTrigger::ManualCompact, obs)?;
         }
         let messages = self.agent.messages().to_vec();
-        let Some(plan) = self.plan_compaction(&messages, MANUAL_COMPACT_KEEP_TOKENS) else {
+        let Some(plan) = self
+            .compaction
+            .plan_manual(&messages, MANUAL_COMPACT_KEEP_TOKENS)
+        else {
             return obs.on_event(AgentEvent::Notice(
                 "nothing to compact yet: the context is only recent or not yet persisted turns."
                     .to_string(),
@@ -2632,70 +2635,10 @@ impl<P: ChatProvider> Harness<P> {
         )))
     }
 
-    /// Choose the message range to compact. Keeps the largest recent tail whose
-    /// token sum stays within `keep_target` and compacts the older coverable
-    /// messages before it, clamped to the persisted/id-bearing region and
-    /// adjusted so the covered range never splits a tool-call/tool-result pair.
-    /// `None` when no coverable range remains. Auto-compaction passes a
-    /// low-water fraction of the budget; `/compact` passes the small
-    /// [`MANUAL_COMPACT_KEEP_TOKENS`] tail.
+    /// Choose the next pair-safe, durable range while preserving assistant-turn
+    /// boundaries for automatic compaction.
     fn plan_compaction(&self, messages: &[Message], keep_target: u64) -> Option<CompactionPlan> {
-        // Coverable region: the persisted prefix with known entry ids.
-        let n = self.compaction.persisted.min(messages.len());
-        let mut k = messages.len();
-        let mut tail = 0u64;
-        while k > 0 {
-            let t = message_token_estimate(&messages[k - 1]);
-            if tail.saturating_add(t) > keep_target {
-                break;
-            }
-            tail = tail.saturating_add(t);
-            k -= 1;
-        }
-        // Covered range ends at the tail boundary, never past the coverable
-        // (persisted, id-bearing) region.
-        let mut end = k.min(n);
-        // If the retained tail would begin inside an assistant/tool-use turn,
-        // pull the boundary left so reasoning -> text -> tool calls -> results
-        // stay together. A boundary before a user message (or at EOF) is already
-        // between turns.
-        if end < messages.len() && messages[end].role != Role::User {
-            end = assistant_turn_start(messages, end);
-        }
-        // Start at the first coverable (Some-id) message; bail if none.
-        let mut start = (0..end).find(|&i| {
-            self.compaction
-                .entry_ids
-                .get(i)
-                .is_some_and(Option::is_some)
-        })?;
-        // Keep the covered range a contiguous run of coverable ids.
-        if let Some(none_at) = (start..end).find(|&i| self.compaction.entry_ids[i].is_none()) {
-            end = none_at;
-        }
-        // Never begin a covered range on an orphan tool fragment.
-        while start < end
-            && (messages[start].role == Role::Tool
-                || messages[start].role == Role::AssistantToolCall)
-        {
-            start += 1;
-        }
-        // Never split a tool-call / tool-result pair at the tail boundary.
-        while end > start
-            && (messages[end - 1].role == Role::AssistantToolCall
-                || messages.get(end).is_some_and(|m| m.role == Role::Tool))
-        {
-            end -= 1;
-        }
-        if start >= end {
-            return None;
-        }
-        Some(CompactionPlan {
-            start,
-            end,
-            from_id: self.compaction.entry_ids[start].clone()?,
-            to_id: self.compaction.entry_ids[end - 1].clone()?,
-        })
+        self.compaction.plan(messages, keep_target)
     }
 }
 
