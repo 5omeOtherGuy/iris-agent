@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+  <head><title>Reading a File in Rust</title></head>
+  <body>
+    <nav>home docs blog</nav>
+    <article>
+      <h1>Reading a File in Rust</h1>
+      <p>The standard library gives you everything you need to read a whole file
+         into a string without pulling in an external crate. The example below
+         reads the file at a path and prints its contents to standard output.</p>
+      <pre><code>use std::fs;
+
+fn main() {
+    let text = fs::read_to_string("notes.txt").expect("read failed");
+    println!("{text}");
+}
+</code></pre>
+      <p>Prefer <code>fs::read_to_string</code> for UTF-8 text and
+         <code>fs::read</code> for raw bytes when the input is not guaranteed to
+         be valid UTF-8, since the former returns an error on invalid encoding.</p>
+    </article>
+    <footer>Copyright 2026</footer>
+  </body>
+</html>

@@ -40,6 +40,32 @@ const GRAB_CHAR_THRESHOLD: usize = 200;
 const NO_CONTENT_DIAGNOSTIC: &str = "No readable article content could be extracted from this page. It may be a \
      JavaScript application shell, a consent/cookie wall, or otherwise empty.";
 
+/// Honest diagnostic when the page looks like a static snapshot of a
+/// JavaScript single-page app: an empty mount point with no server-rendered
+/// prose. The native reader only sees static HTML, so it says so plainly; the
+/// caller points at the JS-rendering Jina backend as the next step.
+const SPA_DIAGNOSTIC: &str = "This page appears to be a JavaScript single-page application: the static \
+     HTML is an empty app shell with no server-rendered article text, so there \
+     is nothing for the native reader to extract.";
+
+/// Non-content "chrome" landmarks removed before extraction so navigation,
+/// banners, sidebars, and forms cannot masquerade as article prose (or inflate
+/// a JS shell past the readable-content bar). Applied to BOTH the readability
+/// grab and the plain-text fallback.
+const CHROME_SELECTOR: &str = "script, style, noscript, template, svg, iframe, \
+     nav, header, footer, aside, form, \
+     [role=\"navigation\"], [role=\"banner\"], [role=\"contentinfo\"], \
+     [role=\"dialog\"], [aria-modal=\"true\"]";
+
+/// Cookie/consent banner containers removed before extraction. Targeted hooks
+/// (specific SDK ids/classes and `consent`/`cookie-consent`/`gdpr` substrings)
+/// rather than a broad `cookie` match, to avoid deleting a legitimate article.
+const CONSENT_SELECTOR: &str = "#onetrust-banner-sdk, #onetrust-consent-sdk, .cookie-banner, \
+     .cookie-consent, .cookie-notice, .consent-banner, .cc-window, \
+     [class*=\"cookie-consent\"], [class*=\"consent-banner\"], \
+     [id*=\"cookie-consent\"], [id*=\"cookie-banner\"], [id*=\"cookie-notice\"], \
+     [id*=\"consent-banner\"], [id*=\"gdpr\"], [class*=\"gdpr\"]";
+
 /// Result of the local extraction stage. Consumed by `read/native.rs`.
 pub(super) struct Extraction {
     /// Extracted Markdown (or plain-text fallback, or a short honest
@@ -59,8 +85,12 @@ pub(super) struct Extraction {
 /// `spawn_blocking`. Never panics on malformed HTML: it always returns an
 /// [`Extraction`].
 pub(super) fn extract_markdown(html: &str, base_url: &str, max_chars: usize) -> Extraction {
+    // Strip navigation/consent chrome once, up front, so neither the
+    // readability grab nor the fallback mistakes it for article content.
+    let cleaned = strip_chrome(html);
+
     // Preferred path: dom_smoothie article grab -> htmd Markdown.
-    if let Some((markdown, title)) = readability_markdown(html, base_url)
+    if let Some((markdown, title)) = readability_markdown(&cleaned, base_url)
         && markdown.chars().count() >= ARTICLE_MIN_CHARS
     {
         let (content, truncated) = truncate_chars(markdown, max_chars);
@@ -73,8 +103,9 @@ pub(super) fn extract_markdown(html: &str, base_url: &str, max_chars: usize) -> 
     }
 
     // Fallback: strip tags to plain text so we still return something truthful.
+    // Title comes from the ORIGINAL document (chrome removal leaves <head>).
     let fallback_title = document_title(html);
-    let text = fallback_text(html);
+    let text = fallback_text(&cleaned);
     if text.chars().count() >= FALLBACK_MIN_CHARS {
         let (content, truncated) = truncate_chars(text, max_chars);
         return Extraction {
@@ -86,12 +117,47 @@ pub(super) fn extract_markdown(html: &str, base_url: &str, max_chars: usize) -> 
     }
 
     // Nothing usable: report honestly instead of emitting empty or fake content.
+    // Distinguish a JS single-page-app shell from a generic empty page so the
+    // diagnostic is specific and the Jina (JS-rendering) pointer is warranted.
+    let content = if looks_like_spa_shell(html) {
+        SPA_DIAGNOSTIC
+    } else {
+        NO_CONTENT_DIAGNOSTIC
+    };
     Extraction {
-        content: NO_CONTENT_DIAGNOSTIC.to_string(),
+        content: content.to_string(),
         title: fallback_title,
         readable: false,
         truncated: false,
     }
+}
+
+/// Remove navigation/consent chrome from `html` and return the re-serialized
+/// document. Idempotent and panic-free on malformed HTML (dom_query is
+/// lenient); the selectors are constant and validated by the unit tests.
+fn strip_chrome(html: &str) -> String {
+    let doc = Document::from(html);
+    doc.select(CHROME_SELECTOR).remove();
+    doc.select(CONSENT_SELECTOR).remove();
+    doc.html().to_string()
+}
+
+/// Heuristic: does the ORIGINAL HTML look like a static JavaScript SPA shell?
+/// True when the parsed DOM exposes a common framework mount point
+/// (`#root`/`#app`/`#__next`/React root/Angular app) or the markup carries an
+/// "enable JavaScript" placeholder. Uses the DOM selector engine (not raw
+/// string matching) so attribute-whitespace/quote variants are handled. Only
+/// consulted once we already know no readable content was extracted, so a false
+/// positive only swaps one honest diagnostic for a more specific one.
+fn looks_like_spa_shell(html: &str) -> bool {
+    let has_mount = Document::from(html)
+        .select("#root, #app, #__next, [data-reactroot], [ng-app], [ng-version]")
+        .exists();
+    let lower = html.to_ascii_lowercase();
+    let mentions_js = lower.contains("enable javascript")
+        || lower.contains("javascript is required")
+        || lower.contains("please enable js");
+    has_mount || mentions_js
 }
 
 /// Run dom_smoothie then htmd. Returns `(markdown, title)` on a successful grab
@@ -142,13 +208,12 @@ fn readability_markdown(html: &str, base_url: &str) -> Option<(String, Option<St
     Some((markdown, title))
 }
 
-/// Zero-dependency last resort: drop scripts/styles/other non-content nodes and
-/// take the document's formatted text. Used when dom_smoothie fails or grabs
-/// nothing usable, so a page still yields plain prose instead of a panic.
+/// Zero-dependency last resort: take the (already chrome-stripped) document's
+/// formatted text. Re-strips script/style defensively in case a caller passes
+/// un-cleaned HTML, so an inline `<script>` body can never inflate the fallback
+/// and mask a JS shell as readable.
 fn fallback_text(html: &str) -> String {
     let doc = Document::from(html);
-    // These never carry readable prose; leaving them in would let an inline
-    // `<script>` body inflate the fallback and mask a JS shell as readable.
     doc.select("script, style, noscript, template, svg, iframe")
         .remove();
     doc.formatted_text().trim().to_string()
@@ -264,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn js_shell_is_not_readable() {
+    fn js_shell_is_reported_as_spa() {
         let html = r#"
             <html><head><title>App</title></head><body>
             <div id="root"></div>
@@ -273,7 +338,110 @@ mod tests {
         "#;
         let out = extract_markdown(html, "https://example.com/", 5000);
         assert!(!out.readable, "JS shell should not be readable");
-        assert_eq!(out.content, NO_CONTENT_DIAGNOSTIC);
+        assert_eq!(out.content, SPA_DIAGNOSTIC);
+    }
+
+    // ------------------------------------------------------------------
+    // Fixture-driven cases (real HTML files under testdata/).
+    // ------------------------------------------------------------------
+
+    const FIXTURE_TABLE: &str = include_str!("testdata/article_table.html");
+    const FIXTURE_CODE: &str = include_str!("testdata/article_code.html");
+    const FIXTURE_SPA: &str = include_str!("testdata/spa_shell.html");
+    const FIXTURE_CONSENT: &str = include_str!("testdata/consent_wall.html");
+
+    #[test]
+    fn fixture_article_renders_table_and_drops_chrome() {
+        let out = extract_markdown(FIXTURE_TABLE, "https://example.com/report", 5000);
+        assert!(out.readable, "content: {}", out.content);
+        assert_eq!(out.title.as_deref(), Some("Quarterly Data Report"));
+        // Table survives as Markdown.
+        assert!(
+            out.content.contains('|') && out.content.contains("Region"),
+            "expected a Markdown table, got: {}",
+            out.content
+        );
+        assert!(out.content.contains("North") && out.content.contains("East"));
+        // Navigation / promo / footer chrome is gone.
+        assert!(
+            !out.content.contains("login signup"),
+            "nav leaked: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("Subscribe to our newsletter"),
+            "aside leaked: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("All rights reserved"),
+            "footer leaked: {}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn fixture_article_preserves_code_block() {
+        let out = extract_markdown(FIXTURE_CODE, "https://example.com/rust", 5000);
+        assert!(out.readable, "content: {}", out.content);
+        assert!(
+            out.content.contains("fs::read_to_string"),
+            "code body missing: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("fn main"),
+            "code body missing: {}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn fixture_spa_shell_is_reported_as_spa() {
+        let out = extract_markdown(FIXTURE_SPA, "https://example.com/dashboard", 5000);
+        assert!(!out.readable);
+        assert_eq!(out.content, SPA_DIAGNOSTIC);
+    }
+
+    #[test]
+    fn id_only_consent_wall_is_stripped() {
+        // A consent banner hooked only by `id` (no matching class) must still be
+        // removed so it cannot masquerade as readable article prose.
+        let html = r#"
+            <html><head><title>Story</title></head><body>
+            <div id="cookie-consent-root">
+              <p>We and our partners use cookies and process personal data such as
+                 unique identifiers to personalise content and measure performance,
+                 and you may accept or reject these purposes at any time via the
+                 privacy settings link shown at the bottom of every single page.</p>
+            </div>
+            <main><article><p>Loading story…</p></article></main>
+            </body></html>
+        "#;
+        let out = extract_markdown(html, "https://example.com/story", 5000);
+        assert!(!out.readable, "content: {}", out.content);
+        assert!(
+            !out.content.contains("process personal data"),
+            "id-only consent banner leaked: {}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn fixture_consent_wall_is_not_readable() {
+        let out = extract_markdown(FIXTURE_CONSENT, "https://example.com/news", 5000);
+        assert!(!out.readable, "consent wall must not read as an article");
+        // The cookie-banner prose must not survive as "content".
+        assert!(
+            !out.content.contains("We value your privacy"),
+            "consent banner leaked: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("842 partners"),
+            "consent banner leaked: {}",
+            out.content
+        );
     }
 
     #[test]

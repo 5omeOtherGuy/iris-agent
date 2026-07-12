@@ -25,13 +25,42 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 
+use std::time::Duration;
+
 use futures::stream::{Stream, StreamExt};
-use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE, LOCATION};
+use reqwest::header::{CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_TYPE, LOCATION};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::policy::{self, PolicyError};
-use super::{CONNECT_TIMEOUT, MAX_BODY_BYTES, MAX_REDIRECTS, TOTAL_DEADLINE};
+use super::{CONNECT_TIMEOUT, MAX_BODY_BYTES, MAX_DEADLINE, MAX_REDIRECTS, TOTAL_DEADLINE};
+
+/// Per-call fetch bounds for the pinned path. Search (the default) reads the
+/// body regardless of status so it can inspect throttle pages; the native
+/// reader sets `reject_unreadable_response` so a non-2xx status or a file
+/// attachment is refused *before* any body is read.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FetchLimits {
+    /// Total wall-clock deadline for the whole walk (DNS + hops + body).
+    pub(super) deadline: Duration,
+    /// Decompressed body byte cap.
+    pub(super) body_cap: usize,
+    /// When true (native reader), reject a non-2xx response and an attachment
+    /// disposition before reading the body. When false (search scrape), the
+    /// body is always read so the caller can classify throttle/interstitial
+    /// pages itself.
+    pub(super) reject_unreadable_response: bool,
+}
+
+impl Default for FetchLimits {
+    fn default() -> Self {
+        Self {
+            deadline: TOTAL_DEADLINE,
+            body_cap: MAX_BODY_BYTES,
+            reject_unreadable_response: false,
+        }
+    }
+}
 
 /// Async DNS seam. The real resolver hits the system resolver; tests inject a
 /// canned (and possibly per-call-changing, i.e. rebinding) resolver without any
@@ -75,6 +104,13 @@ pub(super) enum FetchError {
     Dns(String),
     /// Too many redirect hops.
     TooManyRedirects,
+    /// The terminal response carried a non-2xx status. Carries only the status
+    /// and final URL -- never any body -- so a diagnostic leaks no response
+    /// content. Raised before the body is read on the native-reader path.
+    HttpStatus { status: u16, final_url: String },
+    /// The response is marked as a file download (`Content-Disposition:
+    /// attachment`), not a page to render. Raised before the body is read.
+    Attachment { final_url: String },
     /// The response Content-Type is not a text-like type we read (e.g. PDF,
     /// image, octet-stream). Carries the raw type so the caller can name the
     /// Jina alternative.
@@ -98,16 +134,20 @@ impl fmt::Display for FetchError {
             }
             Self::Dns(msg) => write!(f, "DNS resolution failed: {msg}"),
             Self::TooManyRedirects => write!(f, "too many redirects (max {MAX_REDIRECTS})"),
+            Self::HttpStatus { status, final_url } => {
+                write!(f, "server returned HTTP {status} for {final_url}")
+            }
+            Self::Attachment { final_url } => write!(
+                f,
+                "{final_url} is a file attachment (Content-Disposition: attachment), \
+                 not a readable page"
+            ),
             Self::UnsupportedContentType(ct) => {
                 write!(f, "unsupported content type for the native reader: {ct}")
             }
             Self::UnsupportedEncoding(enc) => write!(f, "unsupported content encoding: {enc}"),
             Self::Cancelled => write!(f, "request cancelled"),
-            Self::Timeout => write!(
-                f,
-                "request exceeded the {}s deadline",
-                TOTAL_DEADLINE.as_secs()
-            ),
+            Self::Timeout => write!(f, "request exceeded its deadline"),
             Self::Transport(msg) => write!(f, "{msg}"),
         }
     }
@@ -158,16 +198,21 @@ pub(super) enum ContentClass {
 /// re-gated redirect walk -> content-type gate -> size-capped, charset-decoded
 /// body. The whole walk is bounded by the total deadline and abandoned on
 /// `cancel`. No auth/cookies are ever attached, so nothing crosses a redirect.
-pub(super) async fn fetch_pinned(
+/// Pinned fetch with explicit per-call bounds (configurable
+/// deadline/body cap and the native-reader status/attachment rejection). The
+/// native reader passes `read_timeout`/`max_read_response_bytes` and
+/// `reject_unreadable_response = true`; search keeps the defaults.
+pub(super) async fn fetch_pinned_with(
     resolver: &dyn Resolver,
     raw_url: &str,
+    limits: FetchLimits,
     cancel: &CancellationToken,
 ) -> Result<FetchedPage, FetchError> {
-    let walk = fetch_pinned_inner(resolver, raw_url);
+    let walk = fetch_pinned_inner(resolver, raw_url, limits);
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(FetchError::Cancelled),
-        r = tokio::time::timeout(TOTAL_DEADLINE, walk) => match r {
+        r = tokio::time::timeout(limits.deadline, walk) => match r {
             Ok(inner) => inner,
             Err(_) => Err(FetchError::Timeout),
         },
@@ -177,6 +222,7 @@ pub(super) async fn fetch_pinned(
 async fn fetch_pinned_inner(
     resolver: &dyn Resolver,
     raw_url: &str,
+    limits: FetchLimits,
 ) -> Result<FetchedPage, FetchError> {
     let mut current = raw_url.to_string();
     let mut redirects: u32 = 0;
@@ -199,7 +245,7 @@ async fn fetch_pinned_inner(
         guard_resolved_ips(&ips)?;
 
         let addrs: Vec<SocketAddr> = ips.iter().map(|ip| SocketAddr::new(*ip, 0)).collect();
-        let client = build_pinned_client(&host, &addrs)?;
+        let client = build_pinned_client(&host, &addrs, limits.deadline)?;
 
         let response = client
             .get(url.clone())
@@ -225,9 +271,34 @@ async fn fetch_pinned_inner(
             continue;
         }
 
-        // Terminal response: gate the content type before reading the body.
-        // Keep the RAW header (params intact) so the body is decoded with the
-        // declared charset; classification uses the param-stripped form.
+        // Terminal response. Capture the final URL up front so a pre-body
+        // rejection can name it without leaking any response content.
+        let final_url = response.url().to_string();
+        let status_code = status.as_u16();
+
+        // Native-reader path: refuse a non-2xx status and a file-download
+        // disposition BEFORE reading the body (no body leakage). Search leaves
+        // this off so it can inspect throttle/interstitial pages itself.
+        if limits.reject_unreadable_response {
+            if !(200..=299).contains(&status_code) {
+                return Err(FetchError::HttpStatus {
+                    status: status_code,
+                    final_url,
+                });
+            }
+            if response
+                .headers()
+                .get(CONTENT_DISPOSITION)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(is_attachment_disposition)
+            {
+                return Err(FetchError::Attachment { final_url });
+            }
+        }
+
+        // Gate the content type before reading the body. Keep the RAW header
+        // (params intact) so the body is decoded with the declared charset;
+        // classification uses the param-stripped form.
         check_content_encoding(response.headers().get_all(CONTENT_ENCODING).iter())?;
         let raw_content_type = response
             .headers()
@@ -247,13 +318,12 @@ async fn fetch_pinned_inner(
             return Err(FetchError::UnsupportedContentType(ct));
         }
 
-        let final_url = response.url().to_string();
         // reqwest (gzip feature, no manual Accept-Encoding) auto-decodes gzip and
         // strips the header, so `bytes_stream` yields DECOMPRESSED bytes and the
         // cap stays meaningful against a gzip bomb.
         let (bytes, truncated) = collect_capped(
             response.bytes_stream(),
-            MAX_BODY_BYTES,
+            limits.body_cap,
             &CancellationToken::new(),
         )
         .await?;
@@ -261,7 +331,7 @@ async fn fetch_pinned_inner(
         return Ok(finalize_page(
             &raw_content_type,
             &bytes,
-            status.as_u16(),
+            status_code,
             final_url,
             truncated,
             redirects,
@@ -321,13 +391,17 @@ impl reqwest::dns::Resolve for NoFallbackResolver {
 /// proxy, HTTP/1 only, DNS overridden to the exact validated IPs with a
 /// fail-closed resolver beneath it. TLS SNI/cert validation still uses the
 /// hostname. Never reused across hops.
-fn build_pinned_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, FetchError> {
+fn build_pinned_client(
+    host: &str,
+    addrs: &[SocketAddr],
+    deadline: Duration,
+) -> Result<reqwest::Client, FetchError> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .http1_only()
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(TOTAL_DEADLINE)
+        .timeout(deadline)
         .user_agent(super::user_agent())
         .dns_resolver(std::sync::Arc::new(NoFallbackResolver))
         .resolve_to_addrs(host, addrs)
@@ -341,7 +415,10 @@ pub(super) fn build_api_client() -> Result<reqwest::Client, FetchError> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(TOTAL_DEADLINE)
+        // Client-level ceiling only; the actual per-call deadline is enforced
+        // by the `send_api_with` select! wrapper so a longer
+        // configured deadline is never clipped here.
+        .timeout(MAX_DEADLINE)
         .user_agent(super::user_agent())
         .build()
         .map_err(|e| FetchError::Transport(format!("failed to build API client: {e}")))
@@ -351,9 +428,12 @@ pub(super) fn build_api_client() -> Result<reqwest::Client, FetchError> {
 /// Bounds the response to `cap` bytes before the caller parses it (JSON for the
 /// search backends, Markdown for the Jina reader), and races the whole thing
 /// against `cancel` + the total deadline.
-pub(super) async fn send_api(
+/// Send a prepared API request with an explicit per-call `deadline` (the configured
+/// `read_timeout` / `search_timeout`) instead of the default.
+pub(super) async fn send_api_with(
     request: reqwest::RequestBuilder,
     cap: usize,
+    deadline: Duration,
     cancel: &CancellationToken,
 ) -> Result<(u16, Vec<u8>, bool), FetchError> {
     let fut = async {
@@ -369,7 +449,7 @@ pub(super) async fn send_api(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(FetchError::Cancelled),
-        r = tokio::time::timeout(TOTAL_DEADLINE, fut) => match r {
+        r = tokio::time::timeout(deadline, fut) => match r {
             Ok(inner) => inner,
             Err(_) => Err(FetchError::Timeout),
         },
@@ -379,6 +459,17 @@ pub(super) async fn send_api(
 // ---------------------------------------------------------------------------
 // Pure, exhaustively-tested security helpers.
 // ---------------------------------------------------------------------------
+
+/// True when a `Content-Disposition` header value marks the response as a file
+/// download rather than an inline page: the disposition type (the token before
+/// the first `;`) is `attachment`, case-insensitively. `inline` and a missing
+/// header are not attachments.
+pub(super) fn is_attachment_disposition(raw: &str) -> bool {
+    raw.split(';')
+        .next()
+        .map(str::trim)
+        .is_some_and(|t| t.eq_ignore_ascii_case("attachment"))
+}
 
 /// The redirect status codes that carry a `Location` and we follow: moved
 /// permanently/found/see-other/temporary/permanent. 300/304/305/306 are
@@ -625,6 +716,47 @@ mod tests {
             ]),
             Err(FetchError::UnsupportedEncoding(_))
         ));
+    }
+
+    #[test]
+    fn attachment_disposition_detection() {
+        assert!(is_attachment_disposition("attachment"));
+        assert!(is_attachment_disposition("Attachment; filename=\"x.pdf\""));
+        assert!(is_attachment_disposition("  ATTACHMENT ; filename=a.zip"));
+        // inline / form-data / missing are not downloads.
+        assert!(!is_attachment_disposition("inline"));
+        assert!(!is_attachment_disposition("inline; filename=x.html"));
+        assert!(!is_attachment_disposition("form-data; name=field"));
+        assert!(!is_attachment_disposition(""));
+    }
+
+    #[test]
+    fn http_status_and_attachment_errors_carry_url_without_body() {
+        let e = FetchError::HttpStatus {
+            status: 404,
+            final_url: "https://example.com/missing".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("404"));
+        assert!(msg.contains("https://example.com/missing"));
+
+        let e = FetchError::Attachment {
+            final_url: "https://example.com/file.zip".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("attachment"));
+        assert!(msg.contains("https://example.com/file.zip"));
+    }
+
+    #[test]
+    fn default_fetch_limits_preserve_search_behavior() {
+        let l = FetchLimits::default();
+        assert_eq!(l.deadline, TOTAL_DEADLINE);
+        assert_eq!(l.body_cap, MAX_BODY_BYTES);
+        assert!(
+            !l.reject_unreadable_response,
+            "search default must read the body regardless of status"
+        );
     }
 
     #[test]

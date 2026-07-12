@@ -463,6 +463,17 @@ fn resolve_web_tools_config(settings: &config::Settings) -> Result<tools::web::W
         return Ok(tools::web::WebToolsConfig::default());
     }
 
+    // Resolve the GLOBAL-ONLY bounds + endpoint (validated at their boundary).
+    let bounds = settings.web_bounds()?;
+    let searxng_url = settings.searxng_url()?;
+    // A SearXNG search backend has no default endpoint, so it needs a trusted
+    // `searxngUrl`; fail loudly rather than register a tool that cannot run.
+    if web_search == Some(tools::web::SearchBackend::Searxng) && searxng_url.is_none() {
+        anyhow::bail!(
+            "webSearchBackend is \"searxng\" but searxngUrl is not set; add a trusted searxngUrl to global settings"
+        );
+    }
+
     let auth = AuthStore::from_env().ok();
     let key = |service_id: &str, env_var: &str| -> Option<String> {
         match &auth {
@@ -479,6 +490,13 @@ fn resolve_web_tools_config(settings: &config::Settings) -> Result<tools::web::W
         read_web_page,
         brave_key: key(BRAVE_SERVICE_ID, BRAVE_ENV_VAR),
         jina_key: key(JINA_SERVICE_ID, JINA_ENV_VAR),
+        searxng_url,
+        search_timeout: bounds.search_timeout,
+        read_timeout: bounds.read_timeout,
+        max_search_results: bounds.max_search_results,
+        max_search_response_bytes: bounds.max_search_response_bytes,
+        max_read_response_bytes: bounds.max_read_response_bytes,
+        max_read_output_bytes: bounds.max_read_output_bytes,
     })
 }
 

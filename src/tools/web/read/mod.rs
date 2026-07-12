@@ -35,8 +35,10 @@ pub(super) async fn run_read(
     cancel: &CancellationToken,
 ) -> anyhow::Result<PageResult> {
     let mut page = match backend {
-        ReadBackend::Native => native::read(request, resolver, cancel).await?,
-        ReadBackend::Jina => jina::read(config.jina_key.as_deref(), request, cancel).await?,
+        ReadBackend::Native => native::read(config, request, resolver, cancel).await?,
+        ReadBackend::Jina => {
+            jina::read(config, config.jina_key.as_deref(), request, cancel).await?
+        }
     };
 
     if let Some(objective) = request

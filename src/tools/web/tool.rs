@@ -14,13 +14,11 @@ use super::read::{self, ReadRequest};
 use super::search::{self, Recency, SearchQuery};
 use super::{
     FilterReport, PageResult, ReadBackend, SearchBackend, SearchResult, WebToolsConfig,
-    frame_untrusted,
+    frame_untrusted, frame_untrusted_capped,
 };
 
 /// Default number of search results when the caller omits `max_results`.
 const DEFAULT_MAX_RESULTS: usize = 5;
-/// Hard ceiling on requested results (keeps the token cost bounded).
-const MAX_RESULTS_CEILING: usize = 10;
 
 /// Execute a `web_search` call: parse + validate args, dispatch to the resolved
 /// backend, and return framed, ranked results with a truthful filter report in
@@ -31,7 +29,7 @@ pub(crate) async fn execute_web_search(
     args: &Value,
     cancel: &CancellationToken,
 ) -> Result<ToolOutput> {
-    let query = parse_search_query(args)?;
+    let query = parse_search_query(args, config.max_search_results)?;
     let outcome = search::run_search(backend, config, &query, cancel).await?;
 
     let body = render_results(&outcome.results);
@@ -44,6 +42,15 @@ pub(crate) async fn execute_web_search(
         Value::Number(outcome.results.len().into()),
     );
     metadata.insert("filters".into(), filters_to_value(&outcome.filters));
+    metadata.insert(
+        "limits".into(),
+        serde_json::json!({
+            "max_results": query.max_results,
+            "max_search_results": config.max_search_results,
+            "max_search_response_bytes": config.max_search_response_bytes,
+            "search_timeout_ms": config.search_timeout.as_millis() as u64,
+        }),
+    );
 
     Ok(ToolOutput {
         content: text,
@@ -63,15 +70,26 @@ pub(crate) async fn execute_read_web_page(
     let resolver = SystemResolver;
     let page = read::run_read(backend, config, &request, &resolver, cancel).await?;
 
-    let text = frame_untrusted(&page.final_url, backend.as_str(), &page.content);
+    // Bound the WHOLE framed output to the configured cap, preserving the source
+    // header and the untrusted-data marker; only the body is trimmed.
+    let (text, output_truncated) = frame_untrusted_capped(
+        &page.final_url,
+        backend.as_str(),
+        &page.content,
+        config.max_read_output_bytes,
+    );
     Ok(ToolOutput {
         content: text,
-        metadata: read_metadata(backend.as_str(), &page),
+        metadata: read_metadata(backend.as_str(), &page, output_truncated, config),
     })
 }
 
-/// Parse and validate `web_search` arguments.
-fn parse_search_query(args: &Value) -> Result<SearchQuery> {
+/// Parse and validate `web_search` arguments. `max_results_ceiling` is the
+/// configured `maxSearchResults` bound; the requested count is clamped to it so
+/// a caller can never exceed the operator-set ceiling (guarded to at least 1 so
+/// the disabled-placeholder `0` can never panic the clamp).
+fn parse_search_query(args: &Value, max_results_ceiling: usize) -> Result<SearchQuery> {
+    let ceiling = max_results_ceiling.max(1);
     let query = args
         .get("query")
         .and_then(Value::as_str)
@@ -81,12 +99,12 @@ fn parse_search_query(args: &Value) -> Result<SearchQuery> {
         .to_string();
 
     let max_results = match args.get("max_results") {
-        None | Some(Value::Null) => DEFAULT_MAX_RESULTS,
+        None | Some(Value::Null) => DEFAULT_MAX_RESULTS.min(ceiling),
         Some(v) => {
             let n = v
                 .as_u64()
                 .ok_or_else(|| anyhow!("`max_results` must be a positive integer"))?;
-            (n as usize).clamp(1, MAX_RESULTS_CEILING)
+            (n as usize).clamp(1, ceiling)
         }
     };
 
@@ -179,17 +197,47 @@ fn filters_to_value(filters: &[FilterReport]) -> Value {
     Value::Array(filters.iter().map(FilterReport::to_value).collect())
 }
 
-/// Build the `read_web_page` metadata object.
-fn read_metadata(backend: &str, page: &PageResult) -> Map<String, Value> {
+/// Build the `read_web_page` metadata object. Reports both truncation stages
+/// honestly -- `source_truncated` when the fetch/extraction hit the body cap,
+/// `output_truncated` when the final framed output was clipped to the output
+/// cap -- alongside the effective `limits` so the caller can see the bounds
+/// that shaped the result. `truncated` is kept as the OR of both stages for
+/// backward compatibility.
+fn read_metadata(
+    backend: &str,
+    page: &PageResult,
+    output_truncated: bool,
+    config: &WebToolsConfig,
+) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("backend".into(), Value::String(backend.into()));
     m.insert("final_url".into(), Value::String(page.final_url.clone()));
     m.insert("status".into(), Value::Number(page.status.into()));
-    m.insert("truncated".into(), Value::Bool(page.truncated));
+    m.insert("source_truncated".into(), Value::Bool(page.truncated));
+    m.insert("output_truncated".into(), Value::Bool(output_truncated));
+    m.insert(
+        "truncated".into(),
+        Value::Bool(page.truncated || output_truncated),
+    );
     m.insert("redirects".into(), Value::Number(page.redirects.into()));
     if let Some(title) = &page.title {
         m.insert("title".into(), Value::String(title.clone()));
     }
+
+    let mut limits = Map::new();
+    limits.insert(
+        "max_read_response_bytes".into(),
+        Value::Number(config.max_read_response_bytes.into()),
+    );
+    limits.insert(
+        "max_read_output_bytes".into(),
+        Value::Number(config.max_read_output_bytes.into()),
+    );
+    limits.insert(
+        "read_timeout_ms".into(),
+        Value::Number((config.read_timeout.as_millis() as u64).into()),
+    );
+    m.insert("limits".into(), Value::Object(limits));
     m
 }
 
@@ -200,33 +248,47 @@ mod tests {
 
     #[test]
     fn parse_search_defaults_and_clamps() {
-        let q = parse_search_query(&json!({"query": "rust ssrf"})).unwrap();
+        let q = parse_search_query(&json!({"query": "rust ssrf"}), 10).unwrap();
         assert_eq!(q.query, "rust ssrf");
         assert_eq!(q.max_results, DEFAULT_MAX_RESULTS);
 
-        let q = parse_search_query(&json!({"query": "x", "max_results": 99})).unwrap();
-        assert_eq!(q.max_results, MAX_RESULTS_CEILING);
-        let q = parse_search_query(&json!({"query": "x", "max_results": 0})).unwrap();
+        // Requested count is clamped to the configured ceiling.
+        let q = parse_search_query(&json!({"query": "x", "max_results": 99}), 10).unwrap();
+        assert_eq!(q.max_results, 10);
+        let q = parse_search_query(&json!({"query": "x", "max_results": 99}), 3).unwrap();
+        assert_eq!(q.max_results, 3);
+        let q = parse_search_query(&json!({"query": "x", "max_results": 0}), 10).unwrap();
+        assert_eq!(q.max_results, 1);
+        // Default is itself bounded by a small ceiling.
+        let q = parse_search_query(&json!({"query": "x"}), 2).unwrap();
+        assert_eq!(q.max_results, 2);
+        // Disabled-placeholder ceiling of 0 never panics the clamp.
+        let q = parse_search_query(&json!({"query": "x", "max_results": 5}), 0).unwrap();
         assert_eq!(q.max_results, 1);
     }
 
     #[test]
     fn parse_search_rejects_bad_input() {
-        assert!(parse_search_query(&json!({})).is_err());
-        assert!(parse_search_query(&json!({"query": "  "})).is_err());
-        assert!(parse_search_query(&json!({"query": "x", "recency": "decade"})).is_err());
-        assert!(parse_search_query(&json!({"query": "x", "country": "usa"})).is_err());
-        assert!(parse_search_query(&json!({"query": "x", "include_domains": "docs.rs"})).is_err());
+        assert!(parse_search_query(&json!({}), 10).is_err());
+        assert!(parse_search_query(&json!({"query": "  "}), 10).is_err());
+        assert!(parse_search_query(&json!({"query": "x", "recency": "decade"}), 10).is_err());
+        assert!(parse_search_query(&json!({"query": "x", "country": "usa"}), 10).is_err());
+        assert!(
+            parse_search_query(&json!({"query": "x", "include_domains": "docs.rs"}), 10).is_err()
+        );
     }
 
     #[test]
     fn parse_search_accepts_filters() {
-        let q = parse_search_query(&json!({
-            "query": "x",
-            "include_domains": ["docs.rs", "example.com"],
-            "recency": "week",
-            "country": "US",
-        }))
+        let q = parse_search_query(
+            &json!({
+                "query": "x",
+                "include_domains": ["docs.rs", "example.com"],
+                "recency": "week",
+                "country": "US",
+            }),
+            10,
+        )
         .unwrap();
         assert_eq!(q.include_domains.len(), 2);
         assert_eq!(q.recency, Some(Recency::Week));

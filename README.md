@@ -67,13 +67,18 @@ tool-heavy sessions stay readable and stay within their window.
 
 - **Opt-in web tools, off by default.** `web_search` and `read_web_page` are
   independently configurable in settings (`webSearchBackend`:
-  off/native/brave/jina; `readWebPageBackend`: off/native/jina) and are not
-  offered to the model until enabled. Native mode needs no API key; Brave and
-  Jina keys are user-configured (settings or `BRAVE_API_KEY`/`JINA_API_KEY`).
+  off/native/brave/jina/searxng; `readWebPageBackend`: off/native/jina) and are
+  not offered to the model until enabled. Native mode needs no API key; Brave
+  and Jina keys are user-configured (settings or `BRAVE_API_KEY`/`JINA_API_KEY`);
+  `searxng` targets a self-hosted instance via the trusted `searxngUrl`. Bounded
+  by global-only dials: `searchTimeoutMs`/`readTimeoutMs` (default 30000),
+  `maxSearchResults` (default and hard maximum 10), and
+  `maxSearchResponseBytes`/`maxReadResponseBytes`/`maxReadOutputBytes` (default
+  200 KiB); out-of-range values are rejected at load.
   Every call is approval-gated, private/localhost/internal targets are refused
   by an SSRF policy with connection pinning, and fetched content is framed as
-  untrusted external data. The backend settings are global-only, so a cloned
-  repo can never enable network egress (see ADR-0058).
+  untrusted external data. These settings are global-only, so a cloned repo can
+  never enable network egress or redirect where queries go (see ADR-0058).
 
 ## Install
 
