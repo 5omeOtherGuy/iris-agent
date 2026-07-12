@@ -946,13 +946,10 @@ pub(crate) trait MutationGuard {
     /// task" option). Approvals expire when the task settles.
     fn approve(&self, paths: &[PathBuf], all_dirty: bool);
 
-    /// Snapshot the protected set's contents before a mutating call executes so
-    /// an out-of-band write can be detected and restored afterward. `paths` are
-    /// the call's statically-known mutation targets (empty for `bash`): the
-    /// guard also snapshots their pre-call bytes so the checkpoint chain (#263)
-    /// can capture the exact pre-task content of a clean file Iris is about to
-    /// edit, not just the pre-existing dirty set.
-    fn before_exec(&self, paths: &[PathBuf]);
+    /// Prepare for a mutating call and return a preflight halt when execution
+    /// must not proceed. The guard snapshots protected paths and known targets
+    /// before execution. A non-empty result means the tool was not executed.
+    fn before_exec(&self, paths: &[PathBuf]) -> GuardViolation;
 
     /// Re-check the protected set after a mutating call. `approved` are the
     /// paths this call was allowed to change; `expected_after` is the SHA-256
@@ -971,8 +968,8 @@ pub(crate) trait MutationGuard {
     fn restore(&self, paths: &[PathBuf]) -> Result<()>;
 }
 
-/// Outcome of [`MutationGuard::after_exec`]: what, if anything, the guard found
-/// wrong after a mutating call (issues #262, #560).
+/// Outcome of a mutation-guard preflight or postflight check: what, if
+/// anything, requires the call to stop (issues #262, #560).
 #[derive(Debug, Default)]
 pub(crate) struct GuardViolation {
     /// Protected files that changed out-of-band, restorable from the pre-exec
@@ -1510,6 +1507,55 @@ enum ToolOutcome {
     Err(anyhow::Error),
     Cancelled,
     Denied,
+}
+
+fn guard_violation_outcome(
+    guard: &dyn MutationGuard,
+    violation: GuardViolation,
+    call: &ToolCall,
+    workspace: &Path,
+    obs: &dyn AgentObserver,
+    executed: bool,
+) -> Result<ToolOutcome> {
+    let restored =
+        executed && !violation.paths.is_empty() && guard.restore(&violation.paths).is_ok();
+    let paths: Vec<String> = violation
+        .paths
+        .iter()
+        .map(|path| {
+            path.strip_prefix(workspace)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
+        .collect();
+    let what = match &violation.reason {
+        Some(reason) => reason.clone(),
+        None => format!(
+            "modified protected uncommitted file(s): {}",
+            paths.join(", ")
+        ),
+    };
+    let status = if executed { "halted" } else { "not executed" };
+    let recovery = if !executed || violation.paths.is_empty() {
+        ""
+    } else if restored {
+        "; restored from snapshot"
+    } else {
+        "; snapshot restore failed"
+    };
+    if executed && !violation.paths.is_empty() {
+        obs.on_event(AgentEvent::MutationViolation {
+            call: call.clone(),
+            paths,
+            restored,
+        })?;
+    } else {
+        obs.on_event(AgentEvent::Notice(format!("{status}: {what}")))?;
+    }
+    Ok(ToolOutcome::Err(anyhow::anyhow!(
+        "{status}: {what}{recovery}"
+    )))
 }
 
 /// Classified result of one gated verification-command run (issue #265),
@@ -2748,12 +2794,27 @@ impl<P: ChatProvider> Agent<P> {
         // unknown tool yields the same `unknown tool: <name>` result as before.
         let outcome = match self.tools.by_name(&call.name) {
             Some(tool) => {
-                // Announce execution start (so a front-end opens a live cell)
-                // only for a real tool, then inject a per-call streaming emitter
-                // for the run. An unknown tool never opens a phantom cell and
-                // keeps an exact ToolStarted/ToolResult pairing. Only this
-                // exclusive path streams (the parallel/exploration path stays
-                // sink-less), so a single live exec cell is always enough.
+                // Dirty-tree detection layer (issue #262, ADR-0028): a preflight
+                // halt prevents execution; otherwise snapshot protected paths and
+                // re-check them after the call.
+                let guard = env.mutation_guard.filter(|_| is_mutating);
+                if let Some(guard) = guard {
+                    let violation = guard.before_exec(&mutated_paths);
+                    if !violation.is_empty() {
+                        return guard_violation_outcome(
+                            guard,
+                            violation,
+                            call,
+                            env.workspace,
+                            obs,
+                            false,
+                        );
+                    }
+                }
+
+                // Announce execution only after preflight succeeds, then inject a
+                // per-call streaming emitter. Unknown and preflight-halted tools
+                // never open a phantom live cell.
                 obs.on_event(AgentEvent::ToolStarted(call.clone()))?;
                 emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Started)?;
                 let emitter = ToolDeltaEmitter {
@@ -2768,15 +2829,6 @@ impl<P: ChatProvider> Agent<P> {
                     output_sink: Some(&emitter),
                     mutation_guard: env.mutation_guard,
                 };
-                // Dirty-tree detection layer (issue #262, ADR-0028): snapshot the
-                // protected set before a mutating call, then re-check it after.
-                // A protected file changed out-of-band (not an approved target of
-                // this call) is a violation: fail the call, restore from
-                // snapshot, and surface which files changed.
-                let guard = env.mutation_guard.filter(|_| is_mutating);
-                if let Some(guard) = guard {
-                    guard.before_exec(&mutated_paths);
-                }
                 let outcome = run_tool(tool, &call.arguments, &call_env, token.child_token()).await;
                 if let Some(guard) = guard {
                     // Confirm an approved change against the exact bytes the tool
@@ -2793,48 +2845,10 @@ impl<P: ChatProvider> Agent<P> {
                         _ => None,
                     };
                     let violation = guard.after_exec(&mutated_paths, expected_after.as_deref());
-                    if !violation.is_empty() {
-                        // Restore only named file violations; a reason-only halt
-                        // (e.g. an external jj operation) has nothing to restore,
-                        // and must not claim it restored anything (issue #560).
-                        let restored =
-                            !violation.paths.is_empty() && guard.restore(&violation.paths).is_ok();
-                        let paths: Vec<String> = violation
-                            .paths
-                            .iter()
-                            .map(|path| {
-                                path.strip_prefix(env.workspace)
-                                    .unwrap_or(path)
-                                    .display()
-                                    .to_string()
-                            })
-                            .collect();
-                        let what = match &violation.reason {
-                            Some(reason) => reason.clone(),
-                            None => format!(
-                                "modified protected uncommitted file(s): {}",
-                                paths.join(", ")
-                            ),
-                        };
-                        let recovery = if violation.paths.is_empty() {
-                            ""
-                        } else if restored {
-                            "; restored from snapshot"
-                        } else {
-                            "; snapshot restore failed"
-                        };
-                        if violation.paths.is_empty() {
-                            obs.on_event(AgentEvent::Notice(format!("halted: {what}")))?;
-                        } else {
-                            obs.on_event(AgentEvent::MutationViolation {
-                                call: call.clone(),
-                                paths: paths.clone(),
-                                restored,
-                            })?;
-                        }
-                        ToolOutcome::Err(anyhow::anyhow!("halted: {what}{recovery}"))
-                    } else {
+                    if violation.is_empty() {
                         outcome
+                    } else {
+                        guard_violation_outcome(guard, violation, call, env.workspace, obs, true)?
                     }
                 } else {
                     outcome

@@ -63,10 +63,12 @@ pub(super) fn snapshot(workspace: &Path) -> Result<Vec<u8>> {
     jj_stdout(workspace, &["status"])
 }
 
+/// Read the current operation without snapshotting a dirty working copy.
 pub(super) fn current_operation_id(workspace: &Path) -> Result<String> {
     let templated = jj_stdout(
         workspace,
         &[
+            "--ignore-working-copy",
             "op",
             "log",
             "--limit",
@@ -82,7 +84,17 @@ pub(super) fn current_operation_id(workspace: &Path) -> Result<String> {
             return Ok(id);
         }
     }
-    let out = jj_stdout(workspace, &["op", "log", "--limit", "1", "--no-graph"])?;
+    let out = jj_stdout(
+        workspace,
+        &[
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--limit",
+            "1",
+            "--no-graph",
+        ],
+    )?;
     let text = String::from_utf8_lossy(&out);
     text.split_whitespace()
         .find(|token| token.chars().all(|c| c.is_ascii_hexdigit()) && token.len() >= 8)
