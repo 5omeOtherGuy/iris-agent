@@ -21,8 +21,9 @@ carries a self-sufficient text `summary`.
   provider-neutral output containing text, opaque JSON values, and normalized
   usage. Provider names and wire fields remain in Mimir.
 - `compaction.providerNative` is global-only, accepts `off|auto`, and defaults
-  to `auto`. `auto` attempts a provider route only when the active adapter
-  reports capability for the planned range.
+  to `off`. `auto` explicitly opts into a provider route when the active adapter
+  reports capability for the planned range. The hard-tier fallback ladder obeys
+  the same opt-in.
 - The parent-owned Wayland engine remains the only mutation point. Native and
   portable workers share planning, revalidation, carry, recall, persistence,
   apply, and lifecycle events.
@@ -71,11 +72,12 @@ describes this request size, not a missing model capability.
 - **Why not**: It would create a second mutation owner and break live/resume
   equivalence, recall registration, and entry ordering.
 
-### Require explicit provider-native opt-in
+### Enable provider-native compaction by default
 
-- **Why not**: Native compaction is the established default in the reference
-  coding agents. Capability checks and per-process rejection caching preserve a
-  safe portable fallback on unsupported lanes.
+- **Why not**: OpenAI's opaque encrypted continuation and the separately
+  generated portable summary are not guaranteed to be behaviorally equivalent.
+  A later model switch therefore may change behavior at the representation
+  boundary. Explicit opt-in plus a startup warning makes that tradeoff visible.
 
 ## Consequences
 

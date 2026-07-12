@@ -318,6 +318,7 @@ async fn session_loop<P: ChatProvider>(
     startup: StartupUi,
 ) -> Result<()> {
     let StartupUi {
+        notices: _,
         modal: startup_modal,
         mut followup_modal,
         start_page,

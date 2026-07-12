@@ -567,9 +567,9 @@ fn run_agent_inner(
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
     harness.set_compaction_worker(settings.compaction_worker_config()?);
-    harness.set_provider_native(
-        settings.compaction_provider_native()? == config::ProviderNativeMode::Auto,
-    );
+    let provider_native_enabled =
+        settings.compaction_provider_native()? == config::ProviderNativeMode::Auto;
+    harness.set_provider_native(provider_native_enabled);
     install_compaction_summarizer_factory(
         &mut harness,
         background_selection.clone(),
@@ -642,6 +642,7 @@ fn run_agent_inner(
         settings.tui_settings(),
         &swap,
         cli::StartupUi {
+            notices: cli::provider_native_compaction_notices(provider_native_enabled),
             modal: startup_modal,
             followup_modal,
             start_page,
@@ -786,9 +787,12 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
     harness.set_compaction_worker(settings.compaction_worker_config()?);
-    harness.set_provider_native(
-        settings.compaction_provider_native()? == config::ProviderNativeMode::Auto,
-    );
+    let provider_native_enabled =
+        settings.compaction_provider_native()? == config::ProviderNativeMode::Auto;
+    harness.set_provider_native(provider_native_enabled);
+    if provider_native_enabled {
+        eprintln!("warning: {}", cli::PROVIDER_NATIVE_COMPACTION_WARNING);
+    }
     install_compaction_summarizer_factory(
         &mut harness,
         background_selection,
@@ -1039,9 +1043,9 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
     harness.set_compaction_worker(settings.compaction_worker_config()?);
-    harness.set_provider_native(
-        settings.compaction_provider_native()? == config::ProviderNativeMode::Auto,
-    );
+    let provider_native_enabled =
+        settings.compaction_provider_native()? == config::ProviderNativeMode::Auto;
+    harness.set_provider_native(provider_native_enabled);
     install_compaction_summarizer_factory(
         &mut harness,
         background_selection.clone(),
@@ -1101,6 +1105,7 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
         settings.tui_settings(),
         &swap,
         cli::StartupUi {
+            notices: cli::provider_native_compaction_notices(provider_native_enabled),
             modal: jj_modal,
             followup_modal: None,
             start_page: false,

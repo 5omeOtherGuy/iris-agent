@@ -132,13 +132,15 @@ envelope, usage, and `providerNative` origin. Rebuild is byte-identical before
 translation. Only Mimir decides whether the envelope matches the exact adapter
 and model; a selection change discards an in-flight native job.
 
-Decision: `compaction.providerNative=auto` is global-only and the default. The
-legacy Anthropic compact field stays rejected so one reducer has one control.
-Anthropic's adapter remains available to the live probe, but advertises no
-native capability after the Claude Code OAuth lane returned
-`400 invalid_request_error`; `auto` selects the portable worker without a known
-failed request. OpenAI advertises native support and caches rejected models for
-the process.
+Decision: `compaction.providerNative` is global-only and defaults to `off`.
+Explicit `auto` opts into capability-gated native compaction across both primary
+and hard-tier fallback routes and emits a startup warning about model-switch
+behavior. The legacy Anthropic compact field stays rejected so one reducer has
+one control. Anthropic's adapter remains available to the live probe, but
+advertises no native capability after the Claude Code OAuth lane returned
+`400 invalid_request_error`; an explicit `auto` still selects the portable worker
+without a known failed request. OpenAI advertises native support and caches
+rejected models for the process.
 
 Issue: the first real Anthropic probe panicked before the request completed:
 `Cannot drop a runtime in a context where blocking is not allowed. This happens

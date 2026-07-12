@@ -2187,6 +2187,7 @@ fn hard_ladder_escalates_from_subagent_timeout_to_provider_native_when_supported
         single_turn_hard_ladder_harness(&root.path, &workspace.path);
     let native_requests = Arc::new(Mutex::new(Vec::new()));
     let requests = native_requests.clone();
+    harness.compaction.ladder.as_mut().unwrap().hard = u64::MAX;
     harness.set_provider_compaction_factory(Arc::new(move || {
         Ok(Box::new(NativeCompactionProvider {
             requests: requests.clone(),
@@ -2194,6 +2195,35 @@ fn hard_ladder_escalates_from_subagent_timeout_to_provider_native_when_supported
     }));
     let obs = Recorder::default();
     let token = CancellationToken::new();
+
+    let scheduled = block_on(harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 1,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: harness.output_store.as_ref(),
+            task_state: None,
+            observer: &obs,
+        },
+        &token,
+    ))
+    .unwrap();
+    assert!(matches!(scheduled, ContextDirective::Proceed));
+    assert_eq!(
+        harness.compaction.background.as_ref().map(|job| job.origin),
+        Some(CompactionOrigin::Subagent)
+    );
+
+    // Enabling native mode while a portable job is already running must also
+    // gate the hard-tier native fallback. Normally the next job would select
+    // native as its primary worker.
+    harness.set_provider_native(true);
+    harness.compaction.ladder.as_mut().unwrap().hard =
+        super::context_tokens(&messages).saturating_sub(1);
 
     let directive = block_on(harness.compaction.govern(
         BoundaryContext {
@@ -2213,8 +2243,9 @@ fn hard_ladder_escalates_from_subagent_timeout_to_provider_native_when_supported
     .unwrap();
     assert!(matches!(directive, ContextDirective::Replace { .. }));
 
-    // The subagent timed out and the ladder escalated to provider-native.
-    assert_eq!(native_requests.lock().unwrap().len(), 1);
+    // The subagent timed out and the ladder escalated to provider-native. A
+    // second request is permitted if the first rewrite remains above hard.
+    assert!(!native_requests.lock().unwrap().is_empty());
     let entries = compaction_entries(&path);
     assert!(
         entries
@@ -2236,13 +2267,58 @@ fn hard_ladder_escalates_from_subagent_timeout_to_provider_native_when_supported
 }
 
 #[test]
+fn hard_ladder_skips_supported_native_fallback_without_opt_in() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let (mut harness, path, messages) =
+        single_turn_hard_ladder_harness(&root.path, &workspace.path);
+    let native_requests = Arc::new(Mutex::new(Vec::new()));
+    let requests = native_requests.clone();
+    harness.set_provider_compaction_factory(Arc::new(move || {
+        Ok(Box::new(NativeCompactionProvider {
+            requests: requests.clone(),
+        }))
+    }));
+    let obs = Recorder::default();
+
+    let directive = block_on(harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 1,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: harness.output_store.as_ref(),
+            task_state: None,
+            observer: &obs,
+        },
+        &CancellationToken::new(),
+    ))
+    .unwrap();
+
+    assert!(matches!(directive, ContextDirective::Replace { .. }));
+    assert!(native_requests.lock().unwrap().is_empty());
+    let entries = compaction_entries(&path);
+    assert!(entries.iter().any(|entry| entry["origin"] == "excerpts"));
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["origin"] == "providerNative")
+    );
+}
+
+#[test]
 fn hard_ladder_falls_through_to_excerpts_when_native_capability_is_none() {
     let root = temp_dir();
     let workspace = temp_dir();
     let (mut harness, path, messages) =
         single_turn_hard_ladder_harness(&root.path, &workspace.path);
-    // A provider factory whose compaction capability is None (the default):
-    // the ladder must fall through to deterministic excerpts.
+    // Native mode is opted in, but the provider factory advertises no native
+    // capability, so the portable worker runs and the fallback probe must fall
+    // through to deterministic excerpts.
+    harness.set_provider_native(true);
     harness.set_provider_compaction_factory(Arc::new(|| Ok(Box::new(SilentProvider))));
     let obs = Recorder::default();
     let token = CancellationToken::new();

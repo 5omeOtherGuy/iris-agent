@@ -416,11 +416,12 @@ background compaction failed; using deterministic fallback: Anthropic native com
 The session then applied one deterministic excerpts entry, retained
 `--enable-zeta`, and rebuilt byte-exactly. This is a failed native capability
 probe, not a passing native row and not an excluded ordinary-LVP session.
-At this slice boundary, `compaction.providerNative` remained default-off. The
-later OpenAI portable-summary work made `auto` the global default, but Anthropic
-still advertises no native capability; `auto` selects its portable worker
-without repeating this known-failing request. No success metric is inferred
-from the fallback.
+At this slice boundary, `compaction.providerNative` was default-off. The later
+OpenAI portable-summary work briefly made `auto` the global default; the
+portability review restored `off` and made `auto` an explicit warned opt-in.
+Anthropic still advertises no native capability, so an opted-in `auto` selects
+its portable worker without repeating this known-failing request. No success
+metric is inferred from the fallback.
 
 OpenAI v2 capability was probed separately because it cannot yet produce a
 portable Iris entry:

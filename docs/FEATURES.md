@@ -123,9 +123,13 @@
   metadata and warns only on proven stable-prefix breaks, not ordinary cold
   caches. [Partial]
 - **Provider-native compaction** — global-only
-  `compaction.providerNative` accepts capability-gated `auto` (default) or
-  `off`. Entries persist a portable summary plus one adapter-owned opaque
-  block; only the same adapter and exact model replay the block. Anthropic's
+  `compaction.providerNative` accepts `off` (default) or capability-gated `auto`.
+  `auto` is an explicit OpenAI opt-in and emits a startup warning: the opaque
+  encrypted continuation block is reusable only by the same OpenAI model; after
+  a model switch Iris uses the separately generated portable summary, whose
+  differences may change subsequent behavior. Entries persist a portable
+  summary plus one adapter-owned opaque block; only the same adapter and exact
+  model replay the block. Anthropic's
   compact beta adapter remains probe-only after the Claude Code OAuth lane
   returned `400 invalid_request_error`; `auto` selects the portable worker.
   OpenAI's native trigger persists the encrypted compaction item and pairs it

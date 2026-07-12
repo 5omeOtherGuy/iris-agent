@@ -115,9 +115,9 @@ Implemented today:
   usage/cache metadata, and cache-break warnings only when the stable prefix
   provably changed.
 - Anthropic server-side context-management clear edits, a probe-only Anthropic
-  compact adapter, and capability-gated native OpenAI compaction. Native entries
-  persist portable summaries beside provider-owned replay blocks; unsupported
-  lanes use the active-provider summarizer.
+  compact adapter, and default-off, capability-gated native OpenAI compaction.
+  Native entries persist portable summaries beside provider-owned replay blocks;
+  unsupported and non-opted-in lanes use the active-provider summarizer.
 - Mimir provider auth/token loading for OpenAI Codex, Anthropic Claude Code
   subscription OAuth reuse, Antigravity Google OAuth, Anthropic/OpenAI API keys,
   and dedicated keys for configured OpenAI-compatible endpoints.
@@ -1522,8 +1522,10 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    `400 invalid_request_error`, so Anthropic does not advertise native support
    and `auto` selects the active-provider summarizer directly. OpenAI native
    compaction pairs the encrypted item with a separate provider-authored
-   portable summary. Provider-native mode and the active-provider summarizer are
-   the defaults; the portable worker uses a compaction-specific system prompt,
+   portable summary. Provider summaries are the default for every model; OpenAI
+   native mode is an explicit, warned `compaction.providerNative=auto` opt-in
+   whose hard-tier fallback obeys the same switch. The portable worker uses a
+   compaction-specific system prompt,
    and unsupported lanes retain the deterministic fallback. Slice 8 adds the default-off,
    project-tunable `request_compaction` model tool. It only schedules the
    existing governor, validates an empty argument object, and consumes one

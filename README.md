@@ -209,11 +209,15 @@ If unset, `promptCacheRetention` defaults to `short`; set it to `none` to omit
 provider-native prompt-cache hints.
 
 Automatic compaction uses the selected model's effective context window. An
-explicit `contextTokenBudget` remains an absolute upper bound. Provider-native
-compaction and active-provider summaries are the defaults; unsupported native
-routes fall back through the portable summarizer. Microcompaction and
-tool-result compaction remain disabled unless enabled explicitly. Tune or
-disable the trigger ladder with:
+explicit `contextTokenBudget` remains an absolute upper bound. Active-provider
+portable summaries are the default; unsupported routes fall back through the
+portable summarizer. OpenAI native compaction is an explicit global opt-in:
+set `compaction.providerNative` to `auto` (the default is `off`). Native mode
+stores an opaque encrypted continuation block that only the same OpenAI model
+can reuse. After a model switch Iris uses the separately generated portable
+text summary; differences between the two may change subsequent behavior.
+Microcompaction and tool-result compaction remain disabled unless enabled
+explicitly. Tune or disable the trigger ladder with:
 
 ```json
 {

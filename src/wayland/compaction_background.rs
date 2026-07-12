@@ -458,7 +458,8 @@ impl CompactionEngine {
         // native rung. A job that was ALREADY ProviderNative origin and failed,
         // timed out, or did not shrink must not fire a second identical
         // provider-native request; it drops straight to the excerpts rung.
-        if let Some(token) = native
+        if self.provider_native
+            && let Some(token) = native
             && matches!(
                 job.origin,
                 CompactionOrigin::Subagent | CompactionOrigin::Provider
