@@ -823,7 +823,8 @@ impl Transcript {
         &mut self,
         had_work: bool,
         elapsed: Option<Duration>,
-        usage: Option<&ProviderUsage>,
+        flows: &crate::metrics::TokenFlows,
+        timing: &crate::metrics::TimingStats,
     ) {
         if !had_work {
             return;
@@ -832,7 +833,7 @@ impl Transcript {
         self.push_blank();
         self.mark_append_dirty();
         self.rows.push(TranscriptRow {
-            text: turn_divider_label(elapsed, usage),
+            text: turn_divider_label(elapsed, flows, timing),
             style: dim_style(),
             continuation_prefix: None,
             line: None,
@@ -1296,7 +1297,7 @@ impl Transcript {
         let prev = self.last_turn_input_tokens?;
         let cap = self.context_cap.filter(|&cap| cap > 0)?;
         let delta = input_tokens as i64 - prev as i64;
-        let pct = delta as f64 / cap as f64 * 100.0;
+        let pct = crate::metrics::signed_percent_of(delta, cap)?;
         Some(format!("{pct:+.1}%"))
     }
 

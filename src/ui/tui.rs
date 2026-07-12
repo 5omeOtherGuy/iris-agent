@@ -33,6 +33,7 @@ use ratatui::style::Style;
 #[cfg(test)]
 use ratatui::text::{Line, Span};
 
+#[cfg(test)]
 use crate::nexus::ProviderUsage;
 use crate::ui::screen_mode::ScreenMode;
 use crate::ui::terminal_surface::TerminalSurface;
@@ -66,7 +67,7 @@ use rows::{ChromeRow, TranscriptRow, hrule_line};
 pub(crate) use screen::compact_count;
 use screen::render_document_with_hints;
 pub(crate) use screen::{
-    ApprovalPolicy, ContextAccounting, Screen, SwitchCacheStatus, SwitchStatus,
+    ApprovalPolicy, ContextAccounting, Screen, SessionMeter, SwitchCacheStatus, SwitchStatus,
 };
 pub(crate) use screen::{BarSegment, session_bar_hit};
 #[cfg(test)]
@@ -227,29 +228,43 @@ fn format_elapsed_compact(duration: Duration) -> String {
         format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
     }
 }
-fn turn_divider_label(elapsed: Option<Duration>, usage: Option<&ProviderUsage>) -> String {
+/// The divider's telemetry label: task wall time, summed task token flows,
+/// and — when generation time was measured — the task's mean output rate
+/// over provider time (never inflated by tool execution between rounds).
+fn turn_divider_label(
+    elapsed: Option<Duration>,
+    flows: &crate::metrics::TokenFlows,
+    timing: &crate::metrics::TimingStats,
+) -> String {
     let Some(elapsed) = elapsed else {
         return String::new();
     };
     let elapsed = format_elapsed_compact(elapsed);
     let sep = crate::ui::symbols::SEP;
-    match usage {
-        Some(usage) => format!(
-            "{elapsed} {sep} ↑{} ↓{}",
-            compact_count(usage.input_tokens),
-            compact_count(usage.output_tokens)
-        ),
-        None => elapsed,
+    if flows.is_empty() {
+        return elapsed;
     }
+    let mut label = format!(
+        "{elapsed} {sep} ↑{} ↓{}",
+        compact_count(flows.input_tokens),
+        compact_count(flows.output_tokens)
+    );
+    if let Some(rate) = crate::metrics::tokens_per_second(flows.output_tokens, timing.generation)
+        && flows.output_tokens > 0
+    {
+        label.push_str(&format!(" {sep} {} tok/s", rate.round() as u64));
+    }
+    label
 }
 
 #[cfg(test)]
 fn turn_divider_line(
     elapsed: Option<Duration>,
-    usage: Option<&ProviderUsage>,
+    flows: &crate::metrics::TokenFlows,
+    timing: &crate::metrics::TimingStats,
     width: usize,
 ) -> Line<'static> {
-    hrule_line(&turn_divider_label(elapsed, usage), width)
+    hrule_line(&turn_divider_label(elapsed, flows, timing), width)
 }
 
 fn border_style() -> Style {
@@ -1939,6 +1954,7 @@ mod tests {
             turn_id: "t1".to_string(),
             response_id: None,
             usage: None,
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         assert!(
             !screen.transcript.stream.is_active() && !screen.has_stream_work(),
@@ -2449,6 +2465,7 @@ mod tests {
                 total_tokens: 13_000,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         let header = rendered_lines(&mut screen, 100, 18)
             .iter()
@@ -2520,6 +2537,7 @@ mod tests {
                 total_tokens: 13_000,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         settle_stream(&mut screen);
         let settled = thinking_header(&mut screen);
@@ -4323,6 +4341,7 @@ mod tests {
                 total_tokens: 90_000,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         render_perf_cycle(&mut screen, &mut surface, size).expect("bar-change frame");
 
@@ -4694,6 +4713,7 @@ mod tests {
                 total_tokens: 90_000,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         screen.end_turn();
         // 90k/300k => 30% => 3 lit dots (last is the orange edge).
@@ -4728,6 +4748,7 @@ mod tests {
                 total_tokens: 150_000,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         let before = session_bar(&screen, 110)
             .map(|l| line_text(&l))
@@ -4750,7 +4771,7 @@ mod tests {
         screen.set_footer_with_context(
             "gpt-5.5".to_string(),
             None,
-            Some("300k".to_string()),
+            Some(300_000),
             "~/repo".to_string(),
         );
         screen.apply(UiEvent::ProviderTurnCompleted {
@@ -4767,6 +4788,7 @@ mod tests {
                 total_tokens: 150_000,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         let before = session_bar(&screen, 110)
             .map(|l| line_text(&l))
@@ -4777,7 +4799,7 @@ mod tests {
         screen.set_footer_with_context(
             "GPT-5.5".to_string(),
             None,
-            Some("300k".to_string()),
+            Some(300_000),
             "~/repo".to_string(),
         );
         let after = session_bar(&screen, 110)
@@ -4854,6 +4876,7 @@ mod tests {
                 total_tokens: 5_537,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
 
         let lines = rendered_lines(&mut screen, 100, 16);
@@ -4903,6 +4926,7 @@ mod tests {
                 total_tokens: 182_700,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
 
         let before = rendered_text(&mut screen, 100, 16);
@@ -5039,7 +5063,7 @@ mod tests {
                     WORKING_FRAMES[frame],
                     Duration::from_secs(87),
                     true,
-                    None,
+                    &crate::metrics::TokenFlows::default(),
                     0,
                     80,
                 ))
@@ -5077,7 +5101,7 @@ mod tests {
             WORKING_FRAMES[0],
             Duration::from_secs(87),
             true,
-            None,
+            &crate::metrics::TokenFlows::default(),
             0,
             80,
         ))
@@ -5087,7 +5111,7 @@ mod tests {
             WORKING_FRAMES[0],
             Duration::from_secs(87),
             false,
-            Some(&usage),
+            &crate::metrics::TokenFlows::from(&usage),
             0,
             80,
         ))
@@ -5097,7 +5121,7 @@ mod tests {
             WORKING_FRAMES[0],
             Duration::from_secs(87),
             false,
-            None,
+            &crate::metrics::TokenFlows::default(),
             0,
             80,
         ))
@@ -5655,6 +5679,7 @@ mod tests {
                 total_tokens: input + output,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         }
     }
 
@@ -5740,6 +5765,7 @@ mod tests {
             turn_id: "turn".to_string(),
             response_id: None,
             usage: None,
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         let call = call_args("bash", json!({ "command": "echo hi" }));
         screen.apply(UiEvent::ToolStarted(call.clone()));
@@ -5801,7 +5827,7 @@ mod tests {
         screen.set_footer_with_context(
             "gpt-5.5".to_string(),
             None,
-            Some("300k".to_string()),
+            Some(300_000),
             "~/repo".to_string(),
         );
         let _ = screen.wrapped_lines(90);
@@ -5873,7 +5899,7 @@ mod tests {
         screen.set_footer_with_context(
             "gpt-5.5".to_string(),
             None,
-            Some("300k".to_string()),
+            Some(300_000),
             "~/repo".to_string(),
         );
         let _ = screen.wrapped_lines(90);
@@ -5909,7 +5935,7 @@ mod tests {
         screen.set_footer_with_context(
             "gpt-5.5".to_string(),
             None,
-            Some("300k".to_string()),
+            Some(300_000),
             "~/repo".to_string(),
         );
         let _ = screen.wrapped_lines(90);
@@ -6193,6 +6219,7 @@ mod tests {
                 total_tokens: 13_000,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         let lines = rendered_lines(&mut screen, 100, 18);
         let header = lines
@@ -7147,6 +7174,7 @@ mod tests {
                 total_tokens: 2,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
 
         let headers: Vec<&String> = transcript
@@ -7732,6 +7760,7 @@ mod tests {
                 total_tokens: 120,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         let rendered = rendered_text(&mut screen, 120, 13);
         assert!(rendered.contains("◉ CODE ─ OPUS-4.8 XHIGH"), "{rendered}");
@@ -7761,7 +7790,7 @@ mod tests {
             WORKING_FRAMES[0],
             Duration::from_millis(500),
             true,
-            None,
+            &crate::metrics::TokenFlows::default(),
             0,
             80,
         ));
@@ -7773,7 +7802,7 @@ mod tests {
             WORKING_FRAMES[0],
             Duration::from_secs(13),
             true,
-            None,
+            &crate::metrics::TokenFlows::default(),
             0,
             80,
         ));
@@ -7783,7 +7812,7 @@ mod tests {
             WORKING_FRAMES[0],
             Duration::from_secs(87),
             true,
-            None,
+            &crate::metrics::TokenFlows::default(),
             0,
             80,
         ));
@@ -7793,7 +7822,7 @@ mod tests {
             WORKING_FRAMES[0],
             Duration::from_secs(3734),
             true,
-            None,
+            &crate::metrics::TokenFlows::default(),
             0,
             80,
         ));
@@ -7845,6 +7874,7 @@ mod tests {
                 total_tokens: 19_046,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         screen.end_turn();
 
@@ -7885,6 +7915,7 @@ mod tests {
             turn_id: "turn_1".to_string(),
             response_id: None,
             usage: Some(usage(6_800, 35)),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         screen.apply(UiEvent::ToolResult {
             call,
@@ -7899,12 +7930,19 @@ mod tests {
             turn_id: "turn_2".to_string(),
             response_id: None,
             usage: Some(usage(8_000, 40)),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         screen.end_turn();
         let lines: Vec<String> = screen.wrapped_lines(90).iter().map(line_text).collect();
         assert!(
             lines.iter().any(|line| line.contains("↑14.8k ↓75")),
             "divider sums the task's provider turns: {lines:?}"
+        );
+        // Output rate over provider generation time only: two sampled turns
+        // (1200ms - 300ms TTFT each) = 1.8s generating 75 tokens -> 42 tok/s.
+        assert!(
+            lines.iter().any(|line| line.contains("42 tok/s")),
+            "divider reports the task's measured output rate: {lines:?}"
         );
     }
 
@@ -7933,11 +7971,13 @@ mod tests {
             turn_id: "turn_1".to_string(),
             response_id: None,
             usage: Some(usage(10_000, 500, 8_000)),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         screen.apply(UiEvent::ProviderTurnCompleted {
             turn_id: "turn_2".to_string(),
             response_id: None,
             usage: Some(usage(20_000, 1_500, 19_000)),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         screen.end_turn();
         screen.start_turn();
@@ -7945,6 +7985,7 @@ mod tests {
             turn_id: "turn_3".to_string(),
             response_id: None,
             usage: Some(usage(30_000, 1_000, 27_000)),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         screen.end_turn();
 
@@ -7956,7 +7997,10 @@ mod tests {
         assert!(receipt.contains(" ┊ 2 turns ┊ "), "{receipt}");
         assert!(receipt.contains(" ┊ ↑60k ↓3k ┊ "), "{receipt}");
         // 54k cached of 60k sent = 90%.
-        assert!(receipt.ends_with(" ┊ cache 90%"), "{receipt}");
+        assert!(receipt.contains(" ┊ cache 90%"), "{receipt}");
+        // 3k output over three sampled generation windows (3 x 900ms): the
+        // mean output rate over provider generation time, not wall time.
+        assert!(receipt.ends_with(" ┊ 1111 tok/s"), "{receipt}");
     }
 
     #[test]
@@ -7986,6 +8030,7 @@ mod tests {
                 total_tokens: 1_020,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         screen.end_turn();
 
@@ -8011,6 +8056,7 @@ mod tests {
                 total_tokens: 5_100,
                 cache_creation: None,
             }),
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         screen.end_turn();
 
@@ -8062,7 +8108,12 @@ mod tests {
 
     #[test]
     fn turn_divider_label_omits_telemetry_when_usage_is_unavailable() {
-        let line = line_text(&turn_divider_line(Some(Duration::from_secs(16)), None, 60));
+        let line = line_text(&turn_divider_line(
+            Some(Duration::from_secs(16)),
+            &crate::metrics::TokenFlows::default(),
+            &crate::metrics::TimingStats::default(),
+            60,
+        ));
 
         assert!(line.contains("── 16s ─"), "{line}");
         assert!(!line.contains('┊'), "{line}");
@@ -8073,13 +8124,17 @@ mod tests {
     fn turn_divider_elapsed_aligns_with_working_indicator_elapsed() {
         let divider = line_text(&inset_rule_line(
             90,
-            &turn_divider_label(Some(Duration::from_secs(27)), None),
+            &turn_divider_label(
+                Some(Duration::from_secs(27)),
+                &crate::metrics::TokenFlows::default(),
+                &crate::metrics::TimingStats::default(),
+            ),
         ));
         let working = line_text(&working_indicator_line(
             WORKING_FRAMES[1],
             Duration::from_millis(700),
             true,
-            None,
+            &crate::metrics::TokenFlows::default(),
             0,
             90,
         ));
@@ -8095,7 +8150,12 @@ mod tests {
 
     #[test]
     fn turn_divider_unlabelled_when_elapsed_is_unavailable() {
-        let line = line_text(&turn_divider_line(None, None, 60));
+        let line = line_text(&turn_divider_line(
+            None,
+            &crate::metrics::TokenFlows::default(),
+            &crate::metrics::TimingStats::default(),
+            60,
+        ));
 
         assert_eq!(line, "─".repeat(60));
     }

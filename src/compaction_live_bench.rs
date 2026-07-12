@@ -492,7 +492,7 @@ fn run_auto_compaction_live_session(
         Some(AUTO_LIVE_BUDGET),
     );
     harness.set_compaction_trigger(
-        AUTO_LIVE_BUDGET,
+        AUTO_LIVE_BUDGET.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: policy.warn,
@@ -791,7 +791,7 @@ fn reactive_overflow_live(lane: LiveLoopLane) -> Result<()> {
         Some(window),
     );
     harness.set_compaction_trigger(
-        window,
+        window.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: 0.55,
@@ -984,7 +984,7 @@ fn auto_compaction_native_live_anthropic() -> Result<()> {
         Some(window),
     );
     harness.set_compaction_trigger(
-        window,
+        window.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: 0.55,

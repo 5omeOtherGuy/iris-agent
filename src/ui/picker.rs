@@ -738,8 +738,8 @@ fn apply_compaction_trigger<P: ChatProvider>(
 ) -> anyhow::Result<()> {
     let settings = config::Settings::load(harness.workspace())?;
     let selection = switch.selection().clone();
-    let (window, trigger) = crate::resolved_compaction_trigger(&settings, &selection)?;
-    harness.set_compaction_trigger(window, trigger);
+    let (budget, trigger) = crate::resolved_compaction_trigger(&settings, &selection)?;
+    harness.set_compaction_trigger(budget, trigger);
     if !trigger.enabled {
         // Disabling cancels an in-flight background job; the harness emits the
         // `Cancelled` lifecycle through `obs` so the transition is recorded.

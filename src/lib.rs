@@ -19,6 +19,7 @@ mod display_path;
 mod errors;
 mod git;
 mod handles;
+mod metrics;
 mod mimir;
 mod nexus;
 mod print;
@@ -546,9 +547,8 @@ fn run_agent_inner(
     // persistence, and the auto-compaction policy, wrapping the bare in-memory
     // agent. When the context token total exceeds the budget at a turn
     // boundary, the harness compacts before the provider request.
-    let (effective_window, compaction_trigger) =
-        resolved_compaction_trigger(&settings, &selection)?;
-    let budget = Some(effective_window);
+    let (context_budget, compaction_trigger) = resolved_compaction_trigger(&settings, &selection)?;
+    let budget = Some(context_budget.resolved);
     let native_jj = wayland::trust::native_jj(&cwd).unwrap_or(false);
     let mut harness = wayland::Harness::new_configured(
         agent,
@@ -561,7 +561,7 @@ fn run_agent_inner(
             native_jj,
         },
     );
-    harness.set_compaction_trigger(effective_window, compaction_trigger);
+    harness.set_compaction_trigger(context_budget, compaction_trigger);
     // Post-change verification (issue #265): engaged only when a `verify` block
     // is present; the command runs under the unchanged approval gate.
     harness.set_verification(settings.verification());
@@ -768,9 +768,8 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
         }
     };
     announce_skip_permissions(permission_defaults.skip_permissions, session.as_mut());
-    let (effective_window, compaction_trigger) =
-        resolved_compaction_trigger(&settings, &selection)?;
-    let budget = Some(effective_window);
+    let (context_budget, compaction_trigger) = resolved_compaction_trigger(&settings, &selection)?;
+    let budget = Some(context_budget.resolved);
     let native_jj = wayland::trust::native_jj(&cwd).unwrap_or(false);
     let mut harness = wayland::Harness::new_configured(
         agent,
@@ -783,7 +782,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
             native_jj,
         },
     );
-    harness.set_compaction_trigger(effective_window, compaction_trigger);
+    harness.set_compaction_trigger(context_budget, compaction_trigger);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
     harness.set_compaction_worker(settings.compaction_worker_config()?);
@@ -936,18 +935,21 @@ fn install_compaction_summarizer_factory(
 fn resolved_compaction_trigger(
     settings: &config::Settings,
     selection: &mimir::selection::ModelSelection,
-) -> Result<(u64, config::CompactionTriggerConfig)> {
+) -> Result<(
+    metrics::ResolvedContextBudget,
+    config::CompactionTriggerConfig,
+)> {
     let trigger = settings.compaction_trigger()?;
-    let resolved =
+    // One resolution for everything that divides by "the window": the trigger
+    // ladder, /context, and the session-bar meter all receive this same
+    // number, so no two surfaces can disagree on the denominator.
+    let budget = metrics::ResolvedContextBudget::resolve(
         mimir::model_catalog::effective_context_window(selection, config::DEFAULT_SUMMARY_RESERVE)
-            .map(|window| window.effective);
-    let effective_window = match (settings.context_token_budget, resolved) {
-        (Some(legacy), Some(model)) => legacy.min(model),
-        (Some(legacy), None) => legacy,
-        (None, Some(model)) => model,
-        (None, None) => settings.context_token_budget(),
-    };
-    Ok((effective_window, trigger))
+            .map(Into::into),
+        settings.context_token_budget,
+        settings.context_token_budget(),
+    );
+    Ok((budget, trigger))
 }
 
 /// Resume an existing session by id: load its transcript from the store,
@@ -996,9 +998,8 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
-    let (effective_window, compaction_trigger) =
-        resolved_compaction_trigger(&settings, &selection)?;
-    let budget = Some(effective_window);
+    let (context_budget, compaction_trigger) = resolved_compaction_trigger(&settings, &selection)?;
+    let budget = Some(context_budget.resolved);
     let session_id = meta.id.clone();
     let background_selection = Arc::new(Mutex::new(selection.clone()));
     let background_session_id = Arc::new(Mutex::new(session_id.clone()));
@@ -1034,7 +1035,7 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
             native_jj,
         },
     );
-    harness.set_compaction_trigger(effective_window, compaction_trigger);
+    harness.set_compaction_trigger(context_budget, compaction_trigger);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
     harness.set_compaction_worker(settings.compaction_worker_config()?);

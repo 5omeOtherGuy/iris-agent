@@ -698,9 +698,9 @@ pub(crate) fn apply_selection<P: ChatProvider>(
     let scope = switch_scope(&switch.selection, &candidate);
     harness.replace_provider(provider);
     if let Some(settings) = switch.compaction_settings.as_ref()
-        && let Ok((window, trigger)) = crate::resolved_compaction_trigger(settings, &candidate)
+        && let Ok((budget, trigger)) = crate::resolved_compaction_trigger(settings, &candidate)
     {
-        harness.set_compaction_trigger(window, trigger);
+        harness.set_compaction_trigger(budget, trigger);
     }
     // Install the new lane's cache profile for the fold scheduler (issue
     // #400) before recording the switch, so the A2/A3 break is scheduled
@@ -1012,12 +1012,12 @@ pub(crate) fn compaction_panel_parts(
     lines.push(format!("  provider blocks    {}", entry.provider_blocks));
     match &entry.worker_usage {
         Some(usage) => {
-            let cache = usage
-                .cache_read_input_tokens
-                .saturating_mul(100)
-                .checked_div(usage.input_tokens)
-                .map(|percent| format!("{percent}%"))
-                .unwrap_or_else(|| "unknown".to_string());
+            // Shared share arithmetic (half-up, capped, overflow-safe); a
+            // zero-input ratio stays "unknown" rather than a fabricated 0%.
+            let cache =
+                crate::metrics::ratio_percent(usage.cache_read_input_tokens, usage.input_tokens)
+                    .map(|percent| format!("{percent}%"))
+                    .unwrap_or_else(|| "unknown".to_string());
             lines.push(format!(
                 "  worker             {}/{}; input {} / output {} / reasoning {} / total {}; cache read {} ({cache}) / write {}",
                 usage.provider,

@@ -289,6 +289,19 @@ pub(crate) struct EffectiveContextWindow {
     pub(crate) source: ContextWindowSource,
 }
 
+/// Tier-3 owns the conversion into the provider-neutral facts the runtime
+/// carries: inner tiers depend on `metrics`, never on this catalog type.
+impl From<EffectiveContextWindow> for crate::metrics::ContextWindowFacts {
+    fn from(window: EffectiveContextWindow) -> Self {
+        Self {
+            raw: window.raw,
+            max_output_reserve: window.max_output_reserve,
+            summary_reserve: window.summary_reserve,
+            effective: window.effective,
+        }
+    }
+}
+
 /// Resolve the active selection's enforced context capacity. Display labels
 /// remain generated from the same catalog facts; custom compatible endpoints
 /// use their configured numeric window and make no claim about an output cap.
@@ -319,7 +332,7 @@ pub(crate) fn effective_context_window(
     })
 }
 
-fn catalog_context_window(qualified: &str) -> Option<u64> {
+pub(crate) fn catalog_context_window(qualified: &str) -> Option<u64> {
     ctx_label(qualified).and_then(|label| match label {
         "128k" => Some(128_000),
         "200k" => Some(200_000),

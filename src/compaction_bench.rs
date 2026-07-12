@@ -1560,7 +1560,7 @@ fn build_v2_benchmark_harness(
         Some(32_768),
     );
     harness.set_compaction_trigger(
-        32_768,
+        32_768.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: TUNED_POLICY.warn,
@@ -1766,7 +1766,7 @@ fn run_hard_dimension() -> BackgroundArmResult {
     let (mut harness, _root, _workspace) =
         build_v2_benchmark_harness(CompactionWorkerInput::Transcript);
     harness.set_compaction_trigger(
-        32_768,
+        32_768.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: 0.30,
@@ -1880,7 +1880,7 @@ fn run_reactive_dimension() -> BackgroundArmResult {
         Some(32_768),
     );
     harness.set_compaction_trigger(
-        32_768,
+        32_768.into(),
         CompactionTriggerConfig {
             enabled: true,
             warn: TUNED_POLICY.warn,
@@ -2170,7 +2170,7 @@ fn run_policy_candidate(policy: PolicyCandidate) -> SeededArm {
         &prompt_refs,
         |harness| {
             harness.set_compaction_trigger(
-                32_768,
+                32_768.into(),
                 CompactionTriggerConfig {
                     enabled: true,
                     warn: policy.warn,

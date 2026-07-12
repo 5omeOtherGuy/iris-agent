@@ -169,6 +169,10 @@ pub(super) struct CompactionEngine {
     pub(super) persisted: usize,
     pub(super) entry_ids: Vec<Option<String>>,
     pub(super) budget: Option<u64>,
+    /// Full provenance of `budget` (catalog window, reserves, legacy clamp)
+    /// when the Tier-3 app resolved it; `None` for bare-number installs
+    /// (benches, tests). Display-only: enforcement always uses `budget`.
+    pub(super) budget_facts: Option<crate::metrics::ResolvedContextBudget>,
     pub(super) automatic_enabled: bool,
     pub(super) trigger_v2: bool,
     pub(super) ladder: Option<TriggerLadder>,
@@ -231,6 +235,7 @@ impl CompactionEngine {
             persisted,
             entry_ids,
             budget,
+            budget_facts: None,
             automatic_enabled: budget.is_some(),
             trigger_v2: false,
             ladder,

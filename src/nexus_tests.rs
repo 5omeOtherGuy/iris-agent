@@ -1912,6 +1912,7 @@ fn provider_completion_event_carries_response_id_and_usage() -> Result<()> {
                 response_id,
                 usage,
                 completion_reason,
+                ..
             } => Some((
                 turn_id.clone(),
                 response_id.clone(),
@@ -4540,17 +4541,111 @@ fn streamed_events_reach_observer_in_order() -> Result<()> {
     assert_eq!(events[1], AgentEvent::AssistantTextDelta("Hel".to_string()));
     assert_eq!(events[2], AgentEvent::AssistantTextDelta("lo".to_string()));
     assert_eq!(events[3], AgentEvent::AssistantTextEnd("Hello".to_string()));
-    assert_eq!(
-        events[4],
+    match &events[4] {
         AgentEvent::ProviderTurnCompleted {
-            turn_id: "turn_00000000".to_string(),
-            response_id: None,
-            usage: None,
-            completion_reason: None,
+            turn_id,
+            response_id,
+            usage,
+            completion_reason,
+            timing,
+        } => {
+            assert_eq!(turn_id, "turn_00000000");
+            assert_eq!(*response_id, None);
+            assert_eq!(*usage, None);
+            assert_eq!(*completion_reason, None);
+            // Timing is measured wall clock, so assert bounds not equality.
+            assert!(timing.duration > Duration::ZERO);
+            // DeltaProvider streams non-empty text deltas, so TTFT is recorded
+            // and never exceeds the full round-trip duration.
+            match timing.time_to_first_output {
+                Some(ttft) => assert!(ttft <= timing.duration),
+                None => panic!("expected TTFT for a streamed turn"),
+            }
         }
-    );
+        other => panic!("expected ProviderTurnCompleted, got {other:?}"),
+    }
     assert_eq!(events[5], AgentEvent::TurnComplete);
     assert_eq!(harness.agent.messages().last().unwrap().content, "Hello");
+    Ok(())
+}
+
+/// Pull the timing off the single `ProviderTurnCompleted` in an event log.
+fn completed_timing(events: &[AgentEvent]) -> ProviderTurnTiming {
+    events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ProviderTurnCompleted { timing, .. } => Some(timing.clone()),
+            _ => None,
+        })
+        .expect("a completed provider turn")
+}
+
+#[test]
+fn provider_turn_timing_has_no_ttft_for_nonstreaming_completion() -> Result<()> {
+    // FakeProvider yields only a terminal `Completed` event (no streamed
+    // deltas), so the round trip is measured but TTFT is never recorded.
+    let workspace = test_workspace()?;
+    let mut harness = test_harness(
+        FakeProvider::new(vec![Ok(AssistantTurn::text("hi"))]),
+        &workspace.path,
+        crate::tools::built_in_tools(),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let timing = completed_timing(&frontend.events.borrow());
+    assert!(timing.duration > Duration::ZERO);
+    assert_eq!(
+        timing.time_to_first_output, None,
+        "a non-streaming completion must not fabricate TTFT"
+    );
+    Ok(())
+}
+
+#[test]
+fn provider_turn_timing_ignores_empty_deltas_for_ttft() -> Result<()> {
+    // An empty-string text delta streams no visible output, so it must NOT set
+    // the first-output instant: TTFT stays None even though a delta event flowed.
+    let workspace = test_workspace()?;
+    let provider = ScriptedStreamProvider::new(vec![
+        ProviderEvent::TextDelta(String::new()),
+        ProviderEvent::Completed(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let timing = completed_timing(&frontend.events.borrow());
+    assert!(timing.duration > Duration::ZERO);
+    assert_eq!(
+        timing.time_to_first_output, None,
+        "empty deltas carry no output and must not set first-output"
+    );
+    Ok(())
+}
+
+#[test]
+fn provider_turn_timing_records_ttft_for_streamed_deltas() -> Result<()> {
+    // A non-empty streamed delta sets the first-output instant, so TTFT is
+    // recorded and bounded by the full round-trip duration.
+    let workspace = test_workspace()?;
+    let mut harness = test_harness(
+        DeltaProvider,
+        &workspace.path,
+        crate::tools::built_in_tools(),
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("hi", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let timing = completed_timing(&frontend.events.borrow());
+    assert!(timing.duration > Duration::ZERO);
+    let ttft = timing
+        .time_to_first_output
+        .expect("a streamed non-empty delta records TTFT");
+    assert!(ttft <= timing.duration);
     Ok(())
 }
 

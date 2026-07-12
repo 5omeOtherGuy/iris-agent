@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Error, Result, bail};
 use futures::Stream;
@@ -366,6 +366,10 @@ pub(crate) enum AgentEvent {
         /// reports one. Safe metadata: an enumerated completion classification,
         /// never response text. `None` for providers that do not surface it.
         completion_reason: Option<CompletionReason>,
+        /// Wall-clock timing for this provider round trip (duration and
+        /// time-to-first-output). Provider-neutral measurement, not provider
+        /// payload; see [`ProviderTurnTiming`].
+        timing: ProviderTurnTiming,
     },
     /// One provider/model round trip was interrupted before completion.
     ProviderTurnCancelled {
@@ -1486,6 +1490,11 @@ enum StreamResult {
         /// (non-redacted) summary is suppressed so the live thinking block the
         /// front-end already showed is not duplicated.
         saw_reasoning_delta: bool,
+        /// Instant of the FIRST non-empty streamed output delta (text,
+        /// reasoning, or tool-call argument), or `None` when the provider
+        /// completed without streaming a non-empty delta. Consumed by the caller
+        /// to derive time-to-first-output relative to the request-send instant.
+        first_output: Option<Instant>,
     },
     Cancelled {
         partial: String,
@@ -1963,6 +1972,11 @@ impl<P: ChatProvider> Agent<P> {
                 turn_id: provider_turn_id.clone(),
             })?;
 
+            // Captured at the request-send boundary (immediately before the
+            // provider stream is consumed) so the completed turn's duration and
+            // time-to-first-output cover only this provider round trip, never the
+            // tool execution that may run before the next one.
+            let turn_start = Instant::now();
             let stream_result = match self.stream_turn(obs, token).await {
                 Ok(result) => result,
                 Err(error)
@@ -2037,6 +2051,7 @@ impl<P: ChatProvider> Agent<P> {
                     turn,
                     saw_delta,
                     saw_reasoning_delta,
+                    first_output,
                 } => {
                     if turn.completion_reason == Some(CompletionReason::ContextWindowExceeded) {
                         let had_visible_content =
@@ -2135,11 +2150,19 @@ impl<P: ChatProvider> Agent<P> {
                     unanswered_start = None;
 
                     let usage_anchor = usage.clone();
+                    // Measured before this round's tool calls run, so duration is
+                    // this provider round trip only; TTFT is a real streamed
+                    // delta's offset, or None for a non-streaming completion.
+                    let timing = ProviderTurnTiming {
+                        duration: turn_start.elapsed(),
+                        time_to_first_output: first_output.map(|at| at - turn_start),
+                    };
                     obs.on_event(AgentEvent::ProviderTurnCompleted {
                         turn_id: provider_turn_id.clone(),
                         response_id,
                         usage,
                         completion_reason,
+                        timing,
                     })?;
                     // Surface notable completions (truncation, content-less
                     // refusal) to the user. Provider-neutral: driven by the
@@ -2406,6 +2429,10 @@ impl<P: ChatProvider> Agent<P> {
             .respond_stream(&self.messages, &self.tools, token)?;
         let mut saw_delta = false;
         let mut saw_reasoning_delta = false;
+        // Instant of the first non-empty streamed delta of any output channel;
+        // stays `None` for a non-streaming completion. Set once, never fabricated
+        // from wall-clock duration.
+        let mut first_output: Option<Instant> = None;
         let mut partial = String::new();
         loop {
             tokio::select! {
@@ -2416,6 +2443,9 @@ impl<P: ChatProvider> Agent<P> {
                 item = stream.next() => match item {
                     Some(Ok(ProviderEvent::TextDelta(delta))) => {
                         saw_delta = true;
+                        if !delta.is_empty() {
+                            first_output.get_or_insert_with(Instant::now);
+                        }
                         partial.push_str(&delta);
                         obs.on_event(AgentEvent::AssistantTextDelta(delta))?;
                     }
@@ -2424,6 +2454,7 @@ impl<P: ChatProvider> Agent<P> {
                         // becomes the persisted assistant text) or into storage.
                         if !delta.is_empty() {
                             saw_reasoning_delta = true;
+                            first_output.get_or_insert_with(Instant::now);
                             obs.on_event(AgentEvent::AssistantReasoningDelta(delta))?;
                         }
                     }
@@ -2432,6 +2463,7 @@ impl<P: ChatProvider> Agent<P> {
                         // accumulated into `partial` or storage.
                         if !delta.is_empty() {
                             saw_reasoning_delta = true;
+                            first_output.get_or_insert_with(Instant::now);
                             obs.on_event(AgentEvent::AssistantRawReasoningDelta(delta))?;
                         }
                     }
@@ -2445,6 +2477,9 @@ impl<P: ChatProvider> Agent<P> {
                         // turn's tool calls. Approval and execution use only the
                         // completed `ToolCall`, so these deltas cannot change what
                         // runs even if tampered with or dropped.
+                        if !delta.is_empty() {
+                            first_output.get_or_insert_with(Instant::now);
+                        }
                         obs.on_event(AgentEvent::ToolInputDelta { call_id, delta })?;
                     }
                     Some(Ok(ProviderEvent::Activity)) => {}
@@ -2453,6 +2488,7 @@ impl<P: ChatProvider> Agent<P> {
                             turn: Box::new(turn),
                             saw_delta,
                             saw_reasoning_delta,
+                            first_output,
                         });
                     }
                     Some(Err(error)) => return Err(error),
@@ -3237,6 +3273,32 @@ pub(crate) struct ProviderUsage {
     /// that do not report a breakdown leave this `None`. The component totals
     /// are already summed into `cache_write_input_tokens`.
     pub(crate) cache_creation: Option<CacheCreation>,
+}
+
+/// Wall-clock timing for one completed provider round trip. `duration` measures
+/// from the provider request send to the terminal stream event (this round trip
+/// only; it excludes tool execution that runs between round trips).
+/// `time_to_first_output` measures from the same start to the FIRST non-empty
+/// streamed output delta (assistant text delta, reasoning delta, or tool-call
+/// argument delta); it is `None` when the provider completed without streaming
+/// any non-empty delta (e.g. a non-streaming response). TTFT is never fabricated
+/// from `duration` -- only a real streamed delta sets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderTurnTiming {
+    pub(crate) duration: Duration,
+    pub(crate) time_to_first_output: Option<Duration>,
+}
+
+impl ProviderTurnTiming {
+    /// Deterministic fixture for UI/event tests that need a timing value but do
+    /// not assert on its contents. Not compiled into release builds.
+    #[cfg(test)]
+    pub(crate) fn sample() -> Self {
+        Self {
+            duration: Duration::from_millis(1200),
+            time_to_first_output: Some(Duration::from_millis(300)),
+        }
+    }
 }
 
 /// Per-retention breakdown of prompt-cache-creation (write) input tokens, as

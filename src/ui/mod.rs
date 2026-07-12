@@ -156,6 +156,7 @@ pub(crate) enum UiEvent {
         turn_id: String,
         response_id: Option<String>,
         usage: Option<ProviderUsage>,
+        timing: crate::nexus::ProviderTurnTiming,
     },
     ProviderTurnCancelled {
         turn_id: String,
@@ -335,10 +336,12 @@ impl UiEvent {
                 // Provider-neutral completion reason is metadata-only today; no
                 // UI surface renders it yet, so it is intentionally dropped here.
                 completion_reason: _,
+                timing,
             } => UiEvent::ProviderTurnCompleted {
                 turn_id,
                 response_id,
                 usage,
+                timing,
             },
             AgentEvent::ProviderTurnCancelled { turn_id } => {
                 UiEvent::ProviderTurnCancelled { turn_id }
@@ -599,6 +602,7 @@ mod tests {
             response_id: Some("resp_1".to_string()),
             usage: Some(usage.clone()),
             completion_reason: None,
+            timing: crate::nexus::ProviderTurnTiming::sample(),
         });
         assert_eq!(
             mapped,
@@ -606,6 +610,7 @@ mod tests {
                 turn_id: "turn_1".to_string(),
                 response_id: Some("resp_1".to_string()),
                 usage: Some(usage),
+                timing: crate::nexus::ProviderTurnTiming::sample(),
             }
         );
     }

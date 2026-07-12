@@ -206,7 +206,7 @@ fn disabling_auto_compaction_cancels_the_background_job_and_clears_diagnostics()
 
     // Enabled trigger: diagnostics report the resolved ladder + automatic on.
     let mut trigger = Settings::default().compaction_trigger().unwrap();
-    harness.set_compaction_trigger(200_000, trigger);
+    harness.set_compaction_trigger(200_000.into(), trigger);
     let diag = harness.context_diagnostics().expect("ladder present");
     assert!(diag.automatic_enabled);
     assert_eq!(diag.ladder.effective_window, 200_000);
@@ -234,7 +234,7 @@ fn disabling_auto_compaction_cancels_the_background_job_and_clears_diagnostics()
 
     // Disable automatic compaction and cancel the job (the settings apply path).
     trigger.enabled = false;
-    harness.set_compaction_trigger(200_000, trigger);
+    harness.set_compaction_trigger(200_000.into(), trigger);
     assert!(
         harness.cancel_auto_compaction(&NullObserver).unwrap(),
         "a job was cancelled"
