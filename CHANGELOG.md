@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.0...iris-agent-v0.3.1) - 2026-07-12
+
+### Added
+
+- *(metrics)* single-home metrics, turn timing, unified context denominator ([#584](https://github.com/5omeOtherGuy/iris-agent/pull/584))
+- *(tools)* native web_search and read_web_page tools ([#583](https://github.com/5omeOtherGuy/iris-agent/pull/583))
+- *(safety)* add mutation gate controls ([#582](https://github.com/5omeOtherGuy/iris-agent/pull/582))
+- *(live-harness)* harden S1 drive prompt and close pilot-b investigations ([#578](https://github.com/5omeOtherGuy/iris-agent/pull/578))
+- *(live-harness)* record assistant transcripts and log raw provider usage ([#577](https://github.com/5omeOtherGuy/iris-agent/pull/577))
+- *(tui)* add responsive focus mode ([#575](https://github.com/5omeOtherGuy/iris-agent/pull/575))
+- *(live-harness)* migrate tool-efficiency suite into T-series scenarios ([#574](https://github.com/5omeOtherGuy/iris-agent/pull/574))
+- *(live-harness)* config-file campaigns for any model without code edits ([#569](https://github.com/5omeOtherGuy/iris-agent/pull/569))
+
+### Fixed
+
+- *(tools)* honor charset and pass structured text through in native reader ([#585](https://github.com/5omeOtherGuy/iris-agent/pull/585))
+- *(git)* enforce jj operation call windows ([#581](https://github.com/5omeOtherGuy/iris-agent/pull/581))
+- *(tui)* restore IrisMark power-on sequence ([#571](https://github.com/5omeOtherGuy/iris-agent/pull/571))
+
+### Other
+
+- remove hot-path allocations and tighten release codegen ([#586](https://github.com/5omeOtherGuy/iris-agent/pull/586))
+- *(readme)* restructure around distinctive context-layer features ([#579](https://github.com/5omeOtherGuy/iris-agent/pull/579))
+- *(benchmarks)* commit pilot-b campaign artifacts and findings ([#576](https://github.com/5omeOtherGuy/iris-agent/pull/576))
+- highlight 0.3.0 improvements ([#572](https://github.com/5omeOtherGuy/iris-agent/pull/572))
+
 ## [0.3.0](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.2.0...iris-agent-v0.3.0) - 2026-07-10
 
 ### Added
