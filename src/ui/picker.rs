@@ -395,26 +395,35 @@ fn settings_snapshot<P: ChatProvider>(
     let selection = switch.selection();
     // The reasoning switch clicks through the ACTIVE model's levels; a
     // non-reasoning OpenAI-compatible endpoint pins the switch to `off`.
-    let reasoning_levels: Vec<(ReasoningEffort, &'static str)> = if selection.provider
-        == ProviderId::OpenAiCompatible
-        && !selection.open_ai_compatible.reasoning
-    {
-        vec![(ReasoningEffort::Off, ReasoningEffort::Off.as_str())]
-    } else {
-        model_capabilities::level_options(selection.provider, &selection.model)
-            .iter()
-            .map(|option| (option.level, option.label))
-            .collect()
-    };
-    let reasoning = model_capabilities::clamp(
-        selection.provider,
-        &selection.model,
-        selection.reasoning.unwrap_or(ReasoningEffort::DEFAULT),
-    );
+    let open_ai_compatible_reasoning = selection.open_ai_compatible.reasoning;
+    let reasoning_levels: Vec<(ReasoningEffort, &'static str)> =
+        model_capabilities::selectable_options(
+            selection.provider,
+            &selection.model,
+            open_ai_compatible_reasoning,
+        )
+        .iter()
+        .map(|option| (option.level, option.label))
+        .collect();
+    let reasoning =
+        if selection.provider == ProviderId::OpenAiCompatible && !open_ai_compatible_reasoning {
+            ReasoningEffort::Off
+        } else {
+            model_capabilities::clamp(
+                selection.provider,
+                &selection.model,
+                selection.reasoning.unwrap_or(ReasoningEffort::DEFAULT),
+            )
+        };
     let available = available_now();
     let current = current_qualified(switch);
     let default_model = config::default_model_qualified().unwrap_or_else(|| current.clone());
-    let catalog = build_catalog(&available, &current, &default_model);
+    let catalog = build_catalog(
+        &available,
+        &current,
+        &default_model,
+        open_ai_compatible_reasoning,
+    );
     let scope_candidates: Vec<ScopeChoice> = available
         .iter()
         .map(|model| ScopeChoice {
@@ -544,15 +553,24 @@ fn settings_snapshot<P: ChatProvider>(
 /// Build the ENGINE › model hatch catalog: default-first (then by provider),
 /// each row carrying the reasoning levels its inline effort track clicks. This
 /// is the `ModelPicker` ordering + level data, moved onto the hatch (§4.2).
-fn build_catalog(available: &[CatalogModel], current: &str, default: &str) -> Vec<ModelChoice> {
+fn build_catalog(
+    available: &[CatalogModel],
+    current: &str,
+    default: &str,
+    open_ai_compatible_reasoning: bool,
+) -> Vec<ModelChoice> {
     order_by_default(available.to_vec(), default)
         .into_iter()
         .map(|model| {
             let qualified = model.qualified();
-            let levels = model_capabilities::level_options(model.provider, &model.id)
-                .iter()
-                .map(|option| (option.level, option.label))
-                .collect();
+            let levels = model_capabilities::selectable_options(
+                model.provider,
+                &model.id,
+                open_ai_compatible_reasoning,
+            )
+            .iter()
+            .map(|option| (option.level, option.label))
+            .collect();
             ModelChoice {
                 display: model_catalog::display_name(&qualified),
                 provider_label: model.provider.display_name().to_string(),
@@ -1048,7 +1066,7 @@ fn model_header_flash() -> crate::ui::settings_menu::PanelRow {
 fn failures(lines: Vec<String>) -> Vec<String> {
     lines
         .into_iter()
-        .filter(|line| line.contains("not saved"))
+        .filter(|line| line.contains("not saved") || line.contains("is not supported"))
         .collect()
 }
 
@@ -1278,6 +1296,38 @@ mod tests {
             model(ProviderId::OpenAiCodex, "gpt-5.5"),
             model(ProviderId::Anthropic, "claude-sonnet-4-6"),
         ]
+    }
+
+    #[test]
+    fn model_catalog_honors_openai_compatible_reasoning_gate() {
+        let models = vec![model(ProviderId::OpenAiCompatible, "custom")];
+        let disabled = build_catalog(
+            &models,
+            "openai-compatible/custom",
+            "openai-compatible/custom",
+            false,
+        );
+        assert_eq!(disabled[0].levels, vec![(ReasoningEffort::Off, "off")]);
+
+        let enabled = build_catalog(
+            &models,
+            "openai-compatible/custom",
+            "openai-compatible/custom",
+            true,
+        );
+        assert_eq!(
+            enabled[0]
+                .levels
+                .iter()
+                .map(|(level, _)| *level)
+                .collect::<Vec<_>>(),
+            vec![
+                ReasoningEffort::Off,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ]
+        );
     }
 
     #[test]

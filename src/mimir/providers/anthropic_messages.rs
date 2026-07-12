@@ -25,7 +25,7 @@ use super::transport::{
     retry_after_hint, run_with_retry, spawn_stream,
 };
 use crate::errors::AuthError;
-use crate::mimir::anthropic_models::{self, ThinkingMode};
+use crate::mimir::anthropic_models;
 use crate::mimir::auth::anthropic::AnthropicTokenStore;
 use crate::mimir::auth::api_key;
 use crate::mimir::auth::storage::{AuthStore, CredentialKind};
@@ -1177,9 +1177,6 @@ fn build_anthropic_request_for_auth(
     config: AnthropicRequestConfig<'_>,
 ) -> Value {
     let meta = anthropic_models::find(model);
-    let thinking_mode = meta
-        .map(|m| m.thinking)
-        .unwrap_or(ThinkingMode::ManualBudget);
     let output_cap = meta.map(|m| m.output_cap).unwrap_or(DEFAULT_OUTPUT_CAP);
 
     // The `max_tokens` ceiling is the model's full output cap. A fixed 8192
@@ -1203,25 +1200,29 @@ fn build_anthropic_request_for_auth(
         "messages": build_messages(messages, &anthropic_origin(model)),
     });
 
-    // Thinking is added only when a level is set and is not `off`. Both `None`
-    // (no preference) and explicit `Off` omit `thinking` entirely: minimalcc-pi
-    // never sends `thinking: { type: "disabled" }` (it 400s on Fable 5), so
-    // absence is the off signal. The default (None) body stays byte-identical to
-    // today's request.
-    if let Some(level) = reasoning.filter(|level| *level != ReasoningEffort::Off) {
-        match thinking_mode {
-            ThinkingMode::Adaptive => {
+    // Request shaping comes from the shared typed provider/model capability map.
+    // `None`, `off`, and unsupported values omit thinking rather than emitting a
+    // provider field the active model does not advertise.
+    if let Some(level) = reasoning
+        && let Some(wire) =
+            crate::mimir::model_capabilities::wire_config(ProviderId::Anthropic, model, level)
+    {
+        match wire {
+            crate::mimir::model_capabilities::ReasoningWire::AnthropicAdaptive { effort } => {
                 body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
-                body["output_config"] = json!({ "effort": adaptive_effort(level) });
+                body["output_config"] = json!({ "effort": effort });
             }
-            ThinkingMode::ManualBudget => {
+            crate::mimir::model_capabilities::ReasoningWire::AnthropicManual {
+                budget_tokens: budget,
+            } => {
                 let (max_tokens, budget_tokens) =
-                    resolve_manual_thinking(output_cap, manual_budget(level), output_cap);
+                    resolve_manual_thinking(output_cap, budget, output_cap);
                 body["max_tokens"] = json!(max_tokens);
                 if let Some(budget_tokens) = budget_tokens {
                     body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget_tokens });
                 }
             }
+            _ => {}
         }
     }
 
@@ -1381,34 +1382,6 @@ fn apply_context_management(body: &mut Value, context_management: &ContextManage
 
 fn typed_value(kind: &str, value: u64) -> Value {
     json!({ "type": kind, "value": value })
-}
-
-fn manual_budget(level: ReasoningEffort) -> u32 {
-    match level {
-        ReasoningEffort::Off => 0,
-        ReasoningEffort::Minimal => 1024,
-        ReasoningEffort::Low => 4096,
-        ReasoningEffort::Medium => 10240,
-        ReasoningEffort::High => 20480,
-        ReasoningEffort::XHigh => 32768,
-        ReasoningEffort::Max => 32768,
-    }
-}
-
-/// Map an iris reasoning level one notch up Anthropic's `low|medium|high|xhigh|
-/// max` effort scale for adaptive models, so iris `xhigh` reaches Anthropic's
-/// top `max` and iris `minimal` reaches its lowest non-off `low`. Adopted from
-/// minimalcc-pi `CLAUDE_SUBSCRIPTION_ADAPTIVE_OPUS_THINKING_LEVEL_MAP`.
-fn adaptive_effort(level: ReasoningEffort) -> &'static str {
-    match level {
-        ReasoningEffort::Off => "low",
-        ReasoningEffort::Minimal => "low",
-        ReasoningEffort::Low => "medium",
-        ReasoningEffort::Medium => "high",
-        ReasoningEffort::High => "xhigh",
-        ReasoningEffort::XHigh => "max",
-        ReasoningEffort::Max => "max",
-    }
 }
 
 /// Resolve `(max_tokens, budget_tokens)` for manual-budget thinking under
@@ -2716,6 +2689,20 @@ data: {\"type\":\"message_stop\"}\n\n";
             );
             assert!(body.get("output_config").is_none());
         }
+
+        let unsupported = build_anthropic_request(
+            "claude-3-7-sonnet",
+            "P",
+            &messages,
+            &tools,
+            Some(ReasoningEffort::XHigh),
+            PromptCacheRetention::Short,
+            &ContextManagement::default(),
+        );
+        assert!(
+            unsupported.get("thinking").is_none(),
+            "unsupported levels are omitted rather than silently sent"
+        );
     }
 
     #[test]

@@ -156,10 +156,16 @@
   excluded-tool, and tool-input controls. Provider selection rejects overlapping
   local/native tool sets; `auto` falls back to local when native clearing is
   unsupported or cannot honor the configured safety policy. [Implemented]
-- **Runtime model and reasoning switching** — `/model`, `/reasoning`, TUI
-  provider/model/effort pickers, Ctrl+P/Shift+Ctrl+P model cycling,
-  Shift+Tab effort cycling, `/settings`, `/scoped-models`, and session-local or
-  persisted defaults at safe turn boundaries. [Implemented]
+- **Runtime model and native-reasoning switching** — one typed per-model capability
+  map drives provider request construction, startup validation, `/model` and
+  `/reasoning`, the TUI provider/model/effort picker, Ctrl+P/Shift+Ctrl+P model
+  cycling, Shift+Tab effort cycling, `/settings`, `/scoped-models`, and
+  session-local or persisted defaults at safe turn boundaries. It distinguishes
+  OpenAI Responses `reasoning`, Chat Completions `reasoning_effort`, Anthropic
+  manual budgets vs adaptive effort, and Gemini `thinkingConfig`. Unsupported
+  fields are omitted; switches preserve supported effort or show the clamped
+  fallback. `/model` reports supported levels, active level, and wire behavior.
+  [Implemented]
 - **Token-efficient switching** — switches classify as reasoning-only (prefix
   unchanged, silent), model change, or provider change; a model/provider switch
   carrying a large context (over a quarter of the budget) advises `/compact`
@@ -178,9 +184,10 @@
   and Antigravity entries. [Implemented]
 - **Additional providers** — OpenAI API, local, or OpenAI-compatible backends.
   [Planned]
-- **Provider capability matrix** — per-model context window, cache support,
-  tool-call format, reasoning controls, JSON reliability, and image support.
-  [Partial]
+- **Provider capability matrix** — typed per-model native-reasoning controls are
+  implemented and shared by validation, UI, transitions, and request adapters.
+  Context window and cache metadata are model-aware; tool-call format, JSON
+  reliability, and image support are not yet one unified matrix. [Partial]
 
 ## Agent Kernel MVP tools
 
