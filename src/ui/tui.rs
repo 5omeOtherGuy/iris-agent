@@ -7594,6 +7594,7 @@ mod tests {
             compaction_reactive: true,
             compaction_worker_input: "transcript".to_string(),
             resolved_ladder: None,
+            compaction_provider_native: "off".to_string(),
             compaction_summarizer: "subagent".to_string(),
             microcompaction: true,
             microcompaction_watermark: 32_000,
@@ -7651,7 +7652,7 @@ mod tests {
         assert!(rendered.contains("●●●●●●○○○○  232k tokens"), "{rendered}");
         assert!(rendered.contains("▸ gpt-5.5 ┊ openai-codex"), "{rendered}");
         // Nothing windowed: no position row on a tall viewport.
-        assert!(!rendered.contains("(1/35)"), "{rendered}");
+        assert!(!rendered.contains("(1/36)"), "{rendered}");
         // The composer stays protected below the panel.
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }
@@ -7670,7 +7671,7 @@ mod tests {
         // session bar) and the window scrolls with the house position row.
         assert!(rendered.contains("SETTINGS"), "{rendered}");
         assert!(rendered.contains("ENGINE"), "{rendered}");
-        assert!(rendered.contains("(1/35)"), "{rendered}");
+        assert!(rendered.contains("(1/36)"), "{rendered}");
         assert!(!rendered.contains("worktree root"), "windowed:\n{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }

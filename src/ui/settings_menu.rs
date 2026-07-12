@@ -30,9 +30,9 @@
 //! adjusted element renders bright for two ticks (the §6 detent flash), gated
 //! by reduced motion. Dependent controls go dark while their master switch is
 //! off — inert hardware, still operable: the AUTO COMPACT thresholds, tail,
-//! reactive, summarizer, and worker-input knobs follow `automatic`; the
-//! tool-result aggressiveness, cache timing, fold trigger, retain, and
-//! keep-tool-uses knobs follow `tool result compaction`.
+//! reactive, native-compaction, summarizer, and worker-input knobs follow
+//! `automatic`; the tool-result aggressiveness, cache timing, fold trigger,
+//! retain, and keep-tool-uses knobs follow `tool result compaction`.
 //!
 //! All writes go to the user-global settings file via `config::save_*`;
 //! global-vs-project scope governs only load/merge precedence in
@@ -90,6 +90,7 @@ pub(crate) enum Field {
     CompactionKeepRecentTokens,
     CompactionHardWait,
     CompactionReactive,
+    CompactionProviderNative,
     CompactionSummarizer,
     CompactionWorkerInput,
     Microcompaction,
@@ -224,6 +225,7 @@ const SECTIONS: &[Section] = &[
             RowId::Field(Field::CompactionKeepRecentTokens),
             RowId::Field(Field::CompactionHardWait),
             RowId::Field(Field::CompactionReactive),
+            RowId::Field(Field::CompactionProviderNative),
             RowId::Field(Field::CompactionSummarizer),
             RowId::Field(Field::CompactionWorkerInput),
         ],
@@ -440,6 +442,11 @@ pub(crate) struct Snapshot {
     /// The ladder resolved against the active model window, for the dim
     /// resolved-value line. `None` when the harness has no live diagnostics.
     pub(crate) resolved_ladder: Option<ResolvedLadder>,
+    /// Provider-native compaction routing (`compaction.providerNative`,
+    /// `off|auto`). GLOBAL-ONLY. `auto` routes background compaction through the
+    /// provider's opaque compaction blocks (currently Codex only) instead of the
+    /// configured summarizer/worker input.
+    pub(crate) compaction_provider_native: String,
     pub(crate) compaction_summarizer: String,
     /// The resolved tool-result-compaction master switch (`toolResultCompaction
     /// .enabled`, or the legacy `microcompaction` alias). Field name kept for the
@@ -480,6 +487,7 @@ impl Snapshot {
             Field::WebSearchBackend => &["off", "native", "brave", "jina"],
             Field::ReadWebPageBackend => &["off", "native", "jina"],
             Field::CompactionSummarizer => &["excerpts", "provider", "subagent"],
+            Field::CompactionProviderNative => &["off", "auto"],
             Field::CompactionAggressiveness => {
                 &["conservative", "balanced", "aggressive", "custom"]
             }
@@ -506,6 +514,7 @@ impl Snapshot {
             Field::WebSearchBackend => self.web_search_backend.clone(),
             Field::ReadWebPageBackend => self.read_web_page_backend.clone(),
             Field::CompactionSummarizer => self.compaction_summarizer.clone(),
+            Field::CompactionProviderNative => self.compaction_provider_native.clone(),
             Field::CompactionAggressiveness => self.compaction_aggressiveness.clone(),
             Field::CompactionCacheTiming => self.compaction_cache_timing.clone(),
             Field::Theme => self.theme.clone(),
@@ -528,6 +537,7 @@ impl Snapshot {
             Field::WebSearchBackend => self.web_search_backend = value.to_string(),
             Field::ReadWebPageBackend => self.read_web_page_backend = value.to_string(),
             Field::CompactionSummarizer => self.compaction_summarizer = value.to_string(),
+            Field::CompactionProviderNative => self.compaction_provider_native = value.to_string(),
             Field::CompactionAggressiveness => self.compaction_aggressiveness = value.to_string(),
             Field::CompactionCacheTiming => self.compaction_cache_timing = value.to_string(),
             Field::Theme => self.theme = value.to_string(),
@@ -620,6 +630,7 @@ fn archetype(row: RowId) -> Archetype {
             | Field::WebSearchBackend
             | Field::ReadWebPageBackend
             | Field::CompactionSummarizer
+            | Field::CompactionProviderNative
             | Field::CompactionAggressiveness
             | Field::CompactionCacheTiming
             | Field::CompactionEnabled
@@ -673,6 +684,7 @@ fn label(row: RowId) -> &'static str {
             Field::CompactionKeepRecentTokens => "retain tail",
             Field::CompactionHardWait => "hard wait",
             Field::CompactionReactive => "reactive",
+            Field::CompactionProviderNative => "native compaction",
             Field::CompactionSummarizer => "summarizer",
             Field::CompactionWorkerInput => "worker input",
             Field::Microcompaction => "tool result compaction",
@@ -1917,6 +1929,7 @@ impl SettingsPanel {
                 | Field::CompactionKeepRecentTokens
                 | Field::CompactionHardWait
                 | Field::CompactionReactive
+                | Field::CompactionProviderNative
                 | Field::CompactionSummarizer
                 | Field::CompactionWorkerInput,
             ) => !self.snap.compaction_enabled,
@@ -2765,6 +2778,7 @@ mod tests {
                 effective_window: 232_000,
             }),
             compaction_summarizer: "subagent".to_string(),
+            compaction_provider_native: "off".to_string(),
             microcompaction: false,
             microcompaction_watermark: 32_000,
             compaction_aggressiveness: "conservative".to_string(),
@@ -2957,6 +2971,7 @@ mod tests {
         assert!(panel.is_inert(RowId::Field(Field::CompactionKeepRecentTokens)));
         assert!(panel.is_inert(RowId::Field(Field::CompactionHardWait)));
         assert!(panel.is_inert(RowId::Field(Field::CompactionReactive)));
+        assert!(panel.is_inert(RowId::Field(Field::CompactionProviderNative)));
         assert!(panel.is_inert(RowId::Field(Field::CompactionSummarizer)));
         assert!(panel.is_inert(RowId::Field(Field::CompactionWorkerInput)));
         assert!(!panel.is_inert(RowId::Field(Field::CompactionEnabled)));

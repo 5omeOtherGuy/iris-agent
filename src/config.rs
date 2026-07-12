@@ -1061,6 +1061,22 @@ pub(crate) fn save_compaction_threshold_hard(cwd: &Path, fraction: f64) -> Resul
     save_compaction_threshold(cwd, "hard", fraction)
 }
 
+/// Persist the provider-native compaction routing (`compaction.providerNative`,
+/// `off|auto`) in the global settings file. GLOBAL-ONLY, like the load-time
+/// accessor: `auto` routes background compaction through provider opaque
+/// blocks. An unrecognized value falls back to `off` (the built-in default).
+pub(crate) fn save_compaction_provider_native(mode: &str) -> Result<()> {
+    let mode = match mode {
+        "off" | "auto" => mode,
+        _ => "off",
+    };
+    update_global_nested(
+        &["compaction"],
+        &[("providerNative", Value::String(mode.to_string()))],
+        SaveValidation::None,
+    )
+}
+
 /// Persist the background worker's input mode under `compaction.worker.input`.
 /// An unrecognized value falls back to `transcript` (the built-in default), the
 /// same way the load-time accessor degrades.

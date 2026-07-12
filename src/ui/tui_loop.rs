@@ -5955,6 +5955,7 @@ mod tests {
             compaction_reactive: true,
             compaction_worker_input: "transcript".to_string(),
             resolved_ladder: None,
+            compaction_provider_native: "off".to_string(),
             compaction_summarizer: "subagent".to_string(),
             microcompaction: true,
             microcompaction_watermark: 32_000,

@@ -490,6 +490,10 @@ fn settings_snapshot<P: ChatProvider>(
         compaction_reactive: trigger.reactive,
         compaction_worker_input: worker_input,
         resolved_ladder,
+        compaction_provider_native: match settings.compaction_provider_native() {
+            Ok(crate::config::ProviderNativeMode::Auto) => "auto".to_string(),
+            _ => "off".to_string(),
+        },
         compaction_summarizer: settings
             .compaction_summarizer
             .clone()
@@ -672,6 +676,9 @@ fn save_setting_field(
         }
         Field::CompactionSummarizer => {
             config::save_compaction_summarizer(value.unwrap_or("subagent"))
+        }
+        Field::CompactionProviderNative => {
+            config::save_compaction_provider_native(value.unwrap_or("off"))
         }
         Field::Microcompaction => config::save_tool_result_compaction_enabled(parse_bool(value)),
         Field::MicrocompactionWatermark => {
@@ -933,6 +940,13 @@ pub(crate) fn apply_action<P: ChatProvider>(
                         // Summarizer changes affect only the next worker job.
                         if let Ok(settings) = config::Settings::load(harness.workspace()) {
                             harness.set_summarizer(settings.compaction_summarizer());
+                        }
+                    } else if field == settings_menu::Field::CompactionProviderNative {
+                        // Routing changes affect only the next worker job.
+                        if let Ok(settings) = config::Settings::load(harness.workspace())
+                            && let Ok(mode) = settings.compaction_provider_native()
+                        {
+                            harness.set_provider_native(mode == config::ProviderNativeMode::Auto);
                         }
                     } else if field == settings_menu::Field::CompactionWorkerInput {
                         // Worker-input changes affect only the next worker job.
@@ -1275,6 +1289,9 @@ mod tests {
         ));
         assert!(!is_auto_compaction_trigger_field(
             Field::CompactionWorkerInput
+        ));
+        assert!(!is_auto_compaction_trigger_field(
+            Field::CompactionProviderNative
         ));
         // The context cap clamps the window, so it re-resolves the ladder live.
         assert!(is_auto_compaction_trigger_field(Field::ContextTokenBudget));
