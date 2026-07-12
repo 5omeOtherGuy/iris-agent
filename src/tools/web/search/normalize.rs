@@ -12,7 +12,7 @@
 //! - strip a leading `*.` wildcard, the scheme, any userinfo/port/path, and a
 //!   trailing FQDN-root dot;
 //! - drop entries that cannot be a public-domain filter (empty, single-label,
-//!   or unparseable), recording a truthful reason;
+//!   or unparsable), recording a truthful reason;
 //! - de-duplicate (order-preserving) and cap each list at [`MAX_DOMAINS`];
 //! - reject the whole request when a domain appears in BOTH lists (a domain
 //!   cannot be simultaneously required and excluded).
@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(normalize_domain("   "), None);
         assert_eq!(normalize_domain("intranet"), None); // single label
         assert_eq!(normalize_domain("a..com"), None); // empty label
-        assert_eq!(normalize_domain("not a domain"), None); // space -> unparseable host
+        assert_eq!(normalize_domain("not a domain"), None); // space -> unparsable host
     }
 
     #[test]
