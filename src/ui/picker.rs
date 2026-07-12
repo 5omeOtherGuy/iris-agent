@@ -194,13 +194,18 @@ pub(crate) fn open_resume(cwd: &std::path::Path) -> Option<Modal> {
 }
 
 fn resume_task_linked_session_ids(cwd: &std::path::Path) -> BTreeSet<String> {
-    if !config::Settings::load(cwd)
-        .map(|settings| settings.tasks())
-        .unwrap_or(false)
-    {
+    let enabled = config::Settings::load(cwd)
+        .map(|settings| settings.mutation_safety() && settings.tasks())
+        .unwrap_or(false);
+    if !enabled {
         return BTreeSet::new();
     }
-    GitSafety::new_with_workflow(cwd, true).task_linked_session_ids()
+    GitSafety::new_configured(
+        cwd,
+        true,
+        crate::wayland::trust::native_jj(cwd).unwrap_or(false),
+    )
+    .task_linked_session_ids()
 }
 
 /// Turn resumable-session metadata into display rows (id, preview, relative
@@ -380,10 +385,7 @@ fn settings_snapshot<P: ChatProvider>(
     harness: &Harness<P>,
     switch: &ModelSwitch<'_, P>,
 ) -> settings_menu::Snapshot {
-    let settings = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| config::Settings::load(&cwd).ok())
-        .unwrap_or_default();
+    let settings = config::Settings::load(harness.workspace()).unwrap_or_default();
     let tui = settings.tui_settings();
     let selection = switch.selection();
     // The reasoning switch clicks through the ACTIVE model's levels; a
@@ -509,6 +511,9 @@ fn settings_snapshot<P: ChatProvider>(
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty()),
         verify_max_attempts: settings.verification().map(|v| v.max_attempts).unwrap_or(3),
+        mutation_safety: harness.mutation_safety_enabled(),
+        native_jj_available: harness.mutation_safety_enabled() && harness.native_jj_available(),
+        native_jj_enabled: harness.native_jj_enabled(),
         worktree_root: settings.worktree_root.clone(),
         theme: tui
             .and_then(|t| t.theme.clone())
@@ -629,6 +634,8 @@ fn save_setting_field(
         Field::ScrollSpeed => config::save_scroll_speed(value.unwrap_or("3").parse()?),
         Field::ReducedMotion => config::save_reduced_motion(parse_bool(value)),
         Field::DefaultApproval => config::save_default_approval(value.unwrap_or("strict")),
+        Field::MutationSafety => config::save_mutation_safety(parse_bool(value)),
+        Field::NativeJj => crate::wayland::trust::set_native_jj(workspace, parse_bool(value)),
         Field::ContextTokenBudget => {
             config::save_context_token_budget(value.unwrap_or("0").parse()?)
         }
@@ -867,6 +874,25 @@ pub(crate) fn apply_action<P: ChatProvider>(
             ActionResult::Keep(failures(lines))
         }
         ModalAction::SaveSetting { field, value } => {
+            let requested = value.as_deref() == Some("true");
+            let previous_safety = harness.mutation_safety_enabled();
+            let previous_native_jj = harness.native_jj_enabled();
+            let reconfigured = match field {
+                settings_menu::Field::MutationSafety => {
+                    harness.configure_mutation_safety(requested, previous_native_jj)
+                }
+                settings_menu::Field::NativeJj => {
+                    if requested && !harness.native_jj_available() {
+                        Err("native jj integration is unavailable in this workspace")
+                    } else {
+                        harness.configure_mutation_safety(previous_safety, requested)
+                    }
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = reconfigured {
+                return refresh_settings(view, None, vec![error.to_string()], harness, switch);
+            }
             match save_setting_field(field, value.as_deref(), harness.workspace()) {
                 Ok(()) => {
                     // Some settings are read live by the harness, not just at
@@ -930,11 +956,35 @@ pub(crate) fn apply_action<P: ChatProvider>(
                             switch,
                         );
                     }
+                    if field == settings_menu::Field::MutationSafety
+                        && requested
+                        && harness.native_jj_available()
+                        && crate::wayland::trust::native_jj(harness.workspace()).is_none()
+                    {
+                        return ActionResult::Replace(
+                            Box::new(crate::ui::modal::jj_setup()),
+                            Vec::new(),
+                        );
+                    }
+                    if field == settings_menu::Field::MutationSafety {
+                        // Enabling the master can make native jj available in the
+                        // same interaction. Rebuild the faceplate so its dependent
+                        // row never keeps the availability snapshot from when the
+                        // master was off.
+                        return refresh_settings(view, None, Vec::new(), harness, switch);
+                    }
                     // The panel is the display truth while open: it already
                     // clicked the detent, so keep it (no rebuild jank).
                     ActionResult::Keep(Vec::new())
                 }
                 Err(error) => {
+                    if matches!(
+                        field,
+                        settings_menu::Field::MutationSafety | settings_menu::Field::NativeJj
+                    ) {
+                        let _ =
+                            harness.configure_mutation_safety(previous_safety, previous_native_jj);
+                    }
                     // The write failed: rebuild the panel from disk so the
                     // control settles back onto the persisted position.
                     refresh_settings(

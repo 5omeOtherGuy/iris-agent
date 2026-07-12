@@ -28,6 +28,10 @@ pub(super) fn detect(workspace: &Path) -> Option<Workspace> {
         return None;
     }
     let root = root.canonicalize().unwrap_or(root);
+    // Native integration relies on operation-window reads. A `jj` that can find
+    // the workspace but cannot perform this non-snapshotting query is not
+    // compatible and must remain in file-only degraded mode.
+    current_operation_id(&root).ok()?;
     let state_dir = root.join(".jj").join("iris");
     Some(Workspace { state_dir })
 }

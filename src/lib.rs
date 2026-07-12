@@ -504,8 +504,18 @@ fn run_agent_inner(
     let (effective_window, compaction_trigger) =
         resolved_compaction_trigger(&settings, &selection)?;
     let budget = Some(effective_window);
-    let mut harness =
-        wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
+    let native_jj = wayland::trust::native_jj(&cwd).unwrap_or(false);
+    let mut harness = wayland::Harness::new_configured(
+        agent,
+        cwd.clone(),
+        tools::ToolState::new(),
+        session,
+        budget,
+        wayland::MutationSafetyConfig {
+            enabled: settings.mutation_safety(),
+            native_jj,
+        },
+    );
     harness.set_compaction_trigger(effective_window, compaction_trigger);
     // Post-change verification (issue #265): engaged only when a `verify` block
     // is present; the command runs under the unchanged approval gate.
@@ -574,6 +584,11 @@ fn run_agent_inner(
     // The start page (IrisMark + launcher) shows only when Iris launches
     // interactively with no task and no resume target; a bare `iris resume`
     // opens the resume picker instead.
+    let jj_modal = native_jj_discovery_modal(force_plain, &cwd, &settings, &harness);
+    let (startup_modal, followup_modal) = match (startup_modal, jj_modal) {
+        (Some(first), followup) => (Some(first), followup),
+        (None, first) => (first, None),
+    };
     let start_page = startup_modal.is_none();
     cli::run_interactive(
         &mut harness,
@@ -583,6 +598,7 @@ fn run_agent_inner(
         &swap,
         cli::StartupUi {
             modal: startup_modal,
+            followup_modal,
             start_page,
             resumed_session: None,
         },
@@ -711,8 +727,18 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     let (effective_window, compaction_trigger) =
         resolved_compaction_trigger(&settings, &selection)?;
     let budget = Some(effective_window);
-    let mut harness =
-        wayland::Harness::new(agent, cwd.clone(), tools::ToolState::new(), session, budget);
+    let native_jj = wayland::trust::native_jj(&cwd).unwrap_or(false);
+    let mut harness = wayland::Harness::new_configured(
+        agent,
+        cwd.clone(),
+        tools::ToolState::new(),
+        session,
+        budget,
+        wayland::MutationSafetyConfig {
+            enabled: settings.mutation_safety(),
+            native_jj,
+        },
+    );
     harness.set_compaction_trigger(effective_window, compaction_trigger);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
@@ -799,6 +825,19 @@ fn announce_skip_permissions(skip_permissions: bool, session: Option<&mut sessio
     }
     eprintln!("WARNING: {}", nexus::SKIP_PERMISSIONS_BANNER);
     record_skip_permissions(skip_permissions, session);
+}
+
+fn native_jj_discovery_modal<P: ChatProvider>(
+    force_plain: bool,
+    cwd: &Path,
+    settings: &config::Settings,
+    harness: &wayland::Harness<P>,
+) -> Option<ui::modal::Modal> {
+    (!cli::prefers_text_ui(force_plain)
+        && settings.mutation_safety()
+        && harness.native_jj_available()
+        && wayland::trust::native_jj(cwd).is_none())
+    .then(ui::modal::jj_setup)
 }
 
 /// The persisted per-project permission policy for `cwd` (ADR-0027), loaded
@@ -939,13 +978,18 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
     announce_skip_permissions(skip_permissions, session.as_mut());
     tracing::info!(id = %meta.id, messages = resumed, context_tokens, "resumed session");
 
-    let mut harness = wayland::Harness::resumed(
+    let native_jj = wayland::trust::native_jj(&cwd).unwrap_or(false);
+    let mut harness = wayland::Harness::resumed_configured(
         agent,
         cwd.clone(),
         tools::ToolState::new(),
         session,
         entry_ids,
         budget,
+        wayland::MutationSafetyConfig {
+            enabled: settings.mutation_safety(),
+            native_jj,
+        },
     );
     harness.set_compaction_trigger(effective_window, compaction_trigger);
     harness.set_verification(settings.verification());
@@ -1005,6 +1049,7 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
             source,
         )
     };
+    let jj_modal = native_jj_discovery_modal(force_plain, &cwd, &settings, &harness);
     cli::run_interactive(
         &mut harness,
         &mut switch,
@@ -1012,7 +1057,8 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
         settings.tui_settings(),
         &swap,
         cli::StartupUi {
-            modal: None,
+            modal: jj_modal,
+            followup_modal: None,
             start_page: false,
             resumed_session: Some(session_id.clone()),
         },

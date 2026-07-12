@@ -601,6 +601,23 @@ fn jj_workspace_degrades() {
 }
 
 #[test]
+fn jj_workspace_uses_file_only_mode_without_native_consent() {
+    let Some(repo) = init_jj_repo() else {
+        return;
+    };
+    fs::write(repo.path.join("committed.txt"), "dirty\n").unwrap();
+
+    let guard = GitSafety::new_configured(&repo.path, true, false);
+    let notice = guard.note_mutation().expect("jj degraded-mode notice");
+    assert!(notice.contains("native jj integration is off"), "{notice}");
+    assert!(
+        guard
+            .unapproved_protected(&[repo.path.join("committed.txt")])
+            .is_empty()
+    );
+}
+
+#[test]
 fn jj_workspace_uses_native_guard_when_available() {
     let Some(repo) = init_jj_repo() else {
         return;

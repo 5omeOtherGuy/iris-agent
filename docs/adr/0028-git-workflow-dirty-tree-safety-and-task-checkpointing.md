@@ -9,8 +9,10 @@ adoption) and
 (task records carry opaque body + session links; `taskLifecycle` session
 entries), and
 [ADR-0052](0052-task-workflow-v2-opt-in-guard-and-integrated-settlement.md)
-(always-on guard split from opt-in durable task workflow; added settlement
-signals; checkpoint and cleanup semantics)
+(opt-in durable task workflow; added settlement signals; checkpoint and cleanup
+semantics), and
+[ADR-0058](0058-configure-mutation-safety-and-require-native-jj-consent.md)
+(global mutation-safety switch and explicit per-workspace native jj consent)
 **Deciders**: operator + agent design review (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261))
 
 ## Context

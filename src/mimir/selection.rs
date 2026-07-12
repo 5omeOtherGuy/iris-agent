@@ -795,6 +795,7 @@ mod tests {
             compaction_summarizer: None,
             microcompaction: None,
             tool_result_compaction: None,
+            mutation_safety: None,
             tasks: None,
             bash_tool_mode: None,
             prompt_cache_retention: None,

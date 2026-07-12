@@ -359,6 +359,7 @@ pub(crate) struct GitSafety {
 
 impl GitSafety {
     /// Build the guard for `workspace`, detecting git vs degraded mode once.
+    #[cfg(test)]
     pub(crate) fn new(workspace: &Path) -> Self {
         Self::new_with_workflow(workspace, true)
     }
@@ -366,13 +367,42 @@ impl GitSafety {
     /// Build the guard with the durable task workflow explicitly enabled or
     /// disabled. The dirty-tree guard runs in both modes; this flag gates only
     /// records, leases, refs, recovery, and user-facing task UI.
+    #[cfg(test)]
     pub(crate) fn new_with_workflow(workspace: &Path, workflow_enabled: bool) -> Self {
+        Self::new_configured(workspace, workflow_enabled, true)
+    }
+
+    /// Build the guard with explicit native-jj consent. Detection is allowed in
+    /// either state, but jj snapshots/operation tracking are selected only when
+    /// `native_jj` is true.
+    pub(crate) fn new_configured(
+        workspace: &Path,
+        workflow_enabled: bool,
+        native_jj: bool,
+    ) -> Self {
         let canonical = workspace
             .canonicalize()
             .unwrap_or_else(|_| workspace.to_path_buf());
-        let mode = detect_mode(&canonical);
+        let mode = detect_mode(&canonical, native_jj);
+        Self::with_mode(canonical, workflow_enabled, mode)
+    }
+
+    /// Placeholder state while the master switch is off. It performs no Git or
+    /// jj discovery; enabling replaces it with a freshly detected guard.
+    pub(crate) fn new_inactive(workspace: &Path, workflow_enabled: bool) -> Self {
+        let canonical = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
+        Self::with_mode(
+            canonical,
+            workflow_enabled,
+            Mode::Degraded("mutation safety disabled".to_string()),
+        )
+    }
+
+    fn with_mode(workspace: PathBuf, workflow_enabled: bool, mode: Mode) -> Self {
         Self {
-            workspace: canonical,
+            workspace,
             mode,
             workflow_enabled,
             state: Mutex::new(State {
@@ -633,7 +663,6 @@ impl GitSafety {
 
     /// Whether a task baseline is currently captured (test-only): asserts the
     /// lazy-capture boundary (no baseline until the first mutation).
-    #[cfg(test)]
     pub(crate) fn has_task(&self) -> bool {
         self.state.lock().unwrap().task.is_some()
     }
@@ -934,12 +963,27 @@ impl GitSafety {
     }
 }
 
-/// Detect the guard mode for a canonicalized workspace. jj wins when available
-/// because jj owns the working-copy lifecycle; git remains the default backend
-/// for normal git worktrees.
-fn detect_mode(workspace: &Path) -> Mode {
+/// Probe whether the active directory is a jj workspace and the discovered jj
+/// executable supports Iris's non-snapshotting operation query.
+pub(crate) fn native_jj_available(workspace: &Path) -> bool {
+    let canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    jj::detect(&canonical).is_some()
+}
+
+/// Detect the guard mode for a canonicalized workspace. Native jj wins only
+/// after explicit consent; otherwise a jj workspace uses honest file-only
+/// degraded behavior rather than silently falling through to its Git backend.
+fn detect_mode(workspace: &Path, native_jj: bool) -> Mode {
     if let Some(jj_workspace) = jj::detect(workspace) {
-        return Mode::Jj(jj_workspace);
+        if native_jj {
+            return Mode::Jj(jj_workspace);
+        }
+        return Mode::Degraded(
+            "jj workspace detected; native jj integration is off, so mutation safety runs in file-only degraded mode"
+                .to_string(),
+        );
     }
     if workspace.join(".jj").exists() {
         return Mode::Degraded("jj workspace detected but `jj` is unavailable or unusable; dirty-tree safety runs in degraded mode".to_string());

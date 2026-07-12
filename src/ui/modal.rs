@@ -87,6 +87,8 @@ pub(crate) enum ModalAction {
     /// default permission mode (#520) via `cli::apply_permission_mode`, applied
     /// live at the same time; the faceplate skip-approvals row is the trigger.
     ToggleSkipPermissions,
+    /// Accept or decline native jj integration for the active canonical workspace.
+    SetNativeJj(bool),
     /// Edit this project's persistent permission policy (ADR-0027). The loop
     /// persists the edit to the HOME-owned store and refreshes the live agent's
     /// in-memory policy at the safe inter-turn boundary.
@@ -144,6 +146,7 @@ pub(crate) enum ModalOutcome {
 /// (`SwitchContext`, `LoginDialog`, `ApiKeyDialog`) still overlay it.
 #[derive(Debug, Clone)]
 pub(crate) enum Modal {
+    JjSetup(JjSetupPrompt),
     SwitchContext(SwitchContextPrompt),
     // Boxed (like Tasks) so the panel's snapshot does not dominate the enum.
     Settings(Box<crate::ui::settings_menu::SettingsPanel>),
@@ -159,6 +162,7 @@ pub(crate) enum Modal {
 impl Modal {
     pub(crate) fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
         match self {
+            Modal::JjSetup(prompt) => prompt.handle_key(key),
             Modal::SwitchContext(prompt) => prompt.handle_key(key),
             Modal::Settings(panel) => panel.handle_key(key),
             Modal::Session(picker) => picker.handle_key(key),
@@ -171,6 +175,7 @@ impl Modal {
 
     pub(crate) fn paste_text(&mut self, text: &str) -> ModalOutcome {
         match self {
+            Modal::JjSetup(_) => ModalOutcome::Ignore,
             Modal::LoginDialog(dialog) if dialog.accepts_manual_input() => {
                 dialog.push_str(text);
                 ModalOutcome::Redraw
@@ -217,6 +222,7 @@ impl Modal {
 
     pub(crate) fn render(&self, width: u16) -> Vec<Line<'static>> {
         match self {
+            Modal::JjSetup(prompt) => prompt.render(width),
             Modal::SwitchContext(prompt) => prompt.render(width),
             Modal::Settings(panel) => panel.render(width),
             Modal::Session(picker) => picker.render(width),
@@ -361,6 +367,90 @@ pub(crate) fn selector_rows(selector: &Selector, empty: &str) -> Vec<(Line<'stat
         ));
     }
     out
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct JjSetupPrompt {
+    selector: Selector,
+}
+
+impl JjSetupPrompt {
+    pub(crate) fn new() -> Self {
+        Self {
+            selector: Selector::new(
+                vec![
+                    SelectorItem::new("enable", "Enable native jj integration")
+                        .detail("track jj operations and enable jj-aware recovery"),
+                    SelectorItem::new("decline", "Keep native jj integration off")
+                        .detail("use reduced file-only mutation guarantees"),
+                ],
+                false,
+                true,
+                2,
+            ),
+        }
+    }
+
+    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match key {
+            ModalKey::Up => {
+                self.selector.up();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Down => {
+                self.selector.down();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Enter => match self.selector.selected_id() {
+                Some("enable") => ModalOutcome::Emit(ModalAction::SetNativeJj(true)),
+                Some("decline") => ModalOutcome::Emit(ModalAction::SetNativeJj(false)),
+                _ => ModalOutcome::Ignore,
+            },
+            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Emit(ModalAction::SetNativeJj(false)),
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        let mut rows = vec![
+            (
+                Line::from(Span::styled("Iris found a compatible jj workspace.", dim())),
+                false,
+            ),
+            (
+                Line::from(Span::styled(
+                    "Native mode runs jj snapshots and tracks operation boundaries.",
+                    dim(),
+                )),
+                false,
+            ),
+            (
+                Line::from(Span::styled(
+                    "It halts after external operations and enables jj-aware",
+                    dim(),
+                )),
+                false,
+            ),
+            (
+                Line::from(Span::styled(
+                    "rollback/restoration. Off uses reduced file-only protection.",
+                    dim(),
+                )),
+                false,
+            ),
+        ];
+        rows.extend(selector_rows(&self.selector, "No choices"));
+        crate::ui::tui::overlay_menu(
+            Some("Enable native jj integration?"),
+            rows,
+            Some("↑↓ move · ↵ choose · esc keep off"),
+            usize::from(width),
+        )
+    }
+}
+
+pub(crate) fn jj_setup() -> Modal {
+    Modal::JjSetup(JjSetupPrompt::new())
 }
 
 #[derive(Debug, Clone)]
@@ -1009,6 +1099,28 @@ mod tests {
 
     use super::*;
     use crate::wayland::skills::{SkillMetadata, SkillScope};
+
+    #[test]
+    fn jj_setup_explains_effects_and_emits_explicit_decisions() {
+        let mut prompt = JjSetupPrompt::new();
+        let rendered = prompt
+            .render(100)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("snapshots"), "{rendered}");
+        assert!(rendered.contains("external operations"), "{rendered}");
+        assert!(rendered.contains("rollback/restoration"), "{rendered}");
+        assert_eq!(
+            prompt.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::SetNativeJj(true))
+        );
+        assert_eq!(
+            prompt.handle_key(ModalKey::Esc),
+            ModalOutcome::Emit(ModalAction::SetNativeJj(false))
+        );
+    }
 
     #[test]
     fn skill_picker_filters_and_emits_path_qualified_selection() {

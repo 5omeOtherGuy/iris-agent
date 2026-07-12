@@ -7580,6 +7580,9 @@ mod tests {
             alt_screen: "auto".to_string(),
             scroll_speed: 3,
             reduced_motion: false,
+            mutation_safety: true,
+            native_jj_available: true,
+            native_jj_enabled: false,
             worktree_root: None,
         }
     }
@@ -7617,7 +7620,7 @@ mod tests {
         assert!(rendered.contains("●●●●●●○○○○  232k tokens"), "{rendered}");
         assert!(rendered.contains("▸ gpt-5.5 ┊ openai-codex"), "{rendered}");
         // Nothing windowed: no position row on a tall viewport.
-        assert!(!rendered.contains("(1/30)"), "{rendered}");
+        assert!(!rendered.contains("(1/33)"), "{rendered}");
         // The composer stays protected below the panel.
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }
@@ -7636,7 +7639,7 @@ mod tests {
         // session bar) and the window scrolls with the house position row.
         assert!(rendered.contains("SETTINGS"), "{rendered}");
         assert!(rendered.contains("ENGINE"), "{rendered}");
-        assert!(rendered.contains("(1/31)"), "{rendered}");
+        assert!(rendered.contains("(1/33)"), "{rendered}");
         assert!(!rendered.contains("worktree root"), "windowed:\n{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }

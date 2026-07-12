@@ -101,6 +101,8 @@ pub(crate) enum Field {
     PromptCacheRetention,
     VerifyCommand,
     VerifyMaxAttempts,
+    MutationSafety,
+    NativeJj,
     WorktreeRoot,
 }
 
@@ -255,7 +257,11 @@ const SECTIONS: &[Section] = &[
     },
     Section {
         title: "GIT",
-        rows: &[RowId::Field(Field::WorktreeRoot)],
+        rows: &[
+            RowId::Field(Field::MutationSafety),
+            RowId::Field(Field::NativeJj),
+            RowId::Field(Field::WorktreeRoot),
+        ],
     },
 ];
 
@@ -444,6 +450,9 @@ pub(crate) struct Snapshot {
     pub(crate) alt_screen: String,
     pub(crate) scroll_speed: u16,
     pub(crate) reduced_motion: bool,
+    pub(crate) mutation_safety: bool,
+    pub(crate) native_jj_available: bool,
+    pub(crate) native_jj_enabled: bool,
     pub(crate) worktree_root: Option<String>,
 }
 
@@ -464,7 +473,9 @@ impl Snapshot {
             Field::Microcompaction
             | Field::CompactionEnabled
             | Field::CompactionReactive
-            | Field::ReducedMotion => &["off", "on"],
+            | Field::ReducedMotion
+            | Field::MutationSafety
+            | Field::NativeJj => &["off", "on"],
             Field::CompactionWorkerInput => &["transcript", "investigator"],
             _ => &[],
         }
@@ -484,6 +495,8 @@ impl Snapshot {
             Field::CompactionReactive => on_off(self.compaction_reactive),
             Field::CompactionWorkerInput => self.compaction_worker_input.clone(),
             Field::ReducedMotion => on_off(self.reduced_motion),
+            Field::MutationSafety => on_off(self.mutation_safety),
+            Field::NativeJj => on_off(self.native_jj_enabled),
             _ => String::new(),
         }
     }
@@ -502,6 +515,8 @@ impl Snapshot {
             Field::CompactionReactive => self.compaction_reactive = value == "on",
             Field::CompactionWorkerInput => self.compaction_worker_input = value.to_string(),
             Field::ReducedMotion => self.reduced_motion = value == "on",
+            Field::MutationSafety => self.mutation_safety = value == "on",
+            Field::NativeJj => self.native_jj_enabled = value == "on",
             _ => {}
         }
     }
@@ -589,7 +604,9 @@ fn archetype(row: RowId) -> Archetype {
             | Field::CompactionWorkerInput
             | Field::Theme
             | Field::Microcompaction
-            | Field::ReducedMotion => Archetype::Switch,
+            | Field::ReducedMotion
+            | Field::MutationSafety
+            | Field::NativeJj => Archetype::Switch,
             Field::ContextTokenBudget
             | Field::MicrocompactionWatermark
             | Field::CompactionWarn
@@ -644,6 +661,8 @@ fn label(row: RowId) -> &'static str {
             Field::PromptCacheRetention => "prompt cache",
             Field::VerifyCommand => "verify",
             Field::VerifyMaxAttempts => "attempts",
+            Field::MutationSafety => "mutation safety gates",
+            Field::NativeJj => "native jj",
             Field::WorktreeRoot => "worktree root",
         },
     }
@@ -1079,6 +1098,11 @@ impl SettingsPanel {
     }
 
     fn adjust_field(&mut self, field: Field, forward: bool) -> ModalOutcome {
+        if field == Field::NativeJj
+            && (!self.snap.mutation_safety || !self.snap.native_jj_available)
+        {
+            return ModalOutcome::Ignore;
+        }
         match archetype(RowId::Field(field)) {
             Archetype::Switch => {
                 let options = self.snap.switch_options(field);
@@ -1878,6 +1902,9 @@ impl SettingsPanel {
                 | Field::SemanticRetainPerPath
                 | Field::ToolClearingKeepRecent,
             ) => !self.snap.microcompaction,
+            RowId::Field(Field::NativeJj) => {
+                !self.snap.mutation_safety || !self.snap.native_jj_available
+            }
             _ => false,
         }
     }
@@ -2591,7 +2618,9 @@ fn save_token(field: Field, value: &str) -> String {
         Field::Microcompaction
         | Field::CompactionEnabled
         | Field::CompactionReactive
-        | Field::ReducedMotion => (value == "on").to_string(),
+        | Field::ReducedMotion
+        | Field::MutationSafety
+        | Field::NativeJj => (value == "on").to_string(),
         _ => value.to_string(),
     }
 }
@@ -2724,6 +2753,9 @@ mod tests {
             alt_screen: "auto".to_string(),
             scroll_speed: 3,
             reduced_motion: false,
+            mutation_safety: true,
+            native_jj_available: true,
+            native_jj_enabled: false,
             worktree_root: None,
         }
     }
@@ -2860,6 +2892,31 @@ mod tests {
         assert!(
             rendered.contains("configured tail 8k \u{2192} effective tail 4k"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn native_jj_switch_is_disabled_until_discovered_and_master_enabled() {
+        let mut snap = snapshot();
+        snap.native_jj_available = false;
+        let mut panel = SettingsPanel::new(snap);
+        assert_eq!(
+            panel.adjust_field(Field::NativeJj, true),
+            ModalOutcome::Ignore
+        );
+
+        panel.snap.native_jj_available = true;
+        assert_eq!(
+            panel.adjust_field(Field::NativeJj, true),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::NativeJj,
+                value: Some("true".to_string()),
+            })
+        );
+        panel.snap.mutation_safety = false;
+        assert_eq!(
+            panel.adjust_field(Field::NativeJj, false),
+            ModalOutcome::Ignore
         );
     }
 
