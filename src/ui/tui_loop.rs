@@ -5677,6 +5677,8 @@ mod tests {
             semantic_retain_per_path: 1,
             tool_clearing_keep_recent: 8,
             prompt_cache_retention: "short".to_string(),
+            web_search_backend: "off".to_string(),
+            read_web_page_backend: "off".to_string(),
             verify_command: None,
             verify_max_attempts: 3,
             theme: "terminal".to_string(),

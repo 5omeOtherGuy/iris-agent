@@ -9,6 +9,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Auth-file id for the Brave Search service key (a web-tool service
+/// credential, not a chat provider).
+pub(crate) const BRAVE_SERVICE_ID: &str = "brave-search";
+/// Auth-file id for the Jina service key.
+pub(crate) const JINA_SERVICE_ID: &str = "jina";
+/// Environment fallback for the Brave Search key.
+pub(crate) const BRAVE_ENV_VAR: &str = "BRAVE_API_KEY";
+/// Environment fallback for the Jina key.
+pub(crate) const JINA_ENV_VAR: &str = "JINA_API_KEY";
+
 #[derive(Debug, Clone)]
 pub(crate) struct AuthStore {
     path: PathBuf,
@@ -67,6 +77,25 @@ impl AuthStore {
         let mut auth = AuthFile::read_or_default(&self.path)?;
         auth.set_api_key_credentials(provider_id, key)?;
         auth.write(&self.path)
+    }
+
+    /// Resolve a web-tool SERVICE API key (Brave/Jina), NOT a chat provider.
+    /// The stored key wins over the environment fallback (same precedence as
+    /// `api_key_for_provider`); `None` when neither is set or both are blank.
+    /// `service_id` is one of [`BRAVE_SERVICE_ID`] / [`JINA_SERVICE_ID`]; these
+    /// live in the same auth file under a plain string id (never a
+    /// `ProviderId`) so they cannot masquerade as a chat provider.
+    pub(crate) fn service_api_key(&self, service_id: &str, env_var: &str) -> Option<String> {
+        if let Ok(creds) = self.api_key_credentials(service_id) {
+            let key = creds.key.trim();
+            if !key.is_empty() {
+                return Some(key.to_string());
+            }
+        }
+        std::env::var(env_var).ok().and_then(|value| {
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        })
     }
 
     pub(crate) fn credential_kind(&self, provider_id: &str) -> Result<Option<CredentialKind>> {

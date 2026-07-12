@@ -93,7 +93,23 @@ unicode-segmentation = "1"
 # reuse ladder.
 regex = "1"
 toml = "1.1"
-reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls", "http2"], default-features = false }
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls", "http2", "gzip", "stream"], default-features = false }
+# Web tools (web_search / read_web_page). `url` parses and canonicalizes
+# user/model-supplied URLs (punycode/IDNA, host normalization) for the SSRF
+# policy gate -- hand-rolling URL/host parsing is forbidden by the reuse ladder
+# (already in-tree via reqwest; direct-dep promotion). `encoding_rs` does
+# bounded-buffer charset decoding of fetched bodies without reading the whole
+# body first (reqwest's `text_with_charset` would bypass the byte cap; also an
+# in-tree direct-dep promotion). `dom_smoothie` is the maintained readability.js
+# port for article extraction; `htmd` converts the extracted HTML to Markdown
+# (tables included); `dom_query` is the CSS-selector engine (dom_smoothie's own
+# base) reused for DuckDuckGo result-row parsing so no second HTML parser stack
+# is pulled in. All MIT/Apache-2.0/ISC (deny.toml allow-list).
+url = "2.5"
+encoding_rs = "0.8"
+dom_smoothie = "0.18"
+htmd = "0.5"
+dom_query = "0.28"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Semantic-version comparison for `iris update`: only self-replace when the

@@ -798,6 +798,8 @@ mod tests {
             mutation_safety: None,
             tasks: None,
             bash_tool_mode: None,
+            web_search_backend: None,
+            read_web_page_backend: None,
             prompt_cache_retention: None,
             anthropic_context_management: None,
             enabled_models: None,

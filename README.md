@@ -65,6 +65,16 @@ tool-heavy sessions stay readable and stay within their window.
   library crates, so no `rg` or `fd` binary needs to be on `PATH`. On Linux the
   `bash` tool can be confined by the kernel (Landlock LSM).
 
+- **Opt-in web tools, off by default.** `web_search` and `read_web_page` are
+  independently configurable in settings (`webSearchBackend`:
+  off/native/brave/jina; `readWebPageBackend`: off/native/jina) and are not
+  offered to the model until enabled. Native mode needs no API key; Brave and
+  Jina keys are user-configured (settings or `BRAVE_API_KEY`/`JINA_API_KEY`).
+  Every call is approval-gated, private/localhost/internal targets are refused
+  by an SSRF policy with connection pinning, and fetched content is framed as
+  untrusted external data. The backend settings are global-only, so a cloned
+  repo can never enable network egress (see ADR-0058).
+
 ## Install
 
 Prebuilt binaries ship for Linux and macOS (x86_64 and aarch64) — no Rust
