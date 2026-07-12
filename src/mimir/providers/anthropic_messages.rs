@@ -11,7 +11,7 @@
 
 use std::io::BufReader;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use reqwest::blocking::Client;
@@ -65,7 +65,6 @@ const API_ID: &str = "anthropic-messages";
 /// Endpoint path surfaced in failure diagnostics (never the full base URL).
 const ENDPOINT_PATH: &str = "/v1/messages";
 static SERVER_SIDE_FALLBACK_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
-static NATIVE_COMPACTION_UNSUPPORTED_MODELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 /// First system block required on the OAuth lane: omitting it gets the request
 /// rejected as not coming from the Claude Code client.
@@ -264,17 +263,12 @@ impl ChatProvider for AnthropicProvider {
         ))
     }
 
-    fn compaction_capability(&self, input_tokens: u64) -> ProviderCompactionCapability {
-        let unsupported = NATIVE_COMPACTION_UNSUPPORTED_MODELS
-            .get_or_init(|| Mutex::new(HashSet::new()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .contains(&self.model);
-        if !unsupported && input_tokens >= NATIVE_COMPACTION_MIN_INPUT_TOKENS {
-            ProviderCompactionCapability::OpaqueBlocks
-        } else {
-            ProviderCompactionCapability::None
-        }
+    fn compaction_capability(&self, _input_tokens: u64) -> ProviderCompactionCapability {
+        // The adapter remains probeable in live tests, but the Claude Code OAuth
+        // backend rejects its compact beta with `400 invalid_request_error`.
+        // Do not advertise an unverified route: `auto` must select the portable
+        // worker without paying for a known-failing request.
+        ProviderCompactionCapability::None
     }
 
     fn compact_context<'a>(
@@ -489,14 +483,7 @@ impl AnthropicProvider {
                     }
                     return Ok(output);
                 }
-                NativeCompactionAttempt::Unsupported(error) => {
-                    NATIVE_COMPACTION_UNSUPPORTED_MODELS
-                        .get_or_init(|| Mutex::new(HashSet::new()))
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .insert(self.model.clone());
-                    return Err(error);
-                }
+                NativeCompactionAttempt::Unsupported(error) => return Err(error),
                 NativeCompactionAttempt::Reauth(error) if !reauth_used => {
                     reauth_used = true;
                     force_refresh = true;
@@ -2472,6 +2459,24 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         let beta = anthropic_beta(&enabled);
         assert!(beta.contains(CONTEXT_MANAGEMENT_BETA), "{beta}");
         assert!(!beta.contains("compact-2026-01-12"), "{beta}");
+    }
+
+    #[test]
+    fn native_compaction_is_not_advertised_until_a_live_lane_passes() {
+        let provider = AnthropicProvider::new(
+            "claude-opus-4-6",
+            "https://api.anthropic.com",
+            None,
+            "test",
+            PromptCacheRetention::None,
+            ContextManagement::default(),
+            crate::mimir::retry::RetryPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            provider.compaction_capability(100_000),
+            ProviderCompactionCapability::None
+        );
     }
 
     #[test]

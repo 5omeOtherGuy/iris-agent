@@ -62,7 +62,7 @@ use compaction::run_compaction_worker;
 use compaction::*;
 pub(crate) use compaction::{
     CompactionWorkerConfig, CompactionWorkerInput, MAX_COMPACTION_INSTRUCTIONS_CHARS,
-    SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS, SummarizerKind,
+    SUMMARY_SYSTEM_PROMPT, SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS, SummarizerKind,
 };
 use trigger::*;
 

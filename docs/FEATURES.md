@@ -126,10 +126,12 @@
   `compaction.providerNative` accepts capability-gated `auto` (default) or
   `off`. Entries persist a portable summary plus one adapter-owned opaque
   block; only the same adapter and exact model replay the block. Anthropic's
-  compact beta is implemented above its 50k trigger floor. OpenAI's native
-  trigger persists the encrypted compaction item and pairs it with a separate
-  OpenAI-authored portable summary. Rejected model capabilities are cached for
-  the process and fall back to portable provider summarization. (ADR-0056)
+  compact beta adapter remains probe-only after the Claude Code OAuth lane
+  returned `400 invalid_request_error`; `auto` selects the portable worker.
+  OpenAI's native trigger persists the encrypted compaction item and pairs it
+  with a separate OpenAI-authored portable summary. Rejected OpenAI model
+  capabilities are cached for the process and fall back to portable provider
+  summarization. (ADR-0056)
   [Partial]
 - **Anthropic context-management opt-in** — global-only
   `anthropicContextManagement` supports the public clear-tool-use and

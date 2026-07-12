@@ -928,7 +928,7 @@ fn install_compaction_summarizer_factory(
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone();
-        build_provider(&selection, &system_prompt, &session_id)
+        build_provider(&selection, wayland::SUMMARY_SYSTEM_PROMPT, &session_id)
     }));
 }
 

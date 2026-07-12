@@ -35,11 +35,12 @@ carries a self-sufficient text `summary`.
 - A native result with empty portable text or other than one opaque block is
   rejected. Deterministic compaction remains available after any native error.
 
-Anthropic uses the `compact_20260112` context-management edit and
-`compact-2026-01-12` beta. The adapter requests a portable compaction body,
-persists the returned block, and replays it only on the same Anthropic model.
-The public API requires at least 50,000 trigger tokens, so smaller plans do not
-advertise capability.
+Anthropic's `compact_20260112` context-management edit and
+`compact-2026-01-12` beta remain implemented for live probes. The Claude Code
+OAuth lane returned `400 invalid_request_error`, so the adapter does not
+advertise native capability; `auto` selects the portable provider worker
+without paying for a known-failing request. Re-enable advertising only after a
+live lane returns one valid block and portable text.
 
 OpenAI Codex uses a `compaction_trigger` input item to obtain one encrypted
 compaction item. Because that item is opaque, the same worker makes a separate
@@ -50,7 +51,7 @@ normal retry and one-refresh authentication policy, and their reported usage is
 combined on the durable compaction entry. OpenAI publishes no minimum input
 floor for this route, so the model-aware Wayland ladder owns timing.
 
-For both native adapters, an ordinary unsupported-feature `400` disables the
+For OpenAI native compaction, an ordinary unsupported-feature `400` disables the
 model for the process. A classified context-overflow `400` does not: overflow
 describes this request size, not a missing model capability.
 
@@ -98,5 +99,6 @@ describes this request size, not a missing model capability.
 - Opaque blocks may contain sensitive continuation state. They stay in the same
   user-owned session log as the original transcript and are never interpreted
   above Mimir.
-- A backend can reject a documented feature for a selected lane. Cache that
-  rejection for the process and keep `auto` default-off.
+- A backend can reject a documented feature for a selected lane. Do not
+  advertise that model until a live probe passes; cache later rejections for the
+  process.

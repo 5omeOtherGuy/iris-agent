@@ -96,12 +96,24 @@ impl LiveLoopLane {
     }
 
     fn build_provider(self, cache_key: &str) -> Result<Box<dyn ChatProvider>> {
+        self.build_provider_with_system(cache_key, LIVE_SYSTEM_PROMPT)
+    }
+
+    fn build_summary_provider(self, cache_key: &str) -> Result<Box<dyn ChatProvider>> {
+        self.build_provider_with_system(cache_key, crate::wayland::SUMMARY_SYSTEM_PROMPT)
+    }
+
+    fn build_provider_with_system(
+        self,
+        cache_key: &str,
+        system_prompt: &str,
+    ) -> Result<Box<dyn ChatProvider>> {
         match self {
             Self::AnthropicHaiku => Ok(Box::new(AnthropicProvider::new(
                 "claude-haiku-4-5",
                 "https://api.anthropic.com",
                 None,
-                LIVE_SYSTEM_PROMPT,
+                system_prompt,
                 PromptCacheRetention::DEFAULT,
                 ContextManagement::default(),
                 RetryPolicy::default(),
@@ -111,7 +123,7 @@ impl LiveLoopLane {
                     "gpt-5.4-mini",
                     "https://chatgpt.com/backend-api",
                     None,
-                    LIVE_SYSTEM_PROMPT,
+                    system_prompt,
                     cache_key,
                     PromptCacheRetention::DEFAULT,
                     RetryPolicy::default(),
@@ -947,14 +959,52 @@ fn auto_compaction_live_loop_codex() {
 }
 
 #[test]
-#[ignore = "live Anthropic native-compaction probe; set IRIS_BENCH_LIVE=1 to run"]
-fn auto_compaction_native_live_anthropic() -> Result<()> {
-    if !live_loop_enabled("auto_compaction_native_live_anthropic") {
+#[ignore = "live Anthropic provider-summary lifecycle; set IRIS_BENCH_LIVE=1 to run"]
+fn auto_compaction_provider_live_anthropic() -> Result<()> {
+    if !live_loop_enabled("auto_compaction_provider_live_anthropic") {
         return Ok(());
     }
     if !claude_code_credentials_available() {
         anyhow::bail!("no Claude Code credentials discovered");
     }
+    auto_compaction_live(LiveLoopLane::AnthropicHaiku, false, "provider")
+}
+
+#[test]
+#[ignore = "live Codex provider-summary lifecycle; set IRIS_BENCH_LIVE=1 to run"]
+fn auto_compaction_provider_live_codex() -> Result<()> {
+    if !live_loop_enabled("auto_compaction_provider_live_codex") {
+        return Ok(());
+    }
+    auto_compaction_live(LiveLoopLane::CodexMini, false, "provider")
+}
+
+#[test]
+#[ignore = "live Anthropic native-auto fallback lifecycle; set IRIS_BENCH_LIVE=1 to run"]
+fn auto_compaction_native_auto_falls_back_anthropic() -> Result<()> {
+    if !live_loop_enabled("auto_compaction_native_auto_falls_back_anthropic") {
+        return Ok(());
+    }
+    if !claude_code_credentials_available() {
+        anyhow::bail!("no Claude Code credentials discovered");
+    }
+    auto_compaction_live(LiveLoopLane::AnthropicHaiku, true, "provider")
+}
+
+#[test]
+#[ignore = "live Codex native-compaction lifecycle; set IRIS_BENCH_LIVE=1 to run"]
+fn auto_compaction_native_live_codex() -> Result<()> {
+    if !live_loop_enabled("auto_compaction_native_live_codex") {
+        return Ok(());
+    }
+    auto_compaction_live(LiveLoopLane::CodexMini, true, "providerNative")
+}
+
+fn auto_compaction_live(
+    lane: LiveLoopLane,
+    provider_native: bool,
+    expected_origin: &str,
+) -> Result<()> {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root = TempDir::new("native-loop");
     let mut log = SessionLog::create_in(&root.path, &workspace)?;
@@ -972,7 +1022,7 @@ fn auto_compaction_native_live_anthropic() -> Result<()> {
     let stored = store.open(&meta)?;
     let entry_ids = stored.entry_ids.clone();
     let log = SessionLog::resume(&path)?;
-    let provider = LiveLoopLane::AnthropicHaiku.build_provider("native-parent")?;
+    let provider = lane.build_provider("native-parent")?;
     let agent = Agent::resumed(provider, built_in_tools().into_read_only(), stored.messages);
     let window = 80_000;
     let mut harness = Harness::resumed(
@@ -996,17 +1046,19 @@ fn auto_compaction_native_live_anthropic() -> Result<()> {
             reactive: true,
         },
     );
-    harness.set_summarizer(SummarizerKind::Subagent);
+    harness.set_summarizer(SummarizerKind::Provider);
     harness.set_compaction_worker(CompactionWorkerConfig {
         instructions:
             "Preserve exact flags, identifiers, decisions, current state, and next steps."
                 .to_string(),
         ..CompactionWorkerConfig::default()
     });
-    harness.set_compaction_summarizer_factory(Arc::new(build_live_compaction_worker));
-    harness.set_provider_native(true);
-    harness.set_provider_compaction_factory(Arc::new(|| {
-        LiveLoopLane::AnthropicHaiku.build_provider("native-compaction")
+    harness.set_compaction_summarizer_factory(Arc::new(move || {
+        lane.build_summary_provider("provider-summary")
+    }));
+    harness.set_provider_native(provider_native);
+    harness.set_provider_compaction_factory(Arc::new(move || {
+        lane.build_provider("native-compaction")
     }));
     let observer = LiveLoopObserver::default();
     let token = CancellationToken::new();
@@ -1030,8 +1082,8 @@ fn auto_compaction_native_live_anthropic() -> Result<()> {
     ))?;
 
     let entries = compaction_json_entries(&path)?;
-    let native = entries.iter().find(|entry| {
-        entry.get("origin").and_then(serde_json::Value::as_str) == Some("providerNative")
+    let applied = entries.iter().find(|entry| {
+        entry.get("origin").and_then(serde_json::Value::as_str) == Some(expected_origin)
     });
     let resume_exact =
         context_bytes(harness.messages()) == context_bytes(&store.open(&meta)?.messages);
@@ -1056,14 +1108,15 @@ fn auto_compaction_native_live_anthropic() -> Result<()> {
         })
         .collect::<Vec<_>>();
     println!(
-        "NATIVE LIVE lane={} native={} blocks={} usage={} needle={} resume_exact={} failures={} entries={}",
-        LiveLoopLane::AnthropicHaiku.label(),
-        native.is_some(),
-        native
+        "COMPACTION LIVE lane={} path={} applied={} blocks={} usage={} needle={} resume_exact={} failures={} entries={}",
+        lane.label(),
+        expected_origin,
+        applied.is_some(),
+        applied
             .and_then(|entry| entry.get("providerBlocks"))
             .and_then(serde_json::Value::as_array)
             .map_or(0, Vec::len),
-        native
+        applied
             .and_then(|entry| entry.get("workerUsage"))
             .is_some_and(|usage| !usage.is_null()),
         needle,
@@ -1072,15 +1125,24 @@ fn auto_compaction_native_live_anthropic() -> Result<()> {
             .unwrap_or_else(|_| "<unserializable>".to_string()),
         serde_json::to_string(&entries).unwrap_or_else(|_| "<unserializable>".to_string()),
     );
-    assert!(native.is_some(), "provider-native entry was not applied");
     assert!(
-        native
-            .and_then(|entry| entry.get("providerBlocks"))
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|blocks| blocks.len() == 1)
+        lifecycle_failures.is_empty(),
+        "compaction lifecycle failures: {lifecycle_failures:?}"
     );
     assert!(
-        native
+        applied.is_some(),
+        "{expected_origin} compaction entry was not applied"
+    );
+    if expected_origin == "providerNative" {
+        assert!(
+            applied
+                .and_then(|entry| entry.get("providerBlocks"))
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|blocks| blocks.len() == 1)
+        );
+    }
+    assert!(
+        applied
             .and_then(|entry| entry.get("workerUsage"))
             .is_some_and(|usage| !usage.is_null())
     );
