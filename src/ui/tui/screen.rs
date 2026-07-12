@@ -1843,6 +1843,11 @@ impl Screen {
         self.focus_mode = enabled;
     }
 
+    #[cfg(test)]
+    pub(crate) fn focus_mode_enabled(&self) -> bool {
+        self.focus_mode
+    }
+
     /// Toggle the session-scoped focus-mode preference and return its new state.
     pub(crate) fn toggle_focus_mode(&mut self) -> bool {
         self.focus_mode = !self.focus_mode;

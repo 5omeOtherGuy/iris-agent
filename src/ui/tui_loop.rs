@@ -2684,6 +2684,7 @@ async fn dispatch_action<P: ChatProvider>(
 fn apply_live_tui_setting(screen: &mut Screen, field: settings_menu::Field, value: Option<&str>) {
     match field {
         settings_menu::Field::ReducedMotion => screen.set_reduced_motion(value == Some("true")),
+        settings_menu::Field::FocusMode => screen.set_focus_mode(value == Some("true")),
         settings_menu::Field::ScrollSpeed => {
             if let Some(speed) = value.and_then(|value| value.parse::<u16>().ok()) {
                 screen.scroll_speed = speed.clamp(1, 100);
@@ -3864,6 +3865,12 @@ mod tests {
 
         apply_live_tui_setting(&mut screen, settings_menu::Field::ScrollSpeed, Some("500"));
         assert_eq!(screen.scroll_speed, 100, "live value uses persisted clamp");
+
+        apply_live_tui_setting(&mut screen, settings_menu::Field::FocusMode, Some("true"));
+        assert!(
+            screen.focus_mode_enabled(),
+            "focus mode applies without restart"
+        );
     }
 
     #[test]
@@ -5635,6 +5642,7 @@ mod tests {
             alt_screen: "auto".to_string(),
             scroll_speed: 3,
             reduced_motion: false,
+            focus_mode: false,
             worktree_root: None,
         }
     }

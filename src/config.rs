@@ -284,6 +284,9 @@ pub(crate) struct TuiSettings {
     /// `IRIS_REDUCED_MOTION` env switch to persisted config; the env flag still
     /// wins. Display-only preference, so a project may set it.
     pub(crate) reduced_motion: Option<bool>,
+    /// Keep the distraction-free layout enabled for the session. Small panes
+    /// still enter focus mode automatically regardless of this preference.
+    pub(crate) focus_mode: Option<bool>,
     /// Color theme id (ADR-0042). Adaptive `terminal` default; an invalid id
     /// falls back to that default.
     pub(crate) theme: Option<String>,
@@ -1026,6 +1029,11 @@ pub(crate) fn save_reduced_motion(enabled: bool) -> Result<()> {
     update_global_block("tui", &[("reducedMotion", Value::Bool(enabled))])
 }
 
+/// Persist the focus-mode display preference under the `tui` block.
+pub(crate) fn save_focus_mode(enabled: bool) -> Result<()> {
+    update_global_block("tui", &[("focusMode", Value::Bool(enabled))])
+}
+
 /// Persist the selected color theme id under the `tui` block (ADR-0042).
 pub(crate) fn save_theme(theme: &str) -> Result<()> {
     update_global_block("tui", &[("theme", Value::String(theme.to_string()))])
@@ -1476,14 +1484,26 @@ mod tests {
         let dir = temp_dir();
         let global = dir.path.join("global.json");
         let project = dir.path.join("project.json");
-        fs::write(&global, r#"{ "tui": { "altScreen": "never" } }"#).unwrap();
-        fs::write(&project, r#"{ "tui": { "altScreen": "auto" } }"#).unwrap();
+        fs::write(
+            &global,
+            r#"{ "tui": { "altScreen": "never", "focusMode": false } }"#,
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            r#"{ "tui": { "altScreen": "auto", "focusMode": true } }"#,
+        )
+        .unwrap();
         let settings = Settings::load_from(Some(&global), &project).unwrap();
         assert_eq!(
             settings
                 .tui_settings()
                 .and_then(|t| t.alt_screen.as_deref()),
             Some("auto")
+        );
+        assert_eq!(
+            settings.tui_settings().and_then(|t| t.focus_mode),
+            Some(true)
         );
 
         // Global-only config still surfaces, and an absent block yields None.
@@ -2639,6 +2659,7 @@ mod tests {
         save_alt_screen("always").unwrap();
         save_scroll_speed(500).unwrap();
         save_reduced_motion(true).unwrap();
+        save_focus_mode(true).unwrap();
         save_verify_command("  cargo test  ".into()).unwrap();
         save_verify_max_attempts(99).unwrap();
 
@@ -2664,6 +2685,7 @@ mod tests {
         assert_eq!(tui.get("altScreen"), Some(&Value::String("always".into())));
         assert_eq!(tui.get("scrollSpeed"), Some(&Value::from(100)));
         assert_eq!(tui.get("reducedMotion"), Some(&Value::Bool(true)));
+        assert_eq!(tui.get("focusMode"), Some(&Value::Bool(true)));
         assert_eq!(
             tui.get("futureTui"),
             Some(&Value::from(1)),

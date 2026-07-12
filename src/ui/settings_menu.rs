@@ -80,6 +80,7 @@ pub(crate) enum Field {
     AltScreen,
     ScrollSpeed,
     ReducedMotion,
+    FocusMode,
     Theme,
     DefaultApproval,
     ContextTokenBudget,
@@ -251,6 +252,7 @@ const SECTIONS: &[Section] = &[
             RowId::Field(Field::AltScreen),
             RowId::Field(Field::ScrollSpeed),
             RowId::Field(Field::ReducedMotion),
+            RowId::Field(Field::FocusMode),
         ],
     },
     Section {
@@ -444,6 +446,7 @@ pub(crate) struct Snapshot {
     pub(crate) alt_screen: String,
     pub(crate) scroll_speed: u16,
     pub(crate) reduced_motion: bool,
+    pub(crate) focus_mode: bool,
     pub(crate) worktree_root: Option<String>,
 }
 
@@ -464,7 +467,8 @@ impl Snapshot {
             Field::Microcompaction
             | Field::CompactionEnabled
             | Field::CompactionReactive
-            | Field::ReducedMotion => &["off", "on"],
+            | Field::ReducedMotion
+            | Field::FocusMode => &["off", "on"],
             Field::CompactionWorkerInput => &["transcript", "investigator"],
             _ => &[],
         }
@@ -484,6 +488,7 @@ impl Snapshot {
             Field::CompactionReactive => on_off(self.compaction_reactive),
             Field::CompactionWorkerInput => self.compaction_worker_input.clone(),
             Field::ReducedMotion => on_off(self.reduced_motion),
+            Field::FocusMode => on_off(self.focus_mode),
             _ => String::new(),
         }
     }
@@ -502,6 +507,7 @@ impl Snapshot {
             Field::CompactionReactive => self.compaction_reactive = value == "on",
             Field::CompactionWorkerInput => self.compaction_worker_input = value.to_string(),
             Field::ReducedMotion => self.reduced_motion = value == "on",
+            Field::FocusMode => self.focus_mode = value == "on",
             _ => {}
         }
     }
@@ -589,7 +595,8 @@ fn archetype(row: RowId) -> Archetype {
             | Field::CompactionWorkerInput
             | Field::Theme
             | Field::Microcompaction
-            | Field::ReducedMotion => Archetype::Switch,
+            | Field::ReducedMotion
+            | Field::FocusMode => Archetype::Switch,
             Field::ContextTokenBudget
             | Field::MicrocompactionWatermark
             | Field::CompactionWarn
@@ -623,6 +630,7 @@ fn label(row: RowId) -> &'static str {
             Field::AltScreen => "alt screen",
             Field::ScrollSpeed => "scroll speed",
             Field::ReducedMotion => "reduced motion",
+            Field::FocusMode => "focus mode",
             Field::Theme => "theme",
             Field::DefaultApproval => "approvals",
             Field::ContextTokenBudget => "context cap",
@@ -2591,7 +2599,8 @@ fn save_token(field: Field, value: &str) -> String {
         Field::Microcompaction
         | Field::CompactionEnabled
         | Field::CompactionReactive
-        | Field::ReducedMotion => (value == "on").to_string(),
+        | Field::ReducedMotion
+        | Field::FocusMode => (value == "on").to_string(),
         _ => value.to_string(),
     }
 }
@@ -2724,6 +2733,7 @@ mod tests {
             alt_screen: "auto".to_string(),
             scroll_speed: 3,
             reduced_motion: false,
+            focus_mode: false,
             worktree_root: None,
         }
     }
@@ -2938,6 +2948,26 @@ mod tests {
             panel.handle_key(ModalKey::Left),
             ModalOutcome::Emit(ModalAction::SaveSetting {
                 field: Field::Microcompaction,
+                value: Some("false".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn focus_mode_switch_persists_true_and_false() {
+        let mut panel = panel();
+        select_top(&mut panel, RowId::Field(Field::FocusMode));
+        assert_eq!(
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::FocusMode,
+                value: Some("true".to_string()),
+            })
+        );
+        assert_eq!(
+            panel.handle_key(ModalKey::Left),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::FocusMode,
                 value: Some("false".to_string()),
             })
         );

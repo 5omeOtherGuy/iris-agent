@@ -1159,6 +1159,8 @@ pub(crate) fn run_interactive<P: ChatProvider>(
                     .set_reduced_motion(crate::config::reduced_motion_enabled(
                         tui_settings.and_then(|tui| tui.reduced_motion),
                     ));
+                tui.screen
+                    .set_focus_mode(tui_settings.and_then(|tui| tui.focus_mode).unwrap_or(false));
                 for notice in resolution.notices {
                     tui.screen.apply(crate::ui::UiEvent::Notice(notice));
                 }

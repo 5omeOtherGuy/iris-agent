@@ -476,6 +476,7 @@ fn settings_snapshot<P: ChatProvider>(
             .unwrap_or_else(|| "auto".to_string()),
         scroll_speed: tui.and_then(|t| t.scroll_speed).unwrap_or(3),
         reduced_motion: tui.and_then(|t| t.reduced_motion).unwrap_or(false),
+        focus_mode: tui.and_then(|t| t.focus_mode).unwrap_or(false),
         default_approval: cli::current_permission_token(harness).to_string(),
         skip_permissions: harness.skip_permissions(),
         context_token_budget: settings.context_token_budget(),
@@ -628,6 +629,7 @@ fn save_setting_field(
         Field::AltScreen => config::save_alt_screen(value.unwrap_or("auto")),
         Field::ScrollSpeed => config::save_scroll_speed(value.unwrap_or("3").parse()?),
         Field::ReducedMotion => config::save_reduced_motion(parse_bool(value)),
+        Field::FocusMode => config::save_focus_mode(parse_bool(value)),
         Field::DefaultApproval => config::save_default_approval(value.unwrap_or("strict")),
         Field::ContextTokenBudget => {
             config::save_context_token_budget(value.unwrap_or("0").parse()?)

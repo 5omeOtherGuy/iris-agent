@@ -7579,6 +7579,7 @@ mod tests {
             alt_screen: "auto".to_string(),
             scroll_speed: 3,
             reduced_motion: false,
+            focus_mode: false,
             worktree_root: None,
         }
     }
@@ -7635,7 +7636,7 @@ mod tests {
         // session bar) and the window scrolls with the house position row.
         assert!(rendered.contains("SETTINGS"), "{rendered}");
         assert!(rendered.contains("ENGINE"), "{rendered}");
-        assert!(rendered.contains("(1/31)"), "{rendered}");
+        assert!(rendered.contains("(1/32)"), "{rendered}");
         assert!(!rendered.contains("worktree root"), "windowed:\n{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }
