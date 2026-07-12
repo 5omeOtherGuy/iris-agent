@@ -415,22 +415,22 @@ const MAX_VERIFY_MAX_ATTEMPTS: u32 = 10;
 pub(crate) const DEFAULT_WEB_TIMEOUT_MS: u64 = 30_000;
 /// Floor on a web-tool deadline: a sub-second budget cannot complete a real
 /// DNS + TLS + fetch, so it is rejected rather than silently failing calls.
-const MIN_WEB_TIMEOUT_MS: u64 = 1_000;
+pub(crate) const MIN_WEB_TIMEOUT_MS: u64 = 1_000;
 /// Ceiling on a web-tool deadline, so a hand-edited value cannot pin a network
 /// connection open indefinitely.
-const MAX_WEB_TIMEOUT_MS: u64 = 120_000;
+pub(crate) const MAX_WEB_TIMEOUT_MS: u64 = 120_000;
 /// Default hard ceiling on `web_search` results per call when unset.
 pub(crate) const DEFAULT_MAX_SEARCH_RESULTS: u64 = 10;
 /// Absolute ceiling on requested results, bounding token cost regardless of
 /// config.
-const MAX_MAX_SEARCH_RESULTS: u64 = 10;
+pub(crate) const MAX_MAX_SEARCH_RESULTS: u64 = 10;
 /// Default response/output byte cap (200 KiB) when unset.
 pub(crate) const DEFAULT_WEB_MAX_BYTES: u64 = 200 * 1024;
 /// Floor on a byte cap: below 1 KiB no useful page/output survives, so a value
 /// this small is treated as a mistake.
-const MIN_WEB_MAX_BYTES: u64 = 1_024;
+pub(crate) const MIN_WEB_MAX_BYTES: u64 = 1_024;
 /// Ceiling on a byte cap (5 MiB), bounding memory and token cost.
-const MAX_WEB_MAX_BYTES: u64 = 5 * 1024 * 1024;
+pub(crate) const MAX_WEB_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Resolved, validated web-tool bounds. Built by [`Settings::web_bounds`] from
 /// the GLOBAL-ONLY dials and consumed by the registry to configure the web
@@ -1002,6 +1002,77 @@ pub(crate) fn save_read_web_page_backend(backend: &str) -> Result<()> {
         _ => "off",
     };
     update_global(&[("readWebPageBackend", Value::String(backend.to_string()))])
+}
+
+/// Persist or clear the trusted SearXNG endpoint after applying the same
+/// validation used at startup.
+pub(crate) fn save_searxng_url(url: Option<&str>) -> Result<()> {
+    let candidate = url.map(str::trim).filter(|url| !url.is_empty());
+    let validated = Settings {
+        searxng_url: candidate.map(str::to_string),
+        ..Settings::default()
+    }
+    .searxng_url()?;
+    update_global(&[(
+        "searxngUrl",
+        validated.map(Value::String).unwrap_or(Value::Null),
+    )])
+}
+
+fn save_web_number(key: &'static str, value: u64, min: u64, max: u64) -> Result<()> {
+    if !(min..=max).contains(&value) {
+        bail!("{key} must be between {min} and {max}, got {value}");
+    }
+    update_global(&[(key, Value::from(value))])
+}
+
+pub(crate) fn save_search_timeout_ms(value: u64) -> Result<()> {
+    save_web_number(
+        "searchTimeoutMs",
+        value,
+        MIN_WEB_TIMEOUT_MS,
+        MAX_WEB_TIMEOUT_MS,
+    )
+}
+
+pub(crate) fn save_read_timeout_ms(value: u64) -> Result<()> {
+    save_web_number(
+        "readTimeoutMs",
+        value,
+        MIN_WEB_TIMEOUT_MS,
+        MAX_WEB_TIMEOUT_MS,
+    )
+}
+
+pub(crate) fn save_max_search_results(value: u64) -> Result<()> {
+    save_web_number("maxSearchResults", value, 1, MAX_MAX_SEARCH_RESULTS)
+}
+
+pub(crate) fn save_max_search_response_bytes(value: u64) -> Result<()> {
+    save_web_number(
+        "maxSearchResponseBytes",
+        value,
+        MIN_WEB_MAX_BYTES,
+        MAX_WEB_MAX_BYTES,
+    )
+}
+
+pub(crate) fn save_max_read_response_bytes(value: u64) -> Result<()> {
+    save_web_number(
+        "maxReadResponseBytes",
+        value,
+        MIN_WEB_MAX_BYTES,
+        MAX_WEB_MAX_BYTES,
+    )
+}
+
+pub(crate) fn save_max_read_output_bytes(value: u64) -> Result<()> {
+    save_web_number(
+        "maxReadOutputBytes",
+        value,
+        MIN_WEB_MAX_BYTES,
+        MAX_WEB_MAX_BYTES,
+    )
 }
 
 /// Persist the compaction summarizer mode (`excerpts|provider|subagent`) in the
