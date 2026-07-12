@@ -58,7 +58,7 @@ pub(super) fn parameters() -> Value {
 
 pub(super) fn execute(root: &Path, args: &Value) -> Result<super::ToolOutput> {
     let input: GrepInput =
-        serde_json::from_value(args.clone()).context("grep tool arguments must include pattern")?;
+        Deserialize::deserialize(args).context("grep tool arguments must include pattern")?;
     let (text, meta) = grep(root, &input)?;
     Ok(meta.attach(super::ToolOutput::text(text)))
 }

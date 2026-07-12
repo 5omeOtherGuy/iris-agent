@@ -149,7 +149,7 @@ fn engine_round_trips_create_edit_delete_rename_binary() {
     let bin_before = vec![0u8, 159, 146, 150, 255, 0, 1];
     fs::write(&binary, &bin_before).unwrap();
 
-    let mut chain = CheckpointChain::new(root.clone(), "engine1".to_string());
+    let mut chain = CheckpointChain::new(root, "engine1".to_string());
     // Capture pre-task images.
     chain
         .note_before(&edit, Some((b"base\n".to_vec(), Mode::Normal)))
@@ -415,7 +415,7 @@ fn expired_task_auto_settles_accepted_and_deletes_refs() {
         iris_write(&guard, &file, b"old work\n");
         let git_dir = task_state::git_dir(&repo.path).unwrap();
         let task = task_state::load_all(&git_dir).pop().unwrap();
-        (task.task_id.clone(), git_dir)
+        (task.task_id, git_dir)
     };
     assert!(task_ref_count(&repo.path, &task_id) > 0);
 

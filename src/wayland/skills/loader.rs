@@ -778,7 +778,7 @@ mod tests {
             &mut outcome.skills,
             &[
                 CodexSkillRule {
-                    path: Some(path.clone()),
+                    path: Some(path),
                     name: None,
                     enabled: false,
                 },

@@ -107,7 +107,7 @@ fn execute_run(spec: &CampaignSpec, planned: &PlannedRun) -> Result<RunResult> {
     );
     let mut harness = Harness::resumed(
         agent,
-        workspace.clone(),
+        workspace,
         ToolState::new(),
         Some(log),
         entry_ids,

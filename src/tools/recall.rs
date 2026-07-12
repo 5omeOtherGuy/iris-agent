@@ -169,7 +169,7 @@ pub(super) fn execute(
     args: &Value,
 ) -> Result<super::ToolOutput> {
     let input: RecallInput =
-        serde_json::from_value(args.clone()).context("recall tool arguments are malformed")?;
+        Deserialize::deserialize(args).context("recall tool arguments are malformed")?;
     // Optional entry-id span, validated at the boundary: a non-hex bound is
     // malformed input and rejected rather than silently ignored.
     let span = parse_span(input.from.as_deref(), input.to.as_deref())?;

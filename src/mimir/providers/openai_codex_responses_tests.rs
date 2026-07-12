@@ -365,7 +365,7 @@ fn websocket_continuation_sends_only_suffix_when_prefix_matches() {
         "model": "gpt-test",
         "store": false,
         "stream": true,
-        "input": [prior["input"][0].clone(), assistant.clone(), next_user.clone()],
+        "input": [prior["input"][0].clone(), assistant, next_user],
         "tools": []
     });
     let continuation = CodexContinuation {
@@ -387,7 +387,7 @@ fn websocket_continuation_normalizes_server_output_items_for_prefix_match() {
     let prior = json!({
         "model": "gpt-test",
         "store": false,
-        "input": [prior_user.clone()],
+        "input": [prior_user],
         "tools": []
     });
     let response = json!({
@@ -439,7 +439,7 @@ fn websocket_continuation_normalizes_server_output_items_for_prefix_match() {
         "model": "gpt-test",
         "store": false,
         "stream": true,
-        "input": [prior_user, reasoning, assistant, tool_call, tool_result.clone()],
+        "input": [prior_user, reasoning, assistant, tool_call, tool_result],
         "tools": []
     });
     let continuation = CodexContinuation {

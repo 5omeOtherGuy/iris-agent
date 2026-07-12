@@ -424,7 +424,7 @@ fn settings_snapshot<P: ChatProvider>(
         granted_tools: record.allow_tools.iter().cloned().collect(),
         bash_exact: record.allow_bash.iter().cloned().collect(),
         bash_prefix: record.allow_bash_prefix.iter().cloned().collect(),
-        sandbox: record.sandbox.clone(),
+        sandbox: record.sandbox,
     };
     // The MEMORY compaction group reads the RESOLVED tool-result-compaction
     // policy (structured block, or the legacy microcompaction alias); a

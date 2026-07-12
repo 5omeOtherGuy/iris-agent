@@ -1244,7 +1244,7 @@ mod tests {
         let url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com&scope=a+b+c";
         let line = format!("Open: {url}");
         let mut dialog = LoginDialog::new("antigravity", false);
-        dialog.set_lines(vec![line.clone()]);
+        dialog.set_lines(vec![line]);
 
         let width = 40_u16;
         let rendered = dialog.render(width);

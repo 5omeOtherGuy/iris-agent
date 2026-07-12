@@ -33,7 +33,7 @@ pub(super) fn parameters() -> Value {
 
 pub(super) fn execute(root: &Path, args: &Value) -> Result<super::ToolOutput> {
     let input: LsInput =
-        serde_json::from_value(args.clone()).context("ls tool arguments are invalid")?;
+        Deserialize::deserialize(args).context("ls tool arguments are invalid")?;
     ls(root, &input)
 }
 

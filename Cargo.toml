@@ -188,6 +188,15 @@ pr-run-mode = "plan"
 # to treat the divergence from `dist generate` as an error.
 allow-dirty = ["ci"]
 
+# Optimized release profile for source builds (`cargo install`, `cargo build
+# --release`): thin LTO plus a single codegen unit lets LLVM inline and
+# dead-code-eliminate across crate boundaries, which the render/wrap/parse hot
+# paths benefit from. Behavior-identical; only build time goes up. The `dist`
+# profile below inherits this, so prebuilt binaries get the same baseline.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 # Build profile cargo-dist (dist) uses for release artifacts. cargo-dist builds
 # with `--profile dist`; without this section `dist build` fails with
 # "profile `dist` is not defined". Inherits the release profile and enables thin

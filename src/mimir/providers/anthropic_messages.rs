@@ -1984,7 +1984,7 @@ impl AnthropicStreamParser {
                 open_tool_blocks: self.open_tools.len(),
                 open_reasoning_blocks: self.open_reasoning.len(),
                 open_block_indexes,
-                last_event_type: self.last_event_type.clone(),
+                last_event_type: self.last_event_type,
             }));
         }
         if self.text.is_empty() && self.tool_calls.is_empty() && self.reasoning.is_empty() {

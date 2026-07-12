@@ -36,7 +36,7 @@ pub(super) fn execute(
     skill_read_roots: &[std::path::PathBuf],
 ) -> Result<super::ToolOutput> {
     let input: ReadInput =
-        serde_json::from_value(args.clone()).context("read tool arguments must include path")?;
+        Deserialize::deserialize(args).context("read tool arguments must include path")?;
     // Record the read target for the compaction carry (ADR-0044): a successful
     // read's workspace-relative path rides the result metadata so the carry
     // derives from successful results, not raw tool-call arguments.

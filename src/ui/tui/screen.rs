@@ -2870,7 +2870,7 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
         if let Some(prefix) = tree_prefix.clone() {
             spans.push(prefix);
         }
-        spans.push(Span::styled(shown_cwd.clone(), Style::default()));
+        spans.push(Span::styled(shown_cwd, Style::default()));
         spans.extend(vcs_spans);
         if let Some(right) = right {
             let left_w = spans_width(&spans);

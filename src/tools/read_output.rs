@@ -34,7 +34,7 @@ pub(super) fn execute(
     store: Option<&dyn ToolOutputStore>,
     args: &Value,
 ) -> Result<super::ToolOutput> {
-    let input: ReadOutputInput = serde_json::from_value(args.clone())
+    let input: ReadOutputInput = Deserialize::deserialize(args)
         .context("read_output tool arguments must include handle_id")?;
     let store = store.ok_or_else(|| {
         anyhow!("no output handle store is available in this session; nothing to read back")

@@ -1639,7 +1639,7 @@ mod tests {
         full.apply(UiEvent::AssistantText(one.to_string()));
         full.apply(UiEvent::ToolStarted(tool.clone()));
         full.apply(UiEvent::ToolResult {
-            call: tool.clone(),
+            call: tool,
             content: "hi".to_string(),
             exit_code: Some(0),
             duration: Some(std::time::Duration::ZERO),
@@ -1678,7 +1678,7 @@ mod tests {
         let mut screen = Screen::new();
         let _ = screen.wrapped_lines(90);
         let burst = "word ".repeat(100); // 500 bytes, one open paragraph
-        screen.apply(UiEvent::AssistantTextDelta(burst.clone()));
+        screen.apply(UiEvent::AssistantTextDelta(burst));
         // Nothing is shown before the first beat (held in the escapement).
         assert_eq!(
             rendered_needle_count(&mut screen, "word"),
@@ -3113,7 +3113,7 @@ mod tests {
         let call = call_args("bash", json!({ "command": "blob" }));
         screen.apply(UiEvent::ToolStarted(call.clone()));
         screen.apply(UiEvent::ToolOutputDelta {
-            call_id: call.id.clone(),
+            call_id: call.id,
             chunk: "y".repeat(2000),
         });
         let texts: Vec<String> = screen.wrapped_lines(20).iter().map(line_text).collect();
@@ -8684,7 +8684,7 @@ mod tests {
             call_id: call.id.clone(),
             chunk: "partial line\n".to_string(),
         });
-        screen.apply(UiEvent::ToolCancelled(call.clone()));
+        screen.apply(UiEvent::ToolCancelled(call));
         // Compact by default: expand the finalized block to inspect its body.
         screen.toggle_all_panels();
         let rendered = rendered_text(&mut screen, 80, 14);
@@ -8713,7 +8713,7 @@ mod tests {
         });
         surface.render(Size::new(40, 14), &rendered_lines(&mut screen, 40, 14))?;
         screen.apply(UiEvent::ToolResult {
-            call: call.clone(),
+            call,
             content: "hi".to_string(),
             exit_code: Some(0),
             duration: Some(std::time::Duration::from_millis(10)),
