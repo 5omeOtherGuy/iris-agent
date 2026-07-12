@@ -728,7 +728,7 @@ fn rewrite_timestamps(path: &Path, ts_ms: u64) {
         .map(|line| {
             let mut value: Value = serde_json::from_str(line).unwrap();
             if value.get("timestamp").is_some() {
-                value["timestamp"] = json!(ts_ms);
+                value["timestamp"] = Value::from(ts_ms);
             }
             format!("{value}\n")
         })
