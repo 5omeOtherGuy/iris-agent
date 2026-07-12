@@ -465,7 +465,13 @@ fn resolve_web_tools_config(settings: &config::Settings) -> Result<tools::web::W
 
     // Resolve the GLOBAL-ONLY bounds + endpoint (validated at their boundary).
     let bounds = settings.web_bounds()?;
-    let searxng_url = settings.searxng_url()?;
+    // Ignore an unused SearXNG endpoint. A stale typo must not disable another
+    // selected backend; validate it only when query text would be sent there.
+    let searxng_url = if web_search == Some(tools::web::SearchBackend::Searxng) {
+        settings.searxng_url()?
+    } else {
+        None
+    };
     // A SearXNG search backend has no default endpoint, so it needs a trusted
     // `searxngUrl`; fail loudly rather than register a tool that cannot run.
     if web_search == Some(tools::web::SearchBackend::Searxng) && searxng_url.is_none() {
@@ -1832,6 +1838,19 @@ mod tests {
         assert_eq!(menu_next(len - 1, len), 0);
         assert_eq!(menu_prev(0, len), len - 1);
         assert_eq!(menu_prev(1, len), 0);
+    }
+
+    #[test]
+    fn unused_invalid_searxng_url_does_not_break_native_search() {
+        let settings = config::Settings {
+            web_search_backend: Some("native".into()),
+            searxng_url: Some("searx.example".into()),
+            ..config::Settings::default()
+        };
+
+        let web = resolve_web_tools_config(&settings).unwrap();
+        assert_eq!(web.web_search, Some(tools::web::SearchBackend::Native));
+        assert_eq!(web.searxng_url, None);
     }
 
     #[test]

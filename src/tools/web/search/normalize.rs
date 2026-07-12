@@ -9,8 +9,8 @@
 //!   -encodes the host and normalizes legacy numeric IPv4 forms, so our
 //!   canonical form matches what [`policy`](super::super::policy) and the
 //!   connectors see;
-//! - strip a leading `*.` wildcard, a leading `www.`, the scheme, any
-//!   userinfo/port/path, and a trailing FQDN-root dot;
+//! - strip a leading `*.` wildcard, the scheme, any userinfo/port/path, and a
+//!   trailing FQDN-root dot;
 //! - drop entries that cannot be a public-domain filter (empty, single-label,
 //!   or unparseable), recording a truthful reason;
 //! - de-duplicate (order-preserving) and cap each list at [`MAX_DOMAINS`];
@@ -82,6 +82,7 @@ fn normalize_list(name: &str, raw: &[String], reports: &mut Vec<FilterReport>) -
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut duplicates = 0usize;
+    let mut invalid = 0usize;
 
     for entry in raw {
         match normalize_domain(entry) {
@@ -92,12 +93,16 @@ fn normalize_list(name: &str, raw: &[String], reports: &mut Vec<FilterReport>) -
                     duplicates += 1;
                 }
             }
-            None => reports.push(report_with_reason(
-                name,
-                FilterEnforcement::PostFilter,
-                format!("ignored invalid domain {entry:?}"),
-            )),
+            None => invalid += 1,
         }
+    }
+
+    if invalid > 0 {
+        reports.push(report_with_reason(
+            name,
+            FilterEnforcement::PostFilter,
+            format!("ignored {invalid} invalid domain(s)"),
+        ));
     }
 
     if duplicates > 0 {
@@ -153,13 +158,9 @@ pub(super) fn normalize_domain(raw: &str) -> Option<String> {
         Host::Ipv6(a) => a.to_string(),
     };
 
-    // Strip a trailing FQDN-root dot, then a leading `www.` (only when a
-    // registrable label remains, so `www.com` is not reduced to `com`).
+    // Strip a trailing FQDN-root dot. Preserve every hostname label: `www` is
+    // not semantically interchangeable with its parent domain.
     let host = host.trim_end_matches('.');
-    let host = match host.strip_prefix("www.") {
-        Some(rest) if rest.contains('.') => rest,
-        _ => host,
-    };
 
     // A usable domain filter needs at least two labels (a registrable host):
     // reject empty, single-label (`intranet`), and empty-label (`a..com`) forms
@@ -176,10 +177,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonicalizes_scheme_case_www_wildcard_port_path_and_userinfo() {
+    fn canonicalizes_scheme_case_wildcard_port_path_and_userinfo() {
         assert_eq!(
             normalize_domain("https://www.Example.COM/path?q=1"),
-            Some("example.com".to_string())
+            Some("www.example.com".to_string())
         );
         assert_eq!(normalize_domain("*.docs.rs"), Some("docs.rs".to_string()));
         assert_eq!(
@@ -207,12 +208,15 @@ mod tests {
     }
 
     #[test]
-    fn www_is_only_stripped_when_a_registrable_label_remains() {
+    fn www_label_is_preserved() {
         assert_eq!(
             normalize_domain("www.example.com"),
-            Some("example.com".to_string())
+            Some("www.example.com".to_string())
         );
-        // Do not reduce `www.com` to a bare `com`.
+        assert_eq!(
+            normalize_domain("www.gov.uk"),
+            Some("www.gov.uk".to_string())
+        );
         assert_eq!(normalize_domain("www.com"), Some("www.com".to_string()));
     }
 
@@ -232,7 +236,7 @@ mod tests {
             "include_domains",
             &[
                 "example.com".into(),
-                "https://www.example.com/".into(), // canonicalizes to a duplicate
+                "https://example.com/".into(), // canonicalizes to a duplicate
                 "docs.rs".into(),
             ],
             &mut reports,
@@ -270,19 +274,17 @@ mod tests {
         assert_eq!(out, vec!["good.com".to_string()]);
         let ignored: Vec<_> = reports
             .iter()
-            .filter(|r| r.reason.as_deref().unwrap().contains("ignored invalid"))
+            .filter(|r| r.reason.as_deref().unwrap().contains("invalid domain"))
             .collect();
-        assert_eq!(ignored.len(), 2);
+        assert_eq!(ignored.len(), 1);
+        assert!(ignored[0].reason.as_deref().unwrap().contains("2 invalid"));
     }
 
     #[test]
     fn normalize_filters_rejects_include_exclude_conflict() {
         // Both lists name the same site after canonicalization -> hard error.
-        let err = normalize_filters(
-            &["https://www.Example.com/".into()],
-            &["example.com".into()],
-        )
-        .unwrap_err();
+        let err = normalize_filters(&["https://Example.com/".into()], &["example.com".into()])
+            .unwrap_err();
         assert!(err.contains("example.com"), "message was: {err}");
         assert!(err.contains("cannot be required and excluded"));
     }
