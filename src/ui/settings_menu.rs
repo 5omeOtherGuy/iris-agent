@@ -71,7 +71,7 @@ const DEFAULT_LINE_BUDGET: usize = 14;
 /// The per-tool grants the permissions hatch can toggle. Matches the ADR-0027
 /// per-tool approval defaults; `bash` is intentionally absent (bash grants are
 /// per-command, minted at the approval prompt).
-const POLICY_TOOLS: &[&str] = &["write", "edit"];
+const POLICY_TOOLS: &[&str] = &["write", "edit", "web_search", "read_web_page"];
 
 /// A persisted setting adjusted in place on the panel. Pruned relative to the
 /// full `Settings` struct — see the module doc for the service-hatch list.
@@ -99,6 +99,8 @@ pub(crate) enum Field {
     SemanticRetainPerPath,
     ToolClearingKeepRecent,
     PromptCacheRetention,
+    WebSearchBackend,
+    ReadWebPageBackend,
     VerifyCommand,
     VerifyMaxAttempts,
     MutationSafety,
@@ -237,6 +239,13 @@ const SECTIONS: &[Section] = &[
             RowId::Field(Field::SemanticRetainPerPath),
             RowId::Field(Field::ToolClearingKeepRecent),
             RowId::Field(Field::PromptCacheRetention),
+        ],
+    },
+    Section {
+        title: "WEB",
+        rows: &[
+            RowId::Field(Field::WebSearchBackend),
+            RowId::Field(Field::ReadWebPageBackend),
         ],
     },
     Section {
@@ -444,6 +453,12 @@ pub(crate) struct Snapshot {
     pub(crate) semantic_retain_per_path: u64,
     pub(crate) tool_clearing_keep_recent: u64,
     pub(crate) prompt_cache_retention: String,
+    /// Web search tool backend (`off|native|brave|jina`). GLOBAL-ONLY; takes
+    /// effect next session. `off` withholds the tool from the model.
+    pub(crate) web_search_backend: String,
+    /// Read-web-page tool backend (`off|native|jina`). GLOBAL-ONLY; Brave has no
+    /// reader. Takes effect next session.
+    pub(crate) read_web_page_backend: String,
     pub(crate) verify_command: Option<String>,
     pub(crate) verify_max_attempts: u32,
     pub(crate) theme: String,
@@ -462,6 +477,8 @@ impl Snapshot {
             Field::AltScreen => &["auto", "always", "never"],
             Field::DefaultApproval => &["strict", "auto", "never"],
             Field::PromptCacheRetention => &["none", "short", "long"],
+            Field::WebSearchBackend => &["off", "native", "brave", "jina"],
+            Field::ReadWebPageBackend => &["off", "native", "jina"],
             Field::CompactionSummarizer => &["excerpts", "provider", "subagent"],
             Field::CompactionAggressiveness => {
                 &["conservative", "balanced", "aggressive", "custom"]
@@ -486,6 +503,8 @@ impl Snapshot {
             Field::AltScreen => self.alt_screen.clone(),
             Field::DefaultApproval => self.default_approval.clone(),
             Field::PromptCacheRetention => self.prompt_cache_retention.clone(),
+            Field::WebSearchBackend => self.web_search_backend.clone(),
+            Field::ReadWebPageBackend => self.read_web_page_backend.clone(),
             Field::CompactionSummarizer => self.compaction_summarizer.clone(),
             Field::CompactionAggressiveness => self.compaction_aggressiveness.clone(),
             Field::CompactionCacheTiming => self.compaction_cache_timing.clone(),
@@ -506,6 +525,8 @@ impl Snapshot {
             Field::AltScreen => self.alt_screen = value.to_string(),
             Field::DefaultApproval => self.default_approval = value.to_string(),
             Field::PromptCacheRetention => self.prompt_cache_retention = value.to_string(),
+            Field::WebSearchBackend => self.web_search_backend = value.to_string(),
+            Field::ReadWebPageBackend => self.read_web_page_backend = value.to_string(),
             Field::CompactionSummarizer => self.compaction_summarizer = value.to_string(),
             Field::CompactionAggressiveness => self.compaction_aggressiveness = value.to_string(),
             Field::CompactionCacheTiming => self.compaction_cache_timing = value.to_string(),
@@ -596,6 +617,8 @@ fn archetype(row: RowId) -> Archetype {
             Field::AltScreen
             | Field::DefaultApproval
             | Field::PromptCacheRetention
+            | Field::WebSearchBackend
+            | Field::ReadWebPageBackend
             | Field::CompactionSummarizer
             | Field::CompactionAggressiveness
             | Field::CompactionCacheTiming
@@ -659,6 +682,8 @@ fn label(row: RowId) -> &'static str {
             Field::SemanticRetainPerPath => "retain/path",
             Field::ToolClearingKeepRecent => "keep tool uses",
             Field::PromptCacheRetention => "prompt cache",
+            Field::WebSearchBackend => "web search",
+            Field::ReadWebPageBackend => "read page",
             Field::VerifyCommand => "verify",
             Field::VerifyMaxAttempts => "attempts",
             Field::MutationSafety => "mutation safety gates",
@@ -2747,6 +2772,8 @@ mod tests {
             semantic_retain_per_path: 1,
             tool_clearing_keep_recent: 8,
             prompt_cache_retention: "short".to_string(),
+            web_search_backend: "off".to_string(),
+            read_web_page_backend: "off".to_string(),
             verify_command: None,
             verify_max_attempts: 3,
             theme: "terminal".to_string(),
@@ -2975,6 +3002,43 @@ mod tests {
             ModalOutcome::Emit(ModalAction::SaveSetting {
                 field: Field::DefaultApproval,
                 value: Some("auto".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn web_backend_switches_cycle_through_their_options() {
+        let mut panel = panel();
+        select_top(&mut panel, RowId::Field(Field::WebSearchBackend));
+        for expected in ["native", "brave", "jina"] {
+            assert_eq!(
+                panel.handle_key(ModalKey::Right),
+                ModalOutcome::Emit(ModalAction::SaveSetting {
+                    field: Field::WebSearchBackend,
+                    value: Some(expected.to_string()),
+                })
+            );
+        }
+        // Clamps at the last option.
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+
+        select_top(&mut panel, RowId::Field(Field::ReadWebPageBackend));
+        for expected in ["native", "jina"] {
+            assert_eq!(
+                panel.handle_key(ModalKey::Right),
+                ModalOutcome::Emit(ModalAction::SaveSetting {
+                    field: Field::ReadWebPageBackend,
+                    value: Some(expected.to_string()),
+                })
+            );
+        }
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+        // Reverses back down toward `off`.
+        assert_eq!(
+            panel.handle_key(ModalKey::Left),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::ReadWebPageBackend,
+                value: Some("native".to_string()),
             })
         );
     }

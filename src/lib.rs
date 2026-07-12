@@ -435,6 +435,52 @@ fn persist_cli_skip_permissions(cli_skip_permissions: bool) {
     }
 }
 
+/// Resolve the full tool-surface configuration from settings: bash-tool-mode,
+/// the model-compaction tool, and the web-tool backends + keys. An unknown
+/// web-backend value fails loudly here (matching `default_provider`).
+fn resolve_tools_config(settings: &config::Settings) -> Result<tools::ToolsConfig> {
+    Ok(tools::ToolsConfig {
+        bash_tool_mode: settings.bash_tool_mode(),
+        model_compaction_tool: settings.compaction_model_tool(),
+        web: resolve_web_tools_config(settings)?,
+    })
+}
+
+/// Build the [`tools::web::WebToolsConfig`] from settings + the auth store.
+/// Keys are resolved once here (store wins over env); the auth store is only
+/// consulted when a backend is actually enabled, so a fully-off config never
+/// touches the auth file. A missing HOME degrades to env-only key resolution
+/// rather than failing startup.
+fn resolve_web_tools_config(settings: &config::Settings) -> Result<tools::web::WebToolsConfig> {
+    use mimir::auth::storage::{
+        AuthStore, BRAVE_ENV_VAR, BRAVE_SERVICE_ID, JINA_ENV_VAR, JINA_SERVICE_ID,
+    };
+
+    let web_search = settings.web_search_backend()?;
+    let read_web_page = settings.read_web_page_backend()?;
+    if web_search.is_none() && read_web_page.is_none() {
+        return Ok(tools::web::WebToolsConfig::default());
+    }
+
+    let auth = AuthStore::from_env().ok();
+    let key = |service_id: &str, env_var: &str| -> Option<String> {
+        match &auth {
+            Some(store) => store.service_api_key(service_id, env_var),
+            None => std::env::var(env_var)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+        }
+    };
+
+    Ok(tools::web::WebToolsConfig {
+        web_search,
+        read_web_page,
+        brave_key: key(BRAVE_SERVICE_ID, BRAVE_ENV_VAR),
+        jina_key: key(JINA_SERVICE_ID, JINA_ENV_VAR),
+    })
+}
+
 fn persist_session_permission_override(
     persisted_skip_permissions: Option<bool>,
     effective_skip_permissions: bool,
@@ -463,8 +509,7 @@ fn run_agent_inner(
     // from the in-binary shipped fragments plus dynamic context (project docs,
     // date, cwd) and the live tool registry (ADR-0026). Fresh and resume call
     // the same function.
-    let tools =
-        tools::built_in_tools_for(settings.bash_tool_mode(), settings.compaction_model_tool());
+    let tools = tools::built_in_tools_with(&resolve_tools_config(&settings)?);
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     // One resolution point owns provider/model/reasoning precedence; capability
     // validation then rejects a configured reasoning level the model cannot do.
@@ -697,8 +742,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     let permission_defaults =
         startup_permission_defaults(settings.default_approval.as_deref(), skip_permissions);
     persist_cli_skip_permissions(skip_permissions);
-    let tools =
-        tools::built_in_tools_for(settings.bash_tool_mode(), settings.compaction_model_tool());
+    let tools = tools::built_in_tools_with(&resolve_tools_config(&settings)?);
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
@@ -948,8 +992,7 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
     // a fresh session, so a resumed turn gets identical fragment/context output.
     // Onboarding must run first so a newly written ~/.iris/AGENTS.md is picked up.
     wayland::system_prompt::onboarding::maybe_onboard();
-    let tools =
-        tools::built_in_tools_for(settings.bash_tool_mode(), settings.compaction_model_tool());
+    let tools = tools::built_in_tools_with(&resolve_tools_config(&settings)?);
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;

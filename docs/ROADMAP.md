@@ -345,6 +345,20 @@ CLI, and oh-my-pi (omp). Each tool has a tracking issue.
 | `find` | Native: `ignore` + `globset`, no `fd` binary | Claude Code Glob (native) | [#7](https://github.com/5omeOtherGuy/iris-agent/issues/7) |
 | `bash` | Hardened: kernel sandbox + persistent sessions + background jobs + force-quit reaping | Claude Code / Codex | [#3](https://github.com/5omeOtherGuy/iris-agent/issues/3) |
 
+**Web tools [SHIPPED 2026-07-12].** `web_search` and `read_web_page` ship as an
+opt-in, off-by-default egress class (ADR-0058). Per-tool backends
+(`webSearchBackend`: native DuckDuckGo / Brave API / Jina Search;
+`readWebPageBackend`: native pinned-fetch+extraction / Jina Reader) resolve once
+at registry build; a tool is registered only when its backend is not `off`.
+Containment: global-only config, per-call approval with allow-always, one SSRF
+policy (IANA special-purpose deny tables, ports 80/443, no userinfo) applied to
+user and Jina target URLs, a pinned redirect-walking client with a fail-closed
+resolver that closes the DNS-rebinding TOCTOU, decompressed-byte caps, and
+untrusted-content framing. Keys are user-configured service credentials
+(`brave-search`/`jina`) with env fallback. Deferred: concurrency-safe
+classification + fetch semaphore, SearXNG backend, short-TTL read cache, local
+render engine.
+
 Execution order (by impact/effort, independent of the milestone sequence):
 
 1. **Tier 1 — keep the honesty fixes shipped.** The earlier false-advertising

@@ -504,6 +504,14 @@ fn settings_snapshot<P: ChatProvider>(
             .prompt_cache_retention
             .clone()
             .unwrap_or_else(|| "short".to_string()),
+        web_search_backend: settings
+            .web_search_backend
+            .clone()
+            .unwrap_or_else(|| "off".to_string()),
+        read_web_page_backend: settings
+            .read_web_page_backend
+            .clone()
+            .unwrap_or_else(|| "off".to_string()),
         verify_command: settings
             .verify
             .as_ref()
@@ -684,6 +692,8 @@ fn save_setting_field(
         Field::PromptCacheRetention => {
             config::save_prompt_cache_retention(value.unwrap_or("short"))
         }
+        Field::WebSearchBackend => config::save_web_search_backend(value.unwrap_or("off")),
+        Field::ReadWebPageBackend => config::save_read_web_page_backend(value.unwrap_or("off")),
         Field::VerifyCommand => config::save_verify_command(value),
         Field::VerifyMaxAttempts => config::save_verify_max_attempts(value.unwrap_or("3").parse()?),
         Field::WorktreeRoot => config::save_worktree_root(value),
