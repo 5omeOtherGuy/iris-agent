@@ -176,16 +176,16 @@ impl AgentObserver for Recorder {
 
 impl Recorder {
     fn lifecycle(&self, state: CompactionLifecycleState) -> usize {
-        self.events
-            .borrow()
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event,
-                    AgentEvent::CompactionLifecycle { state: seen, .. } if *seen == state
-                )
-            })
-            .count()
+        let events = self.events.borrow();
+        let mut count = 0;
+        for event in events.iter() {
+            if let AgentEvent::CompactionLifecycle { state: seen, .. } = event
+                && *seen == state
+            {
+                count += 1;
+            }
+        }
+        count
     }
 
     fn applied(&self) -> usize {

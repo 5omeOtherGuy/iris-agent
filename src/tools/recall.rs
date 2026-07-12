@@ -335,7 +335,7 @@ fn span_bound_id(turns: &[RecalledTurn], last: bool) -> String {
 fn parse_span(from: Option<&str>, to: Option<&str>) -> Result<Option<(u64, u64)>> {
     let parse = |label: &str, value: &str| -> Result<u64> {
         u64::from_str_radix(value.trim(), 16)
-            .map_err(|_| anyhow!("recall `{label}` must be a hex entry id, got {value:?}"))
+            .map_err(|_| anyhow!("recall `{}` must be a hex entry id, got {:?}", label, value))
     };
     match (from, to) {
         (None, None) => Ok(None),
