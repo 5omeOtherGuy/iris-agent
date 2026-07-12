@@ -48,16 +48,47 @@ pub(super) const DESCRIPTION: &str = "Retrieve ORIGINAL turns from this session.
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
+        "additionalProperties": false,
         "properties": {
-            "handle": { "type": "string", "description": "The recall handle id from a compaction reference (the `recall(handle=...)` marker in the summary). Omit it to address original turns by a standalone `from`/`to` entry-id span instead." },
-            "tool_call_id": { "type": "string", "description": "A tool_call_id from a folded-result stub. Returns the original assistant tool call and result from this session. Exclusive with handle/from/to." },
-            "toolCallId": { "type": "string", "description": "Camel-case alias for tool_call_id. Do not provide both aliases." },
-            "from": { "type": "string", "description": "Inclusive start entry id. With a `handle`, narrows the returned turns to the [from, to] span within the compacted range; without a `handle`, defines a standalone span read directly from this session." },
-            "to": { "type": "string", "description": "Inclusive end entry id for the span (used with `from`)." },
-            "pattern": { "type": "string", "description": "Optional search: return only turns whose content contains this substring, with their entry ids (bounded count)." },
-            "offset": { "type": "integer", "description": "1-indexed turn-group to start the window at (windowed reads only)." },
-            "limit": { "type": "integer", "description": "Maximum turn-groups to return in a windowed read." }
-        }
+            "handle": { "type": "string", "minLength": 1, "description": "The recall handle id from a compaction reference. May be combined with from/to to narrow within that compacted range." },
+            "tool_call_id": { "type": "string", "minLength": 1, "description": "A tool_call_id from a folded-result stub. Returns the original assistant tool call and result from this session." },
+            "from": { "type": "string", "minLength": 1, "description": "Inclusive start entry id. With handle, optionally narrows that range; without handle, must be paired with to." },
+            "to": { "type": "string", "minLength": 1, "description": "Inclusive end entry id. With handle, optionally narrows that range; without handle, must be paired with from." },
+            "pattern": { "type": "string", "minLength": 1, "description": "Optional search: return only turns whose content contains this substring, with their entry ids (bounded count)." },
+            "offset": { "type": "integer", "minimum": 1, "description": "1-indexed turn-group to start the window at (windowed reads only)." },
+            "limit": { "type": "integer", "minimum": 1, "description": "Maximum turn-groups to return in a windowed read." }
+        },
+        "oneOf": [
+            {
+                "title": "Compaction handle",
+                "required": ["handle"],
+                "not": { "required": ["tool_call_id"] }
+            },
+            {
+                "title": "Standalone entry-id span",
+                "required": ["from", "to"],
+                "not": {
+                    "anyOf": [
+                        { "required": ["handle"] },
+                        { "required": ["tool_call_id"] }
+                    ]
+                }
+            },
+            {
+                "title": "Folded tool call",
+                "required": ["tool_call_id"],
+                "not": {
+                    "anyOf": [
+                        { "required": ["handle"] },
+                        { "required": ["from"] },
+                        { "required": ["to"] },
+                        { "required": ["pattern"] },
+                        { "required": ["offset"] },
+                        { "required": ["limit"] }
+                    ]
+                }
+            }
+        ]
     })
 }
 
@@ -134,10 +165,11 @@ pub(crate) fn recall_marker(handle: &str, from: &str, to: &str) -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecallInput {
     #[serde(default)]
     handle: Option<String>,
-    #[serde(default, alias = "toolCallId")]
+    #[serde(default)]
     tool_call_id: Option<String>,
     #[serde(default)]
     from: Option<String>,
@@ -168,34 +200,85 @@ pub(super) fn execute(
     session_span: Option<&dyn SessionSpanReader>,
     args: &Value,
 ) -> Result<super::ToolOutput> {
+    let normalized = normalize_args(args)?;
     let input: RecallInput =
-        Deserialize::deserialize(args).context("recall tool arguments are malformed")?;
-    // Optional entry-id span, validated at the boundary: a non-hex bound is
-    // malformed input and rejected rather than silently ignored.
-    let span = parse_span(input.from.as_deref(), input.to.as_deref())?;
+        Deserialize::deserialize(&normalized).context("recall tool arguments are malformed")?;
 
-    // Exactly one addressing mode. A handle may use a span as a narrowing
-    // modifier; tool-call-id mode is exclusive with every other address.
-    let handle = input
-        .handle
-        .as_deref()
-        .filter(|value| !value.trim().is_empty());
-    let tool_call_id = input
-        .tool_call_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty());
+    let handle = input.handle.as_deref();
+    let tool_call_id = input.tool_call_id.as_deref();
+    let has_from = input.from.is_some();
+    let has_to = input.to.is_some();
+
+    if tool_call_id.is_some()
+        && (handle.is_some()
+            || has_from
+            || has_to
+            || input.pattern.is_some()
+            || input.offset.is_some()
+            || input.limit.is_some())
+    {
+        let conflicts = [
+            (handle.is_some(), "handle"),
+            (has_from, "from"),
+            (has_to, "to"),
+            (input.pattern.is_some(), "pattern"),
+            (input.offset.is_some(), "offset"),
+            (input.limit.is_some(), "limit"),
+        ]
+        .into_iter()
+        .filter_map(|(present, name)| present.then_some(name))
+        .collect::<Vec<_>>()
+        .join("`, `");
+        return Err(anyhow!(
+            "recall mode conflict: `tool_call_id` cannot be combined with `{conflicts}`"
+        ));
+    }
+    if handle.is_none() && tool_call_id.is_none() && has_from != has_to {
+        return Err(anyhow!(
+            "recall standalone span requires both `from` and `to`"
+        ));
+    }
+
+    // Entry-id bounds are validated only after empty-string normalization and
+    // mode selection, so malformed clients receive the most precise error.
+    let span = parse_span(input.from.as_deref(), input.to.as_deref())?;
     if let Some(tool_call_id) = tool_call_id {
-        if handle.is_some() || span.is_some() {
-            return Err(anyhow!(
-                "recall `tool_call_id` is exclusive with `handle`, `from`, and `to`"
-            ));
-        }
         return execute_tool_call(session_span, tool_call_id, &input);
     }
     match handle {
         Some(handle) => execute_handle(store, handle, span, &input),
         None => execute_span(session_span, span, &input),
     }
+}
+
+/// Normalize legacy wire input before Serde sees aliases or validates modes.
+/// Empty strings from schema clients are absent; the unadvertised camel-case
+/// alias remains accepted for compatibility but never coexists with canonical
+/// input during deserialization.
+fn normalize_args(args: &Value) -> Result<Value> {
+    let mut object = args
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow!("recall tool arguments must be an object"))?;
+    object.retain(|key, value| {
+        !matches!(
+            key.as_str(),
+            "handle" | "tool_call_id" | "toolCallId" | "from" | "to" | "pattern"
+        ) || !value.as_str().is_some_and(|value| value.trim().is_empty())
+    });
+
+    if let Some(alias) = object.remove("toolCallId") {
+        if let Some(canonical) = object.get("tool_call_id") {
+            if canonical != &alias {
+                return Err(anyhow!(
+                    "recall tool-call id conflict: `tool_call_id` and legacy `toolCallId` differ"
+                ));
+            }
+        } else {
+            object.insert("tool_call_id".to_string(), alias);
+        }
+    }
+    Ok(Value::Object(object))
 }
 
 fn execute_tool_call(
@@ -551,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_id_mode_returns_the_original_pair_and_accepts_camel_alias() {
+    fn tool_call_id_mode_returns_the_original_pair_and_accepts_unadvertised_legacy_alias() {
         let turns = vec![
             (
                 Some("01".to_string()),
@@ -594,7 +677,8 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("exclusive"), "{error}");
+        assert!(error.contains("mode conflict"), "{error}");
+        assert!(error.contains("`from`"), "{error}");
 
         let error = execute(None, Some(&reader), &json!({"tool_call_id":"missing"}))
             .unwrap_err()
@@ -893,9 +977,66 @@ mod tests {
                 "offset",
                 "pattern",
                 "to",
-                "toolCallId",
                 "tool_call_id",
             ]
         );
+        assert!(params.get("required").is_none());
+        assert_eq!(params["oneOf"].as_array().unwrap().len(), 3);
+        assert_eq!(params["additionalProperties"], json!(false));
+        assert!(!params.to_string().contains("toolCallId"));
+    }
+
+    #[test]
+    fn exact_regression_payload_normalizes_injected_empty_fields() {
+        let messages = [Message::user("Claude Code appears in this original turn")];
+        let ids = [Some("01".to_string())];
+        let (_dir, store, handle) = store_with(&messages, &ids);
+        let payload = json!({
+            "handle": handle,
+            "pattern": "Claude Code",
+            "offset": 1,
+            "limit": 10,
+            "from": "",
+            "to": "",
+            "toolCallId": "",
+            "tool_call_id": ""
+        });
+
+        let normalized = normalize_args(&payload).unwrap();
+        assert_eq!(
+            normalized,
+            json!({
+                "handle": payload["handle"],
+                "pattern": "Claude Code",
+                "offset": 1,
+                "limit": 10
+            })
+        );
+        let out = execute(Some(&store), None, &payload).unwrap();
+        assert!(out.content.contains("Claude Code"), "{}", out.content);
+    }
+
+    #[test]
+    fn conflicting_aliases_and_incomplete_standalone_spans_are_precise_errors() {
+        let alias_error = execute(
+            None,
+            None,
+            &json!({"tool_call_id":"canonical","toolCallId":"legacy"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(alias_error.contains("differ"), "{alias_error}");
+
+        let span_error = execute(None, None, &json!({"from":"01"}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            span_error.contains("requires both `from` and `to`"),
+            "{span_error}"
+        );
+
+        let unknown_error = execute(None, None, &json!({"unknown":""})).unwrap_err();
+        let unknown_error = format!("{unknown_error:#}");
+        assert!(unknown_error.contains("unknown field"), "{unknown_error}");
     }
 }
