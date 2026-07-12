@@ -12,6 +12,13 @@ mod jina;
 
 // Backends reach the shared filter helpers via `super::filters::{...}`.
 
+// Re-exported for the token-efficiency corpus (`web::corpus`) so it can measure
+// the real raw-HTML -> `SearchResult` seam without duplicating the parser
+// (ADR-0036 rule 5). Test-only: the production dispatch uses the parser in
+// place inside `duckduckgo::scrape`.
+#[cfg(test)]
+pub(super) use duckduckgo::parse_html_results;
+
 use tokio_util::sync::CancellationToken;
 
 use super::{FilterReport, SearchBackend, SearchResult, WebToolsConfig};

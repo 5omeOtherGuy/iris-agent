@@ -14,6 +14,9 @@ extend-exclude = [
   "src/tools/find_corpus/",
   # Captured real `ls -la` listings used as ls token-efficiency fixtures.
   "src/tools/ls_corpus/",
+  # Captured real web pages / search responses used as web-tools
+  # token-efficiency fixtures (HTML, Markdown, text/plain); not prose.
+  "src/tools/web/corpus/",
   # Task-scaffold fixtures for the end-to-end tokens-per-task benchmark
   # (issue #210): mini source trees and captured-style test logs, not prose.
   "iris-bench/fixtures/",
