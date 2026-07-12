@@ -809,7 +809,7 @@ fn fifth_compaction_generation_emits_one_degradation_notice() {
         .collect::<Vec<_>>();
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(notices[0].contains("/new"));
-    assert!(notices[0].contains("/compact"));
+    assert!(notices[0].contains("fresh context"));
     assert!(notices[0].contains("recall"));
 }
 
@@ -2187,6 +2187,7 @@ fn hard_ladder_escalates_from_subagent_timeout_to_provider_native_when_supported
         single_turn_hard_ladder_harness(&root.path, &workspace.path);
     let native_requests = Arc::new(Mutex::new(Vec::new()));
     let requests = native_requests.clone();
+    harness.compaction.ladder.as_mut().unwrap().hard = u64::MAX;
     harness.set_provider_compaction_factory(Arc::new(move || {
         Ok(Box::new(NativeCompactionProvider {
             requests: requests.clone(),
@@ -2194,6 +2195,35 @@ fn hard_ladder_escalates_from_subagent_timeout_to_provider_native_when_supported
     }));
     let obs = Recorder::default();
     let token = CancellationToken::new();
+
+    let scheduled = block_on(harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 1,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: harness.output_store.as_ref(),
+            task_state: None,
+            observer: &obs,
+        },
+        &token,
+    ))
+    .unwrap();
+    assert!(matches!(scheduled, ContextDirective::Proceed));
+    assert_eq!(
+        harness.compaction.background.as_ref().map(|job| job.origin),
+        Some(CompactionOrigin::Subagent)
+    );
+
+    // Enabling native mode while a portable job is already running must also
+    // gate the hard-tier native fallback. Normally the next job would select
+    // native as its primary worker.
+    harness.set_provider_native(true);
+    harness.compaction.ladder.as_mut().unwrap().hard =
+        super::context_tokens(&messages).saturating_sub(1);
 
     let directive = block_on(harness.compaction.govern(
         BoundaryContext {
@@ -2213,8 +2243,9 @@ fn hard_ladder_escalates_from_subagent_timeout_to_provider_native_when_supported
     .unwrap();
     assert!(matches!(directive, ContextDirective::Replace { .. }));
 
-    // The subagent timed out and the ladder escalated to provider-native.
-    assert_eq!(native_requests.lock().unwrap().len(), 1);
+    // The subagent timed out and the ladder escalated to provider-native. A
+    // second request is permitted if the first rewrite remains above hard.
+    assert!(!native_requests.lock().unwrap().is_empty());
     let entries = compaction_entries(&path);
     assert!(
         entries
@@ -2236,13 +2267,58 @@ fn hard_ladder_escalates_from_subagent_timeout_to_provider_native_when_supported
 }
 
 #[test]
+fn hard_ladder_skips_supported_native_fallback_without_opt_in() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let (mut harness, path, messages) =
+        single_turn_hard_ladder_harness(&root.path, &workspace.path);
+    let native_requests = Arc::new(Mutex::new(Vec::new()));
+    let requests = native_requests.clone();
+    harness.set_provider_compaction_factory(Arc::new(move || {
+        Ok(Box::new(NativeCompactionProvider {
+            requests: requests.clone(),
+        }))
+    }));
+    let obs = Recorder::default();
+
+    let directive = block_on(harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 1,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: harness.output_store.as_ref(),
+            task_state: None,
+            observer: &obs,
+        },
+        &CancellationToken::new(),
+    ))
+    .unwrap();
+
+    assert!(matches!(directive, ContextDirective::Replace { .. }));
+    assert!(native_requests.lock().unwrap().is_empty());
+    let entries = compaction_entries(&path);
+    assert!(entries.iter().any(|entry| entry["origin"] == "excerpts"));
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["origin"] == "providerNative")
+    );
+}
+
+#[test]
 fn hard_ladder_falls_through_to_excerpts_when_native_capability_is_none() {
     let root = temp_dir();
     let workspace = temp_dir();
     let (mut harness, path, messages) =
         single_turn_hard_ladder_harness(&root.path, &workspace.path);
-    // A provider factory whose compaction capability is None (the default):
-    // the ladder must fall through to deterministic excerpts.
+    // Native mode is opted in, but the provider factory advertises no native
+    // capability, so the portable worker runs and the fallback probe must fall
+    // through to deterministic excerpts.
+    harness.set_provider_native(true);
     harness.set_provider_compaction_factory(Arc::new(|| Ok(Box::new(SilentProvider))));
     let obs = Recorder::default();
     let token = CancellationToken::new();
@@ -2445,6 +2521,128 @@ fn provider_native_origin_timeout_falls_straight_to_excerpts_without_a_second_re
             .iter()
             .any(|entry| entry["origin"] == "providerNative"),
         "a timed-out native job must not apply a provider-native entry: {entries:?}"
+    );
+}
+
+#[test]
+fn planner_prefers_the_largest_pair_safe_run_across_summary_gaps() {
+    let workspace = temp_dir();
+    let messages = vec![
+        Message::user("tiny old fragment"),
+        Message::assistant("tiny answer"),
+        Message::user("[prior compacted summary]"),
+        Message::user(&"large later history ".repeat(500)),
+        Message::assistant(&"large later answer ".repeat(500)),
+    ];
+    let ids = vec![
+        Some("tiny_user".to_string()),
+        Some("tiny_assistant".to_string()),
+        None,
+        Some("large_user".to_string()),
+        Some("large_assistant".to_string()),
+    ];
+    let agent = Agent::resumed(SilentProvider, built_in_tools(), messages.clone());
+    let harness = Harness::resumed(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        None,
+        ids,
+        None,
+    );
+
+    let plan = harness
+        .compaction
+        .plan_manual(&messages, 0)
+        .expect("the later durable run is coverable");
+
+    assert_eq!((plan.start, plan.end), (3, 5));
+    assert_eq!(plan.from_id, "large_user");
+    assert_eq!(plan.to_id, "large_assistant");
+}
+
+#[test]
+fn manual_compact_degrades_when_native_probe_finds_no_worker() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let mut seeded = seed_harness(&root.path, &workspace.path);
+    seeded.harness.set_summarizer(SummarizerKind::Excerpts);
+    seeded.harness.set_provider_native(true);
+    seeded
+        .harness
+        .set_provider_compaction_factory(Arc::new(|| Ok(Box::new(SilentProvider))));
+    let before = super::context_tokens(seeded.harness.messages());
+    let obs = Recorder::default();
+
+    block_on(seeded.harness.compact_now(&obs, &CancellationToken::new()))
+        .expect("manual compaction must use excerpts when no native worker exists");
+
+    assert!(super::context_tokens(seeded.harness.messages()) < before);
+    let entries = compaction_entries(&seeded.path);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["origin"], "excerpts");
+}
+
+struct FailOnContextEvent;
+
+impl AgentObserver for FailOnContextEvent {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        if matches!(
+            event,
+            AgentEvent::ContextPressure { .. }
+                | AgentEvent::CompactionApplied { .. }
+                | AgentEvent::CompactionLifecycle { .. }
+                | AgentEvent::FoldApplied { .. }
+        ) {
+            anyhow::bail!("context-management display channel closed");
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn context_event_failure_cannot_block_or_drop_a_durable_replacement() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let (mut harness, path, messages) = single_turn_hard_harness(&root.path, &workspace.path);
+    harness.set_summarizer(SummarizerKind::Excerpts);
+    let token = CancellationToken::new();
+
+    let directive = block_on(harness.compaction.govern(
+        BoundaryContext {
+            messages: &messages,
+            last_usage: None,
+            round_trip: 1,
+            turn_continues: true,
+        },
+        ApplyContext {
+            workspace: &workspace.path,
+            output_store: harness.output_store.as_ref(),
+            task_state: None,
+            observer: &FailOnContextEvent,
+        },
+        &token,
+    ))
+    .expect("observer telemetry failure must not roll back a durable compaction");
+    let ContextDirective::Replace {
+        messages: compacted,
+    } = directive
+    else {
+        panic!("durable compaction was not returned to Nexus");
+    };
+
+    harness.compaction.persist_messages(&compacted);
+    let store = SessionStore::with_root(root.path.clone());
+    let meta = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|meta| meta.path == path)
+        .unwrap();
+    assert_eq!(
+        store.open(&meta).unwrap().messages,
+        compacted,
+        "live replacement and resume rebuild must stay identical"
     );
 }
 

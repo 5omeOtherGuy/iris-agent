@@ -62,7 +62,7 @@ use compaction::run_compaction_worker;
 use compaction::*;
 pub(crate) use compaction::{
     CompactionWorkerConfig, CompactionWorkerInput, MAX_COMPACTION_INSTRUCTIONS_CHARS,
-    SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS, SummarizerKind,
+    SUMMARY_SYSTEM_PROMPT, SUMMARY_WORKER_MAX_TOOL_ROUNDTRIPS, SummarizerKind,
 };
 use trigger::*;
 
@@ -1805,13 +1805,17 @@ impl<P: ChatProvider> Harness<P> {
             "microcompacted spent tool results"
         );
         self.agent.replace_messages(folded);
-        obs.on_event(AgentEvent::FoldApplied {
-            folds: applied,
-            semantic_dedupe_folds,
-            tool_clearing_folds,
-            reclaimed_tokens_estimate: reclaimed,
-            trigger,
-        })?;
+        emit_context_event(
+            obs,
+            AgentEvent::FoldApplied {
+                folds: applied,
+                semantic_dedupe_folds,
+                tool_clearing_folds,
+                reclaimed_tokens_estimate: reclaimed,
+                trigger,
+            },
+            "microcompaction applied",
+        );
         Ok(applied)
     }
 
@@ -1863,19 +1867,27 @@ impl<P: ChatProvider> Harness<P> {
             .pressure
             .crossing(measurement.tokens, &ladder)
         {
-            obs.on_event(AgentEvent::ContextPressure {
-                tier,
-                measured: measurement.tokens,
-                effective_window: ladder.effective_window,
-                source: measurement.source,
-            })?;
+            emit_context_event(
+                obs,
+                AgentEvent::ContextPressure {
+                    tier,
+                    measured: measurement.tokens,
+                    effective_window: ladder.effective_window,
+                    source: measurement.source,
+                },
+                "context pressure",
+            );
         }
         if ladder.deterministic_only && !self.compaction.tiny_notice_emitted {
             self.compaction.tiny_notice_emitted = true;
-            obs.on_event(AgentEvent::Notice(format!(
-                "context window {} is too small for background summarization; automatic compaction will use deterministic excerpts.",
-                ladder.effective_window
-            )))?;
+            emit_context_event(
+                obs,
+                AgentEvent::Notice(format!(
+                    "context window {} is too small for background summarization; automatic compaction will use deterministic excerpts.",
+                    ladder.effective_window
+                )),
+                "small-window compaction notice",
+            );
         }
 
         match ladder.tier(measurement.tokens) {
@@ -2100,17 +2112,22 @@ impl<P: ChatProvider> Harness<P> {
             return Ok(());
         }
         self.compaction.breaker_notice_emitted = true;
-        obs.on_event(AgentEvent::Notice(format!(
-            "background compaction disabled after {} consecutive failures; deterministic compaction remains active.",
-            self.compaction.consecutive_failures
-        )))
+        emit_context_event(
+            obs,
+            AgentEvent::Notice(format!(
+                "background compaction disabled after {} consecutive failures; deterministic compaction remains active.",
+                self.compaction.consecutive_failures
+            )),
+            "compaction breaker notice",
+        );
+        Ok(())
     }
 
     /// Compact on demand at a safe inter-turn boundary (`/compact`), keeping a
-    /// small recent tail and covering everything older with the summary. Unlike
-    /// [`maybe_auto_compact`](Self::maybe_auto_compact) it needs no budget and
-    /// reports why nothing happened instead of silently no-oping, because the
-    /// user asked.
+    /// small recent tail and replacing the largest pair-safe durable run before
+    /// it. Unlike [`maybe_auto_compact`](Self::maybe_auto_compact) it needs no
+    /// budget and reports why nothing happened instead of silently no-oping,
+    /// because the user asked.
     #[cfg(test)]
     pub(crate) async fn compact_now(
         &mut self,
@@ -2144,39 +2161,47 @@ impl<P: ChatProvider> Harness<P> {
             self.flush_folds(&pending, FoldTrigger::ManualCompact, obs)?;
         }
         let messages = self.agent.messages().to_vec();
-        let Some(plan) = self.plan_compaction(&messages, MANUAL_COMPACT_KEEP_TOKENS) else {
+        let Some(plan) = self
+            .compaction
+            .plan_manual(&messages, MANUAL_COMPACT_KEEP_TOKENS)
+        else {
             return obs.on_event(AgentEvent::Notice(
                 "nothing to compact yet: the context is only recent or not yet persisted turns."
                     .to_string(),
             ));
         };
         let model_backed = self.compaction.has_model_worker();
-        if model_backed {
-            if self.compaction.background.is_none() {
-                let original_instructions = self.compaction.worker.instructions.clone();
-                if let Some(focus) = focus.map(str::trim).filter(|value| !value.is_empty()) {
-                    if !self.compaction.worker.instructions.is_empty() {
-                        self.compaction.worker.instructions.push('\n');
-                    }
-                    self.compaction
-                        .worker
-                        .instructions
-                        .push_str("Manual focus: ");
-                    self.compaction.worker.instructions.push_str(focus);
-                    self.compaction.worker.instructions = self
-                        .compaction
-                        .worker
-                        .instructions
-                        .chars()
-                        .take(MAX_COMPACTION_INSTRUCTIONS_CHARS)
-                        .collect();
+        let mut use_background = self.compaction.background.is_some();
+        if model_backed && !use_background {
+            let original_instructions = self.compaction.worker.instructions.clone();
+            if let Some(focus) = focus.map(str::trim).filter(|value| !value.is_empty()) {
+                if !self.compaction.worker.instructions.is_empty() {
+                    self.compaction.worker.instructions.push('\n');
                 }
-                let started =
-                    self.compaction
-                        .start_background(&messages, plan, &self.workspace, obs, None);
-                self.compaction.worker.instructions = original_instructions;
-                started?;
+                self.compaction
+                    .worker
+                    .instructions
+                    .push_str("Manual focus: ");
+                self.compaction.worker.instructions.push_str(focus);
+                self.compaction.worker.instructions = self
+                    .compaction
+                    .worker
+                    .instructions
+                    .chars()
+                    .take(MAX_COMPACTION_INSTRUCTIONS_CHARS)
+                    .collect();
             }
+            let started = self.compaction.start_background(
+                &messages,
+                plan.clone(),
+                &self.workspace,
+                obs,
+                None,
+            );
+            self.compaction.worker.instructions = original_instructions;
+            use_background = matches!(started?, BackgroundStart::Started);
+        }
+        if use_background {
             let covered = self
                 .compaction
                 .background
@@ -2386,16 +2411,21 @@ impl<P: ChatProvider> Harness<P> {
         worker_usage: Option<ProviderUsage>,
         message: Option<String>,
     ) -> Result<()> {
-        obs.on_event(AgentEvent::CompactionLifecycle {
-            job_id: job.job_id.clone(),
-            state,
-            covered_messages: job.covered_messages,
-            original_tokens_estimate: job.original_tokens,
-            origin: job.origin,
-            worker_usage,
-            trigger_tier: job.trigger_tier,
-            message,
-        })
+        emit_context_event(
+            obs,
+            AgentEvent::CompactionLifecycle {
+                job_id: job.job_id.clone(),
+                state,
+                covered_messages: job.covered_messages,
+                original_tokens_estimate: job.original_tokens,
+                origin: job.origin,
+                worker_usage,
+                trigger_tier: job.trigger_tier,
+                message,
+            },
+            "compaction lifecycle",
+        );
+        Ok(())
     }
 
     fn revalidate_background_plan(&self, job: &BackgroundCompaction) -> Option<CompactionPlan> {
@@ -2632,70 +2662,10 @@ impl<P: ChatProvider> Harness<P> {
         )))
     }
 
-    /// Choose the message range to compact. Keeps the largest recent tail whose
-    /// token sum stays within `keep_target` and compacts the older coverable
-    /// messages before it, clamped to the persisted/id-bearing region and
-    /// adjusted so the covered range never splits a tool-call/tool-result pair.
-    /// `None` when no coverable range remains. Auto-compaction passes a
-    /// low-water fraction of the budget; `/compact` passes the small
-    /// [`MANUAL_COMPACT_KEEP_TOKENS`] tail.
+    /// Choose the next pair-safe, durable range while preserving assistant-turn
+    /// boundaries for automatic compaction.
     fn plan_compaction(&self, messages: &[Message], keep_target: u64) -> Option<CompactionPlan> {
-        // Coverable region: the persisted prefix with known entry ids.
-        let n = self.compaction.persisted.min(messages.len());
-        let mut k = messages.len();
-        let mut tail = 0u64;
-        while k > 0 {
-            let t = message_token_estimate(&messages[k - 1]);
-            if tail.saturating_add(t) > keep_target {
-                break;
-            }
-            tail = tail.saturating_add(t);
-            k -= 1;
-        }
-        // Covered range ends at the tail boundary, never past the coverable
-        // (persisted, id-bearing) region.
-        let mut end = k.min(n);
-        // If the retained tail would begin inside an assistant/tool-use turn,
-        // pull the boundary left so reasoning -> text -> tool calls -> results
-        // stay together. A boundary before a user message (or at EOF) is already
-        // between turns.
-        if end < messages.len() && messages[end].role != Role::User {
-            end = assistant_turn_start(messages, end);
-        }
-        // Start at the first coverable (Some-id) message; bail if none.
-        let mut start = (0..end).find(|&i| {
-            self.compaction
-                .entry_ids
-                .get(i)
-                .is_some_and(Option::is_some)
-        })?;
-        // Keep the covered range a contiguous run of coverable ids.
-        if let Some(none_at) = (start..end).find(|&i| self.compaction.entry_ids[i].is_none()) {
-            end = none_at;
-        }
-        // Never begin a covered range on an orphan tool fragment.
-        while start < end
-            && (messages[start].role == Role::Tool
-                || messages[start].role == Role::AssistantToolCall)
-        {
-            start += 1;
-        }
-        // Never split a tool-call / tool-result pair at the tail boundary.
-        while end > start
-            && (messages[end - 1].role == Role::AssistantToolCall
-                || messages.get(end).is_some_and(|m| m.role == Role::Tool))
-        {
-            end -= 1;
-        }
-        if start >= end {
-            return None;
-        }
-        Some(CompactionPlan {
-            start,
-            end,
-            from_id: self.compaction.entry_ids[start].clone()?,
-            to_id: self.compaction.entry_ids[end - 1].clone()?,
-        })
+        self.compaction.plan(messages, keep_target)
     }
 }
 

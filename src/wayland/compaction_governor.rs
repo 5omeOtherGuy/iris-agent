@@ -207,13 +207,17 @@ impl CompactionEngine {
             );
             folded[plan.index].content = plan.stub.clone();
         }
-        obs.on_event(AgentEvent::FoldApplied {
-            folds: plans.len(),
-            semantic_dedupe_folds,
-            tool_clearing_folds,
-            reclaimed_tokens_estimate: reclaimed,
-            trigger,
-        })?;
+        emit_context_event(
+            obs,
+            AgentEvent::FoldApplied {
+                folds: plans.len(),
+                semantic_dedupe_folds,
+                tool_clearing_folds,
+                reclaimed_tokens_estimate: reclaimed,
+                trigger,
+            },
+            "microcompaction applied",
+        );
         Ok(folded)
     }
 
@@ -260,19 +264,27 @@ impl CompactionEngine {
         let measurement = measure_context(cx.messages, anchor, 0);
         if self.automatic_enabled {
             if let Some(tier) = self.pressure.crossing(measurement.tokens, &ladder) {
-                obs.on_event(AgentEvent::ContextPressure {
-                    tier,
-                    measured: measurement.tokens,
-                    effective_window: ladder.effective_window,
-                    source: measurement.source,
-                })?;
+                emit_context_event(
+                    obs,
+                    AgentEvent::ContextPressure {
+                        tier,
+                        measured: measurement.tokens,
+                        effective_window: ladder.effective_window,
+                        source: measurement.source,
+                    },
+                    "context pressure",
+                );
             }
             if ladder.deterministic_only && !self.tiny_notice_emitted {
                 self.tiny_notice_emitted = true;
-                obs.on_event(AgentEvent::Notice(format!(
-                    "context window {} is too small for background summarization; automatic compaction will use deterministic excerpts.",
-                    ladder.effective_window
-                )))?;
+                emit_context_event(
+                    obs,
+                    AgentEvent::Notice(format!(
+                        "context window {} is too small for background summarization; automatic compaction will use deterministic excerpts.",
+                        ladder.effective_window
+                    )),
+                    "small-window compaction notice",
+                );
             }
         }
 

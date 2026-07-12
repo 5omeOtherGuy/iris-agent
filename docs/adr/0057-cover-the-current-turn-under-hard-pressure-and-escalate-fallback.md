@@ -51,10 +51,9 @@ backstop even after Start could not schedule.
 The subagent fallback becomes a three-rung ladder: **subagent -> provider-native
 -> deterministic excerpts**. When a subagent summary times out at the hard wait,
 fails, or does not shrink, the governor attempts provider-native compaction
-first, and only falls through to excerpts when the active provider does not
-support native compaction or the native attempt itself fails. Eligibility is
-read solely through `ChatProvider::compaction_capability`; no provider name or
-wire field crosses the tier boundary, and the primary summarizer-mode setting
+first only when `compaction.providerNative=auto`, and otherwise falls through to
+excerpts. After that opt-in, capability is read solely through
+`ChatProvider::compaction_capability`; no provider name or wire field crosses the tier boundary, and the primary summarizer-mode setting
 (excerpts/provider/subagent) is unchanged -- the ladder is only the fallback
 chain for the subagent path.
 
@@ -90,11 +89,11 @@ fired.
 - **Why not**: Excerpts are extremely lossy; provider-native compaction already
   exists as a first-class seam and preserves far more at hard pressure.
 
-### Gate the native fallback on the provider-native primary toggle
+### Ignore the provider-native opt-in for the fallback rung
 
-- **Why not**: The toggle selects the primary path. The fallback should fire
-  whenever the active provider is capable, so a subagent-primary session still
-  gets native relief instead of lossy excerpts.
+- **Why not**: It would invoke native compaction after the operator explicitly
+  left it off. The toggle governs every native request; without it the ladder
+  moves directly from the portable worker to deterministic excerpts.
 
 ## Consequences
 

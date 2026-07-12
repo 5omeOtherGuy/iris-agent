@@ -132,11 +132,15 @@ envelope, usage, and `providerNative` origin. Rebuild is byte-identical before
 translation. Only Mimir decides whether the envelope matches the exact adapter
 and model; a selection change discards an in-flight native job.
 
-Decision: `compaction.providerNative=auto` is global-only and the default. The
-legacy Anthropic compact field stays rejected so one reducer has one control.
-Anthropic capability is not advertised below the public 50,000-token trigger
-floor. A rejected model is cached for the process and later jobs use the
-portable ladder.
+Decision: `compaction.providerNative` is global-only and defaults to `off`.
+Explicit `auto` opts into capability-gated native compaction across both primary
+and hard-tier fallback routes and emits a startup warning about model-switch
+behavior. The legacy Anthropic compact field stays rejected so one reducer has
+one control. Anthropic's adapter remains available to the live probe, but
+advertises no native capability after the Claude Code OAuth lane returned
+`400 invalid_request_error`; an explicit `auto` still selects the portable worker
+without a known failed request. OpenAI advertises native support and caches
+rejected models for the process.
 
 Issue: the first real Anthropic probe panicked before the request completed:
 `Cannot drop a runtime in a context where blocking is not allowed. This happens
@@ -158,12 +162,11 @@ probe-gated but does not clear the slice's native-live exit criterion on this
 lane; no success is fabricated.
 
 Decision: the OpenAI v2 `compaction_trigger` shape is pinned by deterministic
-request/response tests and an independently double-gated real probe. The live
-`openai-codex/gpt-5.4-mini` subscription backend accepted it and returned
-exactly one encrypted compaction block. The block does not include portable
-text, so the adapter still does not advertise capability. Accepting it directly
-would violate the cross-provider resume invariant; a future route must
-synthesize and measure text before it can produce a durable entry.
+request/response tests and independently double-gated real probes. The live
+`openai-codex/gpt-5.4-mini` subscription backend returns exactly one encrypted
+compaction block. Iris now obtains a separate OpenAI-authored portable summary,
+combines usage, persists both forms, and advertises the route. The full native
+lifecycle preserves the needle and rebuilds byte-exactly.
 
 Measurement follow-up: the native test's first run is excluded because of the
 runtime panic, and the corrected run is an explicit provider capability failure,

@@ -23,6 +23,16 @@ use crate::wayland::Harness;
 pub(crate) const TASK_WORKFLOW_OFF_NOTICE: &str =
     "task workflow is off - enable with `tasks = true` or `/tasks enable`";
 
+pub(crate) const PROVIDER_NATIVE_COMPACTION_WARNING: &str = "OpenAI native compaction is enabled. Its opaque encrypted continuation block can be reused only by the same OpenAI model. After a model switch, Iris uses a separately generated portable text summary; differences between the two may change subsequent model behavior.";
+
+pub(crate) fn provider_native_compaction_notices(enabled: bool) -> Vec<String> {
+    if enabled {
+        vec![PROVIDER_NATIVE_COMPACTION_WARNING.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Tier-3 runtime mode-switch state: the active [`ModelSelection`], the
 /// assembled system prompt, and a builder that rebuilds a provider for a new
 /// selection. Tier 3 owns this (not the harness): a `/model` `/reasoning` switch
@@ -250,10 +260,11 @@ pub(crate) fn apply_permission_mode<P: ChatProvider>(
     lines
 }
 
-/// Startup-only TUI state: an optional modal to show before the first input
-/// event, whether the home/start page should render, and the session id when
-/// this process already resumed a transcript before entering the loop.
+/// Startup-only UI state: notices to show before the first input event, an
+/// optional TUI modal, whether the home/start page should render, and the session
+/// id when this process already resumed a transcript before entering the loop.
 pub(crate) struct StartupUi {
+    pub(crate) notices: Vec<String>,
     pub(crate) modal: Option<crate::ui::modal::Modal>,
     pub(crate) followup_modal: Option<crate::ui::modal::Modal>,
     pub(crate) start_page: bool,
@@ -1163,6 +1174,9 @@ pub(crate) fn run_interactive<P: ChatProvider>(
                 for notice in resolution.notices {
                     tui.screen.apply(crate::ui::UiEvent::Notice(notice));
                 }
+                for notice in &startup.notices {
+                    tui.screen.apply(crate::ui::UiEvent::Notice(notice.clone()));
+                }
                 return run_tui(harness, tui, switch, swap, startup);
             }
             Err(error) => {
@@ -1180,6 +1194,9 @@ pub(crate) fn run_interactive<P: ChatProvider>(
     // is not a terminal; if TUI creation fails after requesting a startup modal,
     // the branch above errors instead of silently starting a fresh session.
     let mut ui = crate::ui::text::TextUi::stdio();
+    for notice in startup.notices {
+        ui.emit(crate::ui::UiEvent::Notice(notice))?;
+    }
     run_session(harness, &mut ui, switch)
 }
 
@@ -1569,6 +1586,15 @@ mod tests {
                 None => unsafe { env::remove_var(self.key) },
             }
         }
+    }
+
+    #[test]
+    fn provider_native_warning_is_emitted_only_for_explicit_opt_in() {
+        assert!(provider_native_compaction_notices(false).is_empty());
+        assert_eq!(
+            provider_native_compaction_notices(true),
+            vec![PROVIDER_NATIVE_COMPACTION_WARNING.to_string()]
+        );
     }
 
     #[test]

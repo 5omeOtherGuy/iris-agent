@@ -114,9 +114,10 @@ Implemented today:
   prompt-cache keys/24h retention, Anthropic `cache_control`, provider
   usage/cache metadata, and cache-break warnings only when the stable prefix
   provably changed.
-- Anthropic server-side context-management clear edits and capability-gated
-  native compaction for Anthropic and OpenAI, with portable summaries persisted
-  beside provider-owned replay blocks.
+- Anthropic server-side context-management clear edits, a probe-only Anthropic
+  compact adapter, and default-off, capability-gated native OpenAI compaction.
+  Native entries persist portable summaries beside provider-owned replay blocks;
+  unsupported and non-opted-in lanes use the active-provider summarizer.
 - Mimir provider auth/token loading for OpenAI Codex, Anthropic Claude Code
   subscription OAuth reuse, Antigravity Google OAuth, Anthropic/OpenAI API keys,
   and dedicated keys for configured OpenAI-compatible endpoints.
@@ -1517,11 +1518,15 @@ justifies it. Sequence cut 1 first (smallest, unblocks 2-3).
    live job/frozen-fold `/context` detail, and the generation-5 warning. Slice 7
    (ADR-0056) adds the provider-neutral capability seam, additive opaque-block
    persistence, portable cross-provider rebuild, discard-on-selection-change,
-   and the Anthropic compact beta adapter. OpenAI native compaction now pairs
-   the encrypted item with a separate provider-authored portable summary.
-   Provider-native mode and the active-provider summarizer are the defaults;
-   unsupported lanes retain the portable and deterministic fallback ladder.
-   Slice 8 adds the default-off,
+   and the Anthropic compact beta adapter. Its Claude Code OAuth probe returns
+   `400 invalid_request_error`, so Anthropic does not advertise native support
+   and `auto` selects the active-provider summarizer directly. OpenAI native
+   compaction pairs the encrypted item with a separate provider-authored
+   portable summary. Provider summaries are the default for every model; OpenAI
+   native mode is an explicit, warned `compaction.providerNative=auto` opt-in
+   whose hard-tier fallback obeys the same switch. The portable worker uses a
+   compaction-specific system prompt,
+   and unsupported lanes retain the deterministic fallback. Slice 8 adds the default-off,
    project-tunable `request_compaction` model tool. It only schedules the
    existing governor, validates an empty argument object, and consumes one
    request at the next safe continuation boundary even when automatic

@@ -113,9 +113,11 @@ global/user-only.
 
 ADR-0056 supplies the missing durable representation. Compaction entries may
 now persist an adapter-owned `providerBlocks` envelope beside a mandatory,
-self-sufficient text summary. `compaction.providerNative=auto` is global-only,
-the default, and capability-gated. Mimir replays a block only on the same
-adapter and exact model; every other selection uses the text summary.
+self-sufficient text summary. `compaction.providerNative=auto` is global-only
+and explicitly opts into capability-gated native compaction; the default is
+`off`. Mimir replays a block only on the same adapter and exact model; every
+other selection uses the text summary. Iris warns when the opt-in is active
+because the opaque and portable representations may differ after a model switch.
 
 The earlier blanket rejection of Anthropic compact is therefore lifted for the
 normalized provider-native route. The legacy `anthropicContextManagement`

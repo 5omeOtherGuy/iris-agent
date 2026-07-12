@@ -712,8 +712,8 @@ impl Settings {
             .and_then(|value| value.provider_native.as_deref())
             .map(str::trim)
         {
-            Some("off") => Ok(ProviderNativeMode::Off),
-            None | Some("auto") => Ok(ProviderNativeMode::Auto),
+            None | Some("off") => Ok(ProviderNativeMode::Off),
+            Some("auto") => Ok(ProviderNativeMode::Auto),
             Some(_) => bail!("compaction.providerNative must be off|auto"),
         }
     }
@@ -2280,10 +2280,10 @@ mod tests {
     }
 
     #[test]
-    fn provider_native_defaults_auto_and_is_global_only() {
+    fn provider_native_defaults_off_and_is_global_only() {
         assert_eq!(
             Settings::default().compaction_provider_native().unwrap(),
-            ProviderNativeMode::Auto
+            ProviderNativeMode::Off
         );
 
         let dir = temp_dir();

@@ -1477,6 +1477,12 @@ impl Tool for DelayTool {
             while !self.worker_completed.load(Ordering::Acquire) && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            // The provider sets `worker_completed` immediately before its result
+            // reaches the background channel. Yield once more so a saturated
+            // full-suite run can deliver that result before the next boundary.
+            if self.worker_completed.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             Ok(ToolOutput::text("delay complete"))
         })
     }
