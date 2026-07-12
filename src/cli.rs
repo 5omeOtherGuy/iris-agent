@@ -521,10 +521,16 @@ fn handle_reasoning<P: ChatProvider>(
     let provider = switch.selection.provider;
     let model = switch.selection.model.clone();
     if rest.is_empty() {
-        return vec![format!(
-            "usage: /reasoning <{}>",
-            model_capabilities::join_display_levels(provider, &model).replace(", ", "|")
-        )];
+        let levels = model_capabilities::selectable_options(
+            provider,
+            &model,
+            switch.selection.open_ai_compatible.reasoning,
+        )
+        .iter()
+        .map(|option| option.label)
+        .collect::<Vec<_>>()
+        .join("|");
+        return vec![format!("usage: /reasoning <{levels}>")];
     }
     let level = match model_capabilities::parse_level(provider, &model, rest) {
         Ok(level) => level,
@@ -2093,6 +2099,35 @@ mod tests {
         assert_eq!(
             enabled[1],
             "supported reasoning levels: off, low, medium, high"
+        );
+    }
+
+    #[test]
+    fn reasoning_usage_honors_openai_compatible_reasoning_gate() {
+        let (mut harness, _dir) = fake_harness();
+        let build = |_s: &ModelSelection, _p: &str| Ok(FakeProvider::new(vec![]));
+        let mut selected = selection(ProviderId::OpenAiCompatible, "custom-model");
+        let mut switch = Some(ModelSwitch::new(
+            selected.clone(),
+            "PROMPT".to_string(),
+            &build,
+            None,
+        ));
+        assert_eq!(
+            handle_model_command("/reasoning", &mut harness, &mut switch),
+            Some(vec!["usage: /reasoning <off>".to_string()])
+        );
+
+        selected.open_ai_compatible.reasoning = true;
+        switch = Some(ModelSwitch::new(
+            selected,
+            "PROMPT".to_string(),
+            &build,
+            None,
+        ));
+        assert_eq!(
+            handle_model_command("/reasoning", &mut harness, &mut switch),
+            Some(vec!["usage: /reasoning <off|low|medium|high>".to_string()])
         );
     }
 
