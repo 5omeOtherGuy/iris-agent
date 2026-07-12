@@ -260,7 +260,12 @@ fn normalize_args(args: &Value) -> Result<Value> {
         .as_object()
         .cloned()
         .ok_or_else(|| anyhow!("recall tool arguments must be an object"))?;
-    object.retain(|_, value| !value.as_str().is_some_and(|value| value.trim().is_empty()));
+    object.retain(|key, value| {
+        !matches!(
+            key.as_str(),
+            "handle" | "tool_call_id" | "toolCallId" | "from" | "to" | "pattern"
+        ) || !value.as_str().is_some_and(|value| value.trim().is_empty())
+    });
 
     if let Some(alias) = object.remove("toolCallId") {
         if let Some(canonical) = object.get("tool_call_id") {
@@ -1029,5 +1034,9 @@ mod tests {
             span_error.contains("requires both `from` and `to`"),
             "{span_error}"
         );
+
+        let unknown_error = execute(None, None, &json!({"unknown":""})).unwrap_err();
+        let unknown_error = format!("{unknown_error:#}");
+        assert!(unknown_error.contains("unknown field"), "{unknown_error}");
     }
 }
