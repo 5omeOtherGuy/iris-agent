@@ -201,33 +201,13 @@ fn truncate(text: &str, max: usize) -> String {
 
 /// Parse a value into the canonical `CompactionSummary` shape and reject
 /// malformed/missing/unknown/wrong-typed fields. `Ok` means schema-valid.
+/// Delegates to the production validator so the probe can never drift from
+/// the canonical schema again (it once pinned the pre-`preserved_identifiers`
+/// five-field shape and rejected live responses that honored the real schema).
 pub(crate) fn validate_summary(value: &Value) -> Result<(), String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "summary is not a JSON object".to_string())?;
-    const REQUIRED: [&str; 5] = ["goal", "state", "decisions", "key_facts", "next_steps"];
-    for key in object.keys() {
-        if !REQUIRED.contains(&key.as_str()) {
-            return Err(format!("unknown field: {key}"));
-        }
-    }
-    for key in REQUIRED {
-        if !object.contains_key(key) {
-            return Err(format!("missing field: {key}"));
-        }
-    }
-    if !object["goal"].is_string() {
-        return Err("goal is not a string".to_string());
-    }
-    for key in ["state", "decisions", "key_facts", "next_steps"] {
-        let array = object[key]
-            .as_array()
-            .ok_or_else(|| format!("{key} is not an array"))?;
-        if array.iter().any(|item| !item.is_string()) {
-            return Err(format!("{key} contains a non-string item"));
-        }
-    }
-    Ok(())
+    crate::wayland::structured_summary::parse_compaction_summary_value(value)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Assemble the model-emitted JSON from a raw Anthropic Messages SSE body:
@@ -291,7 +271,8 @@ mod tests {
             "state": ["probe written"],
             "decisions": ["native first, forced-tool fallback"],
             "key_facts": ["DEPLOY-KEY-AB12CD34"],
-            "next_steps": ["author ADR"]
+            "next_steps": ["author ADR"],
+            "preserved_identifiers": []
         });
         assert!(validate_summary(&good).is_ok());
         assert!(
