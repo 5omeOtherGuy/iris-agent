@@ -115,6 +115,13 @@ pub(crate) enum HarnessCommand {
     },
 }
 
+pub(crate) struct SettingsResultEvent {
+    pub(crate) result: ActionResult,
+    pub(crate) before: Option<ModelSelection>,
+    pub(crate) after: Option<ModelSelection>,
+    pub(crate) context_tokens: u64,
+}
+
 pub(crate) enum HarnessEvent {
     UiEvent(UiEvent),
     TurnStarted,
@@ -141,13 +148,8 @@ pub(crate) enum HarnessEvent {
     PendingSettingsApplied {
         labels: Vec<String>,
     },
-    ActorState(ActorState),
-    SettingsResult {
-        result: ActionResult,
-        before: Option<ModelSelection>,
-        after: Option<ModelSelection>,
-        context_tokens: u64,
-    },
+    ActorState(Box<ActorState>),
+    SettingsResult(Box<SettingsResultEvent>),
     SettingsActionQueued {
         action: ModalAction,
     },
@@ -343,7 +345,9 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                 }
                 Some(HarnessCommand::Shutdown) | None => return Ok(false),
                 Some(HarnessCommand::RefreshUiState) => {
-                    let _ = self.events.send(HarnessEvent::ActorState(self.state(None)));
+                    let _ = self
+                        .events
+                        .send(HarnessEvent::ActorState(Box::new(self.state(None))));
                 }
                 Some(_) => {}
             }
@@ -367,7 +371,7 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
         let workspace = self.harness.workspace().to_path_buf();
         let _ = self
             .events
-            .send(HarnessEvent::ActorState(active_state.clone()));
+            .send(HarnessEvent::ActorState(Box::new(active_state.clone())));
 
         let (approval_tx, mut approval_rx) = unbounded_channel();
         let bridge = ActorBridge {
@@ -486,7 +490,7 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                                 )));
                             }
                             HarnessCommand::RefreshUiState => {
-                                let _ = self.events.send(HarnessEvent::ActorState(active_state.clone()));
+                                let _ = self.events.send(HarnessEvent::ActorState(Box::new(active_state.clone())));
                             }
                             HarnessCommand::SubmitTurn { text } => {
                                 if !text.trim().is_empty() {
@@ -521,7 +525,9 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
         };
 
         self.apply_pending_settings();
-        let _ = self.events.send(HarnessEvent::ActorState(self.state(None)));
+        let _ = self
+            .events
+            .send(HarnessEvent::ActorState(Box::new(self.state(None))));
         let _ = self.events.send(match active_kind {
             ActiveKind::Turn => HarnessEvent::TurnFinished,
             ActiveKind::Compaction => HarnessEvent::CompactionFinished,
@@ -551,12 +557,14 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
             }
             let after = switch.selection().clone();
             labels.push(label);
-            let _ = self.events.send(HarnessEvent::SettingsResult {
-                result,
-                before: Some(before),
-                after: Some(after),
-                context_tokens: self.harness.context_token_estimate(),
-            });
+            let _ = self.events.send(HarnessEvent::SettingsResult(Box::new(
+                SettingsResultEvent {
+                    result,
+                    before: Some(before),
+                    after: Some(after),
+                    context_tokens: self.harness.context_token_estimate(),
+                },
+            )));
         }
         let _ = self
             .events

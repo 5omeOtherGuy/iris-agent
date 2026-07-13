@@ -37,7 +37,7 @@ use crate::nexus::{AgentObserver, ApprovalDecision, ChatProvider, PermissionMode
 use crate::ui::UiEvent;
 use crate::ui::harness_actor::{
     self, ActiveTokenSlot, ActorState, HarnessActor, HarnessCommand, HarnessEvent, Operation,
-    SettingsOrigin, SteeringMode,
+    SettingsOrigin, SettingsResultEvent, SteeringMode,
 };
 use crate::ui::login::{self, LoginBackend, LoginOutcome, LoginUpdate, OAuthLoginBackend};
 use crate::ui::modal::{LoginDialog, Modal, ModalAction, ModalKey, ModalOutcome};
@@ -2792,13 +2792,16 @@ fn apply_actor_event(
                 )));
             }
         }
-        HarnessEvent::ActorState(state) => apply_actor_state(tui, settings, state),
-        HarnessEvent::SettingsResult {
-            result,
-            before,
-            after,
-            context_tokens,
-        } => apply_settings_result(tui, result, before.as_ref(), after.as_ref(), context_tokens),
+        HarnessEvent::ActorState(state) => apply_actor_state(tui, settings, *state),
+        HarnessEvent::SettingsResult(update) => {
+            let SettingsResultEvent {
+                result,
+                before,
+                after,
+                context_tokens,
+            } = *update;
+            apply_settings_result(tui, result, before.as_ref(), after.as_ref(), context_tokens);
+        }
         HarnessEvent::SettingsActionQueued { action } => {
             deferred.push(DeferredReplay::Action(action));
         }
