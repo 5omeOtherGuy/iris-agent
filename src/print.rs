@@ -13,17 +13,18 @@
 //! path); stdout still carries only the final answer.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::Result;
 use serde::Serialize;
 
 use crate::metrics::TokenFlows;
 use crate::nexus::{
-    AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ReviewContext,
-    ToolCall, ToolEventState,
+    AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, CompletionReason,
+    ReviewContext, ToolCall, ToolEventState, Tools,
 };
 
 /// A parsed `-p`/`--print` invocation: the prompt argument plus whether gated
@@ -109,15 +110,17 @@ pub(crate) fn read_piped_stdin() -> Result<Option<String>> {
 #[derive(Default)]
 pub(crate) struct PrintObserver {
     final_text: RefCell<String>,
-    /// Per-turn token/cache flows folded from `ProviderTurnCompleted.usage`.
-    flows: RefCell<TokenFlows>,
+    /// Completed provider rounds in event order. The raw usage retained beside
+    /// each serialized turn lets `usage_report` derive every v1 total.
+    turns: RefCell<Vec<TurnSample>>,
+    /// Tool invocations in start order. Terminal lifecycle events fill timing;
+    /// output-handle events enrich the same record before it is serialized.
+    tools: RefCell<Vec<UsageTool>>,
+    active_tools: RefCell<HashMap<(String, String), ActiveTool>>,
+    base: UsageBase,
     /// Latest provider/model seen on a completed turn (the run's active cell).
     provider: RefCell<String>,
     model: RefCell<String>,
-    /// Tool uses counted from `ToolLifecycle` `Started` events, by tool name.
-    /// `Started` (not `Succeeded`) is the canonical "one invocation that ran",
-    /// so a tool that errors mid-execution is still counted once.
-    tool_uses: RefCell<BTreeMap<String, u64>>,
     /// When set, the report is (re)written here after every completed provider
     /// turn, so a run that is killed mid-task (e.g. a benchmark agent-timeout)
     /// still leaves the latest token accounting on disk. `None` disables the
@@ -125,12 +128,23 @@ pub(crate) struct PrintObserver {
     usage_path: Option<PathBuf>,
 }
 
+struct TurnSample {
+    turn_id: String,
+    turn: UsageTurn,
+    usage: crate::nexus::ProviderUsage,
+}
+
+struct ActiveTool {
+    started: Instant,
+    index: usize,
+}
+
 impl PrintObserver {
-    /// Build an observer that writes its [`UsageReport`] to `usage_path` after
-    /// each completed provider turn (and on a final flush). `None` disables the
-    /// sink -- the observer still accumulates usage for [`Self::usage_report`].
-    pub(crate) fn new(usage_path: Option<PathBuf>) -> Self {
+    /// Build an observer with the model-visible system-prompt/tool base measured
+    /// before the tool registry moves into the agent.
+    pub(crate) fn with_base(usage_path: Option<PathBuf>, base: UsageBase) -> Self {
         Self {
+            base,
             usage_path,
             ..Self::default()
         }
@@ -161,11 +175,18 @@ impl PrintObserver {
     /// Snapshot the accumulated usage as a serializable report. Borrows only,
     /// so it can be called before [`Self::final_text`] consumes the observer.
     pub(crate) fn usage_report(&self) -> UsageReport {
-        let flows = self.flows.borrow();
-        let tool_uses = self.tool_uses.borrow();
-        UsageReport {
-            provider: self.provider.borrow().clone(),
-            model: self.model.borrow().clone(),
+        let samples = self.turns.borrow();
+        let turns = samples.iter().map(|sample| sample.turn.clone()).collect();
+        let mut flows = TokenFlows::default();
+        for sample in samples.iter() {
+            flows.observe(&sample.usage);
+        }
+        let tools = self.tools.borrow().clone();
+        let mut tool_calls_by_name = BTreeMap::new();
+        for tool in &tools {
+            *tool_calls_by_name.entry(tool.name.clone()).or_insert(0) += 1;
+        }
+        let totals = UsageTotals {
             provider_turns: flows.provider_turns,
             input_tokens: flows.input_tokens,
             output_tokens: flows.output_tokens,
@@ -176,8 +197,17 @@ impl PrintObserver {
             cache_creation_1h_input_tokens: flows.cache_creation_1h_input_tokens,
             cache_creation_reported: flows.cache_creation_reported,
             latest_total_tokens: flows.latest_total_tokens,
-            tool_calls: tool_uses.values().sum(),
-            tool_calls_by_name: tool_uses.clone(),
+            tool_calls: tools.len() as u64,
+            tool_calls_by_name,
+        };
+        UsageReport {
+            provider: self.provider.borrow().clone(),
+            model: self.model.borrow().clone(),
+            base: self.base.clone(),
+            turns,
+            tools,
+            totals: totals.clone(),
+            legacy_totals: totals,
         }
     }
 }
@@ -191,21 +221,110 @@ impl AgentObserver for PrintObserver {
                 *self.final_text.borrow_mut() = text;
             }
             AgentEvent::ProviderTurnCompleted {
-                usage: Some(usage), ..
+                turn_id,
+                usage,
+                completion_reason,
+                timing,
+                ..
             } => {
-                self.provider.replace(usage.provider.clone());
-                self.model.replace(usage.model.clone());
-                self.flows.borrow_mut().observe(&usage);
+                if let Some(usage) = usage {
+                    self.provider.replace(usage.provider.clone());
+                    self.model.replace(usage.model.clone());
+                    let mut turns = self.turns.borrow_mut();
+                    let i = turns.len() as u32;
+                    let fresh = usage
+                        .input_tokens
+                        .saturating_sub(usage.cache_read_input_tokens)
+                        .saturating_sub(usage.cache_write_input_tokens);
+                    turns.push(TurnSample {
+                        turn_id,
+                        turn: UsageTurn {
+                            i,
+                            fresh,
+                            cache_read: usage.cache_read_input_tokens,
+                            cache_write: usage.cache_write_input_tokens,
+                            output: usage.output_tokens,
+                            reasoning: usage.reasoning_output_tokens,
+                            input_full: usage.input_tokens,
+                            duration_ms: duration_ms(timing.duration),
+                            ttft_ms: timing.time_to_first_output.map(duration_ms),
+                            stop_reason: completion_reason.map(completion_reason_name),
+                        },
+                        usage,
+                    });
+                }
                 // Persist incrementally so a mid-task kill (benchmark timeout)
                 // still leaves this turn's cumulative accounting.
                 self.flush_usage();
             }
             AgentEvent::ToolLifecycle {
+                provider_turn_id,
+                call_id,
                 name,
                 state: ToolEventState::Started,
+            } => {
+                let turn = self
+                    .turns
+                    .borrow()
+                    .iter()
+                    .position(|sample| sample.turn_id == provider_turn_id)
+                    .unwrap_or(0) as u32;
+                let mut tools = self.tools.borrow_mut();
+                let index = tools.len();
+                tools.push(UsageTool {
+                    i: index as u32,
+                    turn,
+                    name,
+                    call_id: call_id.clone(),
+                    duration_ms: 0,
+                    offloaded: false,
+                    handle: None,
+                    handle_bytes: None,
+                    handle_lines: None,
+                });
+                self.active_tools.borrow_mut().insert(
+                    (provider_turn_id, call_id),
+                    ActiveTool {
+                        started: Instant::now(),
+                        index,
+                    },
+                );
+            }
+            AgentEvent::OutputHandleStored {
+                provider_turn_id,
+                call_id,
+                handle_id,
+                bytes,
+                lines,
+            } => {
+                if let Some(index) = self
+                    .active_tools
+                    .borrow()
+                    .get(&(provider_turn_id, call_id))
+                    .map(|active| active.index)
+                    && let Some(tool) = self.tools.borrow_mut().get_mut(index)
+                {
+                    tool.offloaded = true;
+                    tool.handle = Some(handle_id);
+                    tool.handle_bytes = Some(bytes as u64);
+                    tool.handle_lines = Some(lines as u64);
+                }
+            }
+            AgentEvent::ToolLifecycle {
+                provider_turn_id,
+                call_id,
+                state:
+                    ToolEventState::Succeeded | ToolEventState::Errored | ToolEventState::Cancelled,
                 ..
             } => {
-                *self.tool_uses.borrow_mut().entry(name).or_insert(0) += 1;
+                if let Some(active) = self
+                    .active_tools
+                    .borrow_mut()
+                    .remove(&(provider_turn_id, call_id))
+                    && let Some(tool) = self.tools.borrow_mut().get_mut(active.index)
+                {
+                    tool.duration_ms = duration_ms(active.started.elapsed());
+                }
             }
             _ => {}
         }
@@ -213,16 +332,98 @@ impl AgentObserver for PrintObserver {
     }
 }
 
-/// End-of-run token/cache/tool accounting for a headless run, emitted as JSON
-/// when `IRIS_USAGE_JSON` names a path. Flow fields mirror
-/// [`crate::metrics::TokenFlows`] (per-turn costs, saturating-summed);
-/// `latest_total_tokens` is the conversation level after the last turn.
-/// `cache_read`/`cache_write` are subsets of `input_tokens` -- never add them
-/// back in. `tool_calls` counts invocations that actually ran.
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn completion_reason_name(reason: CompletionReason) -> &'static str {
+    match reason {
+        CompletionReason::EndTurn => "end_turn",
+        CompletionReason::ToolUse => "tool_use",
+        CompletionReason::MaxOutputTokens => "max_output_tokens",
+        CompletionReason::ContextWindowExceeded => "context_window_exceeded",
+        CompletionReason::StopSequence => "stop_sequence",
+        CompletionReason::Paused => "paused",
+        CompletionReason::Refusal => "refusal",
+        CompletionReason::Other => "other",
+    }
+}
+
+/// Estimated fixed provider context sent before conversation messages.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct UsageBase {
+    pub(crate) system_prompt_tokens: u64,
+    pub(crate) tools: Vec<UsageBaseTool>,
+    pub(crate) tools_total_tokens: u64,
+    pub(crate) base_total_tokens: u64,
+}
+
+impl UsageBase {
+    pub(crate) fn estimate(system_prompt: &str, tools: &Tools) -> Self {
+        let system_prompt_tokens = estimated_tokens(system_prompt);
+        let tools = tools
+            .iter()
+            .map(|tool| {
+                let schema = serde_json::to_string(&tool.parameters())
+                    .expect("serializing a JSON value cannot fail");
+                UsageBaseTool {
+                    name: tool.name().to_string(),
+                    schema_tokens: estimated_tokens(&schema),
+                }
+            })
+            .collect::<Vec<_>>();
+        let tools_total_tokens = tools.iter().map(|tool| tool.schema_tokens).sum::<u64>();
+        Self {
+            system_prompt_tokens,
+            tools,
+            tools_total_tokens,
+            base_total_tokens: system_prompt_tokens.saturating_add(tools_total_tokens),
+        }
+    }
+}
+
+fn estimated_tokens(text: &str) -> u64 {
+    u64::try_from(crate::tools::est_tokens(text)).unwrap_or(u64::MAX)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct UsageReport {
-    pub(crate) provider: String,
-    pub(crate) model: String,
+pub(crate) struct UsageBaseTool {
+    pub(crate) name: String,
+    pub(crate) schema_tokens: u64,
+}
+
+/// Provider-measured token and timing flows for one completed round trip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct UsageTurn {
+    pub(crate) i: u32,
+    pub(crate) fresh: u64,
+    pub(crate) cache_read: u64,
+    pub(crate) cache_write: u64,
+    pub(crate) output: u64,
+    pub(crate) reasoning: u64,
+    pub(crate) input_full: u64,
+    pub(crate) duration_ms: u64,
+    pub(crate) ttft_ms: Option<u64>,
+    pub(crate) stop_reason: Option<&'static str>,
+}
+
+/// One tool invocation, enriched by terminal lifecycle and output-handle events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct UsageTool {
+    pub(crate) i: u32,
+    pub(crate) turn: u32,
+    pub(crate) name: String,
+    pub(crate) call_id: String,
+    pub(crate) duration_ms: u64,
+    pub(crate) offloaded: bool,
+    pub(crate) handle: Option<String>,
+    pub(crate) handle_bytes: Option<u64>,
+    pub(crate) handle_lines: Option<u64>,
+}
+
+/// The cumulative v1 accounting, now rebuilt from the timeline on every flush.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct UsageTotals {
     pub(crate) provider_turns: u32,
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
@@ -237,6 +438,21 @@ pub(crate) struct UsageReport {
     pub(crate) latest_total_tokens: Option<u64>,
     pub(crate) tool_calls: u64,
     pub(crate) tool_calls_by_name: BTreeMap<String, u64>,
+}
+
+/// Headless token/cache/tool timeline emitted when `IRIS_USAGE_JSON` names a
+/// path. `totals` preserves v1 accounting; the flattened copy keeps every v1
+/// top-level JSON key readable by existing consumers while v2 adds structure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct UsageReport {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) base: UsageBase,
+    pub(crate) turns: Vec<UsageTurn>,
+    pub(crate) tools: Vec<UsageTool>,
+    pub(crate) totals: UsageTotals,
+    #[serde(flatten)]
+    legacy_totals: UsageTotals,
 }
 
 /// Write a [`UsageReport`] as pretty JSON to `path`. Best effort: the caller
@@ -441,7 +657,10 @@ mod tests {
         assert_eq!(base.system_prompt_tokens, 2);
         assert_eq!(
             base.tools_total_tokens,
-            base.tools.iter().map(|tool| tool.schema_tokens).sum()
+            base.tools
+                .iter()
+                .map(|tool| tool.schema_tokens)
+                .sum::<u64>()
         );
         assert_eq!(
             base.base_total_tokens,
@@ -524,14 +743,13 @@ mod tests {
         let report = observer.usage_report();
         assert_eq!(
             report.totals.input_tokens,
-            report.turns.iter().map(|turn| turn.input_full).sum()
+            report.turns.iter().map(|turn| turn.input_full).sum::<u64>()
         );
         assert_eq!(
             report.totals.output_tokens,
-            report.turns.iter().map(|turn| turn.output).sum()
+            report.turns.iter().map(|turn| turn.output).sum::<u64>()
         );
-        assert_eq!(report.input_tokens, report.totals.input_tokens);
-        assert_eq!(report.output_tokens, report.totals.output_tokens);
+        assert_eq!(report.legacy_totals, report.totals);
 
         let json = serde_json::to_value(report).unwrap();
         assert_eq!(json["totals"]["input_tokens"], 2500);
@@ -550,16 +768,16 @@ mod tests {
         let report = observer.usage_report();
         assert_eq!(report.provider, "anthropic");
         assert_eq!(report.model, "claude-sonnet-5");
-        assert_eq!(report.provider_turns, 2);
-        assert_eq!(report.input_tokens, 2500);
-        assert_eq!(report.output_tokens, 500);
+        assert_eq!(report.totals.provider_turns, 2);
+        assert_eq!(report.totals.input_tokens, 2500);
+        assert_eq!(report.totals.output_tokens, 500);
         // cache read/write are subsets of input, summed across turns.
-        assert_eq!(report.cache_read_input_tokens, 2200);
-        assert_eq!(report.cache_write_input_tokens, 150);
-        assert_eq!(report.cache_creation_5m_input_tokens, 150);
-        assert!(report.cache_creation_reported);
+        assert_eq!(report.totals.cache_read_input_tokens, 2200);
+        assert_eq!(report.totals.cache_write_input_tokens, 150);
+        assert_eq!(report.totals.cache_creation_5m_input_tokens, 150);
+        assert!(report.totals.cache_creation_reported);
         // total_tokens is a level, replaced by the latest turn (1500 + 300).
-        assert_eq!(report.latest_total_tokens, Some(1800));
+        assert_eq!(report.totals.latest_total_tokens, Some(1800));
     }
 
     #[test]
@@ -578,9 +796,9 @@ mod tests {
             })
             .unwrap();
         let report = observer.usage_report();
-        assert_eq!(report.tool_calls, 3);
-        assert_eq!(report.tool_calls_by_name.get("bash"), Some(&2));
-        assert_eq!(report.tool_calls_by_name.get("read"), Some(&1));
+        assert_eq!(report.totals.tool_calls, 3);
+        assert_eq!(report.totals.tool_calls_by_name.get("bash"), Some(&2));
+        assert_eq!(report.totals.tool_calls_by_name.get("read"), Some(&1));
     }
 
     #[test]
@@ -588,9 +806,9 @@ mod tests {
         let observer = PrintObserver::default();
         observer.on_event(turn_completed(None)).unwrap();
         let report = observer.usage_report();
-        assert_eq!(report.provider_turns, 0);
-        assert_eq!(report.input_tokens, 0);
-        assert!(report.latest_total_tokens.is_none());
+        assert_eq!(report.totals.provider_turns, 0);
+        assert_eq!(report.totals.input_tokens, 0);
+        assert!(report.totals.latest_total_tokens.is_none());
     }
 
     #[test]
@@ -604,7 +822,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
 
-        let observer = PrintObserver::new(Some(path.clone()));
+        let observer = PrintObserver::with_base(Some(path.clone()), UsageBase::default());
         // First completed turn writes the file even though the run has not
         // ended (simulating the state a mid-task kill would leave behind).
         observer
@@ -614,7 +832,9 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).expect("written after turn 1"))
                 .unwrap();
         assert_eq!(after_one["input_tokens"], 1000);
+        assert_eq!(after_one["totals"]["input_tokens"], 1000);
         assert_eq!(after_one["provider_turns"], 1);
+        assert_eq!(after_one["turns"].as_array().unwrap().len(), 1);
 
         // A second turn rewrites with the accumulated totals.
         observer
@@ -637,7 +857,7 @@ mod tests {
             .unwrap();
         observer.flush_usage();
         // usage_report still reflects accumulation for in-process callers.
-        assert_eq!(observer.usage_report().input_tokens, 1000);
+        assert_eq!(observer.usage_report().totals.input_tokens, 1000);
     }
 
     #[test]

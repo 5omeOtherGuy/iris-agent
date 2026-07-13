@@ -14,12 +14,7 @@
 
 use std::time::{Duration, Instant};
 
-/// Rough token estimate: 4 bytes per token, the standard heuristic for
-/// English/code text. Benchmarks compare ratios of this estimate; absolute
-/// counts are not meaningful.
-pub(crate) fn est_tokens(s: &str) -> usize {
-    s.len().div_ceil(4)
-}
+pub(crate) use super::est_tokens;
 
 /// Percentage of estimated tokens removed going from `before` to `after`.
 pub(crate) fn reduction_pct(before: &str, after: &str) -> f64 {
