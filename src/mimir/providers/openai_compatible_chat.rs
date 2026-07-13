@@ -172,8 +172,9 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
                     provider.provider.as_str(),
                     &provider.retry_policy,
                     cancel,
+                    sink,
                     |_| Ok(()),
-                    |_| provider.send_once(url.clone(), &request, sink, cancel),
+                    |_, sink| provider.send_once(url.clone(), &request, sink, cancel),
                 )
             },
             cancel,
