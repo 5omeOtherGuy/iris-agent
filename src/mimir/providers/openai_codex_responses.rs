@@ -181,13 +181,52 @@ impl OpenAiCodexResponsesProvider {
             .map(|output| output.block)
     }
 
+    /// Build a compaction-summary request over this provider's native
+    /// structured-output transport (issue #475 / ADR-0061): `text.format`
+    /// json_schema strict, `tools: []`, `text.verbosity:"low"`, and
+    /// deliberately no top-level `max_output_tokens` (ADR-0061's live probe:
+    /// the `/codex/responses` OAuth lane 400s on it with
+    /// `Unsupported parameter: max_output_tokens`, unlike the OpenAI platform
+    /// Responses API #475's literal JSON was modeled on). Token bounding
+    /// relies on verbosity plus the model's own output cap instead. Pure
+    /// request-building only: callers still send it through the existing
+    /// `OpenAiCodexTokenStore`/`codex_headers`/`resolve_codex_url` path
+    /// themselves.
+    // Reached only from tests until the #472 summarizer wiring slice lands.
+    #[allow(dead_code)]
+    pub(crate) fn build_summary_request(&self, messages: &[Message]) -> Value {
+        build_codex_summary_request(
+            &self.model,
+            &self.system_prompt,
+            messages,
+            self.cache_retention,
+        )
+    }
+
+    /// Build the forced single virtual-tool (`emit_compaction_summary`)
+    /// fallback summary request (issue #475), used only when the native path
+    /// above is rejected as unsupported for this lane/model/auth kind. Iris
+    /// never registers or executes this tool through normal tool
+    /// approval/execution policy: it exists only inside this request builder
+    /// and the matching `wayland::structured_summary` extraction path.
+    // Reached only from tests until the #472 summarizer wiring slice lands.
+    #[allow(dead_code)]
+    pub(crate) fn build_summary_fallback_request(&self, messages: &[Message]) -> Value {
+        build_codex_summary_fallback_request(
+            &self.model,
+            &self.system_prompt,
+            messages,
+            self.cache_retention,
+        )
+    }
+
     /// LIVE capability probe for #475: send one structured-output summary
     /// request over the real Codex OAuth lane and report whether the lane
-    /// honoured it. Reuses the production token store, headers, endpoint, and
-    /// SSE parser so the wire request matches what the compaction summarizer
-    /// would send. `ProbeMode::Native` sets `text.format` json_schema;
-    /// `ProbeMode::ForcedTool` sends the single forced `emit_compaction_summary`
-    /// tool. Never executes any tool.
+    /// honoured it. Reuses the production token store, headers, endpoint,
+    /// request builders (above), and SSE parser so the wire request matches
+    /// what the compaction summarizer would send. `ProbeMode::Native` sets
+    /// `text.format` json_schema; `ProbeMode::ForcedTool` sends the single
+    /// forced `emit_compaction_summary` tool. Never executes any tool.
     #[cfg(test)]
     pub(crate) fn probe_compaction_summary(
         &self,
@@ -195,48 +234,18 @@ impl OpenAiCodexResponsesProvider {
         cancel: &CancellationToken,
     ) -> Result<crate::structured_summary_probe::ProbeOutcome> {
         use crate::structured_summary_probe::{
-            ProbeMode, ProbeOutcome, VIRTUAL_TOOL_NAME, canonical_compaction_schema, toy_transcript,
+            ProbeMode, ProbeOutcome, VIRTUAL_TOOL_NAME, toy_transcript,
         };
         let lane = format!("openai-codex/{}", self.model);
         let messages = vec![Message::user(&toy_transcript())];
-        let mut request = build_codex_request(
-            &self.model,
-            &self.system_prompt,
-            &messages,
-            &Tools::new(Vec::new()),
-            None,
-            None,
-            None,
-            self.cache_retention,
-        );
         // NOTE: the ChatGPT backend-api `/codex/responses` lane rejects
         // `max_output_tokens` (`400 Unsupported parameter`), unlike the OpenAI
-        // platform Responses API that #475 modeled. Production `build_codex_request`
-        // never sends it, so the probe follows production and omits it.
-        match mode {
-            ProbeMode::Native => {
-                request["tools"] = json!([]);
-                request["text"] = json!({
-                    "verbosity": "low",
-                    "format": {
-                        "type": "json_schema",
-                        "name": "compaction_summary",
-                        "strict": true,
-                        "schema": canonical_compaction_schema(),
-                    }
-                });
-            }
-            ProbeMode::ForcedTool => {
-                request["tools"] = json!([{
-                    "type": "function",
-                    "name": VIRTUAL_TOOL_NAME,
-                    "description": "Return the compaction summary.",
-                    "parameters": canonical_compaction_schema(),
-                    "strict": true,
-                }]);
-                request["tool_choice"] = json!({ "type": "function", "name": VIRTUAL_TOOL_NAME });
-            }
-        }
+        // platform Responses API that #475 modeled. `build_summary_request`
+        // follows production and omits it (see its doc comment).
+        let request = match mode {
+            ProbeMode::Native => self.build_summary_request(&messages),
+            ProbeMode::ForcedTool => self.build_summary_fallback_request(&messages),
+        };
 
         let token = self.tokens.access_token(&self.client)?;
         let response = self
@@ -1086,6 +1095,84 @@ fn build_codex_request(
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
     body
+}
+
+/// Build a compaction-summary request using OpenAI's native structured-
+/// output transport (issue #475 / ADR-0061): `text.format` json_schema
+/// strict, `tools: []`, `text.verbosity:"low"`, and deliberately no top-level
+/// `max_output_tokens` -- see [`OpenAiCodexResponsesProvider::build_summary_request`]'s
+/// doc comment for why. Built on [`build_codex_request`] so OAuth-lane
+/// request shaping (store/stream, instructions, input, prompt-cache key,
+/// reasoning) is unchanged; only `tools`/`text` are overridden.
+// Reached only from tests until the #472 summarizer wiring slice lands.
+#[allow(dead_code)]
+fn build_codex_summary_request(
+    model: &str,
+    instructions: &str,
+    messages: &[Message],
+    cache_retention: PromptCacheRetention,
+) -> Value {
+    let mut request = build_codex_request(
+        model,
+        instructions,
+        messages,
+        &Tools::new(Vec::new()),
+        None,
+        None,
+        None,
+        cache_retention,
+    );
+    request["tools"] = json!([]);
+    request["text"] = json!({
+        "verbosity": "low",
+        "format": {
+            "type": "json_schema",
+            "name": "compaction_summary",
+            "strict": true,
+            "schema": crate::wayland::structured_summary::canonical_compaction_schema(),
+        }
+    });
+    request
+}
+
+/// Build the forced single virtual-tool (`emit_compaction_summary`) fallback
+/// summary request (issue #475): the compatibility fallback used only when
+/// the native path above is rejected as unsupported for the active
+/// lane/model/auth kind. Built on [`build_codex_request`] the same way as
+/// [`build_codex_summary_request`]; only `tools`/`tool_choice` are
+/// overridden. Iris never registers or executes this tool through normal
+/// tool approval/execution policy -- it exists only inside this request
+/// builder and the matching `wayland::structured_summary` extraction path.
+// Reached only from tests until the #472 summarizer wiring slice lands.
+#[allow(dead_code)]
+fn build_codex_summary_fallback_request(
+    model: &str,
+    instructions: &str,
+    messages: &[Message],
+    cache_retention: PromptCacheRetention,
+) -> Value {
+    let mut request = build_codex_request(
+        model,
+        instructions,
+        messages,
+        &Tools::new(Vec::new()),
+        None,
+        None,
+        None,
+        cache_retention,
+    );
+    request["tools"] = json!([{
+        "type": "function",
+        "name": crate::wayland::structured_summary::VIRTUAL_TOOL_NAME,
+        "description": "Return the compaction summary.",
+        "parameters": crate::wayland::structured_summary::canonical_compaction_schema(),
+        "strict": true,
+    }]);
+    request["tool_choice"] = json!({
+        "type": "function",
+        "name": crate::wayland::structured_summary::VIRTUAL_TOOL_NAME,
+    });
+    request
 }
 
 #[cfg(test)]
