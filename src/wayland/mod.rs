@@ -2056,8 +2056,20 @@ impl<P: ChatProvider> Harness<P> {
                 break;
             }
             let messages = self.agent.messages().to_vec();
-            let Some(plan) = self.plan_compaction(&messages, keep) else {
-                break;
+            // F19 (c) / F14: the turn-edge deterministic backstop planned with
+            // `Respect`, so once every pre-turn message was summarized it starved
+            // (plan == None) and the Hard branch silently did nothing -- the
+            // governor's mid-turn backstop already uses `HardCurrentTurn`. When
+            // the turn-respecting plan starves at hard pressure, escalate to the
+            // hard-current-turn planner so the orphaned bulk / completed
+            // current-turn content is covered by deterministic excerpts instead
+            // of leaving hard pressure unrelieved.
+            let plan = match self.plan_compaction(&messages, keep) {
+                Some(plan) => plan,
+                None => match self.compaction.plan_manual(&messages, keep) {
+                    Some(plan) => plan,
+                    None => break,
+                },
             };
             self.apply_excerpts_plan(&messages, plan, obs)?;
         }
@@ -2165,10 +2177,18 @@ impl<P: ChatProvider> Harness<P> {
             .compaction
             .plan_manual(&messages, MANUAL_COMPACT_KEEP_TOKENS)
         else {
-            return obs.on_event(AgentEvent::Notice(
-                "nothing to compact yet: the context is only recent or not yet persisted turns."
-                    .to_string(),
-            ));
+            // F19 (d): explain the starvation -- measured context, pressure
+            // tier, and why no range is coverable -- instead of the flat
+            // "only recent or not yet persisted" line that read as a lie at
+            // 268% of the window.
+            let measured = self.context_measurement(0).tokens;
+            let tier = self.compaction.ladder.map(|ladder| ladder.tier(measured));
+            let reason = self
+                .compaction
+                .manual_block_reason(&messages, MANUAL_COMPACT_KEEP_TOKENS);
+            return obs.on_event(AgentEvent::Notice(manual_no_compaction_notice(
+                measured, tier, reason,
+            )));
         };
         let model_backed = self.compaction.has_model_worker();
         let mut use_background = self.compaction.background.is_some();
@@ -2773,13 +2793,91 @@ fn assistant_turn_start(messages: &[Message], mut index: usize) -> usize {
     index
 }
 
+/// Whether a message is a compaction-summary stub. The canonical marker is a
+/// `None` entry id (a run delimiter the planner never covers); this content
+/// check is the defensive backstop for the F16 degraded state where such a stub
+/// carries a durable id and would otherwise be re-compactable. It matches the
+/// deterministic framings produced by [`summarize`]/[`framed_summary`] and the
+/// recall pointer appended to every recall-backed summary body, all of which
+/// are synthesized here and never typed by a user.
+fn is_summary_body(message: &Message) -> bool {
+    if message.role != Role::User {
+        return false;
+    }
+    let content = message.content.trim_start();
+    content.starts_with("[compacted summary of ")
+        || content.starts_with("[auto-compacted summary of ")
+        || message
+            .content
+            .contains("[recall] The original turns of this compacted range")
+}
+
+/// Why a manual `/compact` found no coverable range. Feeds the `/compact` notice
+/// (F19 (d)) so a starved compaction explains itself instead of a flat no-op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ManualBlockReason {
+    /// No turns are durable yet (nothing persisted to cover).
+    NotPersisted,
+    /// Every persisted turn is already covered by a summary.
+    AllCovered,
+    /// The only coverable turns sit inside the protected recent tail.
+    KeepTail,
+    /// Only dangling tool-call/result halves remain; covering them would split a
+    /// pair, so no range is coverable.
+    DanglingHalves,
+}
+
+impl ManualBlockReason {
+    pub(super) fn describe(self) -> &'static str {
+        match self {
+            Self::NotPersisted => "no turns are persisted yet",
+            Self::AllCovered => "every persisted turn is already covered by a summary",
+            Self::KeepTail => "the only coverable turns are inside the protected recent tail",
+            Self::DanglingHalves => {
+                "only dangling tool-call/result halves remain, which cannot be covered without \
+                 splitting a pair"
+            }
+        }
+    }
+}
+
+/// The `/compact` notice shown when no range is coverable: measured context
+/// tokens, the pressure tier, and the reason (F19 (d)).
+fn manual_no_compaction_notice(
+    measured: u64,
+    tier: Option<ContextPressureTier>,
+    reason: ManualBlockReason,
+) -> String {
+    let tier_label = match tier {
+        Some(tier) => format!("{} pressure", tier.as_str()),
+        None => "no measured pressure tier".to_string(),
+    };
+    format!(
+        "nothing to compact: context is ~{measured} tokens ({tier_label}); {}.",
+        reason.describe()
+    )
+}
+
 fn valid_compaction_range(messages: &[Message], start: usize, end: usize) -> bool {
     if start >= end || end > messages.len() {
         return false;
     }
-    if messages[start].role == Role::Tool || messages[start].role == Role::AssistantToolCall {
+    // Start boundary. Reject a leading tool-result half (its call sits before
+    // `start`). A leading assistant tool-call is NOT rejected: when it opens a
+    // complete round its result sits inside the range, so the pair is intact --
+    // this is what lets a "heavy multi-read" run ahead of a summary be covered
+    // (F19). The symmetric guard to `messages[end] == Tool` below is
+    // `messages[start - 1] == AssistantToolCall`: if the message just outside
+    // the start is a tool-call, its result is the covered `start`, so covering
+    // `start` would split that pair.
+    if messages[start].role == Role::Tool {
         return false;
     }
+    if start > 0 && messages[start - 1].role == Role::AssistantToolCall {
+        return false;
+    }
+    // End boundary: reject a trailing tool-call half (its result is excluded) and
+    // an excluded tool-result whose call is the covered `end - 1`.
     if messages[end - 1].role == Role::AssistantToolCall
         || messages.get(end).is_some_and(|m| m.role == Role::Tool)
     {
