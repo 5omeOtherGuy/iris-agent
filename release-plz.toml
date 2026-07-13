@@ -21,10 +21,9 @@ publish = true
 changelog_update = true
 git_tag_enable = false
 git_release_enable = false
-# Iris releases are user-visible feature waves: a `feat:` commit bumps the
-# minor version even on 0.x (0.1.0 -> 0.2.0), reserving patch releases for
-# fix-only tags. Deliberate product choice over Cargo's 0.x convention (which
-# reserves the 0.x minor slot for breaking changes) — pre-1.0 Iris does not
-# promise API stability, and version numbers exist here to tell users how much
-# changed.
-features_always_increment_minor = true
+# Follow Cargo's 0.x convention: on 0.x, `feat:` commits bump the patch
+# version (0.3.1 -> 0.3.2) and the minor slot is reserved for breaking
+# changes. Bumping minor on every feature wave (the previous setting) burns
+# through the 0.x version space too fast for Iris's release cadence —
+# changed 2026-07-13 at Simon's direction.
+features_always_increment_minor = false

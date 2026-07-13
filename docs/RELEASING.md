@@ -30,12 +30,12 @@ Live. `v0.1.0` shipped 2026-07-09 (GitHub release with all nine assets) and
 
 ## Version policy
 
-release-plz computes the next version from conventional commits with
-`features_always_increment_minor = true`: a `feat:` commit bumps the **minor** version even
-on 0.x (`0.1.0 -> 0.2.0`); fix-only releases bump the patch. This is a deliberate product
-choice — pre-1.0 Iris makes no API-stability promise, and the version exists to tell users
-how much changed. The tag must equal `v` + the `Cargo.toml` version so `iris update`
-matches it.
+release-plz computes the next version from conventional commits following Cargo's 0.x
+convention (`features_always_increment_minor = false`, changed 2026-07-13): on 0.x, `feat:`
+and `fix:` commits bump the **patch** version (`0.3.1 -> 0.3.2`) and the minor slot is
+reserved for breaking changes. (Until v0.3.1 the policy was the opposite — every feature
+wave bumped minor — which burned through the 0.x version space too fast.) The tag must
+equal `v` + the `Cargo.toml` version so `iris update` matches it.
 
 ## Prerequisites
 
