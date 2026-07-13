@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.2...iris-agent-v0.3.3) - 2026-07-13
+
+### Added
+
+- add model-driven AskUserQuestion interaction ([#604](https://github.com/5omeOtherGuy/iris-agent/pull/604))
+- load shared user agent instructions ([#605](https://github.com/5omeOtherGuy/iris-agent/pull/605))
+
+### Fixed
+
+- *(compaction)* unstarve the planner on orphan runs before the newest compaction entry ([#608](https://github.com/5omeOtherGuy/iris-agent/pull/608))
+- *(tools)* flatten recall input schema for Anthropic compatibility ([#607](https://github.com/5omeOtherGuy/iris-agent/pull/607))
+
 ## [0.3.2](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.1...iris-agent-v0.3.2) - 2026-07-13
 
 ### Added
