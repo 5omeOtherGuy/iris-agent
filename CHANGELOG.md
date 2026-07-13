@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.3...iris-agent-v0.3.4) - 2026-07-13
+
+### Added
+
+- *(print)* stamp schema_version on headless usage report ([#615](https://github.com/5omeOtherGuy/iris-agent/pull/615))
+- *(compaction)* typed structured-output summaries ([#475](https://github.com/5omeOtherGuy/iris-agent/pull/475)) ([#614](https://github.com/5omeOtherGuy/iris-agent/pull/614))
+- *(print)* emit headless telemetry v2 timelines ([#611](https://github.com/5omeOtherGuy/iris-agent/pull/611))
+- *(print)* emit headless token/tool usage report ([#609](https://github.com/5omeOtherGuy/iris-agent/pull/609))
+
+### Fixed
+
+- use available width for transcript messages ([#616](https://github.com/5omeOtherGuy/iris-agent/pull/616))
+- *(compaction)* observability polish — apply-time route, honest stall warning, cache-metric doc ([#612](https://github.com/5omeOtherGuy/iris-agent/pull/612))
+
 ## [0.3.3](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.2...iris-agent-v0.3.3) - 2026-07-13
 
 ### Added
