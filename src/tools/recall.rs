@@ -43,52 +43,33 @@ const MAX_SEARCH_HITS: usize = 30;
 /// full turns; a windowed read then retrieves the hit verbatim).
 const SEARCH_PREVIEW_CHARS: usize = 200;
 
-pub(super) const DESCRIPTION: &str = "Retrieve ORIGINAL turns from this session. Address them by exactly one mode: a compaction `handle`, a standalone `from`/`to` entry-id span, or a `tool_call_id` shown in a folded tool-result stub. Handle reads may be narrowed by a span. Results can be windowed with `offset`/`limit` or searched with `pattern`; tool-call/tool-result pairs stay intact. Read-only over this session's own transcript: no file path, shell, or approval.";
+// NOTE: Anthropic's Messages API rejects a top-level `oneOf`/`anyOf`/`not` in a
+// tool's `input_schema` (400 invalid_request_error); OpenAI/Codex accepts it,
+// which is how PR #593's combinator block went unnoticed until every request
+// in an Anthropic session started failing. The three-mode exclusivity contract
+// below is therefore stated in prose (description + per-property descriptions)
+// instead of a schema combinator, and enforced server-side in `execute`/
+// `normalize_args` -- see the mode-conflict checks there and the exhaustive
+// forbidden-combination tests in this module.
+pub(super) const DESCRIPTION: &str = "Retrieve ORIGINAL turns from this session. Address them by exactly one of three modes -- do not combine arguments across modes:\n\
+1. `handle` mode: `handle` is required. May be narrowed with `from`/`to`, and/or windowed with `offset`/`limit`, and/or searched with `pattern`. Must NOT be combined with `tool_call_id`.\n\
+2. Span mode: `from` AND `to` are both required together (neither alone). May also use `pattern`/`offset`/`limit`. Must NOT be combined with `handle` or `tool_call_id`.\n\
+3. Folded-tool-call mode: `tool_call_id` (from a folded tool-result stub) is required ALONE -- it must NOT be combined with `handle`, `from`, `to`, `pattern`, `offset`, or `limit`.\n\
+Tool-call/tool-result pairs stay intact in the output. Read-only over this session's own transcript: no file path, shell, or approval.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "handle": { "type": "string", "minLength": 1, "description": "The recall handle id from a compaction reference. May be combined with from/to to narrow within that compacted range." },
-            "tool_call_id": { "type": "string", "minLength": 1, "description": "A tool_call_id from a folded-result stub. Returns the original assistant tool call and result from this session." },
-            "from": { "type": "string", "minLength": 1, "description": "Inclusive start entry id. With handle, optionally narrows that range; without handle, must be paired with to." },
-            "to": { "type": "string", "minLength": 1, "description": "Inclusive end entry id. With handle, optionally narrows that range; without handle, must be paired with from." },
-            "pattern": { "type": "string", "minLength": 1, "description": "Optional search: return only turns whose content contains this substring, with their entry ids (bounded count)." },
-            "offset": { "type": "integer", "minimum": 1, "description": "1-indexed turn-group to start the window at (windowed reads only)." },
-            "limit": { "type": "integer", "minimum": 1, "description": "Maximum turn-groups to return in a windowed read." }
-        },
-        "oneOf": [
-            {
-                "title": "Compaction handle",
-                "required": ["handle"],
-                "not": { "required": ["tool_call_id"] }
-            },
-            {
-                "title": "Standalone entry-id span",
-                "required": ["from", "to"],
-                "not": {
-                    "anyOf": [
-                        { "required": ["handle"] },
-                        { "required": ["tool_call_id"] }
-                    ]
-                }
-            },
-            {
-                "title": "Folded tool call",
-                "required": ["tool_call_id"],
-                "not": {
-                    "anyOf": [
-                        { "required": ["handle"] },
-                        { "required": ["from"] },
-                        { "required": ["to"] },
-                        { "required": ["pattern"] },
-                        { "required": ["offset"] },
-                        { "required": ["limit"] }
-                    ]
-                }
-            }
-        ]
+            "handle": { "type": "string", "minLength": 1, "description": "Mode 1 (handle mode). The recall handle id from a compaction reference. May be combined with from/to/pattern/offset/limit. Must NOT be combined with tool_call_id." },
+            "tool_call_id": { "type": "string", "minLength": 1, "description": "Mode 3 (folded tool call), used ALONE. A tool_call_id from a folded-result stub. Returns the original assistant tool call and result from this session. Must NOT be combined with handle, from, to, pattern, offset, or limit." },
+            "from": { "type": "string", "minLength": 1, "description": "Inclusive start entry id. With handle (mode 1), optionally narrows that range. Without handle (mode 2, span), must be paired with to; must NOT be combined with tool_call_id." },
+            "to": { "type": "string", "minLength": 1, "description": "Inclusive end entry id. With handle (mode 1), optionally narrows that range. Without handle (mode 2, span), must be paired with from; must NOT be combined with tool_call_id." },
+            "pattern": { "type": "string", "minLength": 1, "description": "Optional search, usable with handle mode or span mode: return only turns whose content contains this substring, with their entry ids (bounded count). Must NOT be combined with tool_call_id." },
+            "offset": { "type": "integer", "minimum": 1, "description": "1-indexed turn-group to start the window at (windowed reads only, usable with handle mode or span mode). Must NOT be combined with tool_call_id." },
+            "limit": { "type": "integer", "minimum": 1, "description": "Maximum turn-groups to return in a windowed read (usable with handle mode or span mode). Must NOT be combined with tool_call_id." }
+        }
     })
 }
 
@@ -687,6 +668,83 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_id_conflicts_with_every_other_argument_individually() {
+        // Mode 3 (folded tool call) forbids combining `tool_call_id` with ANY
+        // other argument. Sweep each one individually (not just `from`, as the
+        // test above does) so a regression narrowing the conflict check to a
+        // subset of fields is caught.
+        for (name, value) in [
+            ("handle", json!("some-handle")),
+            ("from", json!("01")),
+            ("to", json!("02")),
+            ("pattern", json!("needle")),
+            ("offset", json!(1)),
+            ("limit", json!(1)),
+        ] {
+            let mut args = serde_json::Map::new();
+            args.insert("tool_call_id".to_string(), json!("call_1"));
+            args.insert(name.to_string(), value);
+            let error = execute(None, None, &Value::Object(args))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("mode conflict"), "{name}: {error}");
+            assert!(error.contains(&format!("`{name}`")), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn standalone_span_supports_pattern_search() {
+        // Valid combination: span mode (`from`+`to`, no `handle`) with `pattern`.
+        // The removed oneOf's span arm only forbade `handle`/`tool_call_id`, so
+        // `pattern` (and `offset`/`limit`, covered separately) stay legal here.
+        let session = FakeSpan(
+            (0..10)
+                .map(|n| {
+                    let content = if n == 4 {
+                        "turn 4 NEEDLE".to_string()
+                    } else {
+                        format!("turn {n}")
+                    };
+                    (Some(format!("{n:02x}")), Message::user(&content))
+                })
+                .collect(),
+        );
+        let out = execute(
+            None,
+            Some(&session),
+            &json!({ "from": "00", "to": "09", "pattern": "NEEDLE" }),
+        )
+        .unwrap();
+        assert_eq!(out.metadata.get("match_count"), Some(&json!(1)));
+        assert!(out.content.contains("id=04"));
+    }
+
+    #[test]
+    fn standalone_span_supports_offset_and_limit_windowing() {
+        // Valid combination: span mode with `offset`/`limit` windowing.
+        let session = FakeSpan(
+            (0..10)
+                .map(|n| {
+                    (
+                        Some(format!("{n:02x}")),
+                        Message::user(&format!("turn {n}")),
+                    )
+                })
+                .collect(),
+        );
+        let out = execute(
+            None,
+            Some(&session),
+            &json!({ "from": "00", "to": "09", "offset": 3, "limit": 2 }),
+        )
+        .unwrap();
+        assert!(out.content.contains("turn 2")); // group #3 (1-indexed)
+        assert!(out.content.contains("turn 3"));
+        assert!(!out.content.contains("turn 4"));
+        assert_eq!(out.metadata.get("truncated"), Some(&json!(true)));
+    }
+
+    #[test]
     fn recall_returns_original_turns_with_pairs_intact() {
         // A user turn, an assistant tool call, and its tool result: recall must
         // return all three and keep the call+result adjacent (one turn-group).
@@ -981,7 +1039,14 @@ mod tests {
             ]
         );
         assert!(params.get("required").is_none());
-        assert_eq!(params["oneOf"].as_array().unwrap().len(), 3);
+        // The schema must be flat: Anthropic's Messages API rejects a top-level
+        // combinator in a tool's `input_schema` (400 invalid_request_error), so
+        // the three-mode exclusivity contract lives in prose (descriptions) and
+        // server-side validation instead, never in `oneOf`/`anyOf`/`not`.
+        assert!(params.get("oneOf").is_none(), "oneOf must not be present");
+        assert!(params.get("anyOf").is_none(), "anyOf must not be present");
+        assert!(params.get("not").is_none(), "not must not be present");
+        assert_eq!(params["type"], json!("object"));
         assert_eq!(params["additionalProperties"], json!(false));
         assert!(!params.to_string().contains("toolCallId"));
     }
