@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 // avoid a config field that triggers nothing, like `contextTokenBudget` already
 // is). Bytes, not lines: context cost tracks bytes/tokens, not line count.
 const MAX_INLINE_TOOL_OUTPUT_BYTES: usize = 50 * 1024;
+const MAX_INTERACTION_FEEDBACK_BYTES: usize = 8 * 1024;
 
 // Head/tail kept in the compact preview of an offloaded output. Their sum is
 // well under MAX_INLINE_TOOL_OUTPUT_BYTES, so an offloaded result is always
@@ -74,6 +75,15 @@ pub(crate) enum ApprovalDecision {
     AllowProject,
     /// Refuse this call. Default for empty/invalid/EOF input (safe-by-default).
     Deny,
+}
+
+/// Result of a required human interaction. Unlike approval, submission carries
+/// the arguments the front-end populated, while rejection can carry bounded
+/// model-visible feedback when the user chooses to continue the conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InteractionOutcome {
+    Submitted(Value),
+    Rejected { feedback: Option<String> },
 }
 
 /// Operator-selected approval preset (ADR-0032). A UX-facing preset over the
@@ -706,6 +716,8 @@ pub(crate) type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput>>
 /// A `!Send` boxed approval future, so `&dyn ApprovalGate` stays object-safe
 /// while `review` is async (and therefore raceable against cancellation).
 pub(crate) type ApprovalFuture<'a> = Pin<Box<dyn Future<Output = Result<ApprovalDecision>> + 'a>>;
+pub(crate) type InteractionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<InteractionOutcome>> + 'a>>;
 
 /// A `!Send` governor future tied to the current loop boundary. The TUI runtime
 /// is single-threaded; model-backed compaction work runs in its own worker and
@@ -918,6 +930,13 @@ pub(crate) trait ApprovalGate {
         allow_project: bool,
         ctx: ReviewContext,
     ) -> ApprovalFuture<'a>;
+
+    /// Request a response for a tool whose purpose is human interaction rather
+    /// than authorization. The safe default rejects, so approval-only hosts can
+    /// never accidentally bypass a required question.
+    fn interact<'a>(&'a self, _call: &'a ToolCall) -> InteractionFuture<'a> {
+        Box::pin(async { Ok(InteractionOutcome::Rejected { feedback: None }) })
+    }
 }
 
 /// Dirty-tree safety seam (issue #262, ADR-0028). Consulted by the core loop
@@ -1171,6 +1190,11 @@ pub(crate) trait Tool {
     fn requires_approval(&self) -> bool {
         false
     }
+    /// Whether execution must pause for a human response. This is independent
+    /// of permission policy and therefore cannot be bypassed by approval modes.
+    fn requires_user_interaction(&self) -> bool {
+        false
+    }
     /// Whether this tool mutates the workspace, so the dirty-tree guard (issue
     /// #262) should capture a baseline on the first such call in a task and
     /// snapshot/verify the protected set around this call. Default: read-only.
@@ -1306,7 +1330,11 @@ impl Tools {
             tools: self
                 .tools
                 .into_iter()
-                .filter(|tool| !tool.is_mutating() && !tool.requires_approval())
+                .filter(|tool| {
+                    !tool.is_mutating()
+                        && !tool.requires_approval()
+                        && !tool.requires_user_interaction()
+                })
                 .collect(),
             caps: self.caps,
         }
@@ -1516,6 +1544,7 @@ enum ToolOutcome {
     Err(anyhow::Error),
     Cancelled,
     Denied,
+    DeniedWithFeedback(String),
 }
 
 fn guard_violation_outcome(
@@ -1887,7 +1916,7 @@ impl<P: ChatProvider> Agent<P> {
                 output: format!("{error:#}"),
                 exit_code: None,
             },
-            ToolOutcome::Denied => VerifyRun::Denied,
+            ToolOutcome::Denied | ToolOutcome::DeniedWithFeedback(_) => VerifyRun::Denied,
             ToolOutcome::Cancelled => VerifyRun::Cancelled,
         };
         // Emit the display-only tool result (proposed/started already fired in
@@ -2586,9 +2615,11 @@ impl<P: ChatProvider> Agent<P> {
     /// that is concurrency-safe and ungated. Gated tools always take the
     /// exclusive path so their approval prompt runs alone.
     fn is_parallelizable(&self, call: &ToolCall) -> bool {
-        self.tools
-            .by_name(&call.name)
-            .is_some_and(|tool| tool.is_concurrency_safe() && !tool.requires_approval())
+        self.tools.by_name(&call.name).is_some_and(|tool| {
+            tool.is_concurrency_safe()
+                && !tool.requires_approval()
+                && !tool.requires_user_interaction()
+        })
     }
 
     /// The exclusive (default) path for one call: approval policy, then a single
@@ -2630,6 +2661,7 @@ impl<P: ChatProvider> Agent<P> {
             .iter()
             .map(|path| crate::display_path::workspace_path(env.workspace, path))
             .collect();
+        let mut interaction_arguments = None;
         if let Some(tool) = self.tools.by_name(&call.name) {
             if let Some(diff) = tool.diff_preview(env.workspace, &call.arguments) {
                 obs.on_event(AgentEvent::DiffPreview {
@@ -2637,7 +2669,35 @@ impl<P: ChatProvider> Agent<P> {
                     diff,
                 })?;
             }
-            if !tool.requires_approval() && !dirty_gate {
+            if tool.requires_user_interaction() {
+                // Required interaction is not approval: every permission mode,
+                // including never-ask and dangerous skip-permissions, must park
+                // here until the user submits, rejects, or cancels the turn.
+                obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
+                let interaction = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Ok(ToolOutcome::Cancelled),
+                    outcome = gate.interact(call) => outcome?,
+                };
+                if token.is_cancelled() {
+                    return Ok(ToolOutcome::Cancelled);
+                }
+                match interaction {
+                    InteractionOutcome::Submitted(arguments) => {
+                        interaction_arguments = Some(arguments);
+                    }
+                    InteractionOutcome::Rejected { feedback: None } => {
+                        return Ok(ToolOutcome::Denied);
+                    }
+                    InteractionOutcome::Rejected {
+                        feedback: Some(feedback),
+                    } => {
+                        return Ok(ToolOutcome::DeniedWithFeedback(
+                            truncate_interaction_feedback(feedback),
+                        ));
+                    }
+                }
+            } else if !tool.requires_approval() && !dirty_gate {
                 obs.on_event(AgentEvent::ToolProposed(call.clone()))?;
             } else if self.skip_permissions {
                 // `--dangerously-skip-permissions` (ADR-0049): the operator has
@@ -2865,7 +2925,9 @@ impl<P: ChatProvider> Agent<P> {
                     output_sink: Some(&emitter),
                     mutation_guard: env.mutation_guard,
                 };
-                let outcome = run_tool(tool, &call.arguments, &call_env, token.child_token()).await;
+                let execution_arguments = interaction_arguments.as_ref().unwrap_or(&call.arguments);
+                let outcome =
+                    run_tool(tool, execution_arguments, &call_env, token.child_token()).await;
                 if let Some(guard) = guard {
                     // Confirm an approved change against the exact bytes the tool
                     // reported writing (ADR-0028 TOCTOU rule). A failed/cancelled
@@ -3011,6 +3073,14 @@ async fn run_parallel(
         .await
 }
 
+fn truncate_interaction_feedback(mut feedback: String) -> String {
+    if feedback.len() > MAX_INTERACTION_FEEDBACK_BYTES {
+        let boundary = feedback.floor_char_boundary(MAX_INTERACTION_FEEDBACK_BYTES);
+        feedback.truncate(boundary);
+    }
+    feedback
+}
+
 /// Run one tool, racing its future against the (child) cancellation token. The
 /// pre-check matters: a synchronous tool body would otherwise run to completion
 /// on the first poll even when already cancelled (the select is `biased` toward
@@ -3077,7 +3147,7 @@ impl OutputHandleMetadata {
 enum ToolResultContract {
     Success(ToolOutput),
     ToolError(Error),
-    Denied,
+    Denied(Option<String>),
     Cancelled,
 }
 
@@ -3091,7 +3161,11 @@ impl ToolResultContract {
     }
 
     fn denied() -> Self {
-        Self::Denied
+        Self::Denied(None)
+    }
+
+    fn denied_with_feedback(feedback: String) -> Self {
+        Self::Denied(Some(feedback))
     }
 
     fn cancelled() -> Self {
@@ -3129,11 +3203,17 @@ impl ToolResultContract {
                 }
                 Value::Object(obj)
             }
-            Self::Denied => json!({
-                "ok": false,
-                "error": "tool call denied by user",
-                "denied": true
-            }),
+            Self::Denied(feedback) => {
+                let mut value = json!({
+                    "ok": false,
+                    "error": "tool call denied by user",
+                    "denied": true
+                });
+                if let Some(feedback) = feedback {
+                    value["feedback"] = Value::String(feedback);
+                }
+                value
+            }
             Self::Cancelled => json!({
                 "ok": false,
                 "error": "tool call cancelled by user",
@@ -3241,6 +3321,19 @@ fn record_call(
                     &call.id,
                     &call.name,
                     &ToolResultContract::denied().into_wire_json(),
+                )
+                .with_provider_turn_id(provider_turn_id),
+            );
+            emit_tool_lifecycle(obs, provider_turn_id, call, ToolEventState::Denied)?;
+            AgentEvent::ToolDenied(call.clone())
+        }
+        ToolOutcome::DeniedWithFeedback(feedback) => {
+            tracing::warn!(tool = %call.name, "tool call denied with feedback");
+            messages.push(
+                Message::tool_result(
+                    &call.id,
+                    &call.name,
+                    &ToolResultContract::denied_with_feedback(feedback).into_wire_json(),
                 )
                 .with_provider_turn_id(provider_turn_id),
             );

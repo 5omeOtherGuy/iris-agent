@@ -2175,6 +2175,11 @@ fn handle_active_modal_event(
             screen.close_modal();
             true
         }
+        ModalOutcome::Emit(ModalAction::ResolveUserQuestion(outcome)) => {
+            let _ = commands.send(HarnessCommand::ResolveInteraction { outcome });
+            screen.close_modal();
+            true
+        }
         ModalOutcome::Emit(ModalAction::InsertSkillMention { name, path }) => {
             screen.close_modal();
             screen
@@ -2326,7 +2331,10 @@ fn handle_active_event(
         }
         // Escape closes focused overlays before it can deny an approval or
         // cancel the operation.
-        if key.code == KeyCode::Esc && screen.focus() == FocusTarget::Modal {
+        if key.code == KeyCode::Esc
+            && screen.focus() == FocusTarget::Modal
+            && !matches!(screen.modal.as_ref(), Some(Modal::AskUserQuestion(_)))
+        {
             screen.close_modal();
             return true;
         }
@@ -2363,7 +2371,7 @@ fn handle_active_event(
                 commands,
             );
         }
-        if key.code == KeyCode::Esc {
+        if key.code == KeyCode::Esc && screen.focus() != FocusTarget::Modal {
             let _ = commands.send(HarnessCommand::CancelActive);
             return true;
         }
@@ -2644,6 +2652,7 @@ async fn run_harness_op<P: ChatProvider>(
                         &mut pending,
                         &mut settings,
                         &mut deferred,
+                        &channels.commands,
                     );
                     sync_esc_cancel_enabled(current_turn, &pending, &tui.screen);
                 }
@@ -2664,6 +2673,7 @@ async fn run_harness_op<P: ChatProvider>(
                     &mut pending,
                     &mut settings,
                     &mut deferred,
+                    &channels.commands,
                 );
                 sync_esc_cancel_enabled(current_turn, &pending, &tui.screen);
                 if refresh_git {
@@ -2727,6 +2737,7 @@ fn apply_actor_event(
     pending: &mut Option<PendingApproval>,
     settings: &mut Option<settings_menu::Snapshot>,
     deferred: &mut Vec<DeferredReplay>,
+    commands: &UnboundedSender<HarnessCommand>,
 ) {
     match event {
         HarnessEvent::UiEvent(event) => tui.screen.apply(event),
@@ -2772,6 +2783,26 @@ fn apply_actor_event(
         HarnessEvent::ApprovalCleared { approved } => {
             *pending = None;
             tui.screen.clear_approval(approved);
+        }
+        HarnessEvent::InteractionRequested { call } => {
+            match crate::ui::ask_user_question::AskUserDialog::from_arguments(&call.arguments) {
+                Ok(dialog) => tui.screen.open_modal(Modal::AskUserQuestion(dialog)),
+                Err(error) => {
+                    tui.screen.apply(UiEvent::Notice(format!(
+                        "invalid AskUserQuestion input: {error:#}"
+                    )));
+                    let _ = commands.send(HarnessCommand::ResolveInteraction {
+                        outcome: crate::nexus::InteractionOutcome::Rejected {
+                            feedback: Some(format!("AskUserQuestion input was invalid: {error}")),
+                        },
+                    });
+                }
+            }
+        }
+        HarnessEvent::InteractionCleared => {
+            if matches!(tui.screen.modal.as_ref(), Some(Modal::AskUserQuestion(_))) {
+                tui.screen.close_modal();
+            }
         }
         HarnessEvent::SettingsApplied { lines } => apply_notices(tui, lines),
         HarnessEvent::SettingsQueued { label, reason, row } => {
@@ -3569,6 +3600,8 @@ fn to_modal_key(event: &Event) -> Option<ModalKey> {
         KeyCode::Down => ModalKey::Down,
         KeyCode::Left if !ctrl && !alt => ModalKey::Left,
         KeyCode::Right if !ctrl && !alt => ModalKey::Right,
+        KeyCode::Tab => ModalKey::Tab,
+        KeyCode::BackTab => ModalKey::BackTab,
         KeyCode::Enter => ModalKey::Enter,
         KeyCode::Esc => ModalKey::Esc,
         KeyCode::Backspace => ModalKey::Backspace,
@@ -6327,8 +6360,7 @@ mod tests {
     fn to_modal_key_maps_navigation_and_chords() {
         assert_eq!(to_modal_key(&key(KeyCode::Up)), Some(ModalKey::Up));
         assert_eq!(to_modal_key(&key(KeyCode::Enter)), Some(ModalKey::Enter));
-        // Tab is not consumed by any modal; it maps to None so it falls through.
-        assert_eq!(to_modal_key(&key(KeyCode::Tab)), None);
+        assert_eq!(to_modal_key(&key(KeyCode::Tab)), Some(ModalKey::Tab));
         assert_eq!(
             to_modal_key(&key(KeyCode::Char('j'))),
             Some(ModalKey::Char('j'))

@@ -25,7 +25,7 @@
 //! - One module per tool: [`read`], [`bash`], [`edit`], [`write`],
 //!   [`grep`], [`find`], [`ls`].
 
-mod ask_user_question;
+pub(crate) mod ask_user_question;
 mod bash;
 #[cfg(test)]
 pub(crate) mod bench_support;
@@ -317,10 +317,25 @@ mod tests {
                 "grep",
                 "find",
                 "ls",
+                "AskUserQuestion",
                 "read_output",
                 "recall"
             ]
         );
+    }
+
+    #[test]
+    fn ask_user_question_is_registered_as_required_read_only_interaction() {
+        let tools = built_in_tools();
+        let tool = tools.by_name("AskUserQuestion").expect("registered tool");
+        assert!(tool.requires_user_interaction());
+        assert!(!tool.requires_approval());
+        assert!(!tool.is_mutating());
+        assert!(
+            tool.description()
+                .contains("Do not use this tool to ask for permission")
+        );
+        assert_eq!(tool.parameters()["additionalProperties"], false);
     }
 
     #[test]
@@ -337,7 +352,10 @@ mod tests {
         // stray call fails as an unknown tool.
         let on = built_in_tools_for(true, false);
         let names: Vec<&str> = on.iter().map(|t| t.name()).collect();
-        assert_eq!(names, vec!["bash", "edit", "read_output", "recall"]);
+        assert_eq!(
+            names,
+            vec!["bash", "edit", "AskUserQuestion", "read_output", "recall"]
+        );
         for gone in ["read", "write", "grep", "find", "ls"] {
             assert!(on.by_name(gone).is_none(), "{gone} should be deactivated");
         }

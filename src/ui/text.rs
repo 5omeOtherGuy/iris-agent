@@ -1,13 +1,15 @@
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, IsTerminal, Stderr, Stdin, Stdout, Write};
 
 use anyhow::Result;
 
 use crate::approval::parse_decision;
-use crate::nexus::{ApprovalDecision, ReviewContext, ToolCall};
+use crate::nexus::{ApprovalDecision, InteractionOutcome, ReviewContext, ToolCall};
 use crate::tool_display::{
     APPROVAL_ALL_DIRTY_LABEL, APPROVAL_DESTRUCTIVE_NOTE, approval_dirty_note, approval_reason_lead,
     exploration_summary, fold, is_exploration_tool, run_target, summarize,
 };
+use crate::tools::ask_user_question::{Annotation, parse_input};
 use crate::ui::{TurnErrorKind, Ui, UiEvent};
 
 // Bracketed-paste control sequences. Enabling makes the terminal wrap pasted
@@ -98,6 +100,14 @@ fn hard_wrap_frame_line(input: &str, width: usize) -> Vec<String> {
     }
     rows.push(current);
     rows
+}
+
+fn truncate_feedback(mut feedback: String) -> String {
+    const MAX_BYTES: usize = 8 * 1024;
+    if feedback.len() > MAX_BYTES {
+        feedback.truncate(feedback.floor_char_boundary(MAX_BYTES));
+    }
+    feedback
 }
 
 pub(crate) struct TextUi<R, W, E> {
@@ -730,6 +740,154 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
         }
     }
 
+    fn request_interaction(&mut self, call: &ToolCall) -> Result<InteractionOutcome> {
+        self.finish_assistant_stream()?;
+        self.start_block()?;
+        let mut input = parse_input(&call.arguments)?;
+        input.answers = BTreeMap::new();
+
+        for question in input.questions.clone() {
+            writeln!(self.out, "{}", question.question)?;
+            for (index, option) in question.options.iter().enumerate() {
+                writeln!(
+                    self.out,
+                    "  {}. {} — {}",
+                    index + 1,
+                    option.label,
+                    option.description
+                )?;
+                if let Some(preview) = &option.preview {
+                    for line in preview.lines() {
+                        writeln!(self.out, "     {line}")?;
+                    }
+                }
+            }
+            let prompt = if question.multi_select {
+                "choose comma-separated numbers, [o] Other, [c] cancel, or [t] chat › "
+            } else {
+                "choose a number, [o] Other, [c] cancel, or [t] chat › "
+            };
+            let (answer, preview) = loop {
+                write!(self.out, "{prompt}")?;
+                self.out.flush()?;
+                let Some(line) = self.read_logical_line()? else {
+                    return Ok(InteractionOutcome::Rejected { feedback: None });
+                };
+                let choice = line.trim();
+                if matches!(choice, "c" | "cancel") {
+                    return Ok(InteractionOutcome::Rejected { feedback: None });
+                }
+                if matches!(choice, "t" | "chat") {
+                    write!(self.out, "what should Iris know? › ")?;
+                    self.out.flush()?;
+                    let feedback = self
+                        .read_logical_line()?
+                        .map(|line| line.trim().to_string())
+                        .filter(|line| !line.is_empty())
+                        .unwrap_or_else(|| {
+                            "The user wants to discuss the questions before answering them."
+                                .to_string()
+                        });
+                    return Ok(InteractionOutcome::Rejected {
+                        feedback: Some(truncate_feedback(feedback)),
+                    });
+                }
+                if matches!(choice, "o" | "other") {
+                    write!(self.out, "answer › ")?;
+                    self.out.flush()?;
+                    let Some(other) = self.read_logical_line()? else {
+                        return Ok(InteractionOutcome::Rejected { feedback: None });
+                    };
+                    let other = other.trim();
+                    if !other.is_empty() {
+                        break (other.to_string(), None);
+                    }
+                    writeln!(self.out, "answer must not be empty")?;
+                    continue;
+                }
+
+                let indexes = choice
+                    .split(',')
+                    .map(|part| part.trim().parse::<usize>())
+                    .collect::<std::result::Result<Vec<_>, _>>();
+                if let Ok(indexes) = indexes
+                    && !indexes.is_empty()
+                    && (question.multi_select || indexes.len() == 1)
+                    && indexes
+                        .iter()
+                        .all(|index| (1..=question.options.len()).contains(index))
+                {
+                    let mut unique = indexes;
+                    unique.sort_unstable();
+                    unique.dedup();
+                    let answer = unique
+                        .iter()
+                        .map(|index| question.options[*index - 1].label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let preview = if question.multi_select {
+                        None
+                    } else {
+                        question.options[unique[0] - 1].preview.clone()
+                    };
+                    break (answer, preview);
+                }
+                writeln!(self.out, "invalid choice")?;
+            };
+            input.answers.insert(question.question.clone(), answer);
+            if let Some(preview) = preview {
+                input
+                    .annotations
+                    .entry(question.question)
+                    .or_insert_with(Annotation::default)
+                    .preview = Some(preview);
+            }
+        }
+
+        if input.questions.len() > 1 {
+            writeln!(self.out, "Review your answers:")?;
+            for question in &input.questions {
+                writeln!(
+                    self.out,
+                    "  {}: {}",
+                    question.header,
+                    input
+                        .answers
+                        .get(&question.question)
+                        .map(String::as_str)
+                        .unwrap_or("")
+                )?;
+            }
+            write!(self.out, "submit? [Y] yes, [c] cancel, [t] chat › ")?;
+            self.out.flush()?;
+            let Some(line) = self.read_logical_line()? else {
+                return Ok(InteractionOutcome::Rejected { feedback: None });
+            };
+            match line.trim().to_ascii_lowercase().as_str() {
+                "" | "y" | "yes" => {}
+                "t" | "chat" => {
+                    write!(self.out, "what should Iris know? › ")?;
+                    self.out.flush()?;
+                    let feedback = self
+                        .read_logical_line()?
+                        .map(|line| line.trim().to_string())
+                        .filter(|line| !line.is_empty())
+                        .unwrap_or_else(|| {
+                            "The user wants to discuss the questions before answering them."
+                                .to_string()
+                        });
+                    return Ok(InteractionOutcome::Rejected {
+                        feedback: Some(truncate_feedback(feedback)),
+                    });
+                }
+                _ => return Ok(InteractionOutcome::Rejected { feedback: None }),
+            }
+        }
+
+        self.in_tool_block = false;
+        Ok(InteractionOutcome::Submitted(serde_json::to_value(input)?))
+    }
+
     fn shutdown(&mut self) -> Result<()> {
         self.finish_assistant_stream()?;
         if self.paste_terminal {
@@ -788,6 +946,62 @@ mod tests {
         let (_, out, err) = ui.into_parts();
         assert!(String::from_utf8(out)?.contains("approve write note.txt?"));
         assert!(err.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn plain_text_interaction_submits_choice_with_preview() -> Result<()> {
+        let call = call_args(
+            "AskUserQuestion",
+            json!({
+                "questions": [{
+                    "question": "Which formatter?",
+                    "header": "Formatter",
+                    "options": [
+                        {"label": "Rustfmt", "description": "Standard", "preview": "formatted code"},
+                        {"label": "None", "description": "No formatting"}
+                    ]
+                }]
+            }),
+        );
+        let mut ui = TextUi::new("1\n".as_bytes(), Vec::new(), Vec::new());
+        let InteractionOutcome::Submitted(arguments) = ui.request_interaction(&call)? else {
+            panic!("choice was not submitted")
+        };
+        assert_eq!(arguments["answers"]["Which formatter?"], "Rustfmt");
+        assert_eq!(
+            arguments["annotations"]["Which formatter?"]["preview"],
+            "formatted code"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plain_text_interaction_relays_chat_feedback() -> Result<()> {
+        let call = call_args(
+            "AskUserQuestion",
+            json!({
+                "questions": [{
+                    "question": "Which formatter?",
+                    "header": "Formatter",
+                    "options": [
+                        {"label": "Rustfmt", "description": "Standard"},
+                        {"label": "None", "description": "No formatting"}
+                    ]
+                }]
+            }),
+        );
+        let mut ui = TextUi::new(
+            "t\nLet's discuss tradeoffs\n".as_bytes(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            ui.request_interaction(&call)?,
+            InteractionOutcome::Rejected {
+                feedback: Some("Let's discuss tradeoffs".to_string())
+            }
+        );
         Ok(())
     }
 

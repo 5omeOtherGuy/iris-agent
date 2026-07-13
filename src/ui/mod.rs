@@ -3,8 +3,8 @@ use std::cell::RefCell;
 use anyhow::Result;
 
 use crate::nexus::{
-    AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ProviderUsage,
-    ReviewContext, ToolCall, VerificationOutcome,
+    AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, InteractionFuture,
+    InteractionOutcome, ProviderUsage, ReviewContext, ToolCall, VerificationOutcome,
 };
 
 /// Maximum characters of failing verification output carried into a notice, so
@@ -134,6 +134,10 @@ pub(crate) trait Ui {
         allow_project: bool,
         ctx: &ReviewContext,
     ) -> Result<ApprovalDecision>;
+
+    /// Block for a required human response. Unlike approval, this remains active
+    /// under every permission preset and may return populated tool arguments.
+    fn request_interaction(&mut self, call: &ToolCall) -> Result<InteractionOutcome>;
 
     /// Release any terminal state acquired for the session (e.g. bracketed
     /// paste). Called once when the session loop ends. Default: no-op.
@@ -551,17 +555,10 @@ impl ApprovalGate for UiBridge<'_> {
                 .borrow_mut()
                 .request_approval(call, allow_always, allow_project, &ctx)
         })
-        // The interactive production front-end is the raw-mode TUI
-        // (`ui::tui::TuiUi`): it reads Ctrl-C at an approval as a key event,
-        // calls `signals::interrupt_from_terminal()` (which trips the per-turn
-        // watcher's `CancellationToken`) and returns Deny, so the FIRST Ctrl-C
-        // abandons a pending approval. This inline call only blocks the executor
-        // when the front-end is the non-interactive `TextUi` fallback (pipes/CI,
-        // or a TTY where the TUI failed to start): there a blocking stdin read
-        // holds the thread, so the loop's cancellation race only lands once
-        // input arrives, with a second Ctrl-C as the force-quit backstop. Either
-        // way, Nexus's post-review `token.is_cancelled()` check keeps a late
-        // decision from running the tool or mutating the session allow-policy.
+    }
+
+    fn interact<'a>(&'a self, call: &'a ToolCall) -> InteractionFuture<'a> {
+        Box::pin(async move { self.ui.borrow_mut().request_interaction(call) })
     }
 }
 
