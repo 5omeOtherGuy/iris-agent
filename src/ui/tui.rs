@@ -7621,6 +7621,7 @@ mod tests {
             native_jj_available: true,
             native_jj_enabled: false,
             worktree_root: None,
+            pending_rows: Vec::new(),
         }
     }
 

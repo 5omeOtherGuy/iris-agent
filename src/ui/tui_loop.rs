@@ -216,6 +216,11 @@ enum RouteOutcome {
     Compact(String),
 }
 
+enum DeferredReplay {
+    Command(String),
+    Action(ModalAction),
+}
+
 /// Outcome of the idle (between-turns) input phase.
 enum IdleOutcome {
     Submit(String),
@@ -526,7 +531,7 @@ async fn session_loop<P: ChatProvider>(
                     RouteOutcome::Compact(focus) => {
                         tui.screen.start_turn();
                         tui.draw()?;
-                        let (_compact_ok, deferred, actions) = run_harness_op(
+                        let (_compact_ok, deferred) = run_harness_op(
                             harness,
                             switch,
                             tui,
@@ -539,16 +544,8 @@ async fn session_loop<P: ChatProvider>(
                             &mut git_generation,
                         )
                         .await?;
-                        replay_deferred_commands(
+                        let _ = replay_deferred(
                             deferred,
-                            harness,
-                            tui,
-                            switch,
-                            &git_cache,
-                            Some(swap),
-                        )?;
-                        if let Some(source) = replay_deferred_actions(
-                            actions,
                             harness,
                             tui,
                             &mut input_rx,
@@ -559,18 +556,16 @@ async fn session_loop<P: ChatProvider>(
                             &steering,
                             &git_cache,
                             &mut git_generation,
+                            Some(swap),
                         )
-                        .await?
-                        {
-                            perform_swap(&source, swap, harness, tui, switch)?;
-                        }
+                        .await?;
                         tui.draw()?;
                     }
                     RouteOutcome::Fall => {
                         tui.screen.commit_user(&prompt);
                         tui.screen.start_turn();
                         tui.draw()?;
-                        let (_turn_ok, deferred, actions) = run_harness_op(
+                        let (_turn_ok, deferred) = run_harness_op(
                             harness,
                             switch,
                             tui,
@@ -583,16 +578,8 @@ async fn session_loop<P: ChatProvider>(
                             &mut git_generation,
                         )
                         .await?;
-                        replay_deferred_commands(
+                        let _ = replay_deferred(
                             deferred,
-                            harness,
-                            tui,
-                            switch,
-                            &git_cache,
-                            Some(swap),
-                        )?;
-                        if let Some(source) = replay_deferred_actions(
-                            actions,
                             harness,
                             tui,
                             &mut input_rx,
@@ -603,11 +590,9 @@ async fn session_loop<P: ChatProvider>(
                             &steering,
                             &git_cache,
                             &mut git_generation,
+                            Some(swap),
                         )
-                        .await?
-                        {
-                            perform_swap(&source, swap, harness, tui, switch)?;
-                        }
+                        .await?;
                         // Turn completion is a refresh trigger: the turn may
                         // have mutated the tree or task state.
                         git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
@@ -2287,9 +2272,9 @@ fn handle_active_submission(
             true
         }
         "/compact" => {
-            let _ = commands.send(HarnessCommand::RequestCompaction {
-                focus: (!rest.is_empty()).then(|| rest.to_string()),
-            });
+            screen.apply(UiEvent::Notice(
+                "cannot compact during an active operation; wait for it to finish".to_string(),
+            ));
             true
         }
         "/focus" => {
@@ -2489,9 +2474,6 @@ fn handle_active_event(
             true
         }
         IdleKey::OpenTasks => {
-            screen.apply(UiEvent::Notice(
-                "task review queued until the active operation finishes".to_string(),
-            ));
             let _ = commands.send(HarnessCommand::QueueCommand {
                 text: "/tasks".to_string(),
             });
@@ -2504,47 +2486,38 @@ fn handle_active_event(
     }
 }
 
-fn replay_deferred_commands<P: ChatProvider>(
-    commands: Vec<String>,
+fn replay_deferred_command<P: ChatProvider>(
+    command: String,
     harness: &mut Harness<P>,
     tui: &mut TuiUi,
     switch: &mut Option<ModelSwitch<'_, P>>,
     git_cache: &GitStatusCache,
-    swap: Option<&SessionLoader<'_>>,
-) -> Result<()> {
-    for command in commands {
-        match route_command(&command, harness, tui, switch, git_cache)? {
-            RouteOutcome::Consumed => {}
-            RouteOutcome::Swap(source) => {
-                if let Some(swap) = swap {
-                    perform_swap(&source, swap, harness, tui, switch)?;
-                } else {
-                    apply_notices(
-                        tui,
-                        vec![format!("queued `{command}` could not switch sessions here")],
-                    );
-                }
-            }
-            RouteOutcome::Compact(focus) => {
-                apply_notices(
-                    tui,
-                    vec![format!(
-                        "queued compaction is ready; run `/compact {focus}` again"
-                    )],
-                );
-            }
-            RouteOutcome::Fall => apply_notices(
+) -> Result<Option<SessionSource>> {
+    match route_command(&command, harness, tui, switch, git_cache)? {
+        RouteOutcome::Consumed => Ok(None),
+        RouteOutcome::Swap(source) => Ok(Some(source)),
+        RouteOutcome::Compact(_) => {
+            apply_notices(
+                tui,
+                vec![
+                    "cannot compact during an active operation; wait for it to finish".to_string(),
+                ],
+            );
+            Ok(None)
+        }
+        RouteOutcome::Fall => {
+            apply_notices(
                 tui,
                 vec![format!("queued command was not recognized: {command}")],
-            ),
+            );
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn replay_deferred_actions<P: ChatProvider>(
-    actions: Vec<ModalAction>,
+async fn replay_deferred<P: ChatProvider>(
+    queued: Vec<DeferredReplay>,
     harness: &mut Harness<P>,
     tui: &mut TuiUi,
     input_rx: &mut UnboundedReceiver<Event>,
@@ -2555,28 +2528,55 @@ async fn replay_deferred_actions<P: ChatProvider>(
     steering: &Rc<SteeringQueue>,
     git_cache: &GitStatusCache,
     git_generation: &mut u64,
+    swap: Option<&SessionLoader<'_>>,
 ) -> Result<Option<SessionSource>> {
     let mut requested = None;
-    for action in actions {
-        if let Some(source) = Box::pin(dispatch_action(
-            action,
-            harness,
-            tui,
-            input_rx,
-            tick,
-            switch,
-            login_backend,
-            current_turn,
-            steering,
-            git_cache,
-            git_generation,
-        ))
-        .await?
-        {
+    let mut switched = false;
+    for item in queued {
+        let source = match item {
+            DeferredReplay::Command(command) => {
+                replay_deferred_command(command, harness, tui, switch, git_cache)?
+            }
+            DeferredReplay::Action(action) => {
+                Box::pin(dispatch_action(
+                    action,
+                    harness,
+                    tui,
+                    input_rx,
+                    tick,
+                    switch,
+                    login_backend,
+                    current_turn,
+                    steering,
+                    git_cache,
+                    git_generation,
+                ))
+                .await?
+            }
+        };
+        let Some(source) = source else {
+            continue;
+        };
+        if switched || requested.is_some() {
+            apply_notices(
+                tui,
+                vec![
+                    "ignored a later queued session switch because an earlier one won".to_string(),
+                ],
+            );
+        } else if let Some(swap) = swap {
+            perform_swap(&source, swap, harness, tui, switch)?;
+            switched = true;
+        } else {
             requested = Some(source);
         }
     }
     Ok(requested)
+}
+
+fn close_active_input(input_open: &mut bool, commands: &UnboundedSender<HarnessCommand>) {
+    *input_open = false;
+    let _ = commands.send(HarnessCommand::Shutdown);
 }
 
 /// Drive one cancellable operation through the local harness actor. Terminal
@@ -2594,7 +2594,7 @@ async fn run_harness_op<P: ChatProvider>(
     steering: Rc<SteeringQueue>,
     git_cache: &GitStatusCache,
     git_generation: &mut u64,
-) -> Result<(bool, Vec<String>, Vec<ModalAction>)> {
+) -> Result<(bool, Vec<DeferredReplay>)> {
     let mut settings = switch
         .as_ref()
         .map(|switch| picker::settings_snapshot(harness, switch));
@@ -2621,8 +2621,7 @@ async fn run_harness_op<P: ChatProvider>(
     let _ = channels.commands.send(HarnessCommand::RefreshUiState);
     let mut actor = Box::pin(actor.run());
     let mut pending: Option<PendingApproval> = None;
-    let mut deferred_commands = Vec::new();
-    let mut deferred_actions = Vec::new();
+    let mut deferred = Vec::new();
     let mut sched = RenderScheduler::new();
     sched.mark_drawn(Instant::now());
     let mut last_resize_width = ratatui::crossterm::terminal::size()
@@ -2644,8 +2643,7 @@ async fn run_harness_op<P: ChatProvider>(
                         tui,
                         &mut pending,
                         &mut settings,
-                        &mut deferred_commands,
-                        &mut deferred_actions,
+                        &mut deferred,
                     );
                     sync_esc_cancel_enabled(current_turn, &pending, &tui.screen);
                 }
@@ -2665,8 +2663,7 @@ async fn run_harness_op<P: ChatProvider>(
                     tui,
                     &mut pending,
                     &mut settings,
-                    &mut deferred_commands,
-                    &mut deferred_actions,
+                    &mut deferred,
                 );
                 sync_esc_cancel_enabled(current_turn, &pending, &tui.screen);
                 if refresh_git {
@@ -2677,8 +2674,7 @@ async fn run_harness_op<P: ChatProvider>(
             }
             maybe = input_rx.recv(), if input_open => {
                 let Some(event) = maybe else {
-                    input_open = false;
-                    let _ = channels.commands.send(HarnessCommand::Shutdown);
+                    close_active_input(&mut input_open, &channels.commands);
                     continue;
                 };
                 if let Event::Resize(width, _) = &event
@@ -2722,7 +2718,7 @@ async fn run_harness_op<P: ChatProvider>(
     };
     tui.screen.set_queued(steering.len());
     tui.screen.clear_approval(false);
-    Ok((succeeded, deferred_commands, deferred_actions))
+    Ok((succeeded, deferred))
 }
 
 fn apply_actor_event(
@@ -2730,14 +2726,25 @@ fn apply_actor_event(
     tui: &mut TuiUi,
     pending: &mut Option<PendingApproval>,
     settings: &mut Option<settings_menu::Snapshot>,
-    deferred_commands: &mut Vec<String>,
-    deferred_actions: &mut Vec<ModalAction>,
+    deferred: &mut Vec<DeferredReplay>,
 ) {
     match event {
         HarnessEvent::UiEvent(event) => tui.screen.apply(event),
         HarnessEvent::TurnStarted | HarnessEvent::CompactionStarted => {}
-        HarnessEvent::TurnFinished => tui.screen.end_turn(),
-        HarnessEvent::CompactionFinished => tui.screen.end_background_work(),
+        HarnessEvent::TurnFinished => {
+            if let Some(settings) = settings.as_mut() {
+                settings.clear_pending();
+            }
+            tui.screen.clear_settings_pending();
+            tui.screen.end_turn();
+        }
+        HarnessEvent::CompactionFinished => {
+            if let Some(settings) = settings.as_mut() {
+                settings.clear_pending();
+            }
+            tui.screen.clear_settings_pending();
+            tui.screen.end_background_work();
+        }
         HarnessEvent::TurnFailed(event) => tui.screen.apply(event),
         HarnessEvent::ApprovalRequested {
             offered_decisions,
@@ -2767,7 +2774,13 @@ fn apply_actor_event(
             tui.screen.clear_approval(approved);
         }
         HarnessEvent::SettingsApplied { lines } => apply_notices(tui, lines),
-        HarnessEvent::SettingsQueued { label, reason } => {
+        HarnessEvent::SettingsQueued { label, reason, row } => {
+            if let Some(row) = row {
+                if let Some(settings) = settings.as_mut() {
+                    settings.mark_pending(row);
+                }
+                tui.screen.mark_settings_pending(row);
+            }
             tui.screen
                 .apply(UiEvent::Notice(format!("queued {label} — {reason}")));
         }
@@ -2786,19 +2799,14 @@ fn apply_actor_event(
             after,
             context_tokens,
         } => apply_settings_result(tui, result, before.as_ref(), after.as_ref(), context_tokens),
-        HarnessEvent::SettingsActionReady { action, label } => {
-            deferred_actions.push(action);
-            tui.screen.apply(UiEvent::Notice(format!(
-                "queued {label} reached a safe boundary"
-            )));
+        HarnessEvent::SettingsActionQueued { action } => {
+            deferred.push(DeferredReplay::Action(action));
         }
         HarnessEvent::CommandQueued(command) => {
-            if !deferred_commands.contains(&command) {
-                deferred_commands.push(command.clone());
-                tui.screen.apply(UiEvent::Notice(format!(
-                    "queued `{command}` until the active operation finishes"
-                )));
-            }
+            tui.screen.apply(UiEvent::Notice(format!(
+                "queued `{command}` until the active operation finishes"
+            )));
+            deferred.push(DeferredReplay::Command(command));
         }
     }
 }
@@ -3089,7 +3097,7 @@ async fn dispatch_action<P: ChatProvider>(
             tui.screen.close_modal();
             tui.screen.start_turn();
             tui.draw()?;
-            let (compact_ok, deferred, actions) = run_harness_op(
+            let (compact_ok, deferred) = run_harness_op(
                 harness,
                 switch,
                 tui,
@@ -3102,9 +3110,8 @@ async fn dispatch_action<P: ChatProvider>(
                 git_generation,
             )
             .await?;
-            replay_deferred_commands(deferred, harness, tui, switch, git_cache, None)?;
-            let requested = replay_deferred_actions(
-                actions,
+            let requested = replay_deferred(
+                deferred,
                 harness,
                 tui,
                 input_rx,
@@ -3115,6 +3122,7 @@ async fn dispatch_action<P: ChatProvider>(
                 steering,
                 git_cache,
                 git_generation,
+                None,
             )
             .await?;
             if requested.is_some() {
@@ -4675,6 +4683,19 @@ mod tests {
             .unwrap();
         channels
             .commands
+            .send(HarnessCommand::ApplySettings {
+                action: ModalAction::BeginLogin(ProviderId::Anthropic),
+                origin: SettingsOrigin::Faceplate(None),
+            })
+            .unwrap();
+        channels
+            .commands
+            .send(HarnessCommand::QueueCommand {
+                text: "/new".to_string(),
+            })
+            .unwrap();
+        channels
+            .commands
             .send(HarnessCommand::CancelActive)
             .unwrap();
 
@@ -4701,10 +4722,25 @@ mod tests {
         let queued = position(|event| matches!(event, HarnessEvent::SettingsQueued { .. }));
         let applied =
             position(|event| matches!(event, HarnessEvent::PendingSettingsApplied { .. }));
+        let tui_action = position(|event| {
+            matches!(
+                event,
+                HarnessEvent::SettingsActionQueued {
+                    action: ModalAction::BeginLogin(ProviderId::Anthropic)
+                }
+            )
+        });
+        let queued_command = position(
+            |event| matches!(event, HarnessEvent::CommandQueued(command) if command == "/new"),
+        );
         let finished = position(|event| matches!(event, HarnessEvent::TurnFinished));
         assert!(started < streamed);
         assert!(streamed < immediate && immediate < finished);
         assert!(queued < applied && applied < finished);
+        assert!(
+            tui_action < queued_command,
+            "deferred commands and actions retain input order"
+        );
         let selection = switch.as_ref().unwrap().selection();
         assert_eq!(selection.provider, ProviderId::Anthropic);
         assert_eq!(selection.model, "claude-sonnet-4-6");
@@ -6071,6 +6107,44 @@ mod tests {
     }
 
     #[test]
+    fn active_input_eof_sends_actor_shutdown() {
+        let (commands, mut command_rx) = unbounded_channel();
+        let mut input_open = true;
+
+        close_active_input(&mut input_open, &commands);
+
+        assert!(!input_open);
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(HarnessCommand::Shutdown)
+        ));
+    }
+
+    #[test]
+    fn mid_turn_compaction_is_rejected_without_becoming_deferred_work() {
+        let mut screen = Screen::new();
+        let mut pending = None;
+        for ch in "/compact focus".chars() {
+            let _ = capture_active_event(
+                &mut screen,
+                key(KeyCode::Char(ch)),
+                &mut pending,
+                &GitStatusCache::default(),
+            );
+        }
+
+        let (changed, commands) = capture_active_event(
+            &mut screen,
+            key(KeyCode::Enter),
+            &mut pending,
+            &GitStatusCache::default(),
+        );
+        assert!(changed);
+        assert!(commands.is_empty(), "active compaction must not be queued");
+        assert!(screen.editor_is_empty());
+    }
+
+    #[test]
     fn mid_turn_settings_opens_immediately_without_steering() {
         let mut screen = Screen::new();
         let steering = SteeringQueue::default();
@@ -6450,6 +6524,7 @@ mod tests {
             native_jj_available: true,
             native_jj_enabled: false,
             worktree_root: None,
+            pending_rows: Vec::new(),
         }
     }
 

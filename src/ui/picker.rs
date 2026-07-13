@@ -535,6 +535,7 @@ pub(crate) fn settings_snapshot<P: ChatProvider>(
         native_jj_available: harness.mutation_safety_enabled() && harness.native_jj_available(),
         native_jj_enabled: harness.native_jj_enabled(),
         worktree_root: settings.worktree_root.clone(),
+        pending_rows: Vec::new(),
         theme: tui
             .and_then(|t| t.theme.clone())
             .unwrap_or_else(|| crate::ui::theme::default().id().to_string()),

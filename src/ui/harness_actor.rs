@@ -23,7 +23,7 @@ use crate::tool_display::approval_dirty_note;
 use crate::ui::UiEvent;
 use crate::ui::modal::ModalAction;
 use crate::ui::picker::{self, ActionResult};
-use crate::ui::settings_menu::{Field, PanelView, Snapshot};
+use crate::ui::settings_menu::{Field, PanelView, RowId, Snapshot};
 use crate::ui::steering::SteeringQueue;
 use crate::wayland::Harness;
 
@@ -136,6 +136,7 @@ pub(crate) enum HarnessEvent {
     SettingsQueued {
         label: String,
         reason: String,
+        row: Option<RowId>,
     },
     PendingSettingsApplied {
         labels: Vec<String>,
@@ -147,9 +148,8 @@ pub(crate) enum HarnessEvent {
         after: Option<ModelSelection>,
         context_tokens: u64,
     },
-    SettingsActionReady {
+    SettingsActionQueued {
         action: ModalAction,
-        label: String,
     },
     CommandQueued(String),
 }
@@ -256,6 +256,20 @@ impl ApprovalGate for ActorBridge {
             Ok(rx.await.unwrap_or(ApprovalDecision::Deny))
         })
     }
+}
+
+fn stop_active_operation(
+    pending_approval: &mut Option<oneshot::Sender<ApprovalDecision>>,
+    events: &UnboundedSender<HarnessEvent>,
+    steering: &SteeringQueue,
+    token: &CancellationToken,
+) {
+    if let Some(reply) = pending_approval.take() {
+        let _ = reply.send(ApprovalDecision::Deny);
+        let _ = events.send(HarnessEvent::ApprovalCleared { approved: false });
+    }
+    steering.clear();
+    token.cancel();
 }
 
 fn operation_failure_event(active_kind: ActiveKind, error: &anyhow::Error) -> HarnessEvent {
@@ -408,14 +422,12 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                                 }
                             }
                             HarnessCommand::CancelActive | HarnessCommand::Shutdown => {
-                                if let Some(reply) = pending_approval.take() {
-                                    let _ = reply.send(ApprovalDecision::Deny);
-                                    let _ = self.events.send(HarnessEvent::ApprovalCleared {
-                                        approved: false,
-                                    });
-                                }
-                                self.steering.clear();
-                                token.cancel();
+                                stop_active_operation(
+                                    &mut pending_approval,
+                                    &self.events,
+                                    &self.steering,
+                                    &token,
+                                );
                             }
                             HarnessCommand::QueueSteering { text, mode } => {
                                 if !text.trim().is_empty() && active_kind == ActiveKind::Turn {
@@ -428,6 +440,7 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                             }
                             HarnessCommand::ApplySettings { action, origin } => {
                                 let label = settings_label(&action);
+                                let row = settings_row(&action);
                                 if let ModalAction::SaveSetting { field, value } = &action
                                     && immediate_during_active(*field)
                                 {
@@ -440,12 +453,24 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                                         Err(error) => vec![format!("could not save setting: {error:#}")],
                                     };
                                     let _ = self.events.send(HarnessEvent::SettingsApplied { lines });
+                                } else if tui_owned_action(&action) {
+                                    active_state.queued_counts.settings += 1;
+                                    let _ = self.events.send(HarnessEvent::SettingsQueued {
+                                        label: label.clone(),
+                                        reason: "applies when the active operation reaches a safe boundary"
+                                            .to_string(),
+                                        row,
+                                    });
+                                    let _ = self
+                                        .events
+                                        .send(HarnessEvent::SettingsActionQueued { action });
                                 } else {
                                     self.pending_settings.push((action, origin, label.clone()));
-                                    active_state.queued_counts.settings = self.pending_settings.len();
+                                    active_state.queued_counts.settings += 1;
                                     let _ = self.events.send(HarnessEvent::SettingsQueued {
                                         label,
                                         reason: "applies when the active operation reaches a safe boundary".to_string(),
+                                        row,
                                     });
                                 }
                             }
@@ -454,12 +479,11 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                                 active_state.queued_counts.commands = self.queued_commands;
                                 let _ = self.events.send(HarnessEvent::CommandQueued(text));
                             }
-                            HarnessCommand::RequestCompaction { focus } => {
-                                let text = focus.filter(|focus| !focus.is_empty())
-                                    .map_or_else(|| "/compact".to_string(), |focus| format!("/compact {focus}"));
-                                self.queued_commands += 1;
-                                active_state.queued_counts.commands = self.queued_commands;
-                                let _ = self.events.send(HarnessEvent::CommandQueued(text));
+                            HarnessCommand::RequestCompaction { .. } => {
+                                let _ = self.events.send(HarnessEvent::UiEvent(UiEvent::Notice(
+                                    "cannot compact during an active operation; wait for it to finish"
+                                        .to_string(),
+                                )));
                             }
                             HarnessCommand::RefreshUiState => {
                                 let _ = self.events.send(HarnessEvent::ActorState(active_state.clone()));
@@ -511,12 +535,6 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
         }
         let mut labels = Vec::new();
         for (action, origin, label) in self.pending_settings.drain(..) {
-            if tui_owned_action(&action) {
-                let _ = self
-                    .events
-                    .send(HarnessEvent::SettingsActionReady { action, label });
-                continue;
-            }
             let Some(switch) = self.switch.as_mut() else {
                 let _ = self.events.send(HarnessEvent::SettingsApplied {
                     lines: vec![format!(
@@ -598,6 +616,31 @@ fn tui_owned_action(action: &ModalAction) -> bool {
     )
 }
 
+fn settings_row(action: &ModalAction) -> Option<RowId> {
+    match action {
+        ModalAction::SelectModel { .. }
+        | ModalAction::ConfirmModelSwitch { .. }
+        | ModalAction::CycleModel { .. } => Some(RowId::Model),
+        ModalAction::AdjustEffort(_) => Some(RowId::Reasoning),
+        ModalAction::ApplyScoped(_) | ModalAction::SaveScoped(_) => Some(RowId::Scope),
+        ModalAction::SaveSetting { field, .. } => Some(RowId::Field(*field)),
+        ModalAction::ToggleSkipPermissions => Some(RowId::SkipApprovals),
+        ModalAction::SetNativeJj(_) => Some(RowId::Field(Field::NativeJj)),
+        ModalAction::EditPolicy(_) => Some(RowId::Permissions),
+        ModalAction::BeginLogin(_)
+        | ModalAction::OpenApiKeyDialog(_)
+        | ModalAction::SaveApiKey(_)
+        | ModalAction::Logout(_) => Some(RowId::Providers),
+        ModalAction::ResumeSession(_)
+        | ModalAction::AdoptTask(_)
+        | ModalAction::ViewTaskSessions(_)
+        | ModalAction::AcceptTask
+        | ModalAction::ShowTaskDiff
+        | ModalAction::ListTaskRollback
+        | ModalAction::InsertSkillMention { .. } => None,
+    }
+}
+
 fn settings_label(action: &ModalAction) -> String {
     match action {
         ModalAction::SelectModel { .. }
@@ -641,6 +684,40 @@ fn immediate_during_active(field: Field) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn eof_shutdown_denies_parked_approval_and_cancels_the_operation() {
+        let (event_tx, mut event_rx) = unbounded_channel();
+        let (approval_tx, mut approval_rx) = unbounded_channel();
+        let bridge = ActorBridge {
+            event_tx,
+            approval_tx,
+        };
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            thought_signature: None,
+            name: "bash".to_string(),
+            arguments: serde_json::json!({ "command": "echo hi" }),
+        };
+        let token = CancellationToken::new();
+        let steering = SteeringQueue::default();
+
+        let review = bridge.review(&call, true, true, ReviewContext::default());
+        let shutdown = async {
+            let request = approval_rx.recv().await.expect("approval request");
+            let mut pending = Some(request.reply);
+            stop_active_operation(&mut pending, &bridge.event_tx, &steering, &token);
+            assert!(pending.is_none());
+        };
+        let (decision, ()) = tokio::join!(review, shutdown);
+
+        assert_eq!(decision.unwrap(), ApprovalDecision::Deny);
+        assert!(token.is_cancelled());
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(HarnessEvent::ApprovalCleared { approved: false })
+        ));
+    }
+
     #[test]
     fn turn_failures_preserve_typed_auth_errors() {
         let error = anyhow::Error::new(crate::errors::AuthError::new("expired token"));
@@ -679,16 +756,12 @@ mod tests {
     }
 
     #[test]
-    fn model_and_reasoning_actions_have_visible_queue_labels() {
-        assert_eq!(
-            settings_label(&ModalAction::AdjustEffort(
-                crate::mimir::selection::ReasoningEffort::High
-            )),
-            "reasoning switch"
-        );
-        assert_eq!(
-            settings_label(&ModalAction::CycleModel { forward: true }),
-            "model switch"
-        );
+    fn model_and_reasoning_actions_have_visible_queue_labels_and_rows() {
+        let reasoning = ModalAction::AdjustEffort(crate::mimir::selection::ReasoningEffort::High);
+        let model = ModalAction::CycleModel { forward: true };
+        assert_eq!(settings_label(&reasoning), "reasoning switch");
+        assert_eq!(settings_row(&reasoning), Some(RowId::Reasoning));
+        assert_eq!(settings_label(&model), "model switch");
+        assert_eq!(settings_row(&model), Some(RowId::Model));
     }
 }
