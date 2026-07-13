@@ -77,7 +77,6 @@ pub(crate) struct ActorState {
     pub(crate) compaction_state: Option<CompactionLifecycleState>,
     pub(crate) task_state: TaskState,
     pub(crate) settings: Option<Snapshot>,
-    pub(crate) context_tokens: u64,
     pub(crate) context_budget: Option<u64>,
 }
 
@@ -120,7 +119,7 @@ pub(crate) enum HarnessEvent {
     UiEvent(UiEvent),
     TurnStarted,
     TurnFinished,
-    TurnFailed(String),
+    TurnFailed(UiEvent),
     CompactionStarted,
     CompactionFinished,
     ApprovalRequested {
@@ -128,7 +127,9 @@ pub(crate) enum HarnessEvent {
         call: ToolCall,
         reason: Option<String>,
     },
-    ApprovalCleared,
+    ApprovalCleared {
+        approved: bool,
+    },
     SettingsApplied {
         lines: Vec<String>,
     },
@@ -138,7 +139,6 @@ pub(crate) enum HarnessEvent {
     },
     PendingSettingsApplied {
         labels: Vec<String>,
-        lines: Vec<String>,
     },
     ActorState(ActorState),
     SettingsResult {
@@ -258,6 +258,14 @@ impl ApprovalGate for ActorBridge {
     }
 }
 
+fn operation_failure_event(active_kind: ActiveKind, error: &anyhow::Error) -> HarnessEvent {
+    let failure = UiEvent::from_turn_error(error);
+    match active_kind {
+        ActiveKind::Turn => HarnessEvent::TurnFailed(failure),
+        ActiveKind::Compaction => HarnessEvent::UiEvent(failure),
+    }
+}
+
 #[derive(Default)]
 struct SettingsEventSink {
     events: RefCell<Vec<UiEvent>>,
@@ -286,7 +294,7 @@ pub(crate) struct HarnessActor<'a, 'b, P> {
     steering: Rc<SteeringQueue>,
     token_slot: ActiveTokenSlot,
     pending_settings: Vec<(ModalAction, SettingsOrigin, String)>,
-    pending_commands: Vec<String>,
+    queued_commands: usize,
 }
 
 impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
@@ -306,7 +314,7 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
             steering,
             token_slot,
             pending_settings: Vec::new(),
-            pending_commands: Vec::new(),
+            queued_commands: 0,
         }
     }
 
@@ -387,14 +395,24 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                         match command {
                             HarnessCommand::Approve { decision } => {
                                 if let Some(reply) = pending_approval.take() {
+                                    let approved = matches!(
+                                        decision,
+                                        ApprovalDecision::Allow
+                                            | ApprovalDecision::AllowAlways
+                                            | ApprovalDecision::AllowProject
+                                    );
                                     let _ = reply.send(decision);
-                                    let _ = self.events.send(HarnessEvent::ApprovalCleared);
+                                    let _ = self
+                                        .events
+                                        .send(HarnessEvent::ApprovalCleared { approved });
                                 }
                             }
                             HarnessCommand::CancelActive | HarnessCommand::Shutdown => {
                                 if let Some(reply) = pending_approval.take() {
                                     let _ = reply.send(ApprovalDecision::Deny);
-                                    let _ = self.events.send(HarnessEvent::ApprovalCleared);
+                                    let _ = self.events.send(HarnessEvent::ApprovalCleared {
+                                        approved: false,
+                                    });
                                 }
                                 self.steering.clear();
                                 token.cancel();
@@ -407,7 +425,6 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                                     }
                                 }
                                 active_state.queued_counts.steering = self.steering.len();
-                                let _ = self.events.send(HarnessEvent::ActorState(active_state.clone()));
                             }
                             HarnessCommand::ApplySettings { action, origin } => {
                                 let label = settings_label(&action);
@@ -433,13 +450,15 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                                 }
                             }
                             HarnessCommand::QueueCommand { text } => {
-                                self.pending_commands.push(text.clone());
+                                self.queued_commands += 1;
+                                active_state.queued_counts.commands = self.queued_commands;
                                 let _ = self.events.send(HarnessEvent::CommandQueued(text));
                             }
                             HarnessCommand::RequestCompaction { focus } => {
                                 let text = focus.filter(|focus| !focus.is_empty())
                                     .map_or_else(|| "/compact".to_string(), |focus| format!("/compact {focus}"));
-                                self.pending_commands.push(text.clone());
+                                self.queued_commands += 1;
+                                active_state.queued_counts.commands = self.queued_commands;
                                 let _ = self.events.send(HarnessEvent::CommandQueued(text));
                             }
                             HarnessCommand::RefreshUiState => {
@@ -458,7 +477,9 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
 
         if let Some(reply) = pending_approval.take() {
             let _ = reply.send(ApprovalDecision::Deny);
-            let _ = self.events.send(HarnessEvent::ApprovalCleared);
+            let _ = self
+                .events
+                .send(HarnessEvent::ApprovalCleared { approved: false });
         }
         *self.token_slot.lock().expect("turn token lock poisoned") = None;
         if token.is_cancelled() || active_kind == ActiveKind::Compaction {
@@ -468,13 +489,9 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
         let succeeded = match result {
             Ok(()) => true,
             Err(error) => {
-                let message = format!("{error:#}");
-                let _ = self.events.send(match active_kind {
-                    ActiveKind::Turn => HarnessEvent::TurnFailed(message),
-                    ActiveKind::Compaction => {
-                        HarnessEvent::UiEvent(UiEvent::from_turn_error(&error))
-                    }
-                });
+                let _ = self
+                    .events
+                    .send(operation_failure_event(active_kind, &error));
                 false
             }
         };
@@ -493,7 +510,6 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
             return;
         }
         let mut labels = Vec::new();
-        let mut all_lines = Vec::new();
         for (action, origin, label) in self.pending_settings.drain(..) {
             if tui_owned_action(&action) {
                 let _ = self
@@ -502,9 +518,11 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                 continue;
             }
             let Some(switch) = self.switch.as_mut() else {
-                all_lines.push(format!(
-                    "could not apply queued {label}: model switching is unavailable"
-                ));
+                let _ = self.events.send(HarnessEvent::SettingsApplied {
+                    lines: vec![format!(
+                        "could not apply queued {label}: model switching is unavailable"
+                    )],
+                });
                 continue;
             };
             let before = switch.selection().clone();
@@ -514,9 +532,7 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                 let _ = self.events.send(HarnessEvent::UiEvent(event));
             }
             let after = switch.selection().clone();
-            let lines = action_result_lines(&result);
             labels.push(label);
-            all_lines.extend(lines);
             let _ = self.events.send(HarnessEvent::SettingsResult {
                 result,
                 before: Some(before),
@@ -524,10 +540,9 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                 context_tokens: self.harness.context_token_estimate(),
             });
         }
-        let _ = self.events.send(HarnessEvent::PendingSettingsApplied {
-            labels,
-            lines: all_lines,
-        });
+        let _ = self
+            .events
+            .send(HarnessEvent::PendingSettingsApplied { labels });
     }
 
     fn state(&self, active_kind: Option<ActiveKind>) -> ActorState {
@@ -550,7 +565,7 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
             queued_counts: QueuedCounts {
                 steering: self.steering.len(),
                 settings: self.pending_settings.len(),
-                commands: self.pending_commands.len(),
+                commands: self.queued_commands,
             },
             permission_mode,
             compaction_state: active_kind
@@ -561,7 +576,6 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                 active_id: self.harness.current_task_id(),
             },
             settings,
-            context_tokens: self.harness.context_token_estimate(),
             context_budget: self.harness.context_budget(),
         }
     }
@@ -582,14 +596,6 @@ fn tui_owned_action(action: &ModalAction) -> bool {
             | ModalAction::SaveApiKey(_)
             | ModalAction::Logout(_)
     )
-}
-
-fn action_result_lines(result: &ActionResult) -> Vec<String> {
-    match result {
-        ActionResult::Close(lines)
-        | ActionResult::Keep(lines)
-        | ActionResult::Replace(_, lines) => lines.clone(),
-    }
 }
 
 fn settings_label(action: &ModalAction) -> String {
@@ -634,6 +640,18 @@ fn immediate_during_active(field: Field) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_failures_preserve_typed_auth_errors() {
+        let error = anyhow::Error::new(crate::errors::AuthError::new("expired token"));
+        assert!(matches!(
+            operation_failure_event(ActiveKind::Turn, &error),
+            HarnessEvent::TurnFailed(UiEvent::TurnError {
+                kind: crate::ui::TurnErrorKind::Auth,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn active_setting_classification_keeps_runtime_mutations_for_the_boundary() {

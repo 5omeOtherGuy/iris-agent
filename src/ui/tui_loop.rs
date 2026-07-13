@@ -26,7 +26,6 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use ratatui_textarea::CursorMove;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::oneshot;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use tokio_util::sync::CancellationToken;
 
@@ -165,6 +164,19 @@ fn set_esc_cancel_enabled(current_turn: &ActiveTokenSlot, enabled: bool) {
     }
 }
 
+fn sync_esc_cancel_enabled(
+    current_turn: &ActiveTokenSlot,
+    pending: &Option<PendingApproval>,
+    screen: &Screen,
+) {
+    set_esc_cancel_enabled(
+        current_turn,
+        pending.is_none()
+            && !matches!(screen.focus(), FocusTarget::Modal | FocusTarget::Palette)
+            && screen.session_menu.is_none(),
+    );
+}
+
 /// Run the interactive terminal-surface session to completion on `runtime`, then
 /// restore the terminal. `tui` already owns raw mode and paste/key flags.
 pub(crate) fn run<P: ChatProvider>(
@@ -251,11 +263,9 @@ enum IdleKey {
     Menu(MenuAction),
 }
 
-/// A gated tool waiting for the user's decision: the reply channel back into the
-/// turn future plus whether "always" is on offer.
+/// A gated tool waiting for the user's decision.
 struct PendingApproval {
     call: ToolCall,
-    reply: oneshot::Sender<ApprovalDecision>,
     allow_always: bool,
     allow_project: bool,
 }
@@ -2323,8 +2333,7 @@ fn handle_active_event(
             return open_active_settings(screen, settings, None);
         }
         if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
-            if let Some(approval) = pending.take() {
-                let _ = approval.reply.send(ApprovalDecision::Deny);
+            if pending.take().is_some() {
                 screen.clear_approval(false);
             }
             let _ = commands.send(HarnessCommand::CancelActive);
@@ -2349,7 +2358,13 @@ fn handle_active_event(
         {
             let approval = pending.take().expect("pending approval present");
             screen.note_approval(&approval.call, decision);
-            let _ = approval.reply.send(decision);
+            let approved = matches!(
+                decision,
+                ApprovalDecision::Allow
+                    | ApprovalDecision::AllowAlways
+                    | ApprovalDecision::AllowProject
+            );
+            screen.clear_approval(approved);
             let _ = commands.send(HarnessCommand::Approve { decision });
             return true;
         }
@@ -2632,6 +2647,7 @@ async fn run_harness_op<P: ChatProvider>(
                         &mut deferred_commands,
                         &mut deferred_actions,
                     );
+                    sync_esc_cancel_enabled(current_turn, &pending, &tui.screen);
                 }
                 break result?;
             }
@@ -2652,6 +2668,7 @@ async fn run_harness_op<P: ChatProvider>(
                     &mut deferred_commands,
                     &mut deferred_actions,
                 );
+                sync_esc_cancel_enabled(current_turn, &pending, &tui.screen);
                 if refresh_git {
                     git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
                 }
@@ -2682,15 +2699,7 @@ async fn run_harness_op<P: ChatProvider>(
                     tui.screen.set_queued(steering.len());
                     request_render(&mut sched, tui)?;
                 }
-                set_esc_cancel_enabled(
-                    current_turn,
-                    pending.is_none()
-                        && !matches!(
-                            tui.screen.focus(),
-                            FocusTarget::Modal | FocusTarget::Palette
-                        )
-                        && tui.screen.session_menu.is_none(),
-                );
+                sync_esc_cancel_enabled(current_turn, &pending, &tui.screen);
             }
             _ = tick.tick() => {
                 if tui.screen.tick() {
@@ -2729,10 +2738,7 @@ fn apply_actor_event(
         HarnessEvent::TurnStarted | HarnessEvent::CompactionStarted => {}
         HarnessEvent::TurnFinished => tui.screen.end_turn(),
         HarnessEvent::CompactionFinished => tui.screen.end_background_work(),
-        HarnessEvent::TurnFailed(message) => {
-            tui.screen
-                .apply(UiEvent::Notice(format!("turn failed: {message}")));
-        }
+        HarnessEvent::TurnFailed(event) => tui.screen.apply(event),
         HarnessEvent::ApprovalRequested {
             offered_decisions,
             call,
@@ -2750,31 +2756,28 @@ fn apply_actor_event(
                 offered_decisions.allow_project,
                 offered_decisions.dirty_gate,
             );
-            let (reply, _discarded) = oneshot::channel();
             *pending = Some(PendingApproval {
                 call,
-                reply,
                 allow_always: offered_decisions.allow_always,
                 allow_project: offered_decisions.allow_project,
             });
         }
-        HarnessEvent::ApprovalCleared => {
+        HarnessEvent::ApprovalCleared { approved } => {
             *pending = None;
-            tui.screen.clear_approval(false);
+            tui.screen.clear_approval(approved);
         }
         HarnessEvent::SettingsApplied { lines } => apply_notices(tui, lines),
         HarnessEvent::SettingsQueued { label, reason } => {
             tui.screen
                 .apply(UiEvent::Notice(format!("queued {label} — {reason}")));
         }
-        HarnessEvent::PendingSettingsApplied { labels, lines } => {
+        HarnessEvent::PendingSettingsApplied { labels } => {
             if !labels.is_empty() {
                 tui.screen.apply(UiEvent::Notice(format!(
                     "applied queued settings: {}",
                     labels.join(", ")
                 )));
             }
-            apply_notices(tui, switch_notice_lines(lines));
         }
         HarnessEvent::ActorState(state) => apply_actor_state(tui, settings, state),
         HarnessEvent::SettingsResult {
@@ -2813,7 +2816,6 @@ fn apply_actor_state(
         compaction_state: _compaction_state,
         task_state: _task_state,
         settings: actor_settings,
-        context_tokens: _context_tokens,
         context_budget,
     } = state;
     *settings = actor_settings;
@@ -4239,14 +4241,12 @@ mod tests {
         )
     }
 
-    fn handle_running_event_with_token(
+    fn capture_active_event(
         screen: &mut Screen,
         event: Event,
         pending: &mut Option<PendingApproval>,
-        steering: &SteeringQueue,
         git_cache: &GitStatusCache,
-        token: &CancellationToken,
-    ) -> bool {
+    ) -> (bool, Vec<HarnessCommand>) {
         let (commands, mut command_rx) = unbounded_channel();
         let settings = settings_menu::tests::snapshot();
         let changed = super::handle_active_event(
@@ -4258,7 +4258,20 @@ mod tests {
             &commands,
             git_cache,
         );
-        while let Ok(command) = command_rx.try_recv() {
+        let commands = std::iter::from_fn(|| command_rx.try_recv().ok()).collect();
+        (changed, commands)
+    }
+
+    fn handle_running_event_with_token(
+        screen: &mut Screen,
+        event: Event,
+        pending: &mut Option<PendingApproval>,
+        steering: &SteeringQueue,
+        git_cache: &GitStatusCache,
+        token: &CancellationToken,
+    ) -> bool {
+        let (changed, commands) = capture_active_event(screen, event, pending, git_cache);
+        for command in commands {
             match command {
                 HarnessCommand::QueueSteering { text, mode } => match mode {
                     SteeringMode::Steering => steering.enqueue_steering(text),
@@ -5747,72 +5760,73 @@ mod tests {
     }
 
     #[test]
-    fn running_event_approval_keys_resolve_oneshot() {
+    fn running_event_approval_keys_send_actor_decisions() {
         let mut screen = Screen::new();
-        let steering = SteeringQueue::default();
-        // Allow.
-        let (tx, rx) = oneshot::channel();
+        screen.show_approval(true, false, false);
+
         let mut pending = Some(PendingApproval {
             call: call(),
-            reply: tx,
             allow_always: true,
             allow_project: false,
         });
-        assert!(handle_running_event(
+        let (changed, commands) = capture_active_event(
             &mut screen,
             key(KeyCode::Char('y')),
             &mut pending,
-            &steering,
-        ));
+            &GitStatusCache::default(),
+        );
+        assert!(changed);
         assert!(pending.is_none());
-        assert_eq!(rx.blocking_recv().unwrap(), ApprovalDecision::Allow);
+        assert!(matches!(
+            commands.as_slice(),
+            [HarnessCommand::Approve {
+                decision: ApprovalDecision::Allow
+            }]
+        ));
+        assert_eq!(screen.work_phase_label(), "Preparing tool");
 
-        // Deny via 'n'.
-        let (tx, rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
             call: call(),
-            reply: tx,
             allow_always: false,
             allow_project: false,
         });
-        handle_running_event(
+        let (_, commands) = capture_active_event(
             &mut screen,
             key(KeyCode::Char('n')),
             &mut pending,
-            &steering,
+            &GitStatusCache::default(),
         );
-        assert_eq!(rx.blocking_recv().unwrap(), ApprovalDecision::Deny);
+        assert!(matches!(
+            commands.as_slice(),
+            [HarnessCommand::Approve {
+                decision: ApprovalDecision::Deny
+            }]
+        ));
 
-        // 'a' is ignored when always is not on offer (and not typed: the composer
-        // is frozen while an approval is pending).
-        let (tx, mut rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
             call: call(),
-            reply: tx,
             allow_always: false,
             allow_project: false,
         });
-        assert!(!handle_running_event(
+        let (changed, commands) = capture_active_event(
             &mut screen,
             key(KeyCode::Char('a')),
             &mut pending,
-            &steering,
-        ));
+            &GitStatusCache::default(),
+        );
+        assert!(!changed);
+        assert!(commands.is_empty());
         assert!(pending.is_some());
-        assert!(rx.try_recv().is_err());
-        // The frozen-composer key did not leak into the editor.
         assert!(screen.editor_is_empty());
     }
 
     #[test]
-    fn running_ctrl_c_denies_pending_approval_and_clears_queue() {
+    fn running_ctrl_c_clears_pending_approval_and_queue() {
         let mut screen = Screen::new();
         let steering = SteeringQueue::default();
         steering.enqueue_steering("queued".to_string());
-        let (tx, rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
             call: call(),
-            reply: tx,
             allow_always: true,
             allow_project: false,
         });
@@ -5823,9 +5837,34 @@ mod tests {
             &steering,
         ));
         assert!(pending.is_none());
-        assert_eq!(rx.blocking_recv().unwrap(), ApprovalDecision::Deny);
-        // Aborting also discards what the user had queued.
         assert_eq!(steering.len(), 0);
+    }
+
+    #[test]
+    fn esc_cancellation_disables_as_soon_as_approval_or_overlay_owns_escape() {
+        let token_slot = Arc::new(Mutex::new(Some(harness_actor::ActiveToken {
+            token: CancellationToken::new(),
+            esc_cancels: true,
+        })));
+        let mut screen = Screen::new();
+        let pending = Some(PendingApproval {
+            call: call(),
+            allow_always: true,
+            allow_project: false,
+        });
+
+        sync_esc_cancel_enabled(&token_slot, &pending, &screen);
+        assert!(
+            !token_slot.lock().unwrap().as_ref().unwrap().esc_cancels,
+            "approval Esc must deny without pre-cancelling the actor token"
+        );
+
+        let pending = None;
+        screen.open_modal(Modal::Settings(Box::new(
+            settings_menu::SettingsPanel::new(settings_menu::tests::snapshot()),
+        )));
+        sync_esc_cancel_enabled(&token_slot, &pending, &screen);
+        assert!(!token_slot.lock().unwrap().as_ref().unwrap().esc_cancels);
     }
 
     #[test]
@@ -5852,31 +5891,27 @@ mod tests {
 
     #[test]
     fn running_esc_denies_pending_approval_without_cancelling_turn() {
-        // A pending approval owns Esc: it denies (preserved) and must not cancel
-        // the turn's token (issue #511 must not regress approval Esc).
         let mut screen = Screen::new();
-        let steering = SteeringQueue::default();
-        let (tx, rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
             call: call(),
-            reply: tx,
             allow_always: true,
             allow_project: false,
         });
         let token = CancellationToken::new();
-        assert!(handle_running_event_with_token(
+        let (changed, commands) = capture_active_event(
             &mut screen,
             key(KeyCode::Esc),
             &mut pending,
-            &steering,
             &GitStatusCache::default(),
-            &token,
-        ));
-        assert_eq!(rx.blocking_recv().unwrap(), ApprovalDecision::Deny);
-        assert!(
-            !token.is_cancelled(),
-            "approval Esc denies, it does not cancel the turn"
         );
+        assert!(changed);
+        assert!(matches!(
+            commands.as_slice(),
+            [HarnessCommand::Approve {
+                decision: ApprovalDecision::Deny
+            }]
+        ));
+        assert!(!token.is_cancelled());
     }
 
     #[test]
@@ -5989,10 +6024,8 @@ mod tests {
             settings_menu::SettingsPanel::new(settings_menu::tests::snapshot()),
         )));
         let steering = SteeringQueue::default();
-        let (reply, decision) = oneshot::channel();
         let mut pending = Some(PendingApproval {
             call: call(),
-            reply,
             allow_always: true,
             allow_project: false,
         });
@@ -6004,7 +6037,6 @@ mod tests {
             &steering,
         ));
 
-        assert_eq!(decision.blocking_recv().unwrap(), ApprovalDecision::Allow);
         assert!(pending.is_none());
         assert!(matches!(screen.modal, Some(Modal::Settings(_))));
     }
@@ -6022,10 +6054,8 @@ mod tests {
         );
         assert_eq!(screen.focus(), FocusTarget::Palette);
 
-        let (reply, decision) = oneshot::channel();
         let mut pending = Some(PendingApproval {
             call: call(),
-            reply,
             allow_always: true,
             allow_project: false,
         });
@@ -6036,7 +6066,6 @@ mod tests {
             &steering,
         ));
 
-        assert_eq!(decision.blocking_recv().unwrap(), ApprovalDecision::Allow);
         assert!(pending.is_none());
         assert_eq!(screen.focus(), FocusTarget::Palette);
     }
@@ -6113,10 +6142,8 @@ mod tests {
     fn page_keys_do_not_consume_a_pending_approval() {
         let mut screen = Screen::new();
         let steering = SteeringQueue::default();
-        let (tx, _rx) = oneshot::channel();
         let mut pending = Some(PendingApproval {
             call: call(),
-            reply: tx,
             allow_always: true,
             allow_project: false,
         });
