@@ -532,9 +532,21 @@ pub(crate) struct Snapshot {
     pub(crate) native_jj_available: bool,
     pub(crate) native_jj_enabled: bool,
     pub(crate) worktree_root: Option<String>,
+    /// Controls changed during an active operation and awaiting its boundary.
+    pub(crate) pending_rows: Vec<RowId>,
 }
 
 impl Snapshot {
+    pub(crate) fn mark_pending(&mut self, row: RowId) {
+        if !self.pending_rows.contains(&row) {
+            self.pending_rows.push(row);
+        }
+    }
+
+    pub(crate) fn clear_pending(&mut self) {
+        self.pending_rows.clear();
+    }
+
     fn switch_options(&self, field: Field) -> &'static [&'static str] {
         match field {
             Field::AltScreen => &["auto", "always", "never"],
@@ -1003,6 +1015,14 @@ impl SettingsPanel {
             edit: None,
             flash: None,
         }
+    }
+
+    pub(crate) fn mark_pending(&mut self, row: RowId) {
+        self.snap.mark_pending(row);
+    }
+
+    pub(crate) fn clear_pending(&mut self) {
+        self.snap.clear_pending();
     }
 
     /// Open with a hatch pre-expanded and the cursor on its most useful child —
@@ -2248,10 +2268,18 @@ impl SettingsPanel {
             },
         ));
         let editing = selected && self.edit.is_some();
+        let pending = self.snap.pending_rows.contains(&row);
         if editing {
             self.push_edit_spans(&mut spans);
         } else {
-            self.push_top_control_spans(row, &mut spans, flashing, inert, avail);
+            let control_width = avail.saturating_sub(if pending { 9 } else { 0 });
+            self.push_top_control_spans(row, &mut spans, flashing, inert, control_width);
+        }
+        if pending {
+            spans.push(Span::styled(
+                " \u{00b7} queued".to_string(),
+                Style::default().fg(crate::ui::palette::orange()),
+            ));
         }
         Line::from(spans)
     }
@@ -2968,7 +2996,7 @@ fn line_width(line: &Line<'static>) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn model_choice(
@@ -3020,7 +3048,7 @@ mod tests {
         }
     }
 
-    fn snapshot() -> Snapshot {
+    pub(crate) fn snapshot() -> Snapshot {
         Snapshot {
             default_model: "openai-codex/gpt-5.5".to_string(),
             reasoning_levels: vec![
@@ -3104,6 +3132,7 @@ mod tests {
             native_jj_available: true,
             native_jj_enabled: false,
             worktree_root: None,
+            pending_rows: Vec::new(),
         }
     }
 
@@ -3167,6 +3196,28 @@ mod tests {
     fn expand(panel: &mut SettingsPanel, port: RowId) {
         select_top(panel, port);
         panel.handle_key(ModalKey::Enter);
+    }
+
+    #[test]
+    fn queued_engine_changes_are_marked_on_the_faceplate() {
+        let mut panel = panel();
+        panel.mark_pending(RowId::Model);
+        panel.mark_pending(RowId::Reasoning);
+
+        let rendered = text(&panel.render_budgeted(80, 60));
+        let model = rendered
+            .lines()
+            .find(|line| line.trim_start().starts_with("model "))
+            .expect("model row");
+        let reasoning = rendered
+            .lines()
+            .find(|line| line.trim_start().starts_with("reasoning "))
+            .expect("reasoning row");
+        assert!(model.contains("· queued"));
+        assert!(reasoning.contains("· queued"));
+
+        panel.clear_pending();
+        assert!(!text(&panel.render_budgeted(80, 60)).contains("· queued"));
     }
 
     #[test]

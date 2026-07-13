@@ -7,7 +7,7 @@
 //! harness (which the turn drains through). Mirrors pi's per-`Agent` steering /
 //! follow-up queues, but the drain policy lives here, not in the loop.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use crate::nexus::SteeringSource;
@@ -27,12 +27,6 @@ use crate::nexus::SteeringSource;
 pub(crate) struct SteeringQueue {
     steering: RefCell<VecDeque<String>>,
     follow_up: RefCell<VecDeque<String>>,
-    /// A `/settings` typed mid-turn: a UI navigation intent, not model input
-    /// (issue #489). The input arm sets it instead of steering the command
-    /// into the turn; the loop drains it at the next safe boundary and opens
-    /// the settings picker there. Kept beside the message queues because both
-    /// are shared (`Rc`) between the input arm and the loop.
-    settings_request: Cell<bool>,
 }
 
 impl SteeringQueue {
@@ -44,20 +38,6 @@ impl SteeringQueue {
     /// Queue a follow-up message, injected when the agent would otherwise stop.
     pub(crate) fn enqueue_follow_up(&self, text: String) {
         self.follow_up.borrow_mut().push_back(text);
-    }
-
-    /// Record that the user asked to open settings mid-turn. Idempotent: a
-    /// second request before the boundary drains is a no-op.
-    pub(crate) fn request_settings(&self) {
-        self.settings_request.set(true);
-    }
-
-    /// Take the pending settings request, clearing it. Returns whether one was
-    /// queued so the loop opens the settings picker exactly once at the
-    /// boundary. Independent of [`clear`]: a UI navigation intent survives a
-    /// turn cancel so the picker still opens after the turn ends.
-    pub(crate) fn take_settings(&self) -> bool {
-        self.settings_request.replace(false)
     }
 
     /// Count of all queued messages (both kinds), for a "queued" indicator.

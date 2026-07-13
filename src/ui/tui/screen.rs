@@ -1547,6 +1547,18 @@ impl Screen {
         self.modal = Some(modal);
     }
 
+    pub(crate) fn mark_settings_pending(&mut self, row: crate::ui::settings_menu::RowId) {
+        if let Some(Modal::Settings(panel)) = self.modal.as_mut() {
+            panel.mark_pending(row);
+        }
+    }
+
+    pub(crate) fn clear_settings_pending(&mut self) {
+        if let Some(Modal::Settings(panel)) = self.modal.as_mut() {
+            panel.clear_pending();
+        }
+    }
+
     // --- session-bar dropdowns ---
 
     /// Open a SessionBar dropdown. Exclusive slot: an already-open dropdown
