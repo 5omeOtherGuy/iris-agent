@@ -131,7 +131,7 @@ pub(crate) struct PrintObserver {
 struct TurnSample {
     turn_id: String,
     turn: UsageTurn,
-    usage: crate::nexus::ProviderUsage,
+    usage: Option<crate::nexus::ProviderUsage>,
 }
 
 struct ActiveTool {
@@ -179,7 +179,9 @@ impl PrintObserver {
         let turns = samples.iter().map(|sample| sample.turn.clone()).collect();
         let mut flows = TokenFlows::default();
         for sample in samples.iter() {
-            flows.observe(&sample.usage);
+            if let Some(usage) = &sample.usage {
+                flows.observe(usage);
+            }
         }
         let tools = self.tools.borrow().clone();
         let mut tool_calls_by_name = BTreeMap::new();
@@ -227,32 +229,45 @@ impl AgentObserver for PrintObserver {
                 timing,
                 ..
             } => {
-                if let Some(usage) = usage {
+                if let Some(usage) = &usage {
                     self.provider.replace(usage.provider.clone());
                     self.model.replace(usage.model.clone());
-                    let mut turns = self.turns.borrow_mut();
-                    let i = turns.len() as u32;
-                    let fresh = usage
-                        .input_tokens
-                        .saturating_sub(usage.cache_read_input_tokens)
-                        .saturating_sub(usage.cache_write_input_tokens);
-                    turns.push(TurnSample {
-                        turn_id,
-                        turn: UsageTurn {
-                            i,
-                            fresh,
-                            cache_read: usage.cache_read_input_tokens,
-                            cache_write: usage.cache_write_input_tokens,
-                            output: usage.output_tokens,
-                            reasoning: usage.reasoning_output_tokens,
-                            input_full: usage.input_tokens,
-                            duration_ms: duration_ms(timing.duration),
-                            ttft_ms: timing.time_to_first_output.map(duration_ms),
-                            stop_reason: completion_reason.map(completion_reason_name),
-                        },
-                        usage,
-                    });
                 }
+                let mut turns = self.turns.borrow_mut();
+                let i = turns.len() as u32;
+                let (fresh, cache_read, cache_write, output, reasoning, input_full) = usage
+                    .as_ref()
+                    .map(|usage| {
+                        (
+                            usage
+                                .input_tokens
+                                .saturating_sub(usage.cache_read_input_tokens)
+                                .saturating_sub(usage.cache_write_input_tokens),
+                            usage.cache_read_input_tokens,
+                            usage.cache_write_input_tokens,
+                            usage.output_tokens,
+                            usage.reasoning_output_tokens,
+                            usage.input_tokens,
+                        )
+                    })
+                    .unwrap_or_default();
+                turns.push(TurnSample {
+                    turn_id,
+                    turn: UsageTurn {
+                        i,
+                        fresh,
+                        cache_read,
+                        cache_write,
+                        output,
+                        reasoning,
+                        input_full,
+                        duration_ms: duration_ms(timing.duration),
+                        ttft_ms: timing.time_to_first_output.map(duration_ms),
+                        stop_reason: completion_reason.map(completion_reason_name),
+                    },
+                    usage,
+                });
+                drop(turns);
                 // Persist incrementally so a mid-task kill (benchmark timeout)
                 // still leaves this turn's cumulative accounting.
                 self.flush_usage();
@@ -364,11 +379,16 @@ impl UsageBase {
         let tools = tools
             .iter()
             .map(|tool| {
-                let schema = serde_json::to_string(&tool.parameters())
+                let declaration = serde_json::json!({
+                    "name": tool.name(),
+                    "description": tool.description(),
+                    "input_schema": tool.parameters(),
+                });
+                let declaration = serde_json::to_string(&declaration)
                     .expect("serializing a JSON value cannot fail");
                 UsageBaseTool {
                     name: tool.name().to_string(),
-                    schema_tokens: estimated_tokens(&schema),
+                    schema_tokens: estimated_tokens(&declaration),
                 }
             })
             .collect::<Vec<_>>();
