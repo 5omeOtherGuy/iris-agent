@@ -206,6 +206,19 @@ impl Recorder {
             _ => None,
         })
     }
+
+    /// Every plain `AgentEvent::Notice` text recorded, in order. Used to check
+    /// the user-visible apply notice names its route (audit F11c/F20).
+    fn notices(&self) -> Vec<String> {
+        self.events
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -1431,6 +1444,14 @@ fn manual_compact_uses_worker_pipeline_and_records_focus() {
     assert_eq!(
         entries[0]["instructions"],
         "Manual focus: preserve the exact flag"
+    );
+    // Audit F11c/F20: the apply notice names the route (here `subagent`, since
+    // `set_summarizer(SummarizerKind::Subagent)` above selects it) instead of
+    // leaving it discoverable only via `/compaction`.
+    let notices = obs.notices();
+    assert!(
+        notices.iter().any(|text| text.contains("via subagent")),
+        "{notices:?}"
     );
 }
 

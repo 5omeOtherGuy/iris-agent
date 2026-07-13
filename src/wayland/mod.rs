@@ -1994,8 +1994,9 @@ impl<P: ChatProvider> Harness<P> {
             return Ok(());
         };
         obs.on_event(AgentEvent::Notice(format!(
-            "compacted {} earlier message(s) to stay within the {budget}-token context budget.",
-            outcome.covered
+            "compacted {} earlier message(s) via {} to stay within the {budget}-token context budget.",
+            outcome.covered,
+            outcome.origin.as_str(),
         )))
     }
 
@@ -2226,7 +2227,7 @@ impl<P: ChatProvider> Harness<P> {
                 .compaction
                 .background
                 .as_ref()
-                .map(|job| (job.covered_messages, job.original_tokens));
+                .map(|job| (job.covered_messages, job.original_tokens, job.origin));
             loop {
                 if token.is_cancelled() {
                     return obs.on_event(AgentEvent::Notice(
@@ -2247,9 +2248,11 @@ impl<P: ChatProvider> Harness<P> {
                 {
                     let after = context_tokens(&replacement);
                     self.agent.replace_messages(replacement);
-                    let (covered, original) = covered.unwrap_or_default();
+                    let (covered, original, origin) =
+                        covered.unwrap_or((0, 0, CompactionOrigin::Excerpts));
                     return obs.on_event(AgentEvent::Notice(format!(
-                        "compacted {covered} earlier message(s): ~{original} tokens replaced; context is now ~{after} tokens."
+                        "compacted {covered} earlier message(s) via {}: ~{original} tokens replaced; context is now ~{after} tokens.",
+                        origin.as_str(),
                     )));
                 }
                 if self.compaction.background.is_none() {
@@ -2268,8 +2271,11 @@ impl<P: ChatProvider> Harness<P> {
             return obs.on_event(AgentEvent::Notice("compaction cancelled.".to_string()));
         };
         obs.on_event(AgentEvent::Notice(format!(
-            "compacted {} earlier message(s): ~{} tokens replaced by a ~{}-token summary.",
-            outcome.covered, outcome.original_tokens, outcome.summary_tokens
+            "compacted {} earlier message(s) via {}: ~{} tokens replaced by a ~{}-token summary.",
+            outcome.covered,
+            outcome.origin.as_str(),
+            outcome.original_tokens,
+            outcome.summary_tokens
         )))
     }
 

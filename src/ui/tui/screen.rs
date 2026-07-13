@@ -3662,6 +3662,7 @@ mod tests {
             original_tokens_estimate: original,
             summary_tokens_estimate: summary,
             budget: 4096,
+            origin: crate::nexus::CompactionOrigin::Provider,
         }
     }
 
@@ -5235,6 +5236,7 @@ mod tests {
             original_tokens_estimate: 40_000,
             summary_tokens_estimate: 4_000,
             budget: 80_000,
+            origin: crate::nexus::CompactionOrigin::Provider,
         });
         screen.apply(UiEvent::ProviderTurnCompleted {
             turn_id: "turn_1".to_string(),
