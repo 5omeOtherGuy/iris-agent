@@ -655,6 +655,21 @@ mod tests {
         let tools = crate::tools::built_in_tools();
         let base = UsageBase::estimate("12345", &tools);
         assert_eq!(base.system_prompt_tokens, 2);
+        let bash = tools.by_name("bash").expect("bash tool");
+        let bash_declaration = serde_json::to_string(&json!({
+            "name": bash.name(),
+            "description": bash.description(),
+            "input_schema": bash.parameters(),
+        }))
+        .unwrap();
+        assert_eq!(
+            base.tools
+                .iter()
+                .find(|tool| tool.name == "bash")
+                .unwrap()
+                .schema_tokens,
+            estimated_tokens(&bash_declaration)
+        );
         assert_eq!(
             base.tools_total_tokens,
             base.tools
@@ -802,13 +817,44 @@ mod tests {
     }
 
     #[test]
-    fn usage_report_ignores_turns_without_usage() {
+    fn usage_report_preserves_turns_without_usage_and_tool_associations() {
         let observer = PrintObserver::default();
-        observer.on_event(turn_completed(None)).unwrap();
+        observer
+            .on_event(AgentEvent::ProviderTurnCompleted {
+                turn_id: "t0".to_string(),
+                response_id: None,
+                usage: None,
+                completion_reason: Some(crate::nexus::CompletionReason::EndTurn),
+                timing: crate::nexus::ProviderTurnTiming {
+                    duration: std::time::Duration::from_millis(900),
+                    time_to_first_output: None,
+                },
+            })
+            .unwrap();
+        observer
+            .on_event(turn_completed(Some(provider_usage(100, 20, 0, 0))))
+            .unwrap();
+        observer.on_event(tool_started("bash")).unwrap();
+
         let report = observer.usage_report();
-        assert_eq!(report.totals.provider_turns, 0);
-        assert_eq!(report.totals.input_tokens, 0);
-        assert!(report.totals.latest_total_tokens.is_none());
+        assert_eq!(
+            report.turns[0],
+            UsageTurn {
+                i: 0,
+                fresh: 0,
+                cache_read: 0,
+                cache_write: 0,
+                output: 0,
+                reasoning: 0,
+                input_full: 0,
+                duration_ms: 900,
+                ttft_ms: None,
+                stop_reason: Some("end_turn"),
+            }
+        );
+        assert_eq!(report.turns[1].i, 1);
+        assert_eq!(report.tools[0].turn, 1);
+        assert_eq!(report.totals.provider_turns, 1);
     }
 
     #[test]
