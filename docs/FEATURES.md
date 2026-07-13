@@ -378,9 +378,11 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 
 - **Fragment-based system prompt** — Wayland assembles provider-visible
   instructions from in-binary shipped fragments (the single source of truth,
-  ADR-0026), project docs (`AGENTS.md`/`CLAUDE.md`), runtime context, and
-  generated live-tool blocks. No `.md` fragment files are loaded from disk.
-  [Implemented]
+  ADR-0026), machine-local user instructions (`~/.agents/AGENTS.md` followed by
+  Iris-specific `~/.iris/AGENTS.md`), root-to-leaf project docs
+  (`AGENTS.md`/`CLAUDE.md`), runtime context, and generated live-tool blocks. All
+  instruction files use bounded, symlink-refusing reads. No `.md` fragment files
+  are loaded from disk. [Implemented]
 - **Fragment ordering** — internal fragments use `name` for XML tags and
   numeric `slot` ordering (`slot: 0` disables). [Implemented]
 - **Named slots and selector schema** — replace numeric slots with named slots

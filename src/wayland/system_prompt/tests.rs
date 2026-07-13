@@ -640,6 +640,76 @@ fn discover_prepends_iris_agents_when_present() {
 }
 
 #[test]
+fn discover_prepends_shared_hub_before_iris_and_project_docs() {
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    let hub_dir = home.path.join(".agents");
+    fs::create_dir_all(&hub_dir).unwrap();
+    fs::write(hub_dir.join("AGENTS.md"), "SHARED HUB RULES").unwrap();
+    let iris_dir = home.path.join(".iris");
+    fs::create_dir_all(&iris_dir).unwrap();
+    fs::write(iris_dir.join("AGENTS.md"), "IRIS RULES").unwrap();
+
+    let ws = temp_dir();
+    fs::write(ws.path.join("AGENTS.md"), "PROJECT RULES").unwrap();
+
+    let docs = discover_project_docs(&ws.path);
+    let pos = |needle: &str| {
+        docs.iter()
+            .position(|(_, c)| c.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} present"))
+    };
+    let (hub, iris, project) = (
+        pos("SHARED HUB RULES"),
+        pos("IRIS RULES"),
+        pos("PROJECT RULES"),
+    );
+    assert!(
+        hub < iris && iris < project,
+        "shared hub is outermost, then iris, then project (got {hub}, {iris}, {project})"
+    );
+    assert!(docs[hub].0.contains(".agents/AGENTS.md"));
+}
+
+#[cfg(unix)]
+#[test]
+fn discover_rejects_a_symlinked_shared_hub_doc() {
+    use std::os::unix::fs::symlink;
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    let secret = home.path.join("secret.txt");
+    fs::write(&secret, "TOP SECRET HOST FILE").unwrap();
+    let hub_dir = home.path.join(".agents");
+    fs::create_dir_all(&hub_dir).unwrap();
+    symlink(&secret, hub_dir.join("AGENTS.md")).unwrap();
+
+    let ws = temp_dir();
+    let docs = discover_project_docs(&ws.path);
+    assert!(
+        docs.iter()
+            .all(|(_, c)| !c.contains("TOP SECRET HOST FILE")),
+        "a symlinked ~/.agents/AGENTS.md must not be read"
+    );
+}
+
+#[test]
+fn discover_does_not_duplicate_hub_doc_when_cwd_is_inside_the_hub() {
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    let hub_dir = home.path.join(".agents");
+    fs::create_dir_all(hub_dir.join("skills")).unwrap();
+    fs::write(hub_dir.join("AGENTS.md"), "SHARED HUB RULES").unwrap();
+
+    // Working inside the hub: the ancestor walk visits ~/.agents itself.
+    let docs = discover_project_docs(&hub_dir.join("skills"));
+    let hits = docs
+        .iter()
+        .filter(|(_, c)| c.contains("SHARED HUB RULES"))
+        .count();
+    assert_eq!(hits, 1, "hub doc must be folded in exactly once");
+}
+
+#[test]
 fn discover_skips_empty_iris_agents_sentinel() {
     let home = temp_dir();
     let _env = EnvGuard::with_home(&home.path);

@@ -40,6 +40,22 @@ pub(crate) struct PeerDoc {
     pub(crate) content: String,
 }
 
+/// Directory of the machine-local shared agents hub: `$HOME/.agents`. Iris
+/// reads its user-level instructions from this hub alongside Iris-specific
+/// overrides in `~/.iris`.
+const SHARED_AGENTS_DIR: &str = ".agents";
+
+/// Resolve the shared cross-harness AGENTS.md path: `$HOME/.agents/AGENTS.md`.
+/// Returns `None` when `HOME` is not set or empty.
+pub(crate) fn shared_agents_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    Some(
+        Path::new(&home)
+            .join(SHARED_AGENTS_DIR)
+            .join(IRIS_AGENTS_FILENAME),
+    )
+}
+
 /// Resolve the Iris user-level AGENTS.md path: `$HOME/.iris/AGENTS.md`.
 /// Returns `None` when `HOME` is not set or empty.
 pub(crate) fn iris_agents_path() -> Option<PathBuf> {
