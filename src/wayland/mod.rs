@@ -22,7 +22,7 @@ pub(crate) mod trust;
 mod skills_tests;
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -2884,6 +2884,44 @@ fn valid_compaction_range(messages: &[Message], start: usize, end: usize) -> boo
         return false;
     }
     true
+}
+
+/// Independent-by-construction check: does covering `[start, end)` sever any
+/// tool-call from its result? Keyed on `tool_call_id` rather than the
+/// role-adjacency logic `valid_compaction_range`/`plan_with_mode` use, so it
+/// stays a meaningful backstop even when a run boundary is not where role
+/// adjacency assumes.
+///
+/// This closes an adversarial-fuzz finding: `plan_with_mode` treats a `None`
+/// entry id as a run delimiter and, in the real pipeline, that only ever
+/// lands on a `Role::User` summary body. A `None` id on a tool-CALL message
+/// instead turns the call into a delimiter that no run ever covers, while its
+/// result can still surface inside a later run -- role-adjacency trimming
+/// alone never flags that split because the call is simply absent from both
+/// runs being compared. Matching by id catches it regardless of which side of
+/// a boundary the orphaned half falls on.
+fn splits_pair_by_id(messages: &[Message], start: usize, end: usize) -> bool {
+    let mut call_idx: HashMap<&str, usize> = HashMap::new();
+    let mut result_idx: HashMap<&str, usize> = HashMap::new();
+    for (i, m) in messages.iter().enumerate() {
+        if let Some(id) = m.tool_call_id.as_deref() {
+            match m.role {
+                Role::AssistantToolCall => {
+                    call_idx.insert(id, i);
+                }
+                Role::Tool => {
+                    result_idx.insert(id, i);
+                }
+                _ => {}
+            }
+        }
+    }
+    let covered = |i: usize| start <= i && i < end;
+    call_idx.iter().any(|(id, &ci)| {
+        result_idx
+            .get(id)
+            .is_some_and(|&ri| covered(ci) != covered(ri))
+    })
 }
 
 /// Index where the fold pass's retained tail begins: the most-recent turns whose

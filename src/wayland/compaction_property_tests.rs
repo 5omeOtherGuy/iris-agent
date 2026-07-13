@@ -27,7 +27,7 @@
 //! generator that gives permanent bit-exact reproducibility from a fixed seed,
 //! which is exactly what a regression-oriented property test wants.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -37,7 +37,7 @@ use serde_json::json;
 use super::{
     ApplyContext, CompactionEngine, CompactionSummary, MANUAL_COMPACT_KEEP_TOKENS,
     ManualBlockReason, PlanTurnMode, context_tokens, fold_tail_start, manual_no_compaction_notice,
-    summarize, valid_compaction_range,
+    splits_pair_by_id, summarize, valid_compaction_range,
 };
 use crate::config::{Settings, ToolResultCompactionPolicy};
 use crate::nexus::{AgentEvent, AgentObserver, ContextPressureTier, Message, Role, ToolCall};
@@ -180,32 +180,12 @@ fn generate_transcript(rng: &mut SplitMix64) -> Vec<Message> {
     messages
 }
 
-/// Independent oracle: does covering `[start, end)` sever any tool-call from
-/// its result? Keyed on `tool_call_id`, so it is not a restatement of the
-/// role-adjacency logic in `valid_compaction_range` / `plan`.
-fn splits_pair_by_id(messages: &[Message], start: usize, end: usize) -> bool {
-    let mut call_idx: HashMap<&str, usize> = HashMap::new();
-    let mut result_idx: HashMap<&str, usize> = HashMap::new();
-    for (i, m) in messages.iter().enumerate() {
-        if let Some(id) = m.tool_call_id.as_deref() {
-            match m.role {
-                Role::AssistantToolCall => {
-                    call_idx.insert(id, i);
-                }
-                Role::Tool => {
-                    result_idx.insert(id, i);
-                }
-                _ => {}
-            }
-        }
-    }
-    let covered = |i: usize| start <= i && i < end;
-    call_idx.iter().any(|(id, &ci)| {
-        result_idx
-            .get(id)
-            .is_some_and(|&ri| covered(ci) != covered(ri))
-    })
-}
+// `splits_pair_by_id` (does covering `[start, end)` sever any tool-call from
+// its result, keyed on `tool_call_id` rather than the role-adjacency logic in
+// `valid_compaction_range` / `plan`) lives in `super` and is imported above:
+// `plan_with_mode` now gates candidate runs on it directly, so the planner
+// and this test's oracle share one implementation instead of two that could
+// silently drift apart.
 
 /// After a rewrite, every tool-call id must still have its result id present
 /// and vice versa: a split pair leaves exactly one orphaned half.
@@ -917,4 +897,84 @@ fn plan_hard_mode_still_enforces_pair_trims() {
     );
     assert!(valid_compaction_range(&messages, hard.start, hard.end));
     assert!(!splits_pair_by_id(&messages, hard.start, hard.end));
+}
+
+/// Adversarial-review finding: `plan_with_mode` treats a `None` entry id as a
+/// run delimiter and assumes -- true only in the real pipeline, where live
+/// apply and rebuild both push `Message::user` for a summary -- that a `None`
+/// id only ever lands on a `Role::User` body. A fuzzer that instead injects a
+/// `None` id onto a tool-CALL message (the reviewer's seed-0 shape: call at
+/// index 1, its result at index 3) turned the call into an unreachable
+/// delimiter while its result stayed coverable in the next run, producing a
+/// plan that severed the pair. `apply_summary`'s `valid_compaction_range`
+/// caught it as a silent no-op, but that is exactly the starvation failure
+/// shape this branch exists to remove: the planner itself must never offer
+/// that range.
+#[test]
+fn plan_never_splits_pair_when_none_id_lands_on_a_tool_call() {
+    // (1) Adversarial shape: `None` forced onto the tool-CALL half.
+    let call_a = ToolCall {
+        id: "call_a".to_string(),
+        name: "read".to_string(),
+        arguments: json!({ "path": "a.rs" }),
+        thought_signature: None,
+    };
+    let call_b = ToolCall {
+        id: "call_b".to_string(),
+        name: "read".to_string(),
+        arguments: json!({ "path": "b.rs" }),
+        thought_signature: None,
+    };
+    let messages = vec![
+        Message::user("open the task"),                                    // 0
+        Message::assistant_tool_call(&call_a),                             // 1 (forced None)
+        Message::assistant_tool_call(&call_b),                             // 2
+        Message::tool_result(&call_a.id, "read", &"result a ".repeat(50)), // 3
+        Message::tool_result(&call_b.id, "read", &"result b ".repeat(50)), // 4
+        Message::user("later request"),                                    // 5
+        Message::assistant("later answer"),                                // 6
+    ];
+    let (mut engine, _sessions, _ws) = persisted_engine(&messages);
+    assert_eq!(messages[1].role, Role::AssistantToolCall);
+    engine.entry_ids[1] = None;
+
+    for &mode in &[PlanTurnMode::Respect, PlanTurnMode::HardCurrentTurn] {
+        let plan = engine.plan_with_mode(&messages, 0, mode);
+        // The planner must never emit the id-splitting range: either it falls
+        // through to another valid run, or it finds none and returns `None`.
+        if let Some(plan) = plan {
+            assert!(
+                !splits_pair_by_id(&messages, plan.start, plan.end),
+                "{mode:?}: plan {}..{} split the call_a/result_a pair behind \
+                 the None id injected on the call at index 1",
+                plan.start,
+                plan.end
+            );
+            assert!(valid_compaction_range(&messages, plan.start, plan.end));
+        }
+    }
+
+    // (2) Realistic shape: `None` lands only on a `Role::User` summary body,
+    // matching what live apply and rebuild actually produce. The id-keyed
+    // gate must not change today's behavior for this shape.
+    let realistic = vec![
+        Message::user("[older compacted summary]"),
+        Message::assistant_tool_call(&call_a),
+        Message::tool_result(&call_a.id, "read", &"old read output ".repeat(50)),
+        Message::user("recent request"),
+        Message::assistant("recent answer"),
+    ];
+    let (mut realistic_engine, _s2, _w2) = persisted_engine(&realistic);
+    realistic_engine.entry_ids[0] = None;
+    let keep = context_tokens(&realistic[3..]);
+    let plan = realistic_engine
+        .plan(&realistic, keep)
+        .expect("the complete pair after the summary is coverable");
+    assert_eq!(
+        (plan.start, plan.end),
+        (1, 3),
+        "the id-keyed gate must not change the plan for the realistic \
+         None-only-on-summary shape"
+    );
+    assert!(!splits_pair_by_id(&realistic, plan.start, plan.end));
 }

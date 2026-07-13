@@ -843,7 +843,20 @@ impl CompactionEngine {
             // compaction stub (a summary body that, in the degraded id-carrying
             // state, slipped past the `None` run delimiter) is not a coverable
             // range; a valid plan must include at least one real turn.
-            if start < end && !(start..end).all(|index| is_summary_body(&messages[index])) {
+            //
+            // Pair-completeness by id is the final gate, independent of the
+            // role-adjacency trims above: it does not assume a `None` entry id
+            // only ever lands on a `Role::User` summary body. A run that would
+            // sever a tool-call/result pair by id (e.g. a `None` id landing on
+            // the call turns it into a delimiter no run covers, orphaning its
+            // result inside this one) is never a candidate; the loop falls
+            // through to the next run by mass rank instead of emitting a plan
+            // that `apply_summary`'s `valid_compaction_range` would silently
+            // no-op. This must hold in release, not just debug_assert.
+            if start < end
+                && !(start..end).all(|index| is_summary_body(&messages[index]))
+                && !splits_pair_by_id(messages, start, end)
+            {
                 let tokens = context_tokens(&messages[start..end]);
                 if best
                     .as_ref()
