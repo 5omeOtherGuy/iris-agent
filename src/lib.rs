@@ -847,9 +847,22 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     let piped = print::read_piped_stdin()?;
     let prompt = print::merge_prompt(prompt_arg, piped.as_deref());
 
-    let observer = print::PrintObserver::default();
+    // Opt-in diagnostics sink (benchmarking): when `IRIS_USAGE_JSON` names a
+    // path, the observer writes the run's token/cache/tool accounting there
+    // after every provider turn, so even an errored or killed turn leaves the
+    // latest totals. `None` disables the sink; stdout stays answer-only.
+    let usage_path = env::var("IRIS_USAGE_JSON")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from);
+    let observer = print::PrintObserver::new(usage_path);
     let gate = print::PrintApprovalGate::new(approve);
-    cli::run_print_turn(&mut harness, &prompt, &observer, &gate)?;
+    let turn_result = cli::run_print_turn(&mut harness, &prompt, &observer, &gate);
+
+    // Final flush regardless of turn outcome (best effort, never propagated),
+    // then surface any turn error after the accounting is safely on disk.
+    observer.flush_usage();
+    turn_result?;
 
     // Only the final assistant answer reaches stdout; everything else is
     // suppressed by the observer.
