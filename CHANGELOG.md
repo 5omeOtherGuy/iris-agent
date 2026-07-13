@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.1...iris-agent-v0.3.2) - 2026-07-13
+
+### Added
+
+- *(tui)* keep commands live during active turns ([#600](https://github.com/5omeOtherGuy/iris-agent/pull/600))
+- *(web)* harden and bound web tools ([#592](https://github.com/5omeOtherGuy/iris-agent/pull/592))
+- *(web)* benchmark and enforce web-tools token efficiency (ADR-0059) ([#589](https://github.com/5omeOtherGuy/iris-agent/pull/589))
+
+### Fixed
+
+- *(mimir)* keep retry backoff from tripping the stream idle guard ([#602](https://github.com/5omeOtherGuy/iris-agent/pull/602))
+- *(settings)* refresh compaction controls ([#601](https://github.com/5omeOtherGuy/iris-agent/pull/601))
+- *(compaction)* portable summary directive + one explained COMPACTION settings surface ([#597](https://github.com/5omeOtherGuy/iris-agent/pull/597))
+- centralize native reasoning capabilities ([#595](https://github.com/5omeOtherGuy/iris-agent/pull/595))
+- *(settings)* expose web tool configuration ([#596](https://github.com/5omeOtherGuy/iris-agent/pull/596))
+- *(tools)* correct recall argument binding ([#593](https://github.com/5omeOtherGuy/iris-agent/pull/593))
+- resolve code scanning unused variable alerts ([#590](https://github.com/5omeOtherGuy/iris-agent/pull/590))
+- *(compaction)* preserve rewrite invariants and provider routing ([#587](https://github.com/5omeOtherGuy/iris-agent/pull/587))
+
+### Other
+
+- *(release)* stop bumping minor for features on 0.x ([#603](https://github.com/5omeOtherGuy/iris-agent/pull/603))
+- *(deps)* bump tokio-tungstenite from 0.28.0 to 0.30.0 ([#599](https://github.com/5omeOtherGuy/iris-agent/pull/599))
+- *(deps)* bump the cargo-minor-and-patch group with 2 updates ([#598](https://github.com/5omeOtherGuy/iris-agent/pull/598))
+
 ## [0.3.1](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.0...iris-agent-v0.3.1) - 2026-07-12
 
 ### Added
