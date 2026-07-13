@@ -1,15 +1,57 @@
 # SPEC — Ask-user-questions: model-driven multiple-choice clarification
 
-Status: reference capture — behavioral spec of the claude-code `AskUserQuestion`
-feature, not yet scheduled for Iris. Source snapshot: `~/vendor/claude-code`
-@ `6ba4060` (leaked tree; consult, do not vendor — verify against current
-reference before implementing). Captured 2026-07-13.
+Status: Iris implementation target, informed by the claude-code reference at
+`~/vendor/claude-code` @ `6ba4060` (leaked tree; consult, do not vendor). Reference
+behavior was captured 2026-07-13; the Iris goal and acceptance gate below are
+prescriptive.
+
+## Implementation goal
+
+Give the model one read-only `AskUserQuestion` tool that pauses every call for a
+human response and gives the user an Iris-native docked dialog for 1–4 structured
+questions. Users can choose one or several labeled options, enter an automatic
+`Other` answer, compare option previews, review multi-question answers, submit,
+cancel, or hand the exchange back through `Chat about this`. Submitted answers
+return as a successful tool result; conversational hand-back remains a rejected
+result carrying model-visible feedback. Permission presets, including
+never-ask and dangerous skip-permissions, must not bypass required interaction.
+
+The first Iris slice deliberately excludes reference-only capabilities Iris does
+not otherwise have: plan mode/interview skip, image attachments, HTML preview
+hosts, analytics, and external-editor notes. Markdown preview text is supported;
+the dialog follows Iris's docked-overlay grammar rather than copying Ink layout.
+
+## Definition of done
+
+- The live tool registry and generated provider declarations include
+  `AskUserQuestion` with a strict schema: 1–4 unique questions, 2–4 unique option
+  labels per question, 12-character headers, optional markdown previews,
+  `multiSelect`, and dialog-populated answers/annotations.
+- Model guidance states when to ask, how `Other`, `multiSelect`, recommendations,
+  and previews work, and prevents use as a generic permission prompt.
+- Nexus models required interaction separately from ordinary approval. Strict,
+  auto, never-ask, and dangerous skip-permissions all wait for the user; cancel
+  yields an ordinary denied result and `Chat about this` yields a denied result
+  with bounded model-visible feedback.
+- The TUI supports single-question auto-submit, multi-question navigation and
+  review, single- and multi-select answers, free-text `Other`, focused markdown
+  preview display, cancel, and `Chat about this`. The plain-text fallback can
+  complete the same answer and feedback paths without a TTY.
+- Automated tests cover schema boundaries/uniqueness, registration and guidance,
+  answer/result encoding, permission-mode non-bypass, feedback relay, dialog
+  navigation, `Other`, multi-select, preview rendering, cancel, and actor routing.
+- Live checks exercise a single-select fast path, a multi-question review, an
+  `Other` response, a preview, cancel, and `Chat about this` in a real tmux TUI.
+  Captures must show the expected dialog/result state with no stuck turn.
+- `bash scripts/gate.sh` passes with no skipped feature tests.
+
+## Reference behavior
 
 Purpose: document exactly how the reference implements a tool that lets the
 model pause execution and ask the user 1–4 structured multiple-choice
-questions, so an Iris equivalent can be specified against observed behavior
-rather than guesswork. This spec is descriptive of the reference, not
-prescriptive for Iris.
+questions, so Iris behavior stays grounded in observed behavior rather than
+guesswork. Sections below describe the reference; the goal and definition of
+done above define the Iris commitment.
 
 Reference files:
 - Tool: `src/tools/AskUserQuestionTool/AskUserQuestionTool.tsx`, `prompt.ts`

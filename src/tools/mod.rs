@@ -25,6 +25,7 @@
 //! - One module per tool: [`read`], [`bash`], [`edit`], [`write`],
 //!   [`grep`], [`find`], [`ls`].
 
+mod ask_user_question;
 mod bash;
 #[cfg(test)]
 pub(crate) mod bench_support;

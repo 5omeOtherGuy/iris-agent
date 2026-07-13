@@ -66,6 +66,7 @@ fn truncate_tail(text: &str, max: usize) -> String {
     format!("...(truncated)\n{tail}")
 }
 
+pub(crate) mod ask_user_question;
 pub(crate) mod clipboard;
 pub(crate) mod harness_actor;
 pub(crate) mod highlight;
