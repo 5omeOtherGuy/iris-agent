@@ -203,6 +203,7 @@ impl PrintObserver {
             tool_calls_by_name,
         };
         UsageReport {
+            schema_version: USAGE_SCHEMA_VERSION,
             provider: self.provider.borrow().clone(),
             model: self.model.borrow().clone(),
             base: self.base.clone(),
@@ -463,8 +464,14 @@ pub(crate) struct UsageTotals {
 /// Headless token/cache/tool timeline emitted when `IRIS_USAGE_JSON` names a
 /// path. `totals` preserves v1 accounting; the flattened copy keeps every v1
 /// top-level JSON key readable by existing consumers while v2 adds structure.
+/// Structure version of the emitted [`UsageReport`]. Bumped when the JSON shape
+/// changes so consumers (the benchmark analyzer) can branch without inferring
+/// the version from which fields happen to be present.
+pub(crate) const USAGE_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct UsageReport {
+    pub(crate) schema_version: u32,
     pub(crate) provider: String,
     pub(crate) model: String,
     pub(crate) base: UsageBase,
@@ -897,6 +904,7 @@ mod tests {
         let after_one: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("written after turn 1"))
                 .unwrap();
+        assert_eq!(after_one["schema_version"], 2);
         assert_eq!(after_one["input_tokens"], 1000);
         assert_eq!(after_one["totals"]["input_tokens"], 1000);
         assert_eq!(after_one["provider_turns"], 1);
