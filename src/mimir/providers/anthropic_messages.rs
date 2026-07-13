@@ -161,13 +161,63 @@ impl AnthropicProvider {
         })
     }
 
+    /// This provider's OAuth-vs-API-key auth kind, derived from the resolved
+    /// auth source. Small shared helper for the summary request builders
+    /// below (the existing `respond_stream`/`compact_context_blocking`/
+    /// `probe_compaction_summary` call sites keep their own inline match --
+    /// this helper is additive, not a forced refactor of those).
+    // Reached only from tests until the #472 summarizer wiring slice lands.
+    #[allow(dead_code)]
+    fn auth_kind(&self) -> AnthropicAuthKind {
+        match &self.auth {
+            AnthropicAuthSource::OAuth(_) => AnthropicAuthKind::OAuth,
+            AnthropicAuthSource::ApiKey(_) => AnthropicAuthKind::ApiKey,
+        }
+    }
+
+    /// Build a compaction-summary request over this provider's native
+    /// structured-output transport (issue #475 / ADR-0061). Derives the
+    /// OAuth-vs-API-key auth kind from this provider's resolved auth source
+    /// so header/beta shaping matches whichever lane is active; callers
+    /// still send it through the existing token store/headers/endpoint
+    /// themselves -- this method only builds the request body.
+    // Reached only from tests until the #472 summarizer wiring slice lands.
+    #[allow(dead_code)]
+    pub(crate) fn build_summary_request(&self, messages: &[Message]) -> Value {
+        build_anthropic_summary_request_for_auth(
+            &self.model,
+            &self.system_prompt,
+            messages,
+            self.reasoning,
+            self.cache_retention,
+            self.auth_kind(),
+        )
+    }
+
+    /// Build the forced single virtual-tool (`emit_compaction_summary`)
+    /// fallback summary request (issue #475), used only when the native path
+    /// above is rejected as unsupported for this lane/model/auth kind.
+    // Reached only from tests until the #472 summarizer wiring slice lands.
+    #[allow(dead_code)]
+    pub(crate) fn build_summary_fallback_request(&self, messages: &[Message]) -> Value {
+        build_anthropic_summary_fallback_request_for_auth(
+            &self.model,
+            &self.system_prompt,
+            messages,
+            self.reasoning,
+            self.cache_retention,
+            self.auth_kind(),
+        )
+    }
+
     /// LIVE capability probe for #475: send one structured-output summary
     /// request over the real Anthropic Messages OAuth lane and report whether
     /// the lane honoured it. Reuses the production token store, OAuth/beta
-    /// headers, endpoint, and request builder so the wire request matches what
-    /// the compaction summarizer would send. `ProbeMode::Native` sets
-    /// `output_config.format` json_schema; `ProbeMode::ForcedTool` sends the
-    /// single forced `emit_compaction_summary` tool. Never executes any tool.
+    /// headers, endpoint, and request builders (above) so the wire request
+    /// matches what the compaction summarizer would send. `ProbeMode::Native`
+    /// sets `output_config.format` json_schema; `ProbeMode::ForcedTool` sends
+    /// the single forced `emit_compaction_summary` tool. Never executes any
+    /// tool.
     #[cfg(test)]
     pub(crate) fn probe_compaction_summary(
         &self,
@@ -175,51 +225,14 @@ impl AnthropicProvider {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<crate::structured_summary_probe::ProbeOutcome> {
         use crate::structured_summary_probe::{
-            ProbeMode, ProbeOutcome, VIRTUAL_TOOL_NAME, canonical_compaction_schema,
-            collect_anthropic_sse, toy_transcript,
+            ProbeMode, ProbeOutcome, collect_anthropic_sse, toy_transcript,
         };
         let lane = format!("anthropic/{}", self.model);
         let messages = vec![Message::user(&toy_transcript())];
-        let mut request = build_anthropic_request(
-            &self.model,
-            &self.system_prompt,
-            &messages,
-            &Tools::new(Vec::new()),
-            None,
-            self.cache_retention,
-            &self.context_management,
-        );
-        request["max_tokens"] = json!(2048);
-        match mode {
-            ProbeMode::Native => {
-                request["tools"] = json!([]);
-                // No adaptive effort was requested (reasoning=None), so no
-                // `output_config` exists yet; merge `format` into whatever is
-                // present, preserving `effort` per #475.
-                if let Some(config) = request
-                    .get_mut("output_config")
-                    .and_then(Value::as_object_mut)
-                {
-                    config.insert(
-                        "format".to_string(),
-                        json!({ "type": "json_schema", "schema": canonical_compaction_schema() }),
-                    );
-                } else {
-                    request["output_config"] = json!({
-                        "format": { "type": "json_schema", "schema": canonical_compaction_schema() }
-                    });
-                }
-            }
-            ProbeMode::ForcedTool => {
-                request["tools"] = json!([{
-                    "name": VIRTUAL_TOOL_NAME,
-                    "description": "Return the compaction summary.",
-                    "input_schema": canonical_compaction_schema(),
-                    "strict": true,
-                }]);
-                request["tool_choice"] = json!({ "type": "tool", "name": VIRTUAL_TOOL_NAME });
-            }
-        }
+        let request = match mode {
+            ProbeMode::Native => self.build_summary_request(&messages),
+            ProbeMode::ForcedTool => self.build_summary_fallback_request(&messages),
+        };
 
         let auth = match &self.auth {
             AnthropicAuthSource::OAuth(tokens) => {
@@ -1442,6 +1455,107 @@ fn native_compaction_instructions(instructions: &str) -> String {
     } else {
         format!("{instructions} {guard}")
     }
+}
+
+/// Compaction-summary output cap (issue #475): both the native and
+/// forced-tool fallback summary requests cap `max_tokens` here regardless of
+/// the model's full output cap -- a structured summary is a short, bounded
+/// artifact, not a full-length response.
+// Reached only from tests until the #472 summarizer wiring slice lands.
+#[allow(dead_code)]
+const SUMMARY_MAX_TOKENS: u32 = 2048;
+
+/// Build a compaction-summary request using Anthropic's native structured-
+/// output transport (issue #475 / ADR-0061): `output_config.format`
+/// json_schema, `tools: []`, `max_tokens: 2048`. Built on
+/// [`build_anthropic_request_for_auth`] so OAuth/API-key headers, betas, the
+/// Claude Code identity system block, and endpoint resolution are unchanged;
+/// only `tools`/`max_tokens`/`output_config` are overridden. When adaptive-
+/// effort reasoning already set `output_config: { effort }`, `format` is
+/// merged into that object instead of overwriting it (both cases are
+/// covered in the module's tests).
+// Reached only from tests until the #472 summarizer wiring slice lands.
+#[allow(dead_code)]
+fn build_anthropic_summary_request_for_auth(
+    model: &str,
+    system_prompt: &str,
+    messages: &[Message],
+    reasoning: Option<ReasoningEffort>,
+    cache_retention: PromptCacheRetention,
+    auth_kind: AnthropicAuthKind,
+) -> Value {
+    let mut request = build_anthropic_request_for_auth(
+        model,
+        system_prompt,
+        messages,
+        &Tools::new(Vec::new()),
+        reasoning,
+        AnthropicRequestConfig {
+            cache_retention,
+            context_management: &ContextManagement::default(),
+            auth_kind,
+        },
+    );
+    request["tools"] = json!([]);
+    request["max_tokens"] = json!(SUMMARY_MAX_TOKENS);
+    let format = json!({
+        "type": "json_schema",
+        "schema": crate::wayland::structured_summary::canonical_compaction_schema(),
+    });
+    match request
+        .get_mut("output_config")
+        .and_then(Value::as_object_mut)
+    {
+        Some(output_config) => {
+            output_config.insert("format".to_string(), format);
+        }
+        None => request["output_config"] = json!({ "format": format }),
+    }
+    request
+}
+
+/// Build the forced single virtual-tool (`emit_compaction_summary`) fallback
+/// summary request (issue #475): the compatibility fallback used only when
+/// the native path above is rejected as unsupported for the active
+/// lane/model/auth kind. Built on [`build_anthropic_request_for_auth`] the
+/// same way as [`build_anthropic_summary_request_for_auth`]. Iris never
+/// registers or executes this tool through normal tool approval/execution
+/// policy -- it exists only inside this request builder and the matching
+/// `wayland::structured_summary` extraction path.
+// Reached only from tests until the #472 summarizer wiring slice lands.
+#[allow(dead_code)]
+fn build_anthropic_summary_fallback_request_for_auth(
+    model: &str,
+    system_prompt: &str,
+    messages: &[Message],
+    reasoning: Option<ReasoningEffort>,
+    cache_retention: PromptCacheRetention,
+    auth_kind: AnthropicAuthKind,
+) -> Value {
+    let mut request = build_anthropic_request_for_auth(
+        model,
+        system_prompt,
+        messages,
+        &Tools::new(Vec::new()),
+        reasoning,
+        AnthropicRequestConfig {
+            cache_retention,
+            context_management: &ContextManagement::default(),
+            auth_kind,
+        },
+    );
+    request["max_tokens"] = json!(SUMMARY_MAX_TOKENS);
+    request["tools"] = json!([{
+        "name": crate::wayland::structured_summary::VIRTUAL_TOOL_NAME,
+        "description": "Return the compaction summary.",
+        "input_schema": crate::wayland::structured_summary::canonical_compaction_schema(),
+        "strict": true,
+    }]);
+    request["tool_choice"] = json!({
+        "type": "tool",
+        "name": crate::wayland::structured_summary::VIRTUAL_TOOL_NAME,
+    });
+    request
 }
 
 /// Manual-budget thinking token budget for an iris reasoning level. Adopted
@@ -4049,5 +4163,260 @@ data: {{\"type\":\"message_stop\"}}
         assert_eq!(messages[0]["role"], json!("user"));
         assert_eq!(messages[0]["content"][0]["text"], json!("skill catalog"));
         assert_eq!(messages[0]["content"][1]["text"], json!("task"));
+    }
+
+    // -- issue #475 / ADR-0061: structured-output compaction summary request
+    // plumbing ------------------------------------------------------------
+
+    #[test]
+    fn native_summary_request_sets_json_schema_format_no_tools_and_bounded_tokens() {
+        use crate::wayland::structured_summary::canonical_compaction_schema;
+
+        let request = build_anthropic_summary_request_for_auth(
+            "claude-opus-4-8",
+            "P",
+            &[Message::user("hi")],
+            None,
+            PromptCacheRetention::Short,
+            AnthropicAuthKind::OAuth,
+        );
+
+        assert_eq!(request["tools"], json!([]));
+        assert_eq!(request["max_tokens"], json!(2048));
+        assert_eq!(
+            request["output_config"]["format"]["type"],
+            json!("json_schema")
+        );
+        assert_eq!(
+            request["output_config"]["format"]["schema"],
+            canonical_compaction_schema()
+        );
+        // No adaptive effort was requested, so `output_config` did not already
+        // exist -- confirm it was created fresh with only `format`.
+        assert_eq!(
+            request["output_config"].as_object().unwrap().len(),
+            1,
+            "no stray `effort` when none was set"
+        );
+        // Unrelated request shaping (Claude Code identity, model) is unchanged.
+        assert_eq!(request["model"], json!("claude-opus-4-8"));
+        assert_eq!(request["system"][0]["text"], json!(CLAUDE_CODE_IDENTITY));
+    }
+
+    #[test]
+    fn native_summary_request_merges_format_into_existing_adaptive_effort_output_config() {
+        use crate::wayland::structured_summary::canonical_compaction_schema;
+
+        // Sonnet 5 is adaptive: `Some(ReasoningEffort::High)` makes
+        // `build_anthropic_request_for_auth` set `output_config: { effort }`
+        // before the summary builder runs. `format` must merge into that
+        // object, not overwrite it -- `effort` must survive.
+        let request = build_anthropic_summary_request_for_auth(
+            "claude-sonnet-5",
+            "P",
+            &[Message::user("hi")],
+            Some(ReasoningEffort::High),
+            PromptCacheRetention::Short,
+            AnthropicAuthKind::OAuth,
+        );
+
+        assert_eq!(request["output_config"]["effort"], json!("xhigh"));
+        assert_eq!(
+            request["output_config"]["format"]["type"],
+            json!("json_schema")
+        );
+        assert_eq!(
+            request["output_config"]["format"]["schema"],
+            canonical_compaction_schema()
+        );
+        assert_eq!(request["tools"], json!([]));
+        assert_eq!(request["max_tokens"], json!(2048));
+    }
+
+    #[test]
+    fn forced_tool_fallback_summary_request_forces_the_single_virtual_tool() {
+        use crate::wayland::structured_summary::{VIRTUAL_TOOL_NAME, canonical_compaction_schema};
+
+        let request = build_anthropic_summary_fallback_request_for_auth(
+            "claude-opus-4-8",
+            "P",
+            &[Message::user("hi")],
+            None,
+            PromptCacheRetention::Short,
+            AnthropicAuthKind::OAuth,
+        );
+
+        let tools = request["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], json!(VIRTUAL_TOOL_NAME));
+        assert_eq!(tools[0]["strict"], json!(true));
+        assert_eq!(tools[0]["input_schema"], canonical_compaction_schema());
+        assert_eq!(
+            request["tool_choice"],
+            json!({ "type": "tool", "name": VIRTUAL_TOOL_NAME })
+        );
+        assert_eq!(request["max_tokens"], json!(2048));
+    }
+
+    #[test]
+    fn summary_requests_preserve_oauth_headers_and_betas() {
+        let request = build_anthropic_summary_request_for_auth(
+            "claude-opus-4-8",
+            "P",
+            &[Message::user("hi")],
+            None,
+            PromptCacheRetention::Short,
+            AnthropicAuthKind::OAuth,
+        );
+        let headers = anthropic_headers("fake-oauth-token", &request).expect("headers");
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+            "Bearer fake-oauth-token"
+        );
+        assert_eq!(
+            headers
+                .get("anthropic-dangerous-direct-browser-access")
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(headers.get("x-app").unwrap(), "cli");
+        assert_eq!(
+            headers.get("anthropic-version").unwrap().to_str().unwrap(),
+            ANTHROPIC_VERSION
+        );
+        let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(beta.contains(BASE_ANTHROPIC_BETA));
+        assert!(headers.get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn summary_requests_preserve_api_key_headers_and_betas() {
+        let request = build_anthropic_summary_request_for_auth(
+            "claude-opus-4-8",
+            "P",
+            &[Message::user("hi")],
+            None,
+            PromptCacheRetention::Short,
+            AnthropicAuthKind::ApiKey,
+        );
+        // API-key requests omit the Claude Code identity system block.
+        assert_eq!(request["system"].as_array().unwrap().len(), 1);
+        let headers =
+            anthropic_headers_for_auth(&AnthropicAuth::ApiKey("sk-ant".to_string()), &request)
+                .expect("headers");
+        assert_eq!(
+            headers.get("x-api-key").unwrap().to_str().unwrap(),
+            "sk-ant"
+        );
+        assert!(headers.get(AUTHORIZATION).is_none());
+        let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(beta.contains(CLAUDE_CODE_BETA));
+        assert!(!beta.contains("oauth"));
+    }
+
+    #[test]
+    fn provider_builds_native_and_fallback_summary_requests_from_its_own_auth() -> Result<()> {
+        let provider = AnthropicProvider {
+            client: super::super::transport::shared_client(),
+            model: "claude-opus-4-8".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            reasoning: None,
+            system_prompt: "P".to_string(),
+            cache_retention: PromptCacheRetention::Short,
+            context_management: ContextManagement::default(),
+            cache_prefix: Arc::new(Mutex::new(super::super::PromptCachePrefix::default())),
+            auth: AnthropicAuthSource::ApiKey("sk-ant".to_string()),
+            retry_policy: crate::mimir::retry::RetryPolicy::default(),
+        };
+        let messages = [Message::user("hi")];
+
+        let native = provider.build_summary_request(&messages);
+        assert_eq!(native["tools"], json!([]));
+        assert_eq!(
+            native["output_config"]["format"]["type"],
+            json!("json_schema")
+        );
+        // API-key auth kind flowed through: no Claude Code identity block.
+        assert_eq!(native["system"].as_array().unwrap().len(), 1);
+
+        let fallback = provider.build_summary_fallback_request(&messages);
+        assert_eq!(
+            fallback["tool_choice"]["name"],
+            json!(crate::wayland::structured_summary::VIRTUAL_TOOL_NAME)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_a_native_summary_from_a_real_text_delta_sse_shape() {
+        use crate::wayland::structured_summary::extract_native_summary;
+
+        let summary_json = json!({
+            "goal": "Ship #475 structured summaries",
+            "state": ["renderer written"],
+            "decisions": ["native first, forced-tool fallback second"],
+            "key_facts": ["src/wayland/structured_summary/ holds the new modules"],
+            "next_steps": ["wire provider request plumbing"],
+            "preserved_identifiers": []
+        })
+        .to_string();
+        let escaped = summary_json.replace('\\', "\\\\").replace('"', "\\\"");
+        let body = format!(
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+             data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n\
+             data: {{\"type\":\"message_stop\"}}\n\n"
+        );
+
+        let turn = parse_anthropic_sse(&body).expect("stream should parse");
+        let summary = extract_native_summary(&turn).expect("schema-valid native summary");
+        assert_eq!(summary.goal, "Ship #475 structured summaries");
+        assert_eq!(summary.next_steps, vec!["wire provider request plumbing"]);
+    }
+
+    #[test]
+    fn extracts_a_forced_tool_summary_from_a_real_tool_use_sse_shape() {
+        use crate::wayland::structured_summary::{VIRTUAL_TOOL_NAME, extract_forced_tool_summary};
+
+        let arguments = json!({
+            "goal": "Ship #475 structured summaries",
+            "state": [],
+            "decisions": [],
+            "key_facts": [],
+            "next_steps": ["wire provider request plumbing"],
+            "preserved_identifiers": []
+        })
+        .to_string();
+        let escaped = arguments.replace('\\', "\\\\").replace('"', "\\\"");
+        let body = format!(
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"{VIRTUAL_TOOL_NAME}\"}}}}\n\n\
+             data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{escaped}\"}}}}\n\n\
+             data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+             data: {{\"type\":\"message_stop\"}}\n\n"
+        );
+
+        let turn = parse_anthropic_sse(&body).expect("stream should parse");
+        let summary = extract_forced_tool_summary(&turn).expect("schema-valid forced-tool summary");
+        assert_eq!(summary.goal, "Ship #475 structured summaries");
+    }
+
+    #[test]
+    fn rejects_a_forced_tool_response_with_zero_emit_calls() {
+        use crate::wayland::structured_summary::{
+            SummaryExtractionError, extract_forced_tool_summary,
+        };
+
+        let body = "\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}
+
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"no tool call here\"}}
+
+data: {\"type\":\"message_stop\"}
+
+";
+        let turn = parse_anthropic_sse(body).expect("stream should parse");
+        assert_eq!(
+            extract_forced_tool_summary(&turn).unwrap_err(),
+            SummaryExtractionError::NoToolCall
+        );
     }
 }
