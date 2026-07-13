@@ -40,7 +40,7 @@ use web::WebToolsConfig;
 
 /// Construct the workspace tools the CLI injects into the agent. The order is
 /// the provider-declaration order (`read, bash, edit, write, grep, find, ls`),
-/// with the Iris-specific `read_output` (issue #205) appended last.
+/// followed by `AskUserQuestion` and the Iris-specific session tools.
 pub(crate) fn built_in_tools() -> Tools {
     built_in_tools_for(false, false)
 }

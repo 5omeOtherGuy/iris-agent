@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 
 use crate::nexus::InteractionOutcome;
-use crate::tools::ask_user_question::{Annotation, AskUserQuestionInput, parse_input};
+use crate::tools::ask_user_question::{AskUserQuestionInput, parse_input};
 use crate::ui::modal::ModalKey;
 
 const CHAT_FEEDBACK: &str = "The user wants to discuss the questions before answering them.";
@@ -294,7 +294,7 @@ impl AskUserDialog {
                 let annotation = input
                     .annotations
                     .entry(question.question.clone())
-                    .or_insert_with(Annotation::default);
+                    .or_default();
                 annotation.preview = Some(preview.clone());
             }
         }

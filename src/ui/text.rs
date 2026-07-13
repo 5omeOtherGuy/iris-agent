@@ -9,7 +9,7 @@ use crate::tool_display::{
     APPROVAL_ALL_DIRTY_LABEL, APPROVAL_DESTRUCTIVE_NOTE, approval_dirty_note, approval_reason_lead,
     exploration_summary, fold, is_exploration_tool, run_target, summarize,
 };
-use crate::tools::ask_user_question::{Annotation, parse_input};
+use crate::tools::ask_user_question::parse_input;
 use crate::ui::{TurnErrorKind, Ui, UiEvent};
 
 // Bracketed-paste control sequences. Enabling makes the terminal wrap pasted
@@ -839,7 +839,7 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                 input
                     .annotations
                     .entry(question.question)
-                    .or_insert_with(Annotation::default)
+                    .or_default()
                     .preview = Some(preview);
             }
         }

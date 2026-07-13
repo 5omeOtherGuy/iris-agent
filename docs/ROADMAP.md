@@ -1,6 +1,6 @@
 # Iris — Roadmap
 
-> Status (2026-07-12): Milestone 1, the async-hard runtime completion, and the
+> Status (2026-07-13): Milestone 1, the async-hard runtime completion, and the
 > Milestone 2 foundations are done. Iris has a terminal-surface TUI with
 > Iris-owned transcript replay plus a text fallback, selectable Mimir providers (`openai-codex`,
 > `anthropic`, and `antigravity`), runtime model/reasoning switching, streamed
@@ -96,6 +96,11 @@ Implemented today:
 - Workspace-scoped built-in tools: `read`, `write`, `edit`, `bash`, `grep`,
   `find`, and `ls`. `edit` follows Claude Code's exact-string contract
   (`file_path`/`old_string`/`new_string`/`replace_all`).
+- Claude Code-style `AskUserQuestion`: strict 1–4 question schema, required
+  interaction independent of approval presets, single/multi-select answers,
+  automatic `Other`, previews, multi-question review, cancellation, and bounded
+  `Chat about this` feedback. The TUI uses a docked dialog; the text path has a
+  complete fallback.
 - Harness limits aligned with pi-mono where safe: no default tool-roundtrip cap,
   no default bash timeout, full safe-parallel read-only tool batches, and a
   50 KiB inline display threshold, while memory, capture, approval, and
