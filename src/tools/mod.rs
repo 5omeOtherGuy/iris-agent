@@ -47,6 +47,11 @@ pub(crate) mod web;
 mod web_search;
 mod write;
 
+/// Rough token estimate: four bytes per token, used for relative diagnostics.
+pub(crate) fn est_tokens(text: &str) -> usize {
+    text.len().div_ceil(4)
+}
+
 // The result contract lives in Tier-1 Nexus; tools produce it and re-export it
 // here so the per-tool modules can keep referring to `super::ToolOutput`.
 pub(crate) use crate::nexus::ToolOutput;

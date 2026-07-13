@@ -769,6 +769,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     persist_cli_skip_permissions(skip_permissions);
     let tools = tools::built_in_tools_with(&resolve_tools_config(&settings)?);
     let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
+    let usage_base = print::UsageBase::estimate(&system_prompt, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
     let session_id = session::new_session_id();
@@ -855,7 +856,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
         .ok()
         .filter(|p| !p.is_empty())
         .map(std::path::PathBuf::from);
-    let observer = print::PrintObserver::new(usage_path);
+    let observer = print::PrintObserver::with_base(usage_path, usage_base);
     let gate = print::PrintApprovalGate::new(approve);
     let turn_result = cli::run_print_turn(&mut harness, &prompt, &observer, &gate);
 
