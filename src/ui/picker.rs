@@ -1034,6 +1034,14 @@ pub(crate) fn apply_action<P: ChatProvider>(
                             switch,
                         );
                     }
+                    if field == settings_menu::Field::CompactionAggressiveness {
+                        // Presets can change which resolved reducer passes run;
+                        // reload their exact policy rather than leaving dependent
+                        // controls dimmed from the prior preset while this panel
+                        // remains open.
+                        let flash = view.as_ref().map(|view| view.cursor());
+                        return refresh_settings(view, flash, Vec::new(), harness, switch);
+                    }
                     if field == settings_menu::Field::MutationSafety
                         && requested
                         && harness.native_jj_available()

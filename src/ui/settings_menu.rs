@@ -679,6 +679,14 @@ impl Snapshot {
         }
     }
 
+    /// A capped dial is editable only when its model ceiling can satisfy the
+    /// field's persisted lower bound. A smaller custom-model window makes the
+    /// context cap informational: no valid value can be saved.
+    fn dial_is_editable(&self, field: Field) -> bool {
+        let (min, _) = dial_bounds(field);
+        self.dial_cap(field).is_none_or(|cap| cap >= min)
+    }
+
     fn set_register_value(&mut self, field: Field, value: Option<String>) {
         match field {
             Field::VerifyCommand => self.verify_command = value,
@@ -1345,6 +1353,9 @@ impl SettingsPanel {
         {
             return ModalOutcome::Ignore;
         }
+        if !self.snap.dial_is_editable(field) {
+            return ModalOutcome::Ignore;
+        }
         match archetype(RowId::Field(field)) {
             Archetype::Switch => {
                 let options = self.snap.switch_options(field);
@@ -1456,6 +1467,7 @@ impl SettingsPanel {
                     });
                     ModalOutcome::Redraw
                 }
+                Archetype::Dial if !self.snap.dial_is_editable(field) => ModalOutcome::Ignore,
                 Archetype::Dial => {
                     self.edit = Some(Edit {
                         buffer: self.snap.dial_value(field).to_string(),
@@ -1861,6 +1873,10 @@ impl SettingsPanel {
         };
         let trimmed = edit.buffer.trim().to_string();
         if edit.numeric {
+            if !self.snap.dial_is_editable(field) {
+                edit.error = Some("model window is too small");
+                return ModalOutcome::Redraw;
+            }
             if trimmed.is_empty() {
                 edit.error = Some("enter a number");
                 return ModalOutcome::Redraw;
@@ -2163,6 +2179,9 @@ impl SettingsPanel {
     /// resolved pass is disabled.
     fn is_inert(&self, row: RowId) -> bool {
         match row {
+            RowId::Field(Field::ContextTokenBudget) => {
+                !self.snap.dial_is_editable(Field::ContextTokenBudget)
+            }
             RowId::Field(
                 Field::CompactionWarn
                 | Field::CompactionStart
@@ -4416,6 +4435,30 @@ mod tests {
                 field: Field::ContextTokenBudget,
                 value: Some("127808".to_string()),
             })
+        );
+    }
+
+    #[test]
+    fn context_cap_with_a_sub_reserve_model_window_cannot_emit_an_invalid_save() {
+        let mut panel = panel();
+        panel.snap.model_context_window = Some(4_096);
+        select_top(&mut panel, RowId::Field(Field::ContextTokenBudget));
+
+        assert!(panel.is_inert(RowId::Field(Field::ContextTokenBudget)));
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+        assert_eq!(panel.handle_key(ModalKey::Enter), ModalOutcome::Ignore);
+        assert!(panel.edit.is_none(), "no invalid inline edit opens");
+
+        // A model change between opening and committing an edit is also safe:
+        // the stale register stays open with an explanation rather than emitting
+        // the new, invalid 4,096-token cap.
+        panel.snap.model_context_window = Some(8_192);
+        assert_eq!(panel.handle_key(ModalKey::Enter), ModalOutcome::Redraw);
+        panel.snap.model_context_window = Some(4_096);
+        assert_eq!(panel.handle_key(ModalKey::Enter), ModalOutcome::Redraw);
+        assert_eq!(
+            panel.edit.as_ref().and_then(|edit| edit.error),
+            Some("model window is too small")
         );
     }
 
