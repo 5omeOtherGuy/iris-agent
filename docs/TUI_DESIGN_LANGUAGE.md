@@ -242,17 +242,12 @@ where density matters. Uppercase labels get `--tracking-label` (0.06em).
 overflow a border. Continuation lines align under the content column, not the
 marker (see §7, §8).
 
-**Measure.** Prose is read, not scanned — a line that runs the full width of an
-ultrawide pane loses the reader on the way back. So **prose wraps at
-`min(pane, 96)` columns**: assistant paragraphs / list items / headings,
-thinking bodies, notices, plan-step notes, and user message bodies rag at the
-measure while the marker, rail, and indent stay exactly where they are (nothing
-is centered; the right side simply rags). **Mechanical output uses the full
-pane** — fenced/indented code, tool bodies, diffs, tables, rules/dividers, and
-session chrome are column-aligned and must not reflow. The measure is a **print-
-time** decision: a printed block reflects the terminal it was printed into and
-is never retroactively reflowed (rows are immutable in scrollback). On any pane
-≤ 96 columns the measure is a no-op.
+**Measure.** Transcript content uses the available pane width. Assistant
+markdown, thinking bodies, notices, plan-step notes, user messages, code, tool
+bodies, diffs, tables, rules, and session chrome all wrap or align within that
+boundary. Semantic wrapping and hanging indentation still apply: markers, rails,
+and continuation lines remain on the shared text-column grid, and no row may
+overflow the pane.
 
 ---
 
