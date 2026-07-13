@@ -13,6 +13,7 @@ mod compaction_governor;
 mod fold;
 pub(crate) mod git_safety;
 pub(crate) mod skills;
+pub(crate) mod structured_summary;
 pub(crate) mod subagents;
 pub(crate) mod system_prompt;
 mod trigger;
