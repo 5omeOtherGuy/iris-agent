@@ -32,6 +32,8 @@ pub(crate) enum ModalKey {
     Down,
     Left,
     Right,
+    Tab,
+    BackTab,
     Enter,
     Esc,
     CtrlC,
@@ -75,7 +77,9 @@ pub(crate) enum ModalAction {
     /// Settings panel: the model row clicked ←/→ — cycle through the scoped
     /// models exactly like Ctrl+P. The loop rebuilds the panel on the new
     /// model (the catalog lives beyond the panel's snapshot).
-    CycleModel { forward: bool },
+    CycleModel {
+        forward: bool,
+    },
     /// Persist a settings field to the user-global file (`None` clears the key).
     /// The loop maps the field to its `config::save_*`; the panel stays open
     /// and keeps its own display state (it already clicked the detent).
@@ -124,7 +128,11 @@ pub(crate) enum ModalAction {
     /// Insert one path-qualified skill mention into the composer. The path
     /// disambiguates duplicate skill names exactly as Codex's structured
     /// selector does.
-    InsertSkillMention { name: String, path: String },
+    InsertSkillMention {
+        name: String,
+        path: String,
+    },
+    ResolveUserQuestion(crate::nexus::InteractionOutcome),
 }
 
 /// What the loop does after a modal handled a key.
@@ -155,6 +163,7 @@ pub(crate) enum Modal {
     /// Codex-compatible native skills picker (#521): a composer affordance that
     /// inserts a path-qualified `skill://` mention. Not a settings surface.
     Skills(SkillPicker),
+    AskUserQuestion(crate::ui::ask_user_question::AskUserDialog),
     LoginDialog(LoginDialog),
     ApiKeyDialog(ApiKeyDialog),
 }
@@ -168,6 +177,12 @@ impl Modal {
             Modal::Session(picker) => picker.handle_key(key),
             Modal::Tasks(picker) => picker.handle_key(key),
             Modal::Skills(picker) => picker.handle_key(key),
+            Modal::AskUserQuestion(dialog) => match dialog.handle_key(key) {
+                Some(outcome) => {
+                    ModalOutcome::Emit(ModalAction::ResolveUserQuestion(outcome.into()))
+                }
+                None => ModalOutcome::Redraw,
+            },
             Modal::LoginDialog(dialog) => dialog.handle_key(key),
             Modal::ApiKeyDialog(dialog) => dialog.handle_key(key),
         }
@@ -186,6 +201,10 @@ impl Modal {
             }
             Modal::Settings(panel) => {
                 panel.push_str(text);
+                ModalOutcome::Redraw
+            }
+            Modal::AskUserQuestion(dialog) => {
+                dialog.paste(text);
                 ModalOutcome::Redraw
             }
             _ => ModalOutcome::Ignore,
@@ -228,6 +247,7 @@ impl Modal {
             Modal::Session(picker) => picker.render(width),
             Modal::Tasks(picker) => picker.render(width),
             Modal::Skills(picker) => picker.render(width),
+            Modal::AskUserQuestion(dialog) => dialog.render(width),
             Modal::LoginDialog(dialog) => dialog.render(width),
             Modal::ApiKeyDialog(dialog) => dialog.render(width),
         }

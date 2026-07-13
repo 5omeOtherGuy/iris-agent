@@ -17,7 +17,8 @@ use crate::cli::ModelSwitch;
 use crate::mimir::selection::ModelSelection;
 use crate::nexus::{
     AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider,
-    CompactionLifecycleState, PermissionMode, ReviewContext, ToolCall,
+    CompactionLifecycleState, InteractionFuture, InteractionOutcome, PermissionMode, ReviewContext,
+    ToolCall,
 };
 use crate::tool_display::approval_dirty_note;
 use crate::ui::UiEvent;
@@ -98,6 +99,9 @@ pub(crate) enum HarnessCommand {
     Approve {
         decision: ApprovalDecision,
     },
+    ResolveInteraction {
+        outcome: InteractionOutcome,
+    },
     ApplySettings {
         action: ModalAction,
         origin: SettingsOrigin,
@@ -137,6 +141,10 @@ pub(crate) enum HarnessEvent {
     ApprovalCleared {
         approved: bool,
     },
+    InteractionRequested {
+        call: ToolCall,
+    },
+    InteractionCleared,
     SettingsApplied {
         lines: Vec<String>,
     },
@@ -197,9 +205,15 @@ struct ApprovalRequest {
     reply: oneshot::Sender<ApprovalDecision>,
 }
 
+struct InteractionRequest {
+    call: ToolCall,
+    reply: oneshot::Sender<InteractionOutcome>,
+}
+
 struct ActorBridge {
     event_tx: UnboundedSender<HarnessEvent>,
     approval_tx: UnboundedSender<ApprovalRequest>,
+    interaction_tx: UnboundedSender<InteractionRequest>,
 }
 
 fn review_reason(call: &ToolCall, ctx: &ReviewContext) -> Option<String> {
@@ -258,10 +272,28 @@ impl ApprovalGate for ActorBridge {
             Ok(rx.await.unwrap_or(ApprovalDecision::Deny))
         })
     }
+
+    fn interact<'a>(&'a self, call: &'a ToolCall) -> InteractionFuture<'a> {
+        let call = call.clone();
+        let interaction_tx = self.interaction_tx.clone();
+        Box::pin(async move {
+            let (reply, rx) = oneshot::channel();
+            if interaction_tx
+                .send(InteractionRequest { call, reply })
+                .is_err()
+            {
+                return Ok(InteractionOutcome::Rejected { feedback: None });
+            }
+            Ok(rx
+                .await
+                .unwrap_or(InteractionOutcome::Rejected { feedback: None }))
+        })
+    }
 }
 
 fn stop_active_operation(
     pending_approval: &mut Option<oneshot::Sender<ApprovalDecision>>,
+    pending_interaction: &mut Option<oneshot::Sender<InteractionOutcome>>,
     events: &UnboundedSender<HarnessEvent>,
     steering: &SteeringQueue,
     token: &CancellationToken,
@@ -269,6 +301,10 @@ fn stop_active_operation(
     if let Some(reply) = pending_approval.take() {
         let _ = reply.send(ApprovalDecision::Deny);
         let _ = events.send(HarnessEvent::ApprovalCleared { approved: false });
+    }
+    if let Some(reply) = pending_interaction.take() {
+        let _ = reply.send(InteractionOutcome::Rejected { feedback: None });
+        let _ = events.send(HarnessEvent::InteractionCleared);
     }
     steering.clear();
     token.cancel();
@@ -374,11 +410,14 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
             .send(HarnessEvent::ActorState(Box::new(active_state.clone())));
 
         let (approval_tx, mut approval_rx) = unbounded_channel();
+        let (interaction_tx, mut interaction_rx) = unbounded_channel();
         let bridge = ActorBridge {
             event_tx: self.events.clone(),
             approval_tx,
+            interaction_tx,
         };
         let mut pending_approval: Option<oneshot::Sender<ApprovalDecision>> = None;
+        let mut pending_interaction: Option<oneshot::Sender<InteractionOutcome>> = None;
 
         let result = {
             let mut operation_future: futures::future::LocalBoxFuture<'_, Result<()>> =
@@ -409,6 +448,14 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                             reason: request.reason,
                         });
                     }
+                    Some(request) = interaction_rx.recv() => {
+                        if let Some(previous) = pending_interaction.replace(request.reply) {
+                            let _ = previous.send(InteractionOutcome::Rejected { feedback: None });
+                        }
+                        let _ = self.events.send(HarnessEvent::InteractionRequested {
+                            call: request.call,
+                        });
+                    }
                     Some(command) = self.commands.recv() => {
                         match command {
                             HarnessCommand::Approve { decision } => {
@@ -425,9 +472,16 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                                         .send(HarnessEvent::ApprovalCleared { approved });
                                 }
                             }
+                            HarnessCommand::ResolveInteraction { outcome } => {
+                                if let Some(reply) = pending_interaction.take() {
+                                    let _ = reply.send(outcome);
+                                    let _ = self.events.send(HarnessEvent::InteractionCleared);
+                                }
+                            }
                             HarnessCommand::CancelActive | HarnessCommand::Shutdown => {
                                 stop_active_operation(
                                     &mut pending_approval,
+                                    &mut pending_interaction,
                                     &self.events,
                                     &self.steering,
                                     &token,
@@ -508,6 +562,10 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
             let _ = self
                 .events
                 .send(HarnessEvent::ApprovalCleared { approved: false });
+        }
+        if let Some(reply) = pending_interaction.take() {
+            let _ = reply.send(InteractionOutcome::Rejected { feedback: None });
+            let _ = self.events.send(HarnessEvent::InteractionCleared);
         }
         *self.token_slot.lock().expect("turn token lock poisoned") = None;
         if token.is_cancelled() || active_kind == ActiveKind::Compaction {
@@ -645,7 +703,8 @@ fn settings_row(action: &ModalAction) -> Option<RowId> {
         | ModalAction::AcceptTask
         | ModalAction::ShowTaskDiff
         | ModalAction::ListTaskRollback
-        | ModalAction::InsertSkillMention { .. } => None,
+        | ModalAction::InsertSkillMention { .. }
+        | ModalAction::ResolveUserQuestion(_) => None,
     }
 }
 
@@ -696,9 +755,11 @@ mod tests {
     async fn eof_shutdown_denies_parked_approval_and_cancels_the_operation() {
         let (event_tx, mut event_rx) = unbounded_channel();
         let (approval_tx, mut approval_rx) = unbounded_channel();
+        let (interaction_tx, _interaction_rx) = unbounded_channel();
         let bridge = ActorBridge {
             event_tx,
             approval_tx,
+            interaction_tx,
         };
         let call = ToolCall {
             id: "call-1".to_string(),
@@ -713,7 +774,14 @@ mod tests {
         let shutdown = async {
             let request = approval_rx.recv().await.expect("approval request");
             let mut pending = Some(request.reply);
-            stop_active_operation(&mut pending, &bridge.event_tx, &steering, &token);
+            let mut pending_interaction = None;
+            stop_active_operation(
+                &mut pending,
+                &mut pending_interaction,
+                &bridge.event_tx,
+                &steering,
+                &token,
+            );
             assert!(pending.is_none());
         };
         let (decision, ()) = tokio::join!(review, shutdown);
@@ -723,6 +791,59 @@ mod tests {
         assert!(matches!(
             event_rx.try_recv(),
             Ok(HarnessEvent::ApprovalCleared { approved: false })
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interaction_bridge_routes_submission_and_cancellation() {
+        let (event_tx, mut event_rx) = unbounded_channel();
+        let (approval_tx, _approval_rx) = unbounded_channel();
+        let (interaction_tx, mut interaction_rx) = unbounded_channel();
+        let bridge = ActorBridge {
+            event_tx,
+            approval_tx,
+            interaction_tx,
+        };
+        let call = ToolCall {
+            id: "call-question".to_string(),
+            thought_signature: None,
+            name: "AskUserQuestion".to_string(),
+            arguments: serde_json::json!({"questions": []}),
+        };
+        let interaction = bridge.interact(&call);
+        let submitted = serde_json::json!({"answers": {"q": "a"}});
+        let respond = async {
+            let request = interaction_rx.recv().await.expect("interaction request");
+            assert_eq!(request.call.name, "AskUserQuestion");
+            request
+                .reply
+                .send(InteractionOutcome::Submitted(submitted.clone()))
+                .expect("submit response");
+        };
+        let (outcome, ()) = tokio::join!(interaction, respond);
+        assert_eq!(outcome.unwrap(), InteractionOutcome::Submitted(submitted));
+
+        let cancelled = bridge.interact(&call);
+        let cancel = async {
+            let request = interaction_rx.recv().await.expect("interaction request");
+            let mut pending_interaction = Some(request.reply);
+            let mut pending_approval = None;
+            stop_active_operation(
+                &mut pending_approval,
+                &mut pending_interaction,
+                &bridge.event_tx,
+                &SteeringQueue::default(),
+                &CancellationToken::new(),
+            );
+        };
+        let (outcome, ()) = tokio::join!(cancelled, cancel);
+        assert_eq!(
+            outcome.unwrap(),
+            InteractionOutcome::Rejected { feedback: None }
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(HarnessEvent::InteractionCleared)
         ));
     }
 

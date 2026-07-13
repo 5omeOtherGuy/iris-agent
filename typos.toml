@@ -25,6 +25,8 @@ extend-exclude = [
 [default.extend-identifiers]
 # Repository owner / handle.
 "5omeOtherGuy" = "5omeOtherGuy"
+# Short reference-repository commit pinned in the AskUserQuestion spec.
+"6ba4060" = "6ba4060"
 
 [default.extend-words]
 # Streaming test fixtures split a word across deltas ("Hel" + "lo").

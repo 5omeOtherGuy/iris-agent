@@ -57,6 +57,11 @@
   concurrency-safe, ungated tools (`grep`/`find`/`ls`) run in parallel with
   bounded ordered buffering while unsafe/mutating tools stay exclusive.
   [Implemented]
+- **Model-driven user questions** — `AskUserQuestion` pauses for 1–4 structured
+  questions independently of approval mode. The docked TUI and text fallback
+  support single- and multi-select choices, automatic `Other` input, option
+  previews, multi-question review, cancel, and bounded model-visible
+  `Chat about this` feedback. [Implemented]
 - **Session transcript persistence** — best-effort JSONL read/write store:
   `SessionLog` appends v2 transcript entries with stable ids, `parentId`, and
   token estimates, plus compaction and model-selection audit entries;

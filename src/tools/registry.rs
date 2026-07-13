@@ -33,14 +33,14 @@ use tokio_util::sync::CancellationToken;
 use crate::nexus::{Tool, ToolEnv, ToolFuture, ToolOutput, Tools};
 
 use super::{
-    Preview, ToolState, bash, edit, find, grep, ls, path, read, read_output, read_web_page, recall,
-    render_preview, request_compaction, web, web_search, write,
+    Preview, ToolState, ask_user_question, bash, edit, find, grep, ls, path, read, read_output,
+    read_web_page, recall, render_preview, request_compaction, web, web_search, write,
 };
 use web::WebToolsConfig;
 
 /// Construct the workspace tools the CLI injects into the agent. The order is
 /// the provider-declaration order (`read, bash, edit, write, grep, find, ls`),
-/// with the Iris-specific `read_output` (issue #205) appended last.
+/// followed by `AskUserQuestion` and the Iris-specific session tools.
 pub(crate) fn built_in_tools() -> Tools {
     built_in_tools_for(false, false)
 }
@@ -86,6 +86,7 @@ pub(crate) fn built_in_tools_with(config: &ToolsConfig) -> Tools {
         vec![
             Box::new(BashTool),
             Box::new(EditTool),
+            Box::new(AskUserQuestionTool),
             Box::new(ReadOutputTool),
             Box::new(RecallTool),
         ]
@@ -98,6 +99,7 @@ pub(crate) fn built_in_tools_with(config: &ToolsConfig) -> Tools {
             Box::new(GrepTool),
             Box::new(FindTool),
             Box::new(LsTool),
+            Box::new(AskUserQuestionTool),
             Box::new(ReadOutputTool),
             Box::new(RecallTool),
         ]
@@ -189,6 +191,45 @@ fn render(workspace: &Path, preview: impl FnOnce(&Path) -> Preview) -> Option<St
         Err(error) => return Some(format!("diff unavailable: {error:#}")),
     };
     render_preview(preview(&root))
+}
+
+struct AskUserQuestionTool;
+impl Tool for AskUserQuestionTool {
+    fn name(&self) -> &str {
+        "AskUserQuestion"
+    }
+
+    fn description(&self) -> &str {
+        ask_user_question::DESCRIPTION
+    }
+
+    fn parameters(&self) -> Value {
+        ask_user_question::parameters()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let input = ask_user_question::parse_input(args)?;
+            if input.answers.len() != input.questions.len()
+                || input
+                    .answers
+                    .values()
+                    .any(|answer| answer.trim().is_empty())
+            {
+                anyhow::bail!("AskUserQuestion requires an answer for every question");
+            }
+            Ok(ToolOutput::text(ask_user_question::format_result(&input)))
+        })
+    }
+
+    fn requires_user_interaction(&self) -> bool {
+        true
+    }
 }
 
 struct ReadTool;

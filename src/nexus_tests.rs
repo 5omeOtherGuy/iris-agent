@@ -113,6 +113,8 @@ struct RecordingFrontend {
     /// The structured review facts the last `review` call received, so a test
     /// can assert Nexus threads `destructive`/`dirty_paths` to the gate.
     last_ctx: RefCell<Option<ReviewContext>>,
+    interaction: RefCell<InteractionOutcome>,
+    interaction_count: Cell<usize>,
 }
 
 impl RecordingFrontend {
@@ -123,7 +125,14 @@ impl RecordingFrontend {
             decision: Cell::new(decision),
             events_at_review: RefCell::new(None),
             last_ctx: RefCell::new(None),
+            interaction: RefCell::new(InteractionOutcome::Rejected { feedback: None }),
+            interaction_count: Cell::new(0),
         }
+    }
+
+    fn with_interaction(self, interaction: InteractionOutcome) -> Self {
+        *self.interaction.borrow_mut() = interaction;
+        self
     }
 }
 
@@ -154,6 +163,107 @@ impl ApprovalGate for RecordingFrontend {
         let decision = self.decision.get();
         Box::pin(async move { Ok(decision) })
     }
+
+    fn interact<'a>(&'a self, _call: &'a ToolCall) -> InteractionFuture<'a> {
+        self.interaction_count
+            .set(self.interaction_count.get().saturating_add(1));
+        let outcome = self.interaction.borrow().clone();
+        Box::pin(async move { Ok(outcome) })
+    }
+}
+
+#[test]
+fn required_interaction_runs_under_never_ask_and_skip_permissions() -> Result<()> {
+    let question = json!({
+        "questions": [{
+            "question": "Which database?",
+            "header": "Database",
+            "options": [
+                {"label": "SQLite", "description": "Embedded"},
+                {"label": "Postgres", "description": "Server"}
+            ],
+            "multiSelect": false
+        }]
+    });
+    let submitted = json!({
+        "questions": question["questions"].clone(),
+        "answers": {"Which database?": "SQLite"}
+    });
+
+    for (mode, skip_permissions) in [
+        (ApprovalMode::NeverAsk, false),
+        (ApprovalMode::Strict, true),
+    ] {
+        let workspace = test_workspace()?;
+        let provider = FakeProvider::new(vec![
+            Ok(single_call_turn("AskUserQuestion", question.clone())),
+            Ok(AssistantTurn::text("done")),
+        ]);
+        let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+        harness.set_approval_mode(mode);
+        harness.set_skip_permissions(skip_permissions);
+        let frontend = RecordingFrontend::new(ApprovalDecision::Deny)
+            .with_interaction(InteractionOutcome::Submitted(submitted.clone()));
+
+        block_on(harness.submit_turn("choose", &frontend, &frontend, &CancellationToken::new()))?;
+
+        assert_eq!(frontend.interaction_count.get(), 1);
+        let seen = harness.agent.provider.seen.borrow();
+        let result = seen[1]
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("AskUserQuestion result");
+        assert!(result.content.contains("SQLite"), "{}", result.content);
+        assert!(result.content.contains("\"ok\":true"), "{}", result.content);
+        assert!(
+            !frontend
+                .events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolAutoApprovedDangerous(_)))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn interaction_feedback_is_bounded_and_model_visible() -> Result<()> {
+    let workspace = test_workspace()?;
+    let question = json!({
+        "questions": [{
+            "question": "Which database?",
+            "header": "Database",
+            "options": [
+                {"label": "SQLite", "description": "Embedded"},
+                {"label": "Postgres", "description": "Server"}
+            ]
+        }]
+    });
+    let provider = FakeProvider::new(vec![
+        Ok(single_call_turn("AskUserQuestion", question)),
+        Ok(AssistantTurn::text("done")),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Allow).with_interaction(
+        InteractionOutcome::Rejected {
+            feedback: Some("x".repeat(MAX_INTERACTION_FEEDBACK_BYTES + 100)),
+        },
+    );
+
+    block_on(harness.submit_turn("choose", &frontend, &frontend, &CancellationToken::new()))?;
+
+    let seen = harness.agent.provider.seen.borrow();
+    let result = seen[1]
+        .iter()
+        .find(|message| message.role == Role::Tool)
+        .expect("denied AskUserQuestion result");
+    let wire: Value = serde_json::from_str(&result.content)?;
+    assert_eq!(wire["denied"], true);
+    assert_eq!(
+        wire["feedback"].as_str().expect("feedback").len(),
+        MAX_INTERACTION_FEEDBACK_BYTES
+    );
+    Ok(())
 }
 
 #[test]
@@ -6566,7 +6676,7 @@ impl ChatProvider for SurfaceProbe {
     }
 }
 
-const FULL_SURFACE: [&str; 9] = [
+const FULL_SURFACE: [&str; 10] = [
     "read",
     "bash",
     "edit",
@@ -6574,6 +6684,7 @@ const FULL_SURFACE: [&str; 9] = [
     "grep",
     "find",
     "ls",
+    "AskUserQuestion",
     "read_output",
     "recall",
 ];
@@ -6603,6 +6714,7 @@ fn native_edit_capability_hides_only_edit_but_keeps_it_executable() {
             "grep",
             "find",
             "ls",
+            "AskUserQuestion",
             "read_output",
             "recall"
         ]
@@ -6708,6 +6820,7 @@ fn native_edit_provider_is_advertised_a_surface_without_edit() -> Result<()> {
             "grep",
             "find",
             "ls",
+            "AskUserQuestion",
             "read_output",
             "recall"
         ]
