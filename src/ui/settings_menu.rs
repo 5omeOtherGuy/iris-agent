@@ -2734,7 +2734,7 @@ fn line_width(line: &Line<'static>) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn model_choice(
@@ -2786,7 +2786,7 @@ mod tests {
         }
     }
 
-    fn snapshot() -> Snapshot {
+    pub(crate) fn snapshot() -> Snapshot {
         Snapshot {
             default_model: "openai-codex/gpt-5.5".to_string(),
             reasoning_levels: vec![

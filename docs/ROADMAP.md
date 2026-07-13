@@ -1,6 +1,6 @@
 # Iris — Roadmap
 
-> Status (2026-07-09): Milestone 1, the async-hard runtime completion, and the
+> Status (2026-07-12): Milestone 1, the async-hard runtime completion, and the
 > Milestone 2 foundations are done. Iris has a terminal-surface TUI with
 > Iris-owned transcript replay plus a text fallback, selectable Mimir providers (`openai-codex`,
 > `anthropic`, and `antigravity`), runtime model/reasoning switching, streamed
@@ -86,8 +86,11 @@ Implemented today:
   after the current round's tool calls), Alt+Enter queues a follow-up (injected
   only when the agent would otherwise stop). Nexus owns the injection points and
   a `SteeringSource` seam; the Tier-3 `SteeringQueue` owns the drain policy; the
-  working indicator shows a queued count and Ctrl-C clears the queue. The text/
-  non-TTY path never steers.
+  working indicator shows a queued count and Ctrl-C clears the queue. A local
+  TUI harness actor keeps slash commands, the settings faceplate, transcript
+  inspection, approvals, and cancellation live during provider streaming, tool
+  execution, approval review, and compaction; runtime-affecting settings queue
+  to the next safe boundary. The text/non-TTY path never steers.
 - Typed boundary errors with process exit codes (`src/errors.rs`) and `RUST_LOG`
   tracing to stderr (`src/telemetry.rs`).
 - Workspace-scoped built-in tools: `read`, `write`, `edit`, `bash`, `grep`,

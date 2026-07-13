@@ -381,7 +381,7 @@ pub(crate) fn refresh_settings_panel<P: ChatProvider>(
 /// panel controls, and the hatch payloads) so the panel shows each control's
 /// real position. Reads the merged global+project config for `cwd`; a read
 /// failure degrades to built-in defaults rather than failing the panel.
-fn settings_snapshot<P: ChatProvider>(
+pub(crate) fn settings_snapshot<P: ChatProvider>(
     harness: &Harness<P>,
     switch: &ModelSwitch<'_, P>,
 ) -> settings_menu::Snapshot {
@@ -642,7 +642,7 @@ fn percent_to_fraction(value: Option<&str>) -> anyhow::Result<f64> {
 /// pre-validate/clamp the value, so the parse here is a safety net; the typed
 /// `config::save_*` also clamp defensively. `value` is `None` for the
 /// empty-clears fields (unbounded round-trips, unset command/worktree root).
-fn save_setting_field(
+pub(crate) fn persist_setting_field(
     field: settings_menu::Field,
     value: Option<&str>,
     workspace: &std::path::Path,
@@ -928,7 +928,7 @@ pub(crate) fn apply_action<P: ChatProvider>(
             if let Err(error) = reconfigured {
                 return refresh_settings(view, None, vec![error.to_string()], harness, switch);
             }
-            match save_setting_field(field, value.as_deref(), harness.workspace()) {
+            match persist_setting_field(field, value.as_deref(), harness.workspace()) {
                 Ok(()) => {
                     // Some settings are read live by the harness, not just at
                     // startup: mirror the persisted value onto the running

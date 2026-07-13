@@ -1,13 +1,11 @@
 //! The persistent async event loop that drives the terminal-surface TUI (Tier 3).
 //!
-//! One `tokio::select!` on the existing current-thread runtime multiplexes four
-//! sources: terminal input (a dedicated OS thread feeding a channel, since
-//! ratatui's crossterm re-export does not enable the `event-stream` feature),
-//! the agent's `AgentEvent`s (pushed through [`LoopBridge`] into a channel), a
-//! render tick that animates the spinner, and -- while a turn runs -- the
-//! approval request channel. The turn itself is a single pinned
-//! `harness.submit_turn` future polled by the same select, so the loop stays
-//! responsive (scroll, spinner, approval) while the agent works.
+//! One `tokio::select!` on the existing current-thread runtime multiplexes
+//! terminal input (a dedicated OS thread feeds a channel because ratatui's
+//! crossterm re-export does not enable `event-stream`), typed [`HarnessEvent`]s
+//! from the local harness actor, and render ticks. The actor exclusively borrows
+//! the harness while a turn or compaction runs; this loop keeps terminal input,
+//! focus, overlays, approval routing, and rendering live throughout.
 //!
 //! Cancellation: raw mode delivers Ctrl-C as a key event, not SIGINT. Because a
 //! synchronous tool (`bash`) can block the executor thread, the input thread --
@@ -16,8 +14,8 @@
 //! per-turn watcher provided. The select loop then resolves any pending
 //! approval as Deny so the turn unblocks and Nexus aborts it.
 //!
-//! Nexus is untouched: this loop only consumes its `AgentObserver` /
-//! `ApprovalGate` seams via [`LoopBridge`].
+//! Nexus stays UI-neutral: the local harness actor adapts its observer and
+//! approval seams into typed TUI events and commands.
 
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -36,12 +34,12 @@ use crate::cli::{LoadedSource, ModelSwitch, SessionLoader, SessionSource, Startu
 use crate::git::status::{GitStatusCache, VcsStatus};
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::selection::ModelSelection;
-use crate::nexus::{
-    AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider, PermissionMode,
-    ReviewContext, ToolCall,
-};
-use crate::tool_display::approval_dirty_note;
+use crate::nexus::{AgentObserver, ApprovalDecision, ChatProvider, PermissionMode, ToolCall};
 use crate::ui::UiEvent;
+use crate::ui::harness_actor::{
+    self, ActiveTokenSlot, ActorState, HarnessActor, HarnessCommand, HarnessEvent, Operation,
+    SettingsOrigin, SteeringMode,
+};
 use crate::ui::login::{self, LoginBackend, LoginOutcome, LoginUpdate, OAuthLoginBackend};
 use crate::ui::modal::{LoginDialog, Modal, ModalAction, ModalKey, ModalOutcome};
 use crate::ui::picker::{self, ActionResult, ModelCommand};
@@ -156,17 +154,8 @@ impl RenderScheduler {
     }
 }
 
-/// The active turn's cancellation token, shared with the input thread so raw
-/// Ctrl-C (and Esc when no higher-priority UI owns it) cancels even while a
-/// synchronous tool blocks the executor thread.
-struct RunningTurn {
-    token: CancellationToken,
-    esc_cancels: bool,
-}
-
-type CurrentTurn = Arc<Mutex<Option<RunningTurn>>>;
-
-fn set_esc_cancel_enabled(current_turn: &CurrentTurn, enabled: bool) {
+/// Update whether the input thread may use Escape to cancel the active actor.
+fn set_esc_cancel_enabled(current_turn: &ActiveTokenSlot, enabled: bool) {
     if let Some(turn) = current_turn
         .lock()
         .expect("turn token lock poisoned")
@@ -271,37 +260,6 @@ struct PendingApproval {
     allow_project: bool,
 }
 
-/// A review request crossing from the turn future into the loop.
-struct ApprovalRequest {
-    call: ToolCall,
-    allow_always: bool,
-    allow_project: bool,
-    /// Whether the `always` choice is the dirty-tree variant (`a all dirty
-    /// files (this task)`), so the composer's decision echo renders the same
-    /// affordance label the block footer does.
-    dirty_gate: bool,
-    reply: oneshot::Sender<ApprovalDecision>,
-}
-
-/// A short, danger-toned caution for the in-block `▲ REVIEW` footer, built from
-/// the structured review facts (never model-authored copy): the destructive
-/// floor (ADR-0010), pre-existing dirty-tree paths the call would touch
-/// (ADR-0028), and — for a shell call on a platform with no kernel sandbox — an
-/// `unsandboxed` posture. `None` when the call is unremarkable.
-fn review_reason(call: &ToolCall, ctx: &ReviewContext) -> Option<String> {
-    let mut parts = Vec::new();
-    if ctx.destructive {
-        parts.push("destructive".to_string());
-    }
-    if let Some(note) = approval_dirty_note(&ctx.dirty_paths, 96) {
-        parts.push(note);
-    }
-    if call.name == "bash" && !crate::tools::platform_can_sandbox() {
-        parts.push("unsandboxed".to_string());
-    }
-    (!parts.is_empty()).then(|| parts.join(" · "))
-}
-
 fn effective_approval_policy<P: ChatProvider>(harness: &Harness<P>) -> ApprovalPolicy {
     if harness.skip_permissions() {
         ApprovalPolicy::SkipPermissions
@@ -325,7 +283,7 @@ async fn session_loop<P: ChatProvider>(
         resumed_session,
     } = startup;
     let (input_tx, mut input_rx) = unbounded_channel::<Event>();
-    let current_turn: CurrentTurn = Arc::new(Mutex::new(None));
+    let current_turn: ActiveTokenSlot = Arc::new(Mutex::new(None));
 
     // Mid-run steering/follow-up queue, shared with the harness so a turn drains
     // what the user types while it runs. Installed once for the session; the
@@ -402,7 +360,7 @@ async fn session_loop<P: ChatProvider>(
                 switch,
                 &login_backend,
                 &current_turn,
-                steering.as_ref(),
+                &steering,
                 &git_cache,
                 &mut git_generation,
             )
@@ -558,40 +516,88 @@ async fn session_loop<P: ChatProvider>(
                     RouteOutcome::Compact(focus) => {
                         tui.screen.start_turn();
                         tui.draw()?;
-                        run_harness_op(
+                        let (_compact_ok, deferred, actions) = run_harness_op(
                             harness,
+                            switch,
                             tui,
                             &mut input_rx,
                             &mut tick,
                             &current_turn,
-                            HarnessOp::Compact(&focus),
-                            steering.as_ref(),
+                            Operation::Compaction((!focus.is_empty()).then_some(focus.clone())),
+                            steering.clone(),
                             &git_cache,
                             &mut git_generation,
                         )
                         .await?;
-                        tui.screen.end_background_work();
-                        open_deferred_settings(harness, tui, switch, steering.as_ref());
+                        replay_deferred_commands(
+                            deferred,
+                            harness,
+                            tui,
+                            switch,
+                            &git_cache,
+                            Some(swap),
+                        )?;
+                        if let Some(source) = replay_deferred_actions(
+                            actions,
+                            harness,
+                            tui,
+                            &mut input_rx,
+                            &mut tick,
+                            switch,
+                            &login_backend,
+                            &current_turn,
+                            &steering,
+                            &git_cache,
+                            &mut git_generation,
+                        )
+                        .await?
+                        {
+                            perform_swap(&source, swap, harness, tui, switch)?;
+                        }
                         tui.draw()?;
                     }
                     RouteOutcome::Fall => {
                         tui.screen.commit_user(&prompt);
                         tui.screen.start_turn();
                         tui.draw()?;
-                        run_harness_op(
+                        let (_turn_ok, deferred, actions) = run_harness_op(
                             harness,
+                            switch,
                             tui,
                             &mut input_rx,
                             &mut tick,
                             &current_turn,
-                            HarnessOp::Turn(&prompt),
-                            steering.as_ref(),
+                            Operation::Turn(prompt.clone()),
+                            steering.clone(),
                             &git_cache,
                             &mut git_generation,
                         )
                         .await?;
-                        tui.screen.end_turn();
-                        open_deferred_settings(harness, tui, switch, steering.as_ref());
+                        replay_deferred_commands(
+                            deferred,
+                            harness,
+                            tui,
+                            switch,
+                            &git_cache,
+                            Some(swap),
+                        )?;
+                        if let Some(source) = replay_deferred_actions(
+                            actions,
+                            harness,
+                            tui,
+                            &mut input_rx,
+                            &mut tick,
+                            switch,
+                            &login_backend,
+                            &current_turn,
+                            &steering,
+                            &git_cache,
+                            &mut git_generation,
+                        )
+                        .await?
+                        {
+                            perform_swap(&source, swap, harness, tui, switch)?;
+                        }
                         // Turn completion is a refresh trigger: the turn may
                         // have mutated the tree or task state.
                         git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
@@ -600,7 +606,6 @@ async fn session_loop<P: ChatProvider>(
                 }
             }
         }
-        open_deferred_settings(harness, tui, switch, steering.as_ref());
         // A model/effort switch (Ctrl+P, Shift+Tab, or a `/model` `/reasoning`
         // command) lands in this iteration; refresh the footer so the trailing
         // draw reflects the new selection immediately, not on the next keypress.
@@ -708,22 +713,6 @@ fn apply_recovery(outcome: RecoveryOutcome, tui: &mut TuiUi) {
                 )],
             );
         }
-    }
-}
-
-/// Open a `/settings` request that was typed while a turn/compact operation was
-/// running. The running phase records only an intent; the modal opens here at a
-/// safe boundary, where model/settings actions already route.
-fn open_deferred_settings<P: ChatProvider>(
-    harness: &Harness<P>,
-    tui: &mut TuiUi,
-    switch: &mut Option<ModelSwitch<'_, P>>,
-    steering: &SteeringQueue,
-) {
-    if steering.take_settings()
-        && let Some(sw) = switch.as_mut()
-    {
-        tui.screen.open_modal(picker::open_settings(harness, sw));
     }
 }
 
@@ -1545,18 +1534,6 @@ fn context_breakdown_lines<P: ChatProvider>(
     lines
 }
 
-/// Whether a submitted line is the `/settings` command (the leading token,
-/// ignoring any trailing arguments), matching `route_command`'s own token
-/// split. Used by the running phase to divert `/settings` from steering into a
-/// deferred picker-open at the next safe boundary (issue #489).
-fn is_settings_command(text: &str) -> bool {
-    let trimmed = text.trim();
-    let cmd = trimmed
-        .split_once(char::is_whitespace)
-        .map_or(trimmed, |(cmd, _)| cmd);
-    cmd == "/settings"
-}
-
 /// Apply the session-scoped focus-mode command. `None` means ordinary input;
 /// `Some` means the line was consumed and carries the honest readout to show.
 /// This is safe during a running turn because it changes presentation only.
@@ -2137,234 +2114,767 @@ async fn idle_phase(
     }
 }
 
-/// Which cancellable harness operation the shared driver runs: a normal agent
-/// turn, or an on-demand compaction (`/compact`, whose provider-backed
-/// summarizer awaits a model request and deserves the same spinner/cancel
-/// treatment as a turn).
-enum HarnessOp<'a> {
-    Turn(&'a str),
-    Compact(&'a str),
+fn open_active_settings(
+    screen: &mut Screen,
+    snapshot: Option<&settings_menu::Snapshot>,
+    target: Option<settings_menu::HatchTarget>,
+) -> bool {
+    let Some(snapshot) = snapshot.cloned() else {
+        screen.apply(UiEvent::Notice(
+            "settings are unavailable for this session".to_string(),
+        ));
+        return true;
+    };
+    let panel = match target {
+        Some(target) => settings_menu::SettingsPanel::with_expanded(snapshot, target),
+        None => settings_menu::SettingsPanel::new(snapshot),
+    };
+    screen.open_modal(Modal::Settings(Box::new(panel)));
+    true
 }
 
-/// Drive one cancellable harness operation (a turn or an on-demand
-/// compaction), staying responsive to input, agent events, approval requests,
-/// and the spinner tick. Returns when the operation future completes.
+fn approval_key(
+    key: &ratatui::crossterm::event::KeyEvent,
+    pending: &PendingApproval,
+) -> Option<ApprovalDecision> {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => Some(ApprovalDecision::Allow),
+        KeyCode::Char('a') | KeyCode::Char('A') if pending.allow_always => {
+            Some(ApprovalDecision::AllowAlways)
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') if pending.allow_project => {
+            Some(ApprovalDecision::AllowProject)
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => Some(ApprovalDecision::Deny),
+        KeyCode::Esc => Some(ApprovalDecision::Deny),
+        _ => None,
+    }
+}
+
+fn handle_active_modal_event(
+    screen: &mut Screen,
+    event: &Event,
+    commands: &UnboundedSender<HarnessCommand>,
+) -> bool {
+    let view = match &screen.modal {
+        Some(Modal::Settings(panel)) => Some(panel.view()),
+        _ => None,
+    };
+    let outcome = if let Event::Paste(text) = event {
+        screen
+            .modal
+            .as_mut()
+            .map_or(ModalOutcome::Ignore, |modal| modal.paste_text(text))
+    } else {
+        to_modal_key(event).map_or(ModalOutcome::Ignore, |key| {
+            screen
+                .modal
+                .as_mut()
+                .map_or(ModalOutcome::Ignore, |modal| modal.handle_key(key))
+        })
+    };
+    match outcome {
+        ModalOutcome::Ignore => false,
+        ModalOutcome::Redraw => true,
+        ModalOutcome::Close => {
+            screen.close_modal();
+            true
+        }
+        ModalOutcome::Emit(ModalAction::InsertSkillMention { name, path }) => {
+            screen.close_modal();
+            screen
+                .editor
+                .insert_str(format!("[${name}](skill://{path}) "));
+            screen.sync_palette();
+            true
+        }
+        ModalOutcome::Emit(action) => {
+            if let ModalAction::SaveSetting { field, value } = &action {
+                apply_live_tui_setting(screen, *field, value.as_deref());
+            }
+            let _ = commands.send(HarnessCommand::ApplySettings {
+                action,
+                origin: SettingsOrigin::Faceplate(view),
+            });
+            true
+        }
+    }
+}
+
+fn handle_active_submission(
+    screen: &mut Screen,
+    text: String,
+    mode: SteeringMode,
+    settings: Option<&settings_menu::Snapshot>,
+    commands: &UnboundedSender<HarnessCommand>,
+) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let (command, rest) = trimmed
+        .split_once(char::is_whitespace)
+        .map_or((trimmed, ""), |(command, rest)| (command, rest.trim()));
+    match command {
+        "/settings" => open_active_settings(screen, settings, None),
+        "/model" | "/reasoning" if rest.is_empty() => {
+            open_active_settings(screen, settings, Some(settings_menu::HatchTarget::Model))
+        }
+        "/scoped-models" => {
+            open_active_settings(screen, settings, Some(settings_menu::HatchTarget::Scope))
+        }
+        "/trust" | "/permissions" => open_active_settings(
+            screen,
+            settings,
+            Some(settings_menu::HatchTarget::Permissions),
+        ),
+        "/login" => open_active_settings(screen, settings, Some(settings_menu::HatchTarget::Login)),
+        "/logout" => {
+            open_active_settings(screen, settings, Some(settings_menu::HatchTarget::Logout))
+        }
+        "/reasoning" => {
+            match crate::mimir::selection::ReasoningEffort::parse(rest) {
+                Ok(effort) => {
+                    let _ = commands.send(HarnessCommand::ApplySettings {
+                        action: ModalAction::AdjustEffort(effort),
+                        origin: SettingsOrigin::Command,
+                    });
+                }
+                Err(error) => screen.apply(UiEvent::Notice(error.to_string())),
+            }
+            true
+        }
+        "/model" => {
+            let choice = settings.and_then(|snapshot| {
+                snapshot.catalog.iter().find(|choice| {
+                    choice.qualified.eq_ignore_ascii_case(rest)
+                        || choice.model_id.eq_ignore_ascii_case(rest)
+                })
+            });
+            if let Some(choice) = choice {
+                let effort = choice
+                    .levels
+                    .iter()
+                    .find(|(effort, _)| {
+                        settings.is_some_and(|snapshot| snapshot.reasoning == *effort)
+                    })
+                    .map(|(effort, _)| *effort)
+                    .or_else(|| choice.levels.first().map(|(effort, _)| *effort))
+                    .unwrap_or(crate::mimir::selection::ReasoningEffort::DEFAULT);
+                let _ = commands.send(HarnessCommand::ApplySettings {
+                    action: ModalAction::SelectModel {
+                        id: choice.qualified.clone(),
+                        effort,
+                        save_default: true,
+                    },
+                    origin: SettingsOrigin::Command,
+                });
+            } else {
+                screen.apply(UiEvent::Notice(format!(
+                    "model `{rest}` is not available in the current catalog"
+                )));
+            }
+            true
+        }
+        "/compact" => {
+            let _ = commands.send(HarnessCommand::RequestCompaction {
+                focus: (!rest.is_empty()).then(|| rest.to_string()),
+            });
+            true
+        }
+        "/focus" => {
+            if let Some(notice) = apply_focus_command(screen, trimmed) {
+                screen.apply(UiEvent::Notice(notice));
+            }
+            true
+        }
+        _ if slash::COMMANDS
+            .iter()
+            .any(|registered| registered.name.eq_ignore_ascii_case(command)) =>
+        {
+            let _ = commands.send(HarnessCommand::QueueCommand {
+                text: trimmed.to_string(),
+            });
+            true
+        }
+        _ => {
+            let _ = commands.send(HarnessCommand::QueueSteering { text, mode });
+            true
+        }
+    }
+}
+
+fn handle_active_event(
+    screen: &mut Screen,
+    event: Event,
+    pending: &mut Option<PendingApproval>,
+    settings: Option<&settings_menu::Snapshot>,
+    skills: &[crate::wayland::skills::SkillMetadata],
+    commands: &UnboundedSender<HarnessCommand>,
+    git_cache: &GitStatusCache,
+) -> bool {
+    if let Event::Key(key) = &event
+        && (key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat)
+    {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // The settings shortcut is non-conflicting and stays live even while an
+        // approval owns its decision keys.
+        if ctrl && key.code == KeyCode::Char(',') {
+            return open_active_settings(screen, settings, None);
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+            if let Some(approval) = pending.take() {
+                let _ = approval.reply.send(ApprovalDecision::Deny);
+                screen.clear_approval(false);
+            }
+            let _ = commands.send(HarnessCommand::CancelActive);
+            return true;
+        }
+        // Escape closes focused overlays before it can deny an approval or
+        // cancel the operation.
+        if key.code == KeyCode::Esc && screen.focus() == FocusTarget::Modal {
+            screen.close_modal();
+            return true;
+        }
+        if key.code == KeyCode::Esc && screen.focus() == FocusTarget::Palette {
+            screen.palette.dismiss();
+            return true;
+        }
+        if key.code == KeyCode::Esc && screen.session_menu.is_some() {
+            screen.session_menu = None;
+            return true;
+        }
+        if let Some(approval) = pending.as_ref()
+            && let Some(decision) = approval_key(key, approval)
+        {
+            let approval = pending.take().expect("pending approval present");
+            screen.note_approval(&approval.call, decision);
+            let _ = approval.reply.send(decision);
+            let _ = commands.send(HarnessCommand::Approve { decision });
+            return true;
+        }
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::ALT) {
+            let text = screen.submit();
+            return handle_active_submission(
+                screen,
+                text,
+                SteeringMode::FollowUp,
+                settings,
+                commands,
+            );
+        }
+        if key.code == KeyCode::Esc {
+            let _ = commands.send(HarnessCommand::CancelActive);
+            return true;
+        }
+    }
+
+    if pending.is_some() {
+        return match event {
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+            {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
+                if ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
+                    screen.toggle_all_panels();
+                    true
+                } else if ctrl && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L')) {
+                    open_active_settings(screen, settings, Some(settings_menu::HatchTarget::Model))
+                } else if pager_scroll_key(screen, key.code, ctrl, alt)
+                    || scrollback_focus_key(screen, key.code, ctrl, alt)
+                {
+                    true
+                } else if screen.focus() == FocusTarget::Palette
+                    && matches!(
+                        key.code,
+                        KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab
+                    )
+                {
+                    matches!(
+                        handle_idle_event(screen, Event::Key(key), git_cache),
+                        IdleKey::Continue
+                    )
+                } else {
+                    false
+                }
+            }
+            Event::Mouse(mouse) => {
+                sticky_prompt_click(screen, &mouse)
+                    || header_click(screen, &mouse)
+                    || pager_link_click(screen, &mouse)
+                    || pager_wheel(screen, &mouse)
+            }
+            Event::Resize(..) => true,
+            Event::FocusGained => screen.set_terminal_focused(true),
+            Event::FocusLost => {
+                screen.set_terminal_focused(false);
+                false
+            }
+            _ => false,
+        };
+    }
+
+    if screen.focus() == FocusTarget::Modal {
+        return handle_active_modal_event(screen, &event, commands);
+    }
+
+    match handle_idle_event(screen, event, git_cache) {
+        IdleKey::Continue => true,
+        IdleKey::Ignore => false,
+        IdleKey::Submit(text) => {
+            handle_active_submission(screen, text, SteeringMode::Steering, settings, commands)
+        }
+        IdleKey::Exit => {
+            let _ = commands.send(HarnessCommand::CancelActive);
+            true
+        }
+        IdleKey::OpenModelPicker => {
+            open_active_settings(screen, settings, Some(settings_menu::HatchTarget::Model))
+        }
+        IdleKey::OpenSkillPicker => {
+            if skills.is_empty() {
+                screen.apply(UiEvent::Notice("No skills are installed.".to_string()));
+            } else {
+                screen.open_modal(Modal::Skills(crate::ui::modal::SkillPicker::new(skills)));
+            }
+            true
+        }
+        IdleKey::CycleModel(forward) => {
+            let _ = commands.send(HarnessCommand::ApplySettings {
+                action: ModalAction::CycleModel { forward },
+                origin: SettingsOrigin::Shortcut,
+            });
+            true
+        }
+        IdleKey::CycleEffort => {
+            if let Some(snapshot) = settings
+                && let Some(index) = snapshot
+                    .reasoning_levels
+                    .iter()
+                    .position(|(effort, _)| *effort == snapshot.reasoning)
+                && !snapshot.reasoning_levels.is_empty()
+            {
+                let effort =
+                    snapshot.reasoning_levels[(index + 1) % snapshot.reasoning_levels.len()].0;
+                let _ = commands.send(HarnessCommand::ApplySettings {
+                    action: ModalAction::AdjustEffort(effort),
+                    origin: SettingsOrigin::Shortcut,
+                });
+            }
+            true
+        }
+        IdleKey::OpenResumePicker => {
+            match picker::open_resume(&std::env::current_dir().unwrap_or_default()) {
+                Some(modal) => screen.open_modal(modal),
+                None => screen.apply(UiEvent::Notice(
+                    "No prior sessions to resume for this directory.".to_string(),
+                )),
+            }
+            true
+        }
+        IdleKey::OpenTasks => {
+            screen.apply(UiEvent::Notice(
+                "task review queued until the active operation finishes".to_string(),
+            ));
+            let _ = commands.send(HarnessCommand::QueueCommand {
+                text: "/tasks".to_string(),
+            });
+            true
+        }
+        IdleKey::OpenSettings => open_active_settings(screen, settings, None),
+        IdleKey::ToggleGitMenu => toggle_git_menu(screen, git_cache),
+        IdleKey::ToggleTreeMenu(filter) => toggle_tree_menu(screen, git_cache, filter),
+        IdleKey::Menu(_) => false,
+    }
+}
+
+fn replay_deferred_commands<P: ChatProvider>(
+    commands: Vec<String>,
+    harness: &mut Harness<P>,
+    tui: &mut TuiUi,
+    switch: &mut Option<ModelSwitch<'_, P>>,
+    git_cache: &GitStatusCache,
+    swap: Option<&SessionLoader<'_>>,
+) -> Result<()> {
+    for command in commands {
+        match route_command(&command, harness, tui, switch, git_cache)? {
+            RouteOutcome::Consumed => {}
+            RouteOutcome::Swap(source) => {
+                if let Some(swap) = swap {
+                    perform_swap(&source, swap, harness, tui, switch)?;
+                } else {
+                    apply_notices(
+                        tui,
+                        vec![format!("queued `{command}` could not switch sessions here")],
+                    );
+                }
+            }
+            RouteOutcome::Compact(focus) => {
+                apply_notices(
+                    tui,
+                    vec![format!(
+                        "queued compaction is ready; run `/compact {focus}` again"
+                    )],
+                );
+            }
+            RouteOutcome::Fall => apply_notices(
+                tui,
+                vec![format!("queued command was not recognized: {command}")],
+            ),
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn run_harness_op<P: ChatProvider>(
+async fn replay_deferred_actions<P: ChatProvider>(
+    actions: Vec<ModalAction>,
     harness: &mut Harness<P>,
     tui: &mut TuiUi,
     input_rx: &mut UnboundedReceiver<Event>,
     tick: &mut tokio::time::Interval,
-    current_turn: &CurrentTurn,
-    op: HarnessOp<'_>,
-    steering: &SteeringQueue,
+    switch: &mut Option<ModelSwitch<'_, P>>,
+    login_backend: &Arc<dyn LoginBackend>,
+    current_turn: &ActiveTokenSlot,
+    steering: &Rc<SteeringQueue>,
     git_cache: &GitStatusCache,
     git_generation: &mut u64,
-) -> Result<bool> {
-    let (event_tx, mut event_rx) = unbounded_channel::<UiEvent>();
-    let (appr_tx, mut appr_rx) = unbounded_channel::<ApprovalRequest>();
-    let bridge = LoopBridge { event_tx, appr_tx };
+) -> Result<Option<SessionSource>> {
+    let mut requested = None;
+    for action in actions {
+        if let Some(source) = Box::pin(dispatch_action(
+            action,
+            harness,
+            tui,
+            input_rx,
+            tick,
+            switch,
+            login_backend,
+            current_turn,
+            steering,
+            git_cache,
+            git_generation,
+        ))
+        .await?
+        {
+            requested = Some(source);
+        }
+    }
+    Ok(requested)
+}
 
-    // Clear any stale interrupt before arming, then publish the token so the
-    // input thread can cancel this turn on Ctrl-C/Esc.
-    crate::signals::reset();
-    let token = CancellationToken::new();
-    *current_turn.lock().expect("turn token lock poisoned") = Some(RunningTurn {
-        token: token.clone(),
-        esc_cancels: true,
-    });
-
+/// Drive one cancellable operation through the local harness actor. Terminal
+/// input and rendering remain in this loop; the actor exclusively borrows the
+/// harness and model-switch state until the operation reaches its boundary.
+#[allow(clippy::too_many_arguments)]
+async fn run_harness_op<P: ChatProvider>(
+    harness: &mut Harness<P>,
+    switch: &mut Option<ModelSwitch<'_, P>>,
+    tui: &mut TuiUi,
+    input_rx: &mut UnboundedReceiver<Event>,
+    tick: &mut tokio::time::Interval,
+    current_turn: &ActiveTokenSlot,
+    op: Operation,
+    steering: Rc<SteeringQueue>,
+    git_cache: &GitStatusCache,
+    git_generation: &mut u64,
+) -> Result<(bool, Vec<String>, Vec<ModalAction>)> {
+    let mut settings = switch
+        .as_ref()
+        .map(|switch| picker::settings_snapshot(harness, switch));
+    let skills = harness.skills().to_vec();
+    let (command_rx, event_tx, mut channels) = harness_actor::channels();
+    let actor = HarnessActor::new(
+        harness,
+        switch,
+        command_rx,
+        event_tx,
+        steering.clone(),
+        current_turn.clone(),
+    );
+    match op {
+        Operation::Turn(text) => {
+            let _ = channels.commands.send(HarnessCommand::SubmitTurn { text });
+        }
+        Operation::Compaction(focus) => {
+            let _ = channels
+                .commands
+                .send(HarnessCommand::RequestCompaction { focus });
+        }
+    }
+    let _ = channels.commands.send(HarnessCommand::RefreshUiState);
+    let mut actor = Box::pin(actor.run());
     let mut pending: Option<PendingApproval> = None;
-    // Cleared once terminal input reaches EOF so the closed channel is no longer
-    // polled (a closed `recv()` is always ready and would otherwise busy-loop).
-    let mut input_open = true;
-
-    // Coalesce the burst of agent events a turn emits to ~one draw per 16ms.
-    // The caller already drew immediately before this turn, so seed the pacing
-    // window as "just drawn" and let the first in-burst event defer to the flush.
+    let mut deferred_commands = Vec::new();
+    let mut deferred_actions = Vec::new();
     let mut sched = RenderScheduler::new();
     sched.mark_drawn(Instant::now());
-    // Width-changing resizes mid-turn (tmux pane drags) hold the scheduler so a
-    // storm settles into one full replay instead of one per coalescing window.
     let mut last_resize_width = ratatui::crossterm::terminal::size()
         .ok()
         .map(|(width, _)| width);
-
-    // A compaction is not a turn, so any Enter/Alt-Enter text the user typed
-    // into the steering queue while the `/compact` spinner ran must not be
-    // carried forward: `compact_now` never drains steering, so it would
-    // otherwise be silently merged into the next real prompt.
-    let is_compact = matches!(op, HarnessOp::Compact(_));
-    let result = {
-        let mut turn: futures::future::LocalBoxFuture<'_, Result<()>> = match op {
-            HarnessOp::Turn(prompt) => Box::pin(async {
-                harness
-                    .submit_turn(prompt, &bridge, &bridge, &token)
-                    .await
-                    .map(|_| ())
-            }),
-            HarnessOp::Compact(focus) => Box::pin(harness.compact_now_with_focus(
-                &bridge,
-                &token,
-                (!focus.is_empty()).then_some(focus),
-            )),
+    let mut input_open = true;
+    let succeeded = loop {
+        let flush_at = match sched.poll(Instant::now()) {
+            RenderAction::Idle => None,
+            RenderAction::DrawNow => Some(Instant::now()),
+            RenderAction::Wait(at) => Some(at),
         };
-        loop {
-            // Compute the next coalesced-draw deadline. When nothing is pending
-            // the branch is disabled, so the loop stays CPU-idle (no timer).
-            let flush_at: Option<Instant> = match sched.poll(Instant::now()) {
-                RenderAction::Idle => None,
-                RenderAction::DrawNow => Some(Instant::now()),
-                RenderAction::Wait(at) => Some(at),
-            };
-            let flush_deadline =
-                flush_at.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
-            tokio::select! {
-                res = &mut turn => {
-                    // The turn may finish in one poll after emitting a burst of
-                    // events; drain them so none are lost.
-                    while let Ok(event) = event_rx.try_recv() {
-                        tui.screen.apply(event);
-                    }
-                    break res;
-                }
-                Some(event) = event_rx.recv() => {
-                    // A tool call reaching a terminal state may have mutated
-                    // the tree: refresh the git snapshot in the background.
-                    if matches!(
+        let flush_deadline = flush_at.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+        tokio::select! {
+            result = &mut actor => {
+                while let Ok(event) = channels.events.try_recv() {
+                    apply_actor_event(
                         event,
+                        tui,
+                        &mut pending,
+                        &mut settings,
+                        &mut deferred_commands,
+                        &mut deferred_actions,
+                    );
+                }
+                break result?;
+            }
+            Some(event) = channels.events.recv() => {
+                let refresh_git = matches!(
+                    &event,
+                    HarnessEvent::UiEvent(
                         UiEvent::ToolResult { .. }
                             | UiEvent::ToolError { .. }
                             | UiEvent::ToolCancelled(_)
-                    ) {
-                        git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
-                    }
-                    tui.screen.apply(event);
-                    // A drained (injected) steering/follow-up message lowers the
-                    // queued count; refresh it from the live queue before redraw.
+                    )
+                );
+                apply_actor_event(
+                    event,
+                    tui,
+                    &mut pending,
+                    &mut settings,
+                    &mut deferred_commands,
+                    &mut deferred_actions,
+                );
+                if refresh_git {
+                    git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
+                }
+                tui.screen.set_queued(steering.len());
+                request_render(&mut sched, tui)?;
+            }
+            maybe = input_rx.recv(), if input_open => {
+                let Some(event) = maybe else {
+                    input_open = false;
+                    let _ = channels.commands.send(HarnessCommand::Shutdown);
+                    continue;
+                };
+                if let Event::Resize(width, _) = &event
+                    && last_resize_width != Some(*width)
+                {
+                    last_resize_width = Some(*width);
+                    sched.hold_until(Instant::now() + RESIZE_REDRAW_DEBOUNCE);
+                }
+                if handle_active_event(
+                    &mut tui.screen,
+                    event,
+                    &mut pending,
+                    settings.as_ref(),
+                    &skills,
+                    &channels.commands,
+                    git_cache,
+                ) {
                     tui.screen.set_queued(steering.len());
                     request_render(&mut sched, tui)?;
                 }
-                Some(request) = appr_rx.recv() => {
-                    // The same offered decision set the loop uses for the block
-                    // footer travels into the screen — including the dirty-gate
-                    // variant of `always` — so the REVIEW posture's decision
-                    // echo cannot diverge from the block footer.
-                    tui.screen.show_approval(
-                        request.allow_always,
-                        request.allow_project,
-                        request.dirty_gate,
-                    );
-                    pending = Some(PendingApproval {
-                        call: request.call.clone(),
-                        reply: request.reply,
-                        allow_always: request.allow_always,
-                        allow_project: request.allow_project,
-                    });
-                    set_esc_cancel_enabled(current_turn, false);
+                set_esc_cancel_enabled(
+                    current_turn,
+                    pending.is_none()
+                        && !matches!(
+                            tui.screen.focus(),
+                            FocusTarget::Modal | FocusTarget::Palette
+                        )
+                        && tui.screen.session_menu.is_none(),
+                );
+            }
+            _ = tick.tick() => {
+                if tui.screen.tick() {
                     request_render(&mut sched, tui)?;
                 }
-                maybe = input_rx.recv(), if input_open => {
-                    match maybe {
-                        Some(event) => {
-                            // Authoritatively cancel here too: a Ctrl-C delivered
-                            // in the submit/arm gap is read by the input thread
-                            // while `current_turn` is None, so it never cancels.
-                            // The event is still queued here, and a turn always
-                            // opens with a cancel-biased, *yielding* provider
-                            // stream before any executor-blocking tool (see
-                            // nexus stream_turn), so this arm runs and cancels
-                            // the token before bash can start. Cancel is
-                            // idempotent with the input thread's own cancel.
-                            if is_ctrl_c(&event) {
-                                token.cancel();
-                            }
-                            if let Event::Resize(width, _) = &event
-                                && last_resize_width != Some(*width)
-                            {
-                                last_resize_width = Some(*width);
-                                sched.hold_until(Instant::now() + RESIZE_REDRAW_DEBOUNCE);
-                            }
-                            if handle_running_event(
-                                &mut tui.screen,
-                                event,
-                                &mut pending,
-                                steering,
-                                git_cache,
-                                &token,
-                            ) {
-                                // Reflect any just-enqueued (or cleared) steering
-                                // input on the working indicator.
-                                tui.screen.set_queued(steering.len());
-                                request_render(&mut sched, tui)?;
-                            }
-                            set_esc_cancel_enabled(
-                                current_turn,
-                                pending.is_none() && tui.screen.session_menu.is_none(),
-                            );
-                        }
-                        None => {
-                            // Terminal input ended (EOF): stop polling the closed
-                            // channel and unblock the turn so it can complete
-                            // instead of awaiting an answer that can never come.
-                            input_open = false;
-                            resolve_input_eof(&mut tui.screen, &mut pending, &token);
-                        }
-                    }
+                if tui.screen.has_stream_work()
+                    && tui.screen.commit_stream_tick(std::time::Instant::now())
+                {
+                    request_render(&mut sched, tui)?;
                 }
-                _ = tick.tick() => {
-                    if tui.screen.tick() {
-                        request_render(&mut sched, tui)?;
-                    }
-                    // Paced commit tick: migrate newly-stable streamed assistant
-                    // lines from the mutable tail into scrollback (issue #87).
-                    if tui.screen.has_stream_work()
-                        && tui.screen.commit_stream_tick(std::time::Instant::now())
-                    {
-                        request_render(&mut sched, tui)?;
-                    }
-                    // A landed git refresh repaints the bar (readout dropdowns
-                    // keep painting last-known values while the turn runs).
-                    if sync_git_status(tui, git_cache, git_generation) {
-                        request_render(&mut sched, tui)?;
-                    }
+                if sync_git_status(tui, git_cache, git_generation) {
+                    request_render(&mut sched, tui)?;
                 }
-                _ = sleep_until(flush_deadline), if flush_at.is_some() => {
-                    // Flush a render coalesced earlier in the burst.
-                    tui.draw()?;
-                    sched.mark_drawn(Instant::now());
-                }
+            }
+            _ = sleep_until(flush_deadline), if flush_at.is_some() => {
+                tui.draw()?;
+                sched.mark_drawn(Instant::now());
             }
         }
     };
-
-    *current_turn.lock().expect("turn token lock poisoned") = None;
-    // On cancellation, drop any still-queued steering/follow-up input even if
-    // the turn future won the select before the input arm processed the Ctrl-C
-    // event (`handle_running_event` clears the queue on the keystroke; this
-    // covers the race where that event is never observed here). Idempotent with
-    // that path. A compaction always clears too: its typed input is not
-    // steering for a turn and must not leak into the next real prompt.
-    if token.is_cancelled() || is_compact {
-        steering.clear();
-        tui.screen.set_queued(0);
-    }
-    // Any approval still pending here means the turn ended without resolving it
-    // (cancellation); its receiver is already gone, so just drop it.
-    drop(pending);
-
-    let succeeded = match result {
-        Ok(()) => true,
-        Err(error) => {
-            tui.screen.apply(UiEvent::from_turn_error(&error));
-            false
-        }
-    };
-    // The turn is unwinding on an error; not an approval-to-run. (The error
-    // event applied just above already set the Finishing phase, so this is a
-    // guarded no-op for the phase, but stays honest about the outcome.)
+    tui.screen.set_queued(steering.len());
     tui.screen.clear_approval(false);
-    Ok(succeeded)
+    Ok((succeeded, deferred_commands, deferred_actions))
+}
+
+fn apply_actor_event(
+    event: HarnessEvent,
+    tui: &mut TuiUi,
+    pending: &mut Option<PendingApproval>,
+    settings: &mut Option<settings_menu::Snapshot>,
+    deferred_commands: &mut Vec<String>,
+    deferred_actions: &mut Vec<ModalAction>,
+) {
+    match event {
+        HarnessEvent::UiEvent(event) => tui.screen.apply(event),
+        HarnessEvent::TurnStarted | HarnessEvent::CompactionStarted => {}
+        HarnessEvent::TurnFinished => tui.screen.end_turn(),
+        HarnessEvent::CompactionFinished => tui.screen.end_background_work(),
+        HarnessEvent::TurnFailed(message) => {
+            tui.screen
+                .apply(UiEvent::Notice(format!("turn failed: {message}")));
+        }
+        HarnessEvent::ApprovalRequested {
+            offered_decisions,
+            call,
+            reason,
+        } => {
+            tui.screen.apply(UiEvent::ToolReview {
+                call: call.clone(),
+                allow_always: offered_decisions.allow_always,
+                allow_project: offered_decisions.allow_project,
+                dirty_gate: offered_decisions.dirty_gate,
+                reason,
+            });
+            tui.screen.show_approval(
+                offered_decisions.allow_always,
+                offered_decisions.allow_project,
+                offered_decisions.dirty_gate,
+            );
+            let (reply, _discarded) = oneshot::channel();
+            *pending = Some(PendingApproval {
+                call,
+                reply,
+                allow_always: offered_decisions.allow_always,
+                allow_project: offered_decisions.allow_project,
+            });
+        }
+        HarnessEvent::ApprovalCleared => {
+            *pending = None;
+            tui.screen.clear_approval(false);
+        }
+        HarnessEvent::SettingsApplied { lines } => apply_notices(tui, lines),
+        HarnessEvent::SettingsQueued { label, reason } => {
+            tui.screen
+                .apply(UiEvent::Notice(format!("queued {label} — {reason}")));
+        }
+        HarnessEvent::PendingSettingsApplied { labels, lines } => {
+            if !labels.is_empty() {
+                tui.screen.apply(UiEvent::Notice(format!(
+                    "applied queued settings: {}",
+                    labels.join(", ")
+                )));
+            }
+            apply_notices(tui, switch_notice_lines(lines));
+        }
+        HarnessEvent::ActorState(state) => apply_actor_state(tui, settings, state),
+        HarnessEvent::SettingsResult {
+            result,
+            before,
+            after,
+            context_tokens,
+        } => apply_settings_result(tui, result, before.as_ref(), after.as_ref(), context_tokens),
+        HarnessEvent::SettingsActionReady { action, label } => {
+            deferred_actions.push(action);
+            tui.screen.apply(UiEvent::Notice(format!(
+                "queued {label} reached a safe boundary"
+            )));
+        }
+        HarnessEvent::CommandQueued(command) => {
+            if !deferred_commands.contains(&command) {
+                deferred_commands.push(command.clone());
+                tui.screen.apply(UiEvent::Notice(format!(
+                    "queued `{command}` until the active operation finishes"
+                )));
+            }
+        }
+    }
+}
+
+fn apply_actor_state(
+    tui: &mut TuiUi,
+    settings: &mut Option<settings_menu::Snapshot>,
+    state: ActorState,
+) {
+    let ActorState {
+        active_kind: _active_kind,
+        selection,
+        queued_counts,
+        permission_mode,
+        compaction_state: _compaction_state,
+        task_state: _task_state,
+        settings: actor_settings,
+        context_tokens: _context_tokens,
+        context_budget,
+    } = state;
+    *settings = actor_settings;
+    if let Some(selection) = selection {
+        let effort = selection.reasoning.map(|effort| {
+            crate::mimir::model_capabilities::display_level(
+                selection.provider,
+                &selection.model,
+                effort,
+            )
+            .to_string()
+        });
+        tui.screen
+            .set_footer_with_context(selection.model, effort, context_budget, footer_cwd());
+    }
+    tui.screen.set_approval_policy(match permission_mode {
+        PermissionMode::DangerousSkipPermissions => ApprovalPolicy::SkipPermissions,
+        PermissionMode::Approval(mode) => ApprovalPolicy::from(mode),
+    });
+    tui.screen.set_queued(queued_counts.steering);
+}
+
+fn apply_settings_result(
+    tui: &mut TuiUi,
+    result: ActionResult,
+    before: Option<&ModelSelection>,
+    after: Option<&ModelSelection>,
+    context_tokens: u64,
+) {
+    let apply_lines = |tui: &mut TuiUi, lines: Vec<String>| {
+        let switched = lines.iter().any(|line| is_switch_confirmation(line));
+        let compact_recommended = lines.iter().any(|line| is_switch_advisory(line));
+        if switched && let Some(selection) = after {
+            tui.screen.set_switch_status(SwitchStatus::new(
+                selection.model.clone(),
+                selection.reasoning.map(|effort| {
+                    crate::mimir::model_capabilities::display_level(
+                        selection.provider,
+                        &selection.model,
+                        effort,
+                    )
+                    .to_string()
+                }),
+                context_tokens,
+                switch_cache_status(before, selection),
+                compact_recommended,
+            ));
+        }
+        apply_notices(tui, switch_notice_lines(lines));
+    };
+    match result {
+        ActionResult::Close(lines) => {
+            apply_lines(tui, lines);
+            tui.screen.close_modal();
+        }
+        ActionResult::Keep(lines) => apply_lines(tui, lines),
+        ActionResult::Replace(modal, lines) => {
+            apply_lines(tui, lines);
+            tui.screen.open_modal(*modal);
+        }
+    }
 }
 
 /// Drive an open picker/dialog to completion: route keys to the modal, apply the
@@ -2380,8 +2890,8 @@ async fn run_modal_phase<P: ChatProvider>(
     tick: &mut tokio::time::Interval,
     switch: &mut Option<ModelSwitch<'_, P>>,
     login_backend: &Arc<dyn LoginBackend>,
-    current_turn: &CurrentTurn,
-    steering: &SteeringQueue,
+    current_turn: &ActiveTokenSlot,
+    steering: &Rc<SteeringQueue>,
     git_cache: &GitStatusCache,
     git_generation: &mut u64,
 ) -> Result<Option<SessionSource>> {
@@ -2520,8 +3030,8 @@ async fn apply_modal_outcome<P: ChatProvider>(
     tick: &mut tokio::time::Interval,
     switch: &mut Option<ModelSwitch<'_, P>>,
     login_backend: &Arc<dyn LoginBackend>,
-    current_turn: &CurrentTurn,
-    steering: &SteeringQueue,
+    current_turn: &ActiveTokenSlot,
+    steering: &Rc<SteeringQueue>,
     git_cache: &GitStatusCache,
     git_generation: &mut u64,
 ) -> Result<Option<SessionSource>> {
@@ -2562,8 +3072,8 @@ async fn dispatch_action<P: ChatProvider>(
     tick: &mut tokio::time::Interval,
     switch: &mut Option<ModelSwitch<'_, P>>,
     login_backend: &Arc<dyn LoginBackend>,
-    current_turn: &CurrentTurn,
-    steering: &SteeringQueue,
+    current_turn: &ActiveTokenSlot,
+    steering: &Rc<SteeringQueue>,
     git_cache: &GitStatusCache,
     git_generation: &mut u64,
 ) -> Result<Option<SessionSource>> {
@@ -2577,21 +3087,38 @@ async fn dispatch_action<P: ChatProvider>(
             tui.screen.close_modal();
             tui.screen.start_turn();
             tui.draw()?;
-            let compact_ok = run_harness_op(
+            let (compact_ok, deferred, actions) = run_harness_op(
                 harness,
+                switch,
                 tui,
                 input_rx,
                 tick,
                 current_turn,
-                HarnessOp::Compact(""),
+                Operation::Compaction(None),
+                steering.clone(),
+                git_cache,
+                git_generation,
+            )
+            .await?;
+            replay_deferred_commands(deferred, harness, tui, switch, git_cache, None)?;
+            let requested = replay_deferred_actions(
+                actions,
+                harness,
+                tui,
+                input_rx,
+                tick,
+                switch,
+                login_backend,
+                current_turn,
                 steering,
                 git_cache,
                 git_generation,
             )
             .await?;
-            tui.screen.end_background_work();
+            if requested.is_some() {
+                return Ok(requested);
+            }
             if !compact_ok {
-                open_deferred_settings(harness, tui, switch, steering);
                 return Ok(None);
             }
             let action = ModalAction::ConfirmModelSwitch {
@@ -2625,7 +3152,6 @@ async fn dispatch_action<P: ChatProvider>(
                     tui.screen.open_modal(*modal);
                 }
             }
-            open_deferred_settings(harness, tui, switch, steering);
         }
         ModalAction::SetNativeJj(enabled) => {
             let previous = harness.native_jj_enabled();
@@ -2787,9 +3313,9 @@ async fn dispatch_action<P: ChatProvider>(
                 return Ok(None);
             };
             let before = sw.selection().clone();
-            // A settings apply runs with no `LoopBridge`; collect any
-            // harness-owned event (the settings-off compaction `Cancelled`
-            // lifecycle) and drain it onto the screen once the action returns.
+            // An out-of-turn settings apply has no active actor bridge; collect
+            // harness-owned events (such as compaction cancellation) and drain
+            // them onto the screen once the action returns.
             let sink = SettingsEventSink::default();
             let result = picker::apply_action(other, view, harness, sw, &sink);
             for event in sink.drain() {
@@ -3047,7 +3573,7 @@ fn to_modal_key(event: &Event) -> Option<ModalKey> {
 /// and, on a raw Ctrl-C while a turn is active (or Esc when no higher-priority
 /// UI owns it), cancels that turn's token from this OS thread (the executor
 /// thread may be blocked in a synchronous tool).
-fn spawn_input_thread(tx: UnboundedSender<Event>, current_turn: CurrentTurn) {
+fn spawn_input_thread(tx: UnboundedSender<Event>, current_turn: ActiveTokenSlot) {
     std::thread::spawn(move || {
         // Ends when terminal reads fail or the loop drops the receiver.
         while let Ok(event) = event::read() {
@@ -3355,6 +3881,13 @@ fn handle_idle_event(screen: &mut Screen, event: Event, git_cache: &GitStatusCac
             screen.editor.delete_next_char();
             return IdleKey::Continue;
         }
+        KeyCode::Enter if alt => {
+            let text = screen.submit();
+            if text.trim().is_empty() {
+                return IdleKey::Continue;
+            }
+            return IdleKey::Submit(text);
+        }
         // Transcript scrolling is handled natively by the terminal over its
         // scrollback (no in-app scroll offset), so PageUp/PageDown fall through.
         KeyCode::Enter if shift || ctrl => {
@@ -3483,27 +4016,6 @@ fn dispatch_command(screen: &mut Screen, cmd: &SlashCommand) -> IdleKey {
     }
 }
 
-/// Terminal input reached EOF while a turn is running: cancel the turn and
-/// release any pending approval as Deny, so a turn awaiting an answer that can
-/// no longer come still completes instead of spinning on the tick forever.
-fn resolve_input_eof(
-    screen: &mut Screen,
-    pending: &mut Option<PendingApproval>,
-    token: &CancellationToken,
-) {
-    token.cancel();
-    if let Some(p) = pending.take() {
-        let _ = p.reply.send(ApprovalDecision::Deny);
-        screen.clear_approval(false);
-    }
-}
-
-/// Handle one terminal event while a turn runs. The composer stays live so the
-/// user can queue a steering message (Enter) or a follow-up (Alt+Enter) without
-/// interrupting the turn; Ctrl-C aborts and Ctrl-O toggles the latest panel.
-/// While a tool is awaiting approval the composer is frozen and only the
-/// approval keys (plus Ctrl-C/-O) act, so a `y`/`n` can't be both an answer and
-/// typed text. Returns whether a redraw is needed.
 /// Tab focus toggle and focused-scrollback entry keys (ADR-0029): arrows
 /// select entries (falling back to line scroll with none), Left/Right
 /// fold/reveal, Enter toggles the fold. Typing a printable character returns
@@ -3676,209 +4188,7 @@ fn pager_scroll_key(screen: &mut Screen, code: KeyCode, ctrl: bool, alt: bool) -
     true
 }
 
-fn handle_running_event(
-    screen: &mut Screen,
-    event: Event,
-    pending: &mut Option<PendingApproval>,
-    steering: &SteeringQueue,
-    git_cache: &GitStatusCache,
-    token: &CancellationToken,
-) -> bool {
-    match event {
-        // Paste composes into the live editor (but not while an approval is
-        // pending, when the composer is frozen).
-        Event::Paste(text) if pending.is_none() => {
-            insert_paste(screen, &text);
-            true
-        }
-        // Pager mode: wheel scrolls the Iris-owned scrollback while a turn
-        // runs; clicks still target the session bar (dropdowns open as
-        // readouts -- click activation is a no-op under readonly).
-        Event::Mouse(mouse) => {
-            if pending.is_none()
-                && let Some(key) = session_bar_click(screen, &mouse, git_cache)
-            {
-                return !matches!(key, IdleKey::Ignore | IdleKey::Menu(_));
-            }
-            if sticky_prompt_click(screen, &mouse) {
-                return true;
-            }
-            if header_click(screen, &mouse) {
-                return true;
-            }
-            if pager_link_click(screen, &mouse) {
-                return true;
-            }
-            pager_wheel(screen, &mouse)
-        }
-        // Resize still triggers a redraw of the terminal surface.
-        Event::Resize(..) => true,
-        // Focus reports pause/resume the spinner's tick redraws; a regain
-        // redraws once to catch the frozen animation and elapsed time up.
-        Event::FocusGained => screen.set_terminal_focused(true),
-        Event::FocusLost => {
-            screen.set_terminal_focused(false);
-            false
-        }
-        Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            let alt = key.modifiers.contains(KeyModifiers::ALT);
-            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-            if ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
-                // ctrl+o always toggles transcript folds; the pinned prompt band
-                // toggles via click or the `o` key, never by pre-empting ctrl+o.
-                screen.toggle_all_panels();
-                return true;
-            }
-            if ctrl
-                && screen.pager_active
-                && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
-            {
-                screen.toggle_mouse();
-                return true;
-            }
-            if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
-                // The input thread already cancelled the token. Aborting also
-                // discards anything the user queued, and unblocks a pending
-                // approval as Deny so Nexus observes the cancellation and aborts.
-                steering.clear();
-                if let Some(p) = pending.take() {
-                    let _ = p.reply.send(ApprovalDecision::Deny);
-                    screen.clear_approval(false);
-                }
-                return true;
-            }
-            // SessionBar dropdowns while a turn runs: readouts. `ctrl-g`
-            // toggles, navigation + esc stay live, every mutating key is a
-            // no-op inside the menu. Never while an approval is pending (the
-            // approval owns input then).
-            if pending.is_none() {
-                if ctrl && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G')) {
-                    toggle_git_menu(screen, git_cache);
-                    return true;
-                }
-                if screen.session_menu.is_some() {
-                    let Some(menu_key) = to_menu_key(key.code, ctrl) else {
-                        return false;
-                    };
-                    let outcome = screen
-                        .session_menu
-                        .as_mut()
-                        .map(|menu| menu.handle_key(menu_key, true))
-                        .unwrap_or(MenuOutcome::Ignore);
-                    return !matches!(
-                        menu_outcome_key(screen, outcome),
-                        IdleKey::Ignore | IdleKey::Menu(_)
-                    );
-                }
-            }
-            // Pager scroll keys stay live while a turn runs -- including while
-            // an approval is pending (scrolling history is exactly what a
-            // reviewer needs before deciding); they never collide with the
-            // y/a/p/n approval keys and never edit or steer.
-            if pager_scroll_key(screen, key.code, ctrl, alt) {
-                return true;
-            }
-            // While a tool is awaiting approval, the composer is frozen: only the
-            // approval keys act, and any other key is ignored (never typed).
-            if let Some(p) = pending.as_ref() {
-                let decision = match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => Some(ApprovalDecision::Allow),
-                    KeyCode::Char('a') | KeyCode::Char('A') if p.allow_always => {
-                        Some(ApprovalDecision::AllowAlways)
-                    }
-                    KeyCode::Char('p') | KeyCode::Char('P') if p.allow_project => {
-                        Some(ApprovalDecision::AllowProject)
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter | KeyCode::Esc => {
-                        Some(ApprovalDecision::Deny)
-                    }
-                    _ => None,
-                };
-                if let Some(decision) = decision {
-                    let p = pending.take().expect("pending approval present");
-                    // The decision folds into the gated tool block's own footer
-                    // (approve → muted note; deny → the block flips to DENIED via
-                    // the ToolDenied event). No separate approval panel.
-                    screen.note_approval(&p.call, decision);
-                    let _ = p.reply.send(decision);
-                    let approved = matches!(
-                        decision,
-                        ApprovalDecision::Allow
-                            | ApprovalDecision::AllowAlways
-                            | ApprovalDecision::AllowProject
-                    );
-                    screen.clear_approval(approved);
-                    return true;
-                }
-                return false;
-            }
-            // Tab focus + entry selection stay available while a turn runs
-            // (after the approval block, so approval keys always win).
-            if scrollback_focus_key(screen, key.code, ctrl, alt) {
-                return true;
-            }
-            if prompt_history_key(screen, key.code, ctrl, alt) {
-                return true;
-            }
-            // No approval pending: the composer is live for steering. Enter
-            // queues a steering message (injected before the next provider
-            // request), Alt+Enter a follow-up (injected when the agent would
-            // otherwise stop); everything else edits the composer.
-            match key.code {
-                KeyCode::Enter if alt => {
-                    let text = screen.submit();
-                    if !text.trim().is_empty() {
-                        steering.enqueue_follow_up(text);
-                    }
-                    true
-                }
-                KeyCode::Enter if shift || ctrl => {
-                    screen.reset_prompt_history_cursor();
-                    screen.editor.insert_newline();
-                    true
-                }
-                KeyCode::Enter => {
-                    let text = screen.submit();
-                    if let Some(notice) = apply_focus_command(screen, &text) {
-                        screen.apply(UiEvent::Notice(notice));
-                    } else if is_settings_command(text.trim()) {
-                        // `/settings` is a UI command, not model input: defer
-                        // opening the settings picker to the next safe boundary
-                        // instead of steering the literal text into the turn
-                        // (issue #489). The loop drains this after the turn ends.
-                        steering.request_settings();
-                        screen.apply(UiEvent::Notice(
-                            "settings will open when this turn ends".to_string(),
-                        ));
-                    } else if !text.trim().is_empty() {
-                        steering.enqueue_steering(text);
-                    }
-                    true
-                }
-                // Esc with nothing higher-priority to consume it (no pending
-                // approval, no open dropdown, not a pager/scrollback key)
-                // cancels the running turn (issue #511). Mirrors Ctrl-C's
-                // abort: drop any queued steering and cancel the token so
-                // Nexus aborts the turn. Cancel is idempotent with the input
-                // thread's own Ctrl-C cancel.
-                KeyCode::Esc => {
-                    steering.clear();
-                    token.cancel();
-                    true
-                }
-                code => apply_editor_key(screen, code, ctrl, alt),
-            }
-        }
-        _ => false,
-    }
-}
-
-/// Collects harness-owned events emitted during an out-of-turn settings apply
-/// (e.g. the `Cancelled` compaction lifecycle when automatic compaction is
-/// disabled mid-job). The modal phase has no [`LoopBridge`], so the caller
-/// drains the collected events onto the screen once the action returns — the
-/// harness stays the event owner and the UI never fabricates the event inline.
+/// Collects harness-owned events emitted during an out-of-turn settings apply.
 #[derive(Default)]
 struct SettingsEventSink {
     events: std::cell::RefCell<Vec<UiEvent>>,
@@ -3896,66 +4206,6 @@ impl AgentObserver for SettingsEventSink {
             .borrow_mut()
             .push(UiEvent::from_agent_event(event));
         Ok(())
-    }
-}
-
-/// Tier-3 adapter that backs Nexus's two front-end seams with the loop's
-/// channels: events are pushed to the render channel, and a review request is
-/// sent with a oneshot the loop resolves from the user's keypress.
-struct LoopBridge {
-    event_tx: UnboundedSender<UiEvent>,
-    appr_tx: UnboundedSender<ApprovalRequest>,
-}
-
-impl AgentObserver for LoopBridge {
-    fn on_event(&self, event: crate::nexus::AgentEvent) -> Result<()> {
-        // The loop drives the turn, so the receiver outlives every send; a send
-        // error would only mean the loop is gone, in which case dropping is fine.
-        let _ = self.event_tx.send(UiEvent::from_agent_event(event));
-        Ok(())
-    }
-}
-
-impl ApprovalGate for LoopBridge {
-    fn review<'a>(
-        &'a self,
-        call: &'a ToolCall,
-        allow_always: bool,
-        allow_project: bool,
-        ctx: ReviewContext,
-    ) -> ApprovalFuture<'a> {
-        let appr_tx = self.appr_tx.clone();
-        let call = call.clone();
-        let dirty_gate = !ctx.dirty_paths.is_empty();
-        // Render the in-block `▲ REVIEW` state (with its footer affordance)
-        // before blocking on the decision, so the gated tool block is visible
-        // while the composer is frozen. Sent on `event_tx` — FIFO after any
-        // `DiffPreview` for the same call — so the review adopts the edit
-        // preview instead of racing it.
-        let _ = self.event_tx.send(UiEvent::ToolReview {
-            call: call.clone(),
-            allow_always,
-            allow_project,
-            dirty_gate,
-            reason: review_reason(&call, &ctx),
-        });
-        Box::pin(async move {
-            let (reply, rx) = oneshot::channel();
-            if appr_tx
-                .send(ApprovalRequest {
-                    call,
-                    allow_always,
-                    allow_project,
-                    dirty_gate,
-                    reply,
-                })
-                .is_err()
-            {
-                return Ok(ApprovalDecision::Deny);
-            }
-            // Safe-by-default: if the loop drops the reply, deny.
-            Ok(rx.await.unwrap_or(ApprovalDecision::Deny))
-        })
     }
 }
 
@@ -3979,7 +4229,7 @@ mod tests {
         pending: &mut Option<PendingApproval>,
         steering: &SteeringQueue,
     ) -> bool {
-        super::handle_running_event(
+        handle_running_event_with_token(
             screen,
             event,
             pending,
@@ -3987,6 +4237,41 @@ mod tests {
             &GitStatusCache::default(),
             &CancellationToken::new(),
         )
+    }
+
+    fn handle_running_event_with_token(
+        screen: &mut Screen,
+        event: Event,
+        pending: &mut Option<PendingApproval>,
+        steering: &SteeringQueue,
+        git_cache: &GitStatusCache,
+        token: &CancellationToken,
+    ) -> bool {
+        let (commands, mut command_rx) = unbounded_channel();
+        let settings = settings_menu::tests::snapshot();
+        let changed = super::handle_active_event(
+            screen,
+            event,
+            pending,
+            Some(&settings),
+            &[],
+            &commands,
+            git_cache,
+        );
+        while let Ok(command) = command_rx.try_recv() {
+            match command {
+                HarnessCommand::QueueSteering { text, mode } => match mode {
+                    SteeringMode::Steering => steering.enqueue_steering(text),
+                    SteeringMode::FollowUp => steering.enqueue_follow_up(text),
+                },
+                HarnessCommand::CancelActive => {
+                    steering.clear();
+                    token.cancel();
+                }
+                _ => {}
+            }
+        }
+        changed
     }
 
     #[test]
@@ -4284,6 +4569,133 @@ mod tests {
             ledger[0],
             "   1. openai-codex/gpt-5.5 in 5000 (cache r4000 w0) out 300 (reasoning 120) total 5300; duration 2500ms ttft none"
         );
+    }
+
+    struct WaitingChat;
+    impl crate::nexus::ChatProvider for WaitingChat {
+        fn respond_stream<'a>(
+            &'a self,
+            _messages: &'a [crate::nexus::Message],
+            _tools: &'a crate::nexus::Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<crate::nexus::ProviderStream<'a>> {
+            use futures::StreamExt;
+            let head = futures::stream::once(async {
+                Ok(crate::nexus::ProviderEvent::TextDelta(
+                    "working".to_string(),
+                ))
+            });
+            let tail = futures::stream::pending::<Result<crate::nexus::ProviderEvent>>();
+            Ok(Box::pin(head.chain(tail)))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actor_orders_turn_events_and_applies_queued_reasoning_at_boundary() {
+        use crate::mimir::test_support::ConfigPathGuard;
+        use crate::nexus::Agent;
+
+        let dir = crate::tools::test_support::temp_dir();
+        let _config = ConfigPathGuard::set(&dir.path.join("settings.json"));
+        let agent = Agent::new(WaitingChat, crate::tools::built_in_tools());
+        let mut harness = Harness::new(
+            agent,
+            dir.path.clone(),
+            crate::tools::ToolState::new(),
+            None,
+            Some(128_000),
+        );
+        let build = |_selection: &ModelSelection, _prompt: &str| Ok(WaitingChat);
+        let mut switch = Some(ModelSwitch::new(
+            null_selection(),
+            "PROMPT".to_string(),
+            &build,
+            None,
+        ));
+        let (command_rx, event_tx, mut channels) = harness_actor::channels();
+        let token_slot = Arc::new(Mutex::new(None));
+        let actor = HarnessActor::new(
+            &mut harness,
+            &mut switch,
+            command_rx,
+            event_tx,
+            Rc::new(SteeringQueue::default()),
+            token_slot,
+        );
+        channels
+            .commands
+            .send(HarnessCommand::SubmitTurn {
+                text: "start".to_string(),
+            })
+            .unwrap();
+        channels
+            .commands
+            .send(HarnessCommand::RefreshUiState)
+            .unwrap();
+        channels
+            .commands
+            .send(HarnessCommand::ApplySettings {
+                action: ModalAction::SaveSetting {
+                    field: settings_menu::Field::ReducedMotion,
+                    value: Some("true".to_string()),
+                },
+                origin: SettingsOrigin::Faceplate(None),
+            })
+            .unwrap();
+        channels
+            .commands
+            .send(HarnessCommand::ApplySettings {
+                action: ModalAction::SelectModel {
+                    id: "anthropic/claude-sonnet-4-6".to_string(),
+                    effort: ReasoningEffort::Medium,
+                    save_default: false,
+                },
+                origin: SettingsOrigin::Faceplate(None),
+            })
+            .unwrap();
+        channels
+            .commands
+            .send(HarnessCommand::ApplySettings {
+                action: ModalAction::AdjustEffort(ReasoningEffort::High),
+                origin: SettingsOrigin::Faceplate(None),
+            })
+            .unwrap();
+        channels
+            .commands
+            .send(HarnessCommand::CancelActive)
+            .unwrap();
+
+        let _succeeded = tokio::time::timeout(Duration::from_secs(2), actor.run())
+            .await
+            .expect("actor stopped after cancellation")
+            .unwrap();
+
+        let events: Vec<_> = std::iter::from_fn(|| channels.events.try_recv().ok()).collect();
+        let position = |predicate: fn(&HarnessEvent) -> bool| {
+            events
+                .iter()
+                .position(predicate)
+                .expect("expected actor event")
+        };
+        let started = position(|event| matches!(event, HarnessEvent::TurnStarted));
+        let streamed = position(|event| {
+            matches!(
+                event,
+                HarnessEvent::UiEvent(UiEvent::AssistantTextDelta(text)) if text == "working"
+            )
+        });
+        let immediate = position(|event| matches!(event, HarnessEvent::SettingsApplied { .. }));
+        let queued = position(|event| matches!(event, HarnessEvent::SettingsQueued { .. }));
+        let applied =
+            position(|event| matches!(event, HarnessEvent::PendingSettingsApplied { .. }));
+        let finished = position(|event| matches!(event, HarnessEvent::TurnFinished));
+        assert!(started < streamed);
+        assert!(streamed < immediate && immediate < finished);
+        assert!(queued < applied && applied < finished);
+        let selection = switch.as_ref().unwrap().selection();
+        assert_eq!(selection.provider, ProviderId::Anthropic);
+        assert_eq!(selection.model, "claude-sonnet-4-6");
+        assert_eq!(selection.reasoning, Some(ReasoningEffort::High));
     }
 
     /// Provider stub for breakdown tests: never called (display-only path).
@@ -5426,7 +5838,7 @@ mod tests {
         steering.enqueue_steering("queued".to_string());
         let token = CancellationToken::new();
         let mut pending: Option<PendingApproval> = None;
-        assert!(super::handle_running_event(
+        assert!(handle_running_event_with_token(
             &mut screen,
             key(KeyCode::Esc),
             &mut pending,
@@ -5452,7 +5864,7 @@ mod tests {
             allow_project: false,
         });
         let token = CancellationToken::new();
-        assert!(super::handle_running_event(
+        assert!(handle_running_event_with_token(
             &mut screen,
             key(KeyCode::Esc),
             &mut pending,
@@ -5476,7 +5888,7 @@ mod tests {
         let steering = SteeringQueue::default();
         let mut pending: Option<PendingApproval> = None;
         let token = CancellationToken::new();
-        super::handle_running_event(
+        handle_running_event_with_token(
             &mut screen,
             key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL),
             &mut pending,
@@ -5485,7 +5897,7 @@ mod tests {
             &token,
         );
         assert!(screen.session_menu.is_some());
-        assert!(super::handle_running_event(
+        assert!(handle_running_event_with_token(
             &mut screen,
             key(KeyCode::Esc),
             &mut pending,
@@ -5553,10 +5965,84 @@ mod tests {
     }
 
     #[test]
-    fn running_settings_command_defers_picker_without_steering() {
-        // Issue #489: `/settings` typed mid-turn is a UI command, not model
-        // input. Enter must request the deferred picker, never steer the text
-        // into the turn.
+    fn mid_turn_slash_opens_palette() {
+        let mut screen = Screen::new();
+        let steering = SteeringQueue::default();
+        let mut pending = None;
+
+        assert!(handle_running_event(
+            &mut screen,
+            key(KeyCode::Char('/')),
+            &mut pending,
+            &steering,
+        ));
+
+        assert_eq!(screen.editor_text(), "/");
+        assert_eq!(screen.focus(), FocusTarget::Palette);
+        assert_eq!(steering.len(), 0);
+    }
+
+    #[test]
+    fn approval_keys_precede_an_open_settings_panel() {
+        let mut screen = Screen::new();
+        screen.open_modal(Modal::Settings(Box::new(
+            settings_menu::SettingsPanel::new(settings_menu::tests::snapshot()),
+        )));
+        let steering = SteeringQueue::default();
+        let (reply, decision) = oneshot::channel();
+        let mut pending = Some(PendingApproval {
+            call: call(),
+            reply,
+            allow_always: true,
+            allow_project: false,
+        });
+
+        assert!(handle_running_event(
+            &mut screen,
+            key(KeyCode::Char('y')),
+            &mut pending,
+            &steering,
+        ));
+
+        assert_eq!(decision.blocking_recv().unwrap(), ApprovalDecision::Allow);
+        assert!(pending.is_none());
+        assert!(matches!(screen.modal, Some(Modal::Settings(_))));
+    }
+
+    #[test]
+    fn approval_keys_precede_an_open_slash_palette() {
+        let mut screen = Screen::new();
+        let steering = SteeringQueue::default();
+        let mut no_approval = None;
+        handle_running_event(
+            &mut screen,
+            key(KeyCode::Char('/')),
+            &mut no_approval,
+            &steering,
+        );
+        assert_eq!(screen.focus(), FocusTarget::Palette);
+
+        let (reply, decision) = oneshot::channel();
+        let mut pending = Some(PendingApproval {
+            call: call(),
+            reply,
+            allow_always: true,
+            allow_project: false,
+        });
+        assert!(handle_running_event(
+            &mut screen,
+            key(KeyCode::Char('y')),
+            &mut pending,
+            &steering,
+        ));
+
+        assert_eq!(decision.blocking_recv().unwrap(), ApprovalDecision::Allow);
+        assert!(pending.is_none());
+        assert_eq!(screen.focus(), FocusTarget::Palette);
+    }
+
+    #[test]
+    fn mid_turn_settings_opens_immediately_without_steering() {
         let mut screen = Screen::new();
         let steering = SteeringQueue::default();
         let mut pending: Option<PendingApproval> = None;
@@ -5569,11 +6055,9 @@ mod tests {
             &mut pending,
             &steering,
         ));
-        assert_eq!(steering.len(), 0, "/settings is not steered to the model");
-        assert!(steering.take_settings(), "the picker is requested");
-        // Drained once: a second boundary check does not re-open it.
-        assert!(!steering.take_settings());
-        assert!(screen.editor_is_empty(), "the composer is cleared");
+        assert_eq!(steering.len(), 0, "/settings is not model steering");
+        assert!(matches!(screen.modal, Some(Modal::Settings(_))));
+        assert!(screen.editor_is_empty());
     }
 
     #[test]
@@ -5623,19 +6107,6 @@ mod tests {
             &steering,
         ));
         assert_eq!(steering.take_steering(), vec!["/settle the merge"]);
-        assert!(!steering.take_settings(), "no settings request for prose");
-    }
-
-    #[test]
-    fn is_settings_command_matches_only_the_settings_token() {
-        assert!(is_settings_command("/settings"));
-        assert!(is_settings_command("  /settings  "));
-        // Trailing args are ignored, matching route_command's token split.
-        assert!(is_settings_command("/settings foo"));
-        assert!(!is_settings_command("/settle"));
-        assert!(!is_settings_command("/settingsx"));
-        assert!(!is_settings_command("settings"));
-        assert!(!is_settings_command("please open /settings"));
     }
 
     #[test]
@@ -5657,36 +6128,6 @@ mod tests {
             &steering,
         ));
         assert!(pending.is_some(), "a page key must not answer the approval");
-    }
-
-    #[test]
-    fn input_eof_cancels_turn_and_denies_pending() {
-        let mut screen = Screen::new();
-        let token = CancellationToken::new();
-        let (tx, rx) = oneshot::channel();
-        let mut pending = Some(PendingApproval {
-            call: call(),
-            reply: tx,
-            allow_always: true,
-            allow_project: false,
-        });
-        resolve_input_eof(&mut screen, &mut pending, &token);
-        assert!(token.is_cancelled(), "EOF cancels the turn token");
-        assert!(pending.is_none(), "EOF takes the pending approval");
-        assert_eq!(
-            rx.blocking_recv().unwrap(),
-            ApprovalDecision::Deny,
-            "EOF resolves the pending approval as Deny"
-        );
-    }
-
-    #[test]
-    fn input_eof_without_pending_just_cancels() {
-        let mut screen = Screen::new();
-        let token = CancellationToken::new();
-        let mut pending: Option<PendingApproval> = None;
-        resolve_input_eof(&mut screen, &mut pending, &token);
-        assert!(token.is_cancelled());
     }
 
     #[test]
