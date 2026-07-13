@@ -28,7 +28,8 @@ use crate::mimir::selection::{CodexTransport, PromptCacheRetention, ReasoningEff
 use crate::nexus::{
     AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderCompactionCapability,
     ProviderCompactionFuture, ProviderCompactionOutput, ProviderStream, ProviderUsage,
-    ReasoningBlock, Role, ToolCall, Tools,
+    ReasoningBlock, Role, StructuredSummaryCapability, StructuredSummaryError,
+    StructuredSummaryFuture, StructuredSummaryMode, ToolCall, Tools,
 };
 
 // Transport resilience for Codex requests. Transient failures (network, 429,
@@ -192,8 +193,6 @@ impl OpenAiCodexResponsesProvider {
     /// request-building only: callers still send it through the existing
     /// `OpenAiCodexTokenStore`/`codex_headers`/`resolve_codex_url` path
     /// themselves.
-    // Reached only from tests until the #472 summarizer wiring slice lands.
-    #[allow(dead_code)]
     pub(crate) fn build_summary_request(&self, messages: &[Message]) -> Value {
         build_codex_summary_request(
             &self.model,
@@ -209,8 +208,6 @@ impl OpenAiCodexResponsesProvider {
     /// never registers or executes this tool through normal tool
     /// approval/execution policy: it exists only inside this request builder
     /// and the matching `wayland::structured_summary` extraction path.
-    // Reached only from tests until the #472 summarizer wiring slice lands.
-    #[allow(dead_code)]
     pub(crate) fn build_summary_fallback_request(&self, messages: &[Message]) -> Value {
         build_codex_summary_fallback_request(
             &self.model,
@@ -218,6 +215,158 @@ impl OpenAiCodexResponsesProvider {
             messages,
             self.cache_retention,
         )
+    }
+
+    /// Send one structured-output compaction-summary request (issue #475) and
+    /// return the resulting `AssistantTurn`, or a typed
+    /// [`StructuredSummaryError`] the `wayland::compaction` fallback ladder
+    /// dispatches on: `Unsupported` (a deterministic 400 that is not a
+    /// context-overflow body -- the caller retries once with
+    /// [`StructuredSummaryMode::ForcedTool`]), `Cancelled` (no further
+    /// fallback), or `Other` (the caller falls back to deterministic
+    /// excerpts). Mirrors [`Self::compact_context_blocking`]'s auth/retry loop
+    /// exactly, reusing the same token store, reauth-once behavior, and
+    /// [`classify_codex_native_failure`] classifier (its "400 and not a
+    /// context-overflow body" rule is a generic transport signal, not
+    /// specific to the native-compaction-trigger request shape).
+    fn run_structured_summary_blocking(
+        &self,
+        messages: &[Message],
+        mode: StructuredSummaryMode,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<AssistantTurn, StructuredSummaryError> {
+        let request = match mode {
+            StructuredSummaryMode::Native => self.build_summary_request(messages),
+            StructuredSummaryMode::ForcedTool => self.build_summary_fallback_request(messages),
+        };
+        let url = resolve_codex_url(&self.base_url).map_err(StructuredSummaryError::Other)?;
+        let mut force_refresh = false;
+        let mut reauth_used = false;
+        let mut transient_retries = 0u32;
+        loop {
+            if cancel.is_cancelled() {
+                return Err(StructuredSummaryError::Cancelled);
+            }
+            let token = if force_refresh {
+                self.tokens.force_refresh(&self.client)
+            } else {
+                self.tokens.access_token(&self.client)
+            }
+            .map_err(StructuredSummaryError::Other)?;
+            force_refresh = false;
+            match self.send_structured_summary_once(url.clone(), &token, &request, cancel) {
+                StructuredSummaryAttempt::Done(turn) => return Ok(turn),
+                StructuredSummaryAttempt::Unsupported(error) => {
+                    // Safe metadata only (status/error_type/model/endpoint;
+                    // never the raw body or credentials -- see the message
+                    // built in `send_structured_summary_once`).
+                    tracing::debug!(
+                        error = %format!("{error:#}"),
+                        "structured-output compaction summary rejected as unsupported"
+                    );
+                    return Err(StructuredSummaryError::Unsupported);
+                }
+                StructuredSummaryAttempt::Reauth(error) if !reauth_used => {
+                    reauth_used = true;
+                    force_refresh = true;
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "structured-output compaction summary auth rejected; refreshing once"
+                    );
+                }
+                StructuredSummaryAttempt::Retry(error, retry_after)
+                    if transient_retries < self.retry_policy.max_retries =>
+                {
+                    transient_retries += 1;
+                    let delay = self
+                        .retry_policy
+                        .backoff_delay(transient_retries, retry_after);
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        attempt = transient_retries,
+                        delay_ms = delay.as_millis() as u64,
+                        "structured-output compaction summary transient error; retrying"
+                    );
+                    sleep_codex_native_retry(delay, cancel);
+                }
+                StructuredSummaryAttempt::Reauth(error)
+                | StructuredSummaryAttempt::Retry(error, _)
+                | StructuredSummaryAttempt::Fatal(error) => {
+                    return Err(StructuredSummaryError::Other(error));
+                }
+            }
+        }
+    }
+
+    fn send_structured_summary_once(
+        &self,
+        url: Url,
+        token: &AccessToken,
+        request: &Value,
+        cancel: &CancellationToken,
+    ) -> StructuredSummaryAttempt {
+        let headers = match codex_headers(token) {
+            Ok(headers) => headers,
+            Err(error) => return StructuredSummaryAttempt::Fatal(error),
+        };
+        let response = match self.client.post(url).headers(headers).json(request).send() {
+            Ok(response) => response,
+            Err(error) => {
+                return StructuredSummaryAttempt::Retry(
+                    anyhow::Error::new(error)
+                        .context("failed to send Codex structured-summary request"),
+                    None,
+                );
+            }
+        };
+        let status = response.status();
+        if status.is_success() {
+            let mut parser = ResponseStreamParser::new(&self.model);
+            let mut sink = DiscardTextSink;
+            if let Err(error) = for_each_sse_event(BufReader::new(response), cancel, |data| {
+                sink.on_activity()?;
+                parser.ingest_event(data, &mut sink)
+            }) {
+                if !cancel.is_cancelled()
+                    && protocol_anomaly_retryable(&error, parser.emitted_visible_output())
+                {
+                    return StructuredSummaryAttempt::Retry(error, None);
+                }
+                return StructuredSummaryAttempt::Fatal(error);
+            }
+            let emitted_visible_output = parser.emitted_visible_output();
+            return match parser.finish() {
+                Ok(turn) => {
+                    if let Some(usage) = &turn.usage {
+                        self.record_usage(usage);
+                    }
+                    StructuredSummaryAttempt::Done(turn)
+                }
+                Err(error) => {
+                    if protocol_anomaly_retryable(&error, emitted_visible_output) {
+                        StructuredSummaryAttempt::Retry(error, None)
+                    } else {
+                        StructuredSummaryAttempt::Fatal(error)
+                    }
+                }
+            };
+        }
+        let retry_after = retry_after_hint(response.headers());
+        let body = response.text().unwrap_or_default();
+        let error_type = extract_error_field(&body, "type")
+            .or_else(|| extract_error_field(&body, "code"))
+            .unwrap_or_else(|| "unknown_error".to_string());
+        let error = anyhow!(
+            "Codex structured-summary request failed [status={} endpoint=/codex/responses model={} error_type={error_type}]",
+            status.as_u16(),
+            self.model
+        );
+        match classify_codex_native_failure(status.as_u16(), &body) {
+            CodexNativeFailure::Unsupported => StructuredSummaryAttempt::Unsupported(error),
+            CodexNativeFailure::Reauth => StructuredSummaryAttempt::Reauth(error),
+            CodexNativeFailure::Retry => StructuredSummaryAttempt::Retry(error, retry_after),
+            CodexNativeFailure::Fatal => StructuredSummaryAttempt::Fatal(error),
+        }
     }
 
     /// LIVE capability probe for #475: send one structured-output summary
@@ -483,6 +632,18 @@ enum CodexNativeFailure {
     Fatal,
 }
 
+/// One structured-output compaction-summary send attempt (issue #475).
+/// Mirrors [`CodexNativeCompactionAttempt`] but carries a full `AssistantTurn`
+/// on success (the summary payload rides in ordinary text/tool-call fields,
+/// not an opaque compaction block).
+enum StructuredSummaryAttempt {
+    Done(AssistantTurn),
+    Unsupported(anyhow::Error),
+    Reauth(anyhow::Error),
+    Retry(anyhow::Error, Option<Duration>),
+    Fatal(anyhow::Error),
+}
+
 fn classify_codex_native_failure(status: u16, body: &str) -> CodexNativeFailure {
     if status == 400 && !super::is_context_overflow_response(status, body) {
         return CodexNativeFailure::Unsupported;
@@ -601,6 +762,24 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
         cancel: &'a CancellationToken,
     ) -> ProviderCompactionFuture<'a> {
         Box::pin(async move { self.compact_context_blocking(messages, instructions, cancel) })
+    }
+
+    fn structured_summary_capability(&self) -> StructuredSummaryCapability {
+        // ADR-0061's live probe: the Codex OAuth lane honours native
+        // structured output on the first request for the probed model. No
+        // per-model unsupported cache (unlike `compaction_capability` above)
+        // -- the fallback ladder already retries once with the forced tool
+        // per job, and #475 does not require cross-job memoization.
+        StructuredSummaryCapability::Native
+    }
+
+    fn run_structured_summary<'a>(
+        &'a self,
+        messages: &'a [Message],
+        mode: StructuredSummaryMode,
+        cancel: &'a CancellationToken,
+    ) -> StructuredSummaryFuture<'a> {
+        Box::pin(async move { self.run_structured_summary_blocking(messages, mode, cancel) })
     }
 }
 
@@ -1104,8 +1283,6 @@ fn build_codex_request(
 /// doc comment for why. Built on [`build_codex_request`] so OAuth-lane
 /// request shaping (store/stream, instructions, input, prompt-cache key,
 /// reasoning) is unchanged; only `tools`/`text` are overridden.
-// Reached only from tests until the #472 summarizer wiring slice lands.
-#[allow(dead_code)]
 fn build_codex_summary_request(
     model: &str,
     instructions: &str,
@@ -1143,8 +1320,6 @@ fn build_codex_summary_request(
 /// overridden. Iris never registers or executes this tool through normal
 /// tool approval/execution policy -- it exists only inside this request
 /// builder and the matching `wayland::structured_summary` extraction path.
-// Reached only from tests until the #472 summarizer wiring slice lands.
-#[allow(dead_code)]
 fn build_codex_summary_fallback_request(
     model: &str,
     instructions: &str,

@@ -48,6 +48,11 @@ impl std::error::Error for SummaryValidationError {}
 /// Parse raw provider JSON text into a validated [`CompactionSummary`].
 /// Rejects malformed JSON, a non-object root, missing/unknown fields, wrong
 /// types, and an all-empty summary.
+// Every non-test caller (the extraction module) already holds a
+// `serde_json::Value` (from an `AssistantTurn`'s text or a tool call's
+// arguments) and calls `parse_compaction_summary_value` directly; this &str
+// entry point is exercised by this module's own tests.
+#[allow(dead_code)]
 pub(crate) fn parse_compaction_summary(
     raw: &str,
 ) -> Result<CompactionSummary, SummaryValidationError> {

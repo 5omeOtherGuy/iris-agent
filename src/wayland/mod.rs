@@ -50,7 +50,8 @@ use crate::nexus::{
     ContextGovernorFuture, ContextMeasurementSource, ContextOverflowFuture,
     ContextOverflowRecovery, ContextPressureTier, FoldTrigger, Message,
     ProviderCompactionCapability, ProviderEvent, ProviderUsage, Role, SessionSpanReader,
-    SteeringSource, ToolEnv, Tools, TurnContextHooks, TurnInput, VerificationOutcome, VerifyRun,
+    SteeringSource, StructuredSummaryCapability, StructuredSummaryError, StructuredSummaryMode,
+    ToolEnv, Tools, TurnContextHooks, TurnInput, VerificationOutcome, VerifyRun,
 };
 use crate::session::{
     CompactionTaskState, SessionLog, estimate_tokens, message_token_estimate, preview_line,

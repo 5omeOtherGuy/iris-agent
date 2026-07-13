@@ -35,7 +35,8 @@ use crate::mimir::selection::{
 use crate::nexus::{
     AssistantTurn, CacheCreation, ChatProvider, CompletionReason, Message, ModelOrigin,
     ProviderCompactionCapability, ProviderCompactionFuture, ProviderCompactionOutput,
-    ProviderStream, ProviderUsage, ReasoningBlock, Role, ToolCall, Tools,
+    ProviderStream, ProviderUsage, ReasoningBlock, Role, StructuredSummaryCapability,
+    StructuredSummaryError, StructuredSummaryFuture, StructuredSummaryMode, ToolCall, Tools,
 };
 
 /// Default output cap for an unknown/non-subscription Anthropic id (conservative
@@ -166,8 +167,6 @@ impl AnthropicProvider {
     /// below (the existing `respond_stream`/`compact_context_blocking`/
     /// `probe_compaction_summary` call sites keep their own inline match --
     /// this helper is additive, not a forced refactor of those).
-    // Reached only from tests until the #472 summarizer wiring slice lands.
-    #[allow(dead_code)]
     fn auth_kind(&self) -> AnthropicAuthKind {
         match &self.auth {
             AnthropicAuthSource::OAuth(_) => AnthropicAuthKind::OAuth,
@@ -181,8 +180,6 @@ impl AnthropicProvider {
     /// so header/beta shaping matches whichever lane is active; callers
     /// still send it through the existing token store/headers/endpoint
     /// themselves -- this method only builds the request body.
-    // Reached only from tests until the #472 summarizer wiring slice lands.
-    #[allow(dead_code)]
     pub(crate) fn build_summary_request(&self, messages: &[Message]) -> Value {
         build_anthropic_summary_request_for_auth(
             &self.model,
@@ -197,8 +194,6 @@ impl AnthropicProvider {
     /// Build the forced single virtual-tool (`emit_compaction_summary`)
     /// fallback summary request (issue #475), used only when the native path
     /// above is rejected as unsupported for this lane/model/auth kind.
-    // Reached only from tests until the #472 summarizer wiring slice lands.
-    #[allow(dead_code)]
     pub(crate) fn build_summary_fallback_request(&self, messages: &[Message]) -> Value {
         build_anthropic_summary_fallback_request_for_auth(
             &self.model,
@@ -208,6 +203,165 @@ impl AnthropicProvider {
             self.cache_retention,
             self.auth_kind(),
         )
+    }
+
+    /// Send one structured-output compaction-summary request (issue #475) and
+    /// return the resulting `AssistantTurn`, or a typed
+    /// [`StructuredSummaryError`] the `wayland::compaction` fallback ladder
+    /// dispatches on: `Unsupported` (a deterministic 400 that is not a
+    /// context-overflow body -- the caller retries once with
+    /// [`StructuredSummaryMode::ForcedTool`]), `Cancelled` (no further
+    /// fallback), or `Other` (the caller falls back to deterministic
+    /// excerpts). Mirrors [`Self::compact_context_blocking`]'s auth/retry loop
+    /// exactly, reusing the same token store, reauth-once behavior, and
+    /// [`is_anthropic_native_unsupported`] classifier (its "400 and not a
+    /// context-overflow body" rule is a generic transport signal, not
+    /// specific to the native-compaction-trigger request shape).
+    fn run_structured_summary_blocking(
+        &self,
+        messages: &[Message],
+        mode: StructuredSummaryMode,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<AssistantTurn, StructuredSummaryError> {
+        let request = match mode {
+            StructuredSummaryMode::Native => self.build_summary_request(messages),
+            StructuredSummaryMode::ForcedTool => self.build_summary_fallback_request(messages),
+        };
+        let mut last_token: Option<String> = None;
+        let mut force_refresh = false;
+        let mut reauth_used = false;
+        let mut transient_retries = 0u32;
+        loop {
+            if cancel.is_cancelled() {
+                return Err(StructuredSummaryError::Cancelled);
+            }
+            let auth = match &self.auth {
+                AnthropicAuthSource::OAuth(tokens) => {
+                    let token = if force_refresh {
+                        tokens.force_refresh(&self.client, last_token.as_deref())
+                    } else {
+                        tokens.access_token(&self.client)
+                    }
+                    .map_err(StructuredSummaryError::Other)?;
+                    last_token = Some(token.clone());
+                    AnthropicAuth::OAuthBearer(token)
+                }
+                AnthropicAuthSource::ApiKey(key) => AnthropicAuth::ApiKey(key.clone()),
+            };
+            force_refresh = false;
+            match self.send_structured_summary_once(&auth, &request, cancel) {
+                StructuredSummaryAttempt::Done(turn) => return Ok(turn),
+                StructuredSummaryAttempt::Unsupported(error) => {
+                    // Safe metadata only (status/error_type; never the raw
+                    // body or credentials -- see the message built in
+                    // `send_structured_summary_once`).
+                    tracing::debug!(
+                        error = %format!("{error:#}"),
+                        "structured-output compaction summary rejected as unsupported"
+                    );
+                    return Err(StructuredSummaryError::Unsupported);
+                }
+                StructuredSummaryAttempt::Reauth(error) if !reauth_used => {
+                    reauth_used = true;
+                    force_refresh = true;
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "structured-output compaction summary auth rejected; refreshing once"
+                    );
+                }
+                StructuredSummaryAttempt::Retry(error, retry_after)
+                    if transient_retries < self.retry_policy.max_retries =>
+                {
+                    transient_retries += 1;
+                    let delay = self
+                        .retry_policy
+                        .backoff_delay(transient_retries, retry_after);
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        attempt = transient_retries,
+                        delay_ms = delay.as_millis() as u64,
+                        "structured-output compaction summary transient error; retrying"
+                    );
+                    sleep_native_retry(delay, cancel);
+                }
+                StructuredSummaryAttempt::Reauth(error)
+                | StructuredSummaryAttempt::Retry(error, _)
+                | StructuredSummaryAttempt::Fatal(error) => {
+                    return Err(StructuredSummaryError::Other(error));
+                }
+            }
+        }
+    }
+
+    fn send_structured_summary_once(
+        &self,
+        auth: &AnthropicAuth,
+        request: &Value,
+        cancel: &CancellationToken,
+    ) -> StructuredSummaryAttempt {
+        let headers = match anthropic_headers_for_auth(auth, request) {
+            Ok(headers) => headers,
+            Err(error) => return StructuredSummaryAttempt::Fatal(error),
+        };
+        let url = format!("{}{ENDPOINT_PATH}", self.base_url);
+        let response = match self.client.post(&url).headers(headers).json(request).send() {
+            Ok(response) => response,
+            Err(error) => {
+                return StructuredSummaryAttempt::Retry(
+                    anyhow::Error::new(error)
+                        .context("failed to send Anthropic structured-summary request"),
+                    None,
+                );
+            }
+        };
+        let status = response.status();
+        if status.is_success() {
+            let mut parser = AnthropicStreamParser::new(
+                anthropic_origin(&self.model),
+                request_has_fallbacks(request),
+            );
+            let mut sink = DiscardSink;
+            if let Err(error) = for_each_sse_event(BufReader::new(response), cancel, |data| {
+                sink.on_activity()?;
+                parser.ingest_event(data, &mut sink)
+            }) {
+                if !cancel.is_cancelled() && !parser.emitted_visible_output() {
+                    return StructuredSummaryAttempt::Retry(error, None);
+                }
+                return StructuredSummaryAttempt::Fatal(error);
+            }
+            let emitted_visible_output = parser.emitted_visible_output();
+            return match parser.finish() {
+                Ok(turn) => {
+                    if let Some(usage) = &turn.usage {
+                        self.record_usage(usage);
+                    }
+                    StructuredSummaryAttempt::Done(turn)
+                }
+                Err(error) => {
+                    if protocol_anomaly_retryable(&error, emitted_visible_output) {
+                        StructuredSummaryAttempt::Retry(error, None)
+                    } else {
+                        StructuredSummaryAttempt::Fatal(error)
+                    }
+                }
+            };
+        }
+        let retry_after = retry_after_hint(response.headers());
+        let body = response.text().unwrap_or_default();
+        let error_type = extract_error_type(&body).unwrap_or_else(|| "unknown_error".to_string());
+        let error = anyhow!(
+            "Anthropic structured-summary request failed (status={}, error_type={error_type})",
+            status.as_u16()
+        );
+        if is_anthropic_native_unsupported(status.as_u16(), &body) {
+            return StructuredSummaryAttempt::Unsupported(error);
+        }
+        match classify_http_status_retryable(status.as_u16()) {
+            HttpClass::Reauth => StructuredSummaryAttempt::Reauth(error),
+            HttpClass::Retry => StructuredSummaryAttempt::Retry(error, retry_after),
+            HttpClass::Fatal => StructuredSummaryAttempt::Fatal(error),
+        }
     }
 
     /// LIVE capability probe for #475: send one structured-output summary
@@ -441,6 +595,24 @@ impl ChatProvider for AnthropicProvider {
         cancel: &'a CancellationToken,
     ) -> ProviderCompactionFuture<'a> {
         Box::pin(async move { self.compact_context_blocking(messages, instructions, cancel) })
+    }
+
+    fn structured_summary_capability(&self) -> StructuredSummaryCapability {
+        // ADR-0061's live probe: the Anthropic OAuth lane honours native
+        // structured output on the first request for the probed model. No
+        // per-model unsupported cache -- the fallback ladder already retries
+        // once with the forced tool per job, and #475 does not require
+        // cross-job memoization.
+        StructuredSummaryCapability::Native
+    }
+
+    fn run_structured_summary<'a>(
+        &'a self,
+        messages: &'a [Message],
+        mode: StructuredSummaryMode,
+        cancel: &'a CancellationToken,
+    ) -> StructuredSummaryFuture<'a> {
+        Box::pin(async move { self.run_structured_summary_blocking(messages, mode, cancel) })
     }
 }
 
@@ -737,6 +909,30 @@ enum NativeCompactionAttempt {
     Reauth(anyhow::Error),
     Retry(anyhow::Error, Option<std::time::Duration>),
     Fatal(anyhow::Error),
+}
+
+/// One structured-output compaction-summary send attempt (issue #475).
+/// Mirrors [`NativeCompactionAttempt`] but carries a full `AssistantTurn` on
+/// success (the summary payload rides in ordinary text/tool-call fields, not
+/// an opaque compaction block).
+enum StructuredSummaryAttempt {
+    Done(AssistantTurn),
+    Unsupported(anyhow::Error),
+    Reauth(anyhow::Error),
+    Retry(anyhow::Error, Option<std::time::Duration>),
+    Fatal(anyhow::Error),
+}
+
+/// A no-op [`TurnSink`]: the structured-summary request has no live UI to
+/// stream deltas to, so text/reasoning deltas are simply discarded while the
+/// full `AssistantTurn` is still assembled by the parser. Mirrors the Codex
+/// adapter's `DiscardTextSink`.
+struct DiscardSink;
+
+impl TurnSink for DiscardSink {
+    fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn sleep_native_retry(delay: std::time::Duration, cancel: &CancellationToken) {
@@ -1461,8 +1657,6 @@ fn native_compaction_instructions(instructions: &str) -> String {
 /// forced-tool fallback summary requests cap `max_tokens` here regardless of
 /// the model's full output cap -- a structured summary is a short, bounded
 /// artifact, not a full-length response.
-// Reached only from tests until the #472 summarizer wiring slice lands.
-#[allow(dead_code)]
 const SUMMARY_MAX_TOKENS: u32 = 2048;
 
 /// Build a compaction-summary request using Anthropic's native structured-
@@ -1474,8 +1668,6 @@ const SUMMARY_MAX_TOKENS: u32 = 2048;
 /// effort reasoning already set `output_config: { effort }`, `format` is
 /// merged into that object instead of overwriting it (both cases are
 /// covered in the module's tests).
-// Reached only from tests until the #472 summarizer wiring slice lands.
-#[allow(dead_code)]
 fn build_anthropic_summary_request_for_auth(
     model: &str,
     system_prompt: &str,
@@ -1522,8 +1714,6 @@ fn build_anthropic_summary_request_for_auth(
 /// registers or executes this tool through normal tool approval/execution
 /// policy -- it exists only inside this request builder and the matching
 /// `wayland::structured_summary` extraction path.
-// Reached only from tests until the #472 summarizer wiring slice lands.
-#[allow(dead_code)]
 fn build_anthropic_summary_fallback_request_for_auth(
     model: &str,
     system_prompt: &str,
