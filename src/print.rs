@@ -435,6 +435,110 @@ mod tests {
     }
 
     #[test]
+    fn usage_report_builds_turn_tool_and_base_timelines() {
+        let tools = crate::tools::built_in_tools();
+        let base = UsageBase::estimate("12345", &tools);
+        assert_eq!(base.system_prompt_tokens, 2);
+        assert_eq!(
+            base.tools_total_tokens,
+            base.tools.iter().map(|tool| tool.schema_tokens).sum()
+        );
+        assert_eq!(
+            base.base_total_tokens,
+            base.system_prompt_tokens + base.tools_total_tokens
+        );
+
+        let observer = PrintObserver::with_base(None, base.clone());
+        observer
+            .on_event(AgentEvent::ProviderTurnCompleted {
+                turn_id: "t1".to_string(),
+                response_id: None,
+                usage: Some(provider_usage(1000, 200, 600, 300)),
+                completion_reason: Some(crate::nexus::CompletionReason::ToolUse),
+                timing: crate::nexus::ProviderTurnTiming {
+                    duration: std::time::Duration::from_millis(1250),
+                    time_to_first_output: Some(std::time::Duration::from_millis(250)),
+                },
+            })
+            .unwrap();
+        observer.on_event(tool_started("bash")).unwrap();
+        observer
+            .on_event(AgentEvent::OutputHandleStored {
+                provider_turn_id: "t1".to_string(),
+                call_id: "call_bash".to_string(),
+                handle_id: "out_abc".to_string(),
+                bytes: 4096,
+                lines: 80,
+            })
+            .unwrap();
+        observer
+            .on_event(AgentEvent::ToolLifecycle {
+                provider_turn_id: "t1".to_string(),
+                call_id: "call_bash".to_string(),
+                name: "bash".to_string(),
+                state: ToolEventState::Succeeded,
+            })
+            .unwrap();
+
+        let report = observer.usage_report();
+        assert_eq!(report.base, base);
+        assert_eq!(report.turns.len(), 1);
+        assert_eq!(
+            report.turns[0],
+            UsageTurn {
+                i: 0,
+                fresh: 100,
+                cache_read: 600,
+                cache_write: 300,
+                output: 200,
+                reasoning: 0,
+                input_full: 1000,
+                duration_ms: 1250,
+                ttft_ms: Some(250),
+                stop_reason: Some("tool_use"),
+            }
+        );
+        assert_eq!(report.tools.len(), 1);
+        let tool = &report.tools[0];
+        assert_eq!(tool.i, 0);
+        assert_eq!(tool.turn, 0);
+        assert_eq!(tool.name, "bash");
+        assert_eq!(tool.call_id, "call_bash");
+        assert!(tool.duration_ms < 1000);
+        assert!(tool.offloaded);
+        assert_eq!(tool.handle.as_deref(), Some("out_abc"));
+        assert_eq!(tool.handle_bytes, Some(4096));
+        assert_eq!(tool.handle_lines, Some(80));
+    }
+
+    #[test]
+    fn usage_totals_are_derived_from_turns_and_preserve_v1_fields() {
+        let observer = PrintObserver::default();
+        observer
+            .on_event(turn_completed(Some(provider_usage(1000, 200, 600, 300))))
+            .unwrap();
+        observer
+            .on_event(turn_completed(Some(provider_usage(1500, 400, 1200, 100))))
+            .unwrap();
+
+        let report = observer.usage_report();
+        assert_eq!(
+            report.totals.input_tokens,
+            report.turns.iter().map(|turn| turn.input_full).sum()
+        );
+        assert_eq!(
+            report.totals.output_tokens,
+            report.turns.iter().map(|turn| turn.output).sum()
+        );
+        assert_eq!(report.input_tokens, report.totals.input_tokens);
+        assert_eq!(report.output_tokens, report.totals.output_tokens);
+
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["totals"]["input_tokens"], 2500);
+        assert_eq!(json["input_tokens"], 2500);
+    }
+
+    #[test]
     fn usage_report_sums_flows_across_provider_turns() {
         let observer = PrintObserver::default();
         observer
