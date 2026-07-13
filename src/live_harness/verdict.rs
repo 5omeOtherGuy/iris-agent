@@ -38,6 +38,12 @@ pub(crate) struct LiveSessionGates {
     pub(crate) context_effective: bool,
     /// The planted needle was answered.
     pub(crate) needle_answered: bool,
+    /// The planted credential-shaped needle (audit F17/F21: a password-like
+    /// fact the scripted user explicitly asked to remember) was answered.
+    /// Scored the same way as `needle_answered`; kept as its own field rather
+    /// than folded into it so a regression that drops only the credential
+    /// (the exact F17 failure mode) is distinguishable in the failure detail.
+    pub(crate) credential_answered: bool,
     /// One recall marker per compaction.
     pub(crate) recall_marker: bool,
     /// The deterministic carry block was retained.
@@ -57,6 +63,7 @@ impl LiveSessionGates {
         self.two_compactions
             && self.context_effective
             && self.needle_answered
+            && self.credential_answered
             && self.recall_marker
             && self.carry_block
             && self.resume_exact
@@ -127,6 +134,7 @@ mod tests {
             g1_non_blocking: true,
             context_effective: true,
             needle_answered: true,
+            credential_answered: true,
             recall_marker: true,
             carry_block: true,
             resume_exact: true,

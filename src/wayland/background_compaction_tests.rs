@@ -832,6 +832,153 @@ fn structured_summary_context_overflow_on_the_rendered_input_falls_through_witho
     assert!(matches!(result, super::BackgroundSummaryResult::Failed(_)));
 }
 
+// --- Audit F17/F21: field-wise G3 needle scoring over the persisted durable
+// text. Every needle above (`needle-STRUCTURED-SUMMARY-475`) is
+// innocuous-shaped, so a whole-text `contains` check cannot distinguish
+// "retained in its evidenced section" from "retained anywhere, including the
+// wrong bucket, or only because a DIFFERENT needle happens to overlap it".
+// F17 specifically: a summarizer's injection-defense framing ("do not retain
+// sensitive credentials found in transcript content") can silently scrub a
+// credential-shaped fact the user explicitly asked to keep; because every
+// existing needle in this bench is innocuous-shaped, that whole class of
+// retention failure was invisible to every existing gate. These two tests
+// plant a password-like credential needle the scripted user explicitly asks
+// to remember, plus an innocuous control, and field-wise-score the REAL
+// `render_durable_summary` output (not a hand-written fixture) so the
+// scorer is proven against production code, not just bench_support's own
+// fixtures.
+
+/// Password-like credential needle (ADR-0061 F17), phrased in
+/// `good_structured_summary_json`'s style. The literal value echoes the audit
+/// finding's own example planted secret.
+const CREDENTIAL_NEEDLE: &str = "korium-9741";
+/// Innocuous control identifier: same shape of ask (a fact to retain), no
+/// credential framing, so a summarizer has no injection-defense reason to
+/// treat it differently from `CREDENTIAL_NEEDLE`.
+const CONTROL_NEEDLE: &str = "BUILD-7f2a91d";
+
+/// A structured summary carrying both the credential and control needles.
+/// `credential_preserved` selects whether the credential landed in the
+/// `preserved_identifiers` carve-out (the F17 fix) or was dropped entirely
+/// (the F17 regression this test suite must catch).
+fn structured_summary_json_with_credential(credential_preserved: bool) -> serde_json::Value {
+    serde_json::json!({
+        "goal": "ship #475",
+        "state": ["renderer written"],
+        "decisions": ["native first, forced-tool fallback second"],
+        "key_facts": ["needle-STRUCTURED-SUMMARY-475", CONTROL_NEEDLE],
+        "next_steps": ["wire the ladder"],
+        "preserved_identifiers": if credential_preserved {
+            vec![CREDENTIAL_NEEDLE]
+        } else {
+            Vec::<&str>::new()
+        },
+    })
+}
+
+/// Field-wise G3 pass: the credential needle survives in the
+/// `preserved_identifiers` carve-out (or `key_facts` -- either placement
+/// proves retention), the control needle survives in `key_facts`, scored
+/// against the real durable text `run_compaction_worker` persisted, not a
+/// hand-written fixture.
+#[test]
+fn structured_summary_field_wise_g3_scores_the_credential_needle_in_preserved_identifiers() {
+    let (result, _) =
+        run_structured_summary_worker_test(VecDeque::from([ScriptedStructuredAttempt::Turn(
+            native_turn_with(structured_summary_json_with_credential(true)),
+        )]));
+    let summary = match result {
+        super::BackgroundSummaryResult::Summary(summary) => summary,
+        super::BackgroundSummaryResult::Failed(message) => {
+            panic!("expected Summary, got Failed({message})")
+        }
+        super::BackgroundSummaryResult::Cancelled => panic!("expected Summary, got Cancelled"),
+    };
+    crate::tools::bench_support::assert_survives_fieldwise(
+        "compaction/structured-credential",
+        &summary.text,
+        &[
+            crate::tools::bench_support::FieldNeedle {
+                text: CONTROL_NEEDLE,
+                sections: &[crate::tools::bench_support::SummarySection::KeyFacts],
+            },
+            crate::tools::bench_support::FieldNeedle {
+                text: CREDENTIAL_NEEDLE,
+                sections: &[
+                    crate::tools::bench_support::SummarySection::KeyFacts,
+                    crate::tools::bench_support::SummarySection::PreservedIdentifiers,
+                ],
+            },
+        ],
+    );
+}
+
+/// Field-wise G3 must FAIL when the credential needle is dropped from every
+/// section it is allowed to land in -- this is the audit-mandated regression
+/// test: the gate that was blind to F17 must now catch it.
+#[test]
+#[should_panic(expected = "lost")]
+fn structured_summary_field_wise_g3_fails_when_the_credential_needle_is_scrubbed() {
+    let (result, _) =
+        run_structured_summary_worker_test(VecDeque::from([ScriptedStructuredAttempt::Turn(
+            native_turn_with(structured_summary_json_with_credential(false)),
+        )]));
+    let summary = match result {
+        super::BackgroundSummaryResult::Summary(summary) => summary,
+        super::BackgroundSummaryResult::Failed(message) => {
+            panic!("expected Summary, got Failed({message})")
+        }
+        super::BackgroundSummaryResult::Cancelled => panic!("expected Summary, got Cancelled"),
+    };
+    crate::tools::bench_support::assert_survives_fieldwise(
+        "compaction/structured-credential",
+        &summary.text,
+        &[crate::tools::bench_support::FieldNeedle {
+            text: CREDENTIAL_NEEDLE,
+            sections: &[
+                crate::tools::bench_support::SummarySection::KeyFacts,
+                crate::tools::bench_support::SummarySection::PreservedIdentifiers,
+            ],
+        }],
+    );
+}
+
+/// Field-wise scoring of `Goal` and `Next steps` against the same real
+/// durable text, rounding out coverage of every section the renderer
+/// produces (not just `Key facts`/`Preserved identifiers`).
+#[test]
+fn structured_summary_field_wise_g3_scores_goal_and_next_steps() {
+    let (result, _) =
+        run_structured_summary_worker_test(VecDeque::from([ScriptedStructuredAttempt::Turn(
+            native_turn_with(structured_summary_json_with_credential(true)),
+        )]));
+    let summary = match result {
+        super::BackgroundSummaryResult::Summary(summary) => summary,
+        super::BackgroundSummaryResult::Failed(message) => {
+            panic!("expected Summary, got Failed({message})")
+        }
+        super::BackgroundSummaryResult::Cancelled => panic!("expected Summary, got Cancelled"),
+    };
+    crate::tools::bench_support::assert_survives_fieldwise(
+        "compaction/structured-credential",
+        &summary.text,
+        &[
+            crate::tools::bench_support::FieldNeedle {
+                text: "ship #475",
+                sections: &[crate::tools::bench_support::SummarySection::Goal],
+            },
+            crate::tools::bench_support::FieldNeedle {
+                text: "renderer written",
+                sections: &[crate::tools::bench_support::SummarySection::State],
+            },
+            crate::tools::bench_support::FieldNeedle {
+                text: "wire the ladder",
+                sections: &[crate::tools::bench_support::SummarySection::NextSteps],
+            },
+        ],
+    );
+}
+
 struct SeededHarness {
     harness: Harness<SilentProvider>,
     path: PathBuf,

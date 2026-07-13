@@ -237,13 +237,28 @@ fn auto_live_policy() -> AutoLivePolicy {
     policy
 }
 
+/// Password-like credential needle (audit F17 / ADR-0061), session-scoped
+/// like `NEEDLE-{session}7f3a9` above so sessions stay isolated. Planted as an
+/// explicitly user-sourced ask -- "remember the deploy password is X -- I'll
+/// need it after compaction" -- rather than as ordinary project context, so
+/// this needle actually exercises the retention class the audit found
+/// invisible: every other needle in this bench is innocuous-shaped, so a
+/// summarizer whose injection-defense framing scrubs credential-shaped facts
+/// would pass every existing gate while silently dropping this one.
+fn live_credential(session: usize) -> String {
+    format!("korium-9741-{session:02x}")
+}
+
 fn auto_live_seed(session: usize, workspace: &std::path::Path) -> Result<Vec<Message>> {
     let needle = format!("NEEDLE-{session:02x}7f3a9: the flag is --enable-zeta");
+    let credential = live_credential(session);
     let cargo = std::fs::read_to_string(workspace.join("Cargo.toml"))?;
     let call_id = format!("auto-live-seed-read-{session}");
     let mut seed = vec![
         Message::user(&format!(
-            "Remember this exact project fact for later: {needle}. We are auditing auto-compaction."
+            "Remember this exact project fact for later: {needle}. Also remember the deploy \
+             password is {credential} -- I'll need it after compaction. We are auditing \
+             auto-compaction."
         )),
         Message::assistant_tool_call(&ToolCall {
             id: call_id.clone(),
@@ -336,7 +351,7 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
         policy.keep_recent_tokens,
     );
     println!(
-        "lane | session | compactions | G1 blocked | G2 max-after/start/pass | shallowest reclaim pre->post/reclaimed/covered%/total% | G3 needle/marker/carry | G4 exact | G5 metadata | worker cache hit | parent cache pre->post/ratio/kind/pairs | real read | error"
+        "lane | session | compactions | G1 blocked | G2 max-after/start/pass | shallowest reclaim pre->post/reclaimed/covered%/total% | G3 needle/credential/marker/carry | G4 exact | G5 metadata | worker cache hit | parent cache pre->post/ratio/kind/pairs | real read | error"
     );
 
     let mut budget_used = 0usize;
@@ -355,12 +370,13 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
                     budget_used += 1;
                 } else if outcome != LiveSessionOutcome::Pass {
                     gate_failures.push(format!(
-                        "session {session:02}: compactions={} G1={:.1}ms/{} G2={} G3={}/{}/{} G4={} G5={} read={}",
+                        "session {session:02}: compactions={} G1={:.1}ms/{} G2={} G3={}/{}/{}/{} G4={} G5={} read={}",
                         row.compactions,
                         row.g1_blocked_ms,
                         row.g1_non_blocking,
                         row.context_effective,
                         row.needle_answered,
+                        row.credential_answered,
                         row.recall_marker,
                         row.carry_block,
                         row.resume_exact,
@@ -375,7 +391,7 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
                     row.metadata_detail.as_deref().unwrap_or("-")
                 };
                 println!(
-                    "{} | {session:02} | {} | {:.1}ms/{} | {}/{}/{} | {}->{}/{}/{:.1}%/{:.1}% | {}/{}/{} | {} | {} | {} | {}->{}/{}/{}/{} | {} | {}",
+                    "{} | {session:02} | {} | {:.1}ms/{} | {}/{}/{} | {}->{}/{}/{:.1}%/{:.1}% | {}/{}/{}/{} | {} | {} | {} | {}->{}/{}/{}/{} | {} | {}",
                     lane.label(),
                     row.compactions,
                     row.g1_blocked_ms,
@@ -389,6 +405,7 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
                     row.shallowest_reclaim.covered_reduction_ratio * 100.0,
                     row.shallowest_reclaim.total_reduction_ratio * 100.0,
                     row.needle_answered,
+                    row.credential_answered,
                     row.recall_marker,
                     row.carry_block,
                     row.resume_exact,
@@ -412,7 +429,7 @@ fn auto_compaction_live_loop(lane: LiveLoopLane, session_count: usize) {
                 budget_used += 1;
                 outcomes.push(LiveSessionOutcome::ErrorExclusion);
                 println!(
-                    "{} | {session:02} | excluded | -/- | -/- | -/-/-/-/- | -/-/- | - | - | - | -->-/-/-/0 | - | {error:#}",
+                    "{} | {session:02} | excluded | -/- | -/- | -/-/-/-/- | -/-/-/- | - | - | - | -->-/-/-/0 | - | {error:#}",
                     lane.label()
                 );
             }
@@ -437,6 +454,7 @@ struct AutoLiveRow {
     context_effective: bool,
     shallowest_reclaim: ApplyReclamation,
     needle_answered: bool,
+    credential_answered: bool,
     recall_marker: bool,
     carry_block: bool,
     resume_exact: bool,
@@ -455,6 +473,7 @@ impl AutoLiveRow {
             g1_non_blocking: self.g1_non_blocking,
             context_effective: self.context_effective,
             needle_answered: self.needle_answered,
+            credential_answered: self.credential_answered,
             recall_marker: self.recall_marker,
             carry_block: self.carry_block,
             resume_exact: self.resume_exact,
@@ -573,8 +592,11 @@ fn run_auto_compaction_live_session(
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
 
+    let credential = live_credential(session);
     let probe = format!(
-        "What was the flag for NEEDLE-{session:02x}7f3a9? If it is behind a compaction reference, use recall. Reply with the flag exactly."
+        "What was the flag for NEEDLE-{session:02x}7f3a9, and what deploy password did I ask you \
+         to remember? If either is behind a compaction reference, use recall. Reply with both \
+         exactly."
     );
     let started = Instant::now();
     block_on(harness.submit_turn(&probe, &observer, &gate, &token))?;
@@ -589,11 +611,24 @@ fn run_auto_compaction_live_session(
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let needle_answered = live_messages
+    let last_assistant_reply = live_messages
         .iter()
         .rev()
-        .find(|message| message.role == Role::Assistant)
-        .is_some_and(|message| message.content.contains("--enable-zeta"));
+        .find(|message| message.role == Role::Assistant);
+    let needle_answered =
+        last_assistant_reply.is_some_and(|message| message.content.contains("--enable-zeta"));
+    // Audit F17/F21: the credential-shaped needle is scored the same way as
+    // the innocuous flag needle above (whole-text, on the model's final
+    // reply) -- this lane's summarizer (`SummarizerKind::Subagent`) replays
+    // the full transcript rather than the issue #475 structured-output route,
+    // so it produces free-form model text with no guaranteed section
+    // structure for field-wise scoring to key on. The field-wise scorer
+    // (`tools::bench_support::assert_survives_fieldwise`) engages instead
+    // wherever a genuine structured durable summary is under test, e.g. the
+    // deterministic `wayland::background_compaction_tests` structured-summary
+    // fallback-ladder coverage.
+    let credential_answered =
+        last_assistant_reply.is_some_and(|message| message.content.contains(&credential));
     let events = observer.events.lock().expect("live events lock");
     let real_read = events.iter().any(|timed| {
         matches!(
@@ -722,6 +757,7 @@ fn run_auto_compaction_live_session(
         context_effective,
         shallowest_reclaim,
         needle_answered,
+        credential_answered,
         recall_marker: context_text.matches("recall(handle=\"").count() >= applies.len(),
         carry_block: context_text.contains(AUTO_LIVE_CARRY_HEADER),
         resume_exact,
