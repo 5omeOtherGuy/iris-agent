@@ -204,10 +204,15 @@ impl OpenAiCodexResponsesProvider {
         // Codex compaction items are intentionally opaque and carry no portable
         // text. Iris therefore pays for a second inference call so cross-model
         // resume retains the provider-independent summary required by ADR-0056.
+        // The summary directive must be the final user turn: when it only rides
+        // in the system instructions and the covered transcript ends on an
+        // unanswered user message, the model answers that message instead of
+        // summarizing.
+        let summary_messages = native_compaction_summary_messages(messages, instructions);
         let summary_request = build_codex_request(
             &self.model,
-            &native_compaction_summary_instructions(instructions),
-            messages,
+            &self.system_prompt,
+            &summary_messages,
             &Tools::new(Vec::new()),
             self.reasoning,
             Some(&self.prompt_cache_key),
@@ -1003,6 +1008,18 @@ fn build_codex_native_compaction_request(
         .expect("request input is an array")
         .push(json!({ "type": "compaction_trigger" }));
     body
+}
+
+/// Covered transcript plus the summary directive as the final user turn. The
+/// directive must not ride only in the system instructions: when the covered
+/// range ends on an unanswered user message, the model answers it instead of
+/// summarizing.
+fn native_compaction_summary_messages(messages: &[Message], instructions: &str) -> Vec<Message> {
+    let mut out = messages.to_vec();
+    out.push(Message::user(&native_compaction_summary_instructions(
+        instructions,
+    )));
+    out
 }
 
 fn native_compaction_summary_instructions(instructions: &str) -> String {

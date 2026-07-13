@@ -689,6 +689,24 @@ fn native_compaction_portable_summary_prompt_is_text_only_and_preserves_focus() 
 }
 
 #[test]
+fn native_compaction_summary_directive_is_the_final_user_turn() {
+    // Regression: a covered range ending on an unanswered user question must
+    // not be the last turn the summary worker sees, or the model answers it
+    // instead of summarizing.
+    let covered = vec![
+        Message::user("what does the API use?"),
+        Message::assistant("the API uses low"),
+        Message::user("but what does OpenAI use, not what does iris use"),
+    ];
+    let request = native_compaction_summary_messages(&covered, "keep exact effort names");
+    assert_eq!(request.len(), covered.len() + 1);
+    let last = request.last().expect("directive appended");
+    assert_eq!(last.role, Role::User);
+    assert!(last.content.contains("self-contained handoff summary"));
+    assert!(last.content.contains("keep exact effort names"));
+}
+
+#[test]
 fn cross_provider_request_uses_portable_summary_and_ignores_anthropic_block() {
     let message =
         Message::user("portable cross-provider summary").with_provider_blocks(vec![json!({

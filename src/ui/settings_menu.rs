@@ -29,10 +29,14 @@
 //! at the safe inter-turn boundary. A change is acknowledged mechanically: the
 //! adjusted element renders bright for two ticks (the §6 detent flash), gated
 //! by reduced motion. Dependent controls go dark while their master switch is
-//! off — inert hardware, still operable: the AUTO COMPACT thresholds, tail,
-//! reactive, summarizer, and worker-input knobs follow `automatic`; the
-//! tool-result aggressiveness, cache timing, fold trigger, retain, and
-//! keep-tool-uses knobs follow `tool result compaction`.
+//! off — inert hardware, still operable: the COMPACTION thresholds, tail,
+//! reactive, native-compaction, summarizer, and worker-input knobs follow
+//! `automatic`; the tool-result aggressiveness, cache timing, fold trigger,
+//! retain, and keep-tool-uses knobs follow `tool result compaction`; knobs no
+//! resolved code path reads (worker input under `excerpts`, the fold trigger
+//! under `breakOnly`/`immediate`, the dedupe/clearing dials when their pass is
+//! off) go dark individually. The selected row's one-line explanation prints
+//! above the footer.
 //!
 //! All writes go to the user-global settings file via `config::save_*`;
 //! global-vs-project scope governs only load/merge precedence in
@@ -90,6 +94,7 @@ pub(crate) enum Field {
     CompactionKeepRecentTokens,
     CompactionHardWait,
     CompactionReactive,
+    CompactionProviderNative,
     CompactionSummarizer,
     CompactionWorkerInput,
     Microcompaction,
@@ -211,6 +216,7 @@ const SECTIONS: &[Section] = &[
             RowId::Reasoning,
             RowId::Scope,
             RowId::Providers,
+            RowId::Field(Field::PromptCacheRetention),
         ],
     },
     Section {
@@ -222,8 +228,9 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
-        title: "AUTO COMPACT",
+        title: "COMPACTION",
         rows: &[
+            RowId::Field(Field::ContextTokenBudget),
             RowId::Field(Field::CompactionEnabled),
             RowId::Field(Field::CompactionWarn),
             RowId::Field(Field::CompactionStart),
@@ -231,21 +238,15 @@ const SECTIONS: &[Section] = &[
             RowId::Field(Field::CompactionKeepRecentTokens),
             RowId::Field(Field::CompactionHardWait),
             RowId::Field(Field::CompactionReactive),
+            RowId::Field(Field::CompactionProviderNative),
             RowId::Field(Field::CompactionSummarizer),
             RowId::Field(Field::CompactionWorkerInput),
-        ],
-    },
-    Section {
-        title: "MEMORY",
-        rows: &[
-            RowId::Field(Field::ContextTokenBudget),
             RowId::Field(Field::Microcompaction),
             RowId::Field(Field::CompactionAggressiveness),
             RowId::Field(Field::CompactionCacheTiming),
             RowId::Field(Field::MicrocompactionWatermark),
             RowId::Field(Field::SemanticRetainPerPath),
             RowId::Field(Field::ToolClearingKeepRecent),
-            RowId::Field(Field::PromptCacheRetention),
         ],
     },
     Section {
@@ -329,9 +330,10 @@ const WEB_BYTES_LADDER: [u64; 10] = [
 /// Hard bounds for typed dial entry, matching the `config::save_*` clamps.
 fn dial_bounds(field: Field) -> (u64, u64) {
     match field {
-        Field::ContextTokenBudget
-        | Field::MicrocompactionWatermark
-        | Field::CompactionKeepRecentTokens => (1_000, 100_000_000),
+        // The config save rejects a cap below the summary reserve; mirror it so
+        // an inline-typed value never round-trips into a save error.
+        Field::ContextTokenBudget => (8_192, 100_000_000),
+        Field::MicrocompactionWatermark | Field::CompactionKeepRecentTokens => (1_000, 100_000_000),
         Field::SemanticRetainPerPath | Field::ToolClearingKeepRecent => (1, 1_000),
         // Thresholds are whole percents; ordering (`warn < start < hard`) is
         // enforced by the config save, which restores the persisted value on a
@@ -477,10 +479,15 @@ pub(crate) struct Snapshot {
     /// The ladder resolved against the active model window, for the dim
     /// resolved-value line. `None` when the harness has no live diagnostics.
     pub(crate) resolved_ladder: Option<ResolvedLadder>,
+    /// Provider-native compaction routing (`compaction.providerNative`,
+    /// `off|auto`). GLOBAL-ONLY. `auto` prefers the provider's opaque compaction
+    /// blocks (currently Codex) and falls back to the configured summarizer when
+    /// native compaction is unavailable.
+    pub(crate) compaction_provider_native: String,
     pub(crate) compaction_summarizer: String,
     /// The resolved tool-result-compaction master switch (`toolResultCompaction
-    /// .enabled`, or the legacy `microcompaction` alias). Field name kept for the
-    /// MEMORY row's identity; the label reads `tool result compaction`.
+    /// .enabled`, or the legacy `microcompaction` alias). Field name kept for
+    /// the row's identity; the label reads `tool result compaction`.
     pub(crate) microcompaction: bool,
     /// The resolved compaction trigger tokens (`toolResultCompaction
     /// .triggerTokens`, or the legacy watermark). The `fold trigger` dial.
@@ -489,6 +496,18 @@ pub(crate) struct Snapshot {
     pub(crate) compaction_cache_timing: String,
     pub(crate) semantic_retain_per_path: u64,
     pub(crate) tool_clearing_keep_recent: u64,
+    /// Whether the RESOLVED tool-result policy runs semantic dedupe (preset or
+    /// explicit config). Drives the `retain/path` inertness honestly: the knob
+    /// is dark when no dedupe pass will read it.
+    pub(crate) semantic_dedupe_enabled: bool,
+    /// Whether the RESOLVED tool-result policy runs tool clearing. Drives the
+    /// `keep tool uses` inertness.
+    pub(crate) tool_clearing_enabled: bool,
+    /// The active model's own effective context window (catalog raw minus
+    /// reserves), before the legacy `contextTokenBudget` clamp. `None` when the
+    /// catalog has no window fact. Caps the `context cap` dial so the setting
+    /// can never claim more window than the model really has.
+    pub(crate) model_context_window: Option<u64>,
     pub(crate) prompt_cache_retention: String,
     /// Web search tool backend (`off|native|brave|jina|searxng`). GLOBAL-ONLY;
     /// takes effect next session. `off` withholds the tool from the model.
@@ -524,6 +543,7 @@ impl Snapshot {
             Field::WebSearchBackend => &["off", "native", "brave", "jina", "searxng"],
             Field::ReadWebPageBackend => &["off", "native", "jina"],
             Field::CompactionSummarizer => &["excerpts", "provider", "subagent"],
+            Field::CompactionProviderNative => &["off", "auto"],
             Field::CompactionAggressiveness => {
                 &["conservative", "balanced", "aggressive", "custom"]
             }
@@ -550,6 +570,7 @@ impl Snapshot {
             Field::WebSearchBackend => self.web_search_backend.clone(),
             Field::ReadWebPageBackend => self.read_web_page_backend.clone(),
             Field::CompactionSummarizer => self.compaction_summarizer.clone(),
+            Field::CompactionProviderNative => self.compaction_provider_native.clone(),
             Field::CompactionAggressiveness => self.compaction_aggressiveness.clone(),
             Field::CompactionCacheTiming => self.compaction_cache_timing.clone(),
             Field::Theme => self.theme.clone(),
@@ -572,6 +593,7 @@ impl Snapshot {
             Field::WebSearchBackend => self.web_search_backend = value.to_string(),
             Field::ReadWebPageBackend => self.read_web_page_backend = value.to_string(),
             Field::CompactionSummarizer => self.compaction_summarizer = value.to_string(),
+            Field::CompactionProviderNative => self.compaction_provider_native = value.to_string(),
             Field::CompactionAggressiveness => self.compaction_aggressiveness = value.to_string(),
             Field::CompactionCacheTiming => self.compaction_cache_timing = value.to_string(),
             Field::Theme => self.theme = value.to_string(),
@@ -588,7 +610,11 @@ impl Snapshot {
 
     fn dial_value(&self, field: Field) -> u64 {
         match field {
-            Field::ContextTokenBudget => self.context_token_budget,
+            Field::ContextTokenBudget => self
+                .model_context_window
+                .map_or(self.context_token_budget, |cap| {
+                    self.context_token_budget.min(cap)
+                }),
             Field::MicrocompactionWatermark => self.microcompaction_watermark,
             Field::CompactionWarn => self.compaction_warn_pct,
             Field::CompactionStart => self.compaction_start_pct,
@@ -643,6 +669,16 @@ impl Snapshot {
         }
     }
 
+    /// The model-truth ceiling for a dial, when one exists: `context cap`
+    /// clamps to the active model's real effective window (a bigger number
+    /// could never bind — the runtime takes `min(cap, window)`).
+    fn dial_cap(&self, field: Field) -> Option<u64> {
+        match field {
+            Field::ContextTokenBudget => self.model_context_window,
+            _ => None,
+        }
+    }
+
     fn set_register_value(&mut self, field: Field, value: Option<String>) {
         match field {
             Field::VerifyCommand => self.verify_command = value,
@@ -678,6 +714,7 @@ fn archetype(row: RowId) -> Archetype {
             | Field::WebSearchBackend
             | Field::ReadWebPageBackend
             | Field::CompactionSummarizer
+            | Field::CompactionProviderNative
             | Field::CompactionAggressiveness
             | Field::CompactionCacheTiming
             | Field::CompactionEnabled
@@ -715,6 +752,110 @@ fn is_port(row: RowId) -> bool {
     matches!(archetype(row), Archetype::Port)
 }
 
+/// One dim explanation sentence per row, printed above the footer for the
+/// selected control. Each sentence states what the code actually does — the
+/// trigger ladder, worker routing, fold policy, and guard semantics are all
+/// verified against their implementations, not aspirational.
+fn describe(row: RowId) -> &'static str {
+    match row {
+        RowId::Model => {
+            "the session's active model; \u{2190}\u{2192} cycles scoped models, \u{21b5} opens the catalog"
+        }
+        RowId::Reasoning => {
+            "how much the active model reasons before answering; levels vary by model"
+        }
+        RowId::Scope => {
+            "which models cycling and the catalog offer; reorder to set the cycle order"
+        }
+        RowId::Providers => "provider credentials: oauth login, api keys, logout",
+        RowId::SkipApprovals => {
+            "run every tool call without asking; persists as the startup default"
+        }
+        RowId::Permissions => {
+            "always-allow grants per tool, plus this project's stored bash grants"
+        }
+        RowId::Field(field) => match field {
+            Field::PromptCacheRetention => {
+                "provider cache hints: short = default ephemeral, long = 1h/24h, none = no hints"
+            }
+            Field::DefaultApproval => {
+                "strict always prompts; auto also runs provably-safe edits; never denies instead"
+            }
+            Field::ContextTokenBudget => {
+                "caps usable context below the model window; compaction thresholds scale to it"
+            }
+            Field::CompactionEnabled => {
+                "summarize old history in the background as the context fills"
+            }
+            Field::CompactionWarn => "context fill that raises a pressure notice",
+            Field::CompactionStart => "context fill where background summarization starts",
+            Field::CompactionHard => {
+                "context fill where the turn pauses for compaction (bounded by hard wait)"
+            }
+            Field::CompactionKeepRecentTokens => {
+                "newest tokens never summarized; capped at a quarter of the window"
+            }
+            Field::CompactionHardWait => {
+                "longest a hard-pressure turn waits for the summary before excerpt fallback"
+            }
+            Field::CompactionReactive => {
+                "after a provider context overflow, compact deterministically and resend"
+            }
+            Field::CompactionProviderNative => {
+                "auto prefers capable Codex compaction; unavailable routes fall back to the summarizer"
+            }
+            Field::CompactionSummarizer => {
+                "excerpts = no model; provider = single summary call; subagent = read-only worker"
+            }
+            Field::CompactionWorkerInput => {
+                "summarize the raw transcript, or a snapshot the worker may investigate"
+            }
+            Field::Microcompaction => {
+                "fold old tool results into recoverable stubs; recall restores the originals"
+            }
+            Field::CompactionAggressiveness => {
+                "conservative dedupes; balanced adds replayable clearing; aggressive clears most"
+            }
+            Field::CompactionCacheTiming => {
+                "when folds may run: only at cache breaks, cache-aware, on pressure, or always"
+            }
+            Field::MicrocompactionWatermark => {
+                "context tokens that force a fold flush (cacheAware/pressureOnly timing)"
+            }
+            Field::SemanticRetainPerPath => {
+                "newest tool results kept per file path when deduping repeated reads"
+            }
+            Field::ToolClearingKeepRecent => "newest tool results tool clearing always keeps",
+            Field::WebSearchBackend => {
+                "web_search backend; off withholds the tool; applies to new sessions"
+            }
+            Field::ReadWebPageBackend => {
+                "read_web_page backend; off withholds the tool; applies to new sessions"
+            }
+            Field::SearxngUrl => "base URL for the SearXNG backend that receives search queries",
+            Field::SearchTimeout => "wall-clock deadline for each web search request",
+            Field::ReadTimeout => "wall-clock deadline for each read_web_page request",
+            Field::MaxSearchResults => "maximum results returned by each web search",
+            Field::MaxSearchResponseBytes => "maximum search response body accepted before parsing",
+            Field::MaxReadResponseBytes => "maximum page response body accepted before extraction",
+            Field::MaxReadOutputBytes => {
+                "maximum extracted read_web_page output returned to the model"
+            }
+            Field::VerifyCommand => {
+                "post-change verification command, run under the normal approval gate"
+            }
+            Field::VerifyMaxAttempts => "verification runs per check before reporting failure",
+            Field::Theme => "panel and transcript color theme",
+            Field::AltScreen => "run in the terminal's alternate screen: auto, always, or never",
+            Field::ScrollSpeed => "lines scrolled per wheel tick",
+            Field::ReducedMotion => "settle animations instantly (flashes, spinners)",
+            Field::MutationSafety => "git snapshot + dirty-tree guard around model file mutations",
+            Field::NativeJj => "back mutation snapshots with jj when the workspace has a jj repo",
+            Field::WorktreeRoot => "where new worktrees are created; empty = ../wt",
+        },
+    }
+}
+
 fn label(row: RowId) -> &'static str {
     match row {
         RowId::Model => "model",
@@ -737,6 +878,7 @@ fn label(row: RowId) -> &'static str {
             Field::CompactionKeepRecentTokens => "retain tail",
             Field::CompactionHardWait => "hard wait",
             Field::CompactionReactive => "reactive",
+            Field::CompactionProviderNative => "native compaction",
             Field::CompactionSummarizer => "summarizer",
             Field::CompactionWorkerInput => "worker input",
             Field::Microcompaction => "tool result compaction",
@@ -1234,9 +1376,17 @@ impl SettingsPanel {
             }
             Archetype::Dial => {
                 let value = self.snap.dial_value(field);
-                let Some(next) = next_detent(ladder(field), value, forward) else {
+                let Some(mut next) = next_detent(ladder(field), value, forward) else {
                     return ModalOutcome::Ignore;
                 };
+                // A model-truth ceiling caps the climb: stepping right never
+                // claims more than the active model's real window.
+                if let Some(cap) = self.snap.dial_cap(field) {
+                    next = next.min(cap);
+                    if next == value {
+                        return ModalOutcome::Ignore;
+                    }
+                }
                 self.snap.set_dial_value(field, next);
                 self.arm_flash(self.cursor.clone());
                 ModalOutcome::Emit(ModalAction::SaveSetting {
@@ -1718,7 +1868,10 @@ impl SettingsPanel {
             match trimmed.parse::<u64>() {
                 Ok(value) => {
                     let (min, max) = dial_bounds(field);
-                    let value = value.clamp(min, max);
+                    let mut value = value.clamp(min, max);
+                    if let Some(cap) = self.snap.dial_cap(field) {
+                        value = value.min(cap);
+                    }
                     self.snap.set_dial_value(field, value);
                     self.edit = None;
                     self.arm_flash(self.cursor.clone());
@@ -1779,12 +1932,12 @@ impl SettingsPanel {
         }
     }
 
-    /// Dim silkscreen lines printed under a section. AUTO COMPACT shows the
+    /// Dim silkscreen lines printed under a section. COMPACTION shows the
     /// ladder resolved against the active model window — reusing the harness
     /// trigger resolution (`/context` diagnostics), never recomputing it here —
     /// so configured fractions/tail read next to their effective token values.
     fn section_footnotes(&self, title: &str) -> Vec<Line<'static>> {
-        if title != "AUTO COMPACT" {
+        if title != "COMPACTION" {
             return Vec::new();
         }
         let Some(ladder) = self.snap.resolved_ladder else {
@@ -1792,7 +1945,8 @@ impl SettingsPanel {
         };
         let mut lines = vec![Line::from(Span::styled(
             format!(
-                "  active model: warn {} / start {} / hard {} / tail {}",
+                "  active model: window {} / warn {} / start {} / hard {} / tail {}",
+                compact_value(ladder.effective_window),
                 compact_value(ladder.warn),
                 compact_value(ladder.start),
                 compact_value(ladder.hard),
@@ -1884,8 +2038,9 @@ impl SettingsPanel {
             .position(|row| *row == self.cursor)
             .unwrap_or(0);
         // Fixed lines outside the body window: masthead, the blank under it,
-        // and overlay_menu's blank + footer.
-        let fixed = 4usize;
+        // the selected row's explanation line, and overlay_menu's blank +
+        // footer.
+        let fixed = 5usize;
         let budget = budget.max(fixed + 3);
         let mut window = budget - fixed;
         let scrolled = rows.len() > window;
@@ -1923,7 +2078,26 @@ impl SettingsPanel {
                 false,
             ));
         }
+        body.push((self.description_line(avail), false));
         crate::ui::tui::overlay_menu(None, body, Some(&self.footer()), avail)
+    }
+
+    /// The selected row's dim explanation, printed as the fixed line above the
+    /// footer. Child rows explain their port. Truncated to the panel width so
+    /// the sentence never wraps into a second line.
+    fn description_line(&self, avail: usize) -> Line<'static> {
+        let row = match &self.cursor {
+            PanelRow::Top(row) => *row,
+            PanelRow::ModelChild(_) => RowId::Model,
+            PanelRow::ScopeChild(_) => RowId::Scope,
+            PanelRow::ProviderChild(_) => RowId::Providers,
+            PanelRow::PolicyTool(_)
+            | PanelRow::PolicyBashExact(_)
+            | PanelRow::PolicyBashPrefix(_) => RowId::Permissions,
+        };
+        let text =
+            crate::ui::textengine::truncate_chars(describe(row), avail.saturating_sub(2).max(8));
+        Line::from(Span::styled(format!("  {text}"), dim()))
     }
 
     /// `SETTINGS` bold + the crate rev right-bound — the faceplate masthead,
@@ -1979,10 +2153,14 @@ impl SettingsPanel {
         }
     }
 
-    /// Whether a row's control is inert (dark but operable) because its master
-    /// switch is off. The AUTO COMPACT knobs follow `automatic`
-    /// (`compaction.enabled`); the tool-result knobs follow `tool result
-    /// compaction` (`toolResultCompaction.enabled`).
+    /// Whether a row's control is inert (dark but operable) because a master
+    /// switch or routing choice makes it unread. The full-context knobs follow
+    /// `automatic` (`compaction.enabled`); `worker input` additionally goes
+    /// dark under the `excerpts` summarizer (no model worker ever reads it);
+    /// the tool-result knobs follow `tool result compaction`, with `fold
+    /// trigger` also dark under `breakOnly`/`immediate` timing (neither path
+    /// reads the watermark) and the dedupe/clearing dials dark when their
+    /// resolved pass is disabled.
     fn is_inert(&self, row: RowId) -> bool {
         match row {
             RowId::Field(
@@ -1992,16 +2170,28 @@ impl SettingsPanel {
                 | Field::CompactionKeepRecentTokens
                 | Field::CompactionHardWait
                 | Field::CompactionReactive
-                | Field::CompactionSummarizer
-                | Field::CompactionWorkerInput,
+                | Field::CompactionProviderNative
+                | Field::CompactionSummarizer,
             ) => !self.snap.compaction_enabled,
-            RowId::Field(
-                Field::CompactionAggressiveness
-                | Field::CompactionCacheTiming
-                | Field::MicrocompactionWatermark
-                | Field::SemanticRetainPerPath
-                | Field::ToolClearingKeepRecent,
-            ) => !self.snap.microcompaction,
+            RowId::Field(Field::CompactionWorkerInput) => {
+                !self.snap.compaction_enabled || self.snap.compaction_summarizer == "excerpts"
+            }
+            RowId::Field(Field::CompactionAggressiveness | Field::CompactionCacheTiming) => {
+                !self.snap.microcompaction
+            }
+            RowId::Field(Field::MicrocompactionWatermark) => {
+                !self.snap.microcompaction
+                    || matches!(
+                        self.snap.compaction_cache_timing.as_str(),
+                        "breakOnly" | "immediate"
+                    )
+            }
+            RowId::Field(Field::SemanticRetainPerPath) => {
+                !self.snap.microcompaction || !self.snap.semantic_dedupe_enabled
+            }
+            RowId::Field(Field::ToolClearingKeepRecent) => {
+                !self.snap.microcompaction || !self.snap.tool_clearing_enabled
+            }
             RowId::Field(Field::NativeJj) => {
                 !self.snap.mutation_safety || !self.snap.native_jj_available
             }
@@ -2865,12 +3055,16 @@ mod tests {
                 effective_window: 232_000,
             }),
             compaction_summarizer: "subagent".to_string(),
+            compaction_provider_native: "off".to_string(),
             microcompaction: false,
             microcompaction_watermark: 32_000,
             compaction_aggressiveness: "conservative".to_string(),
             compaction_cache_timing: "cacheAware".to_string(),
             semantic_retain_per_path: 1,
             tool_clearing_keep_recent: 8,
+            semantic_dedupe_enabled: true,
+            tool_clearing_enabled: false,
+            model_context_window: Some(232_000),
             prompt_cache_retention: "short".to_string(),
             web_search_backend: "off".to_string(),
             read_web_page_backend: "off".to_string(),
@@ -2963,8 +3157,8 @@ mod tests {
         for section in [
             "ENGINE",
             "SAFETY",
-            "AUTO COMPACT",
-            "MEMORY",
+            "COMPACTION",
+            "WEB",
             "CHECKS",
             "PANEL",
             "GIT",
@@ -3038,7 +3232,9 @@ mod tests {
         // A large window: tail is unclamped, so no configured->effective note.
         let rendered = text(&panel().render_budgeted(120, 80));
         assert!(
-            rendered.contains("active model: warn 139k / start 167k / hard 208k / tail 8k"),
+            rendered.contains(
+                "active model: window 232k / warn 139k / start 167k / hard 208k / tail 8k"
+            ),
             "{rendered}"
         );
         assert!(!rendered.contains("configured tail"), "{rendered}");
@@ -3096,6 +3292,7 @@ mod tests {
         assert!(panel.is_inert(RowId::Field(Field::CompactionKeepRecentTokens)));
         assert!(panel.is_inert(RowId::Field(Field::CompactionHardWait)));
         assert!(panel.is_inert(RowId::Field(Field::CompactionReactive)));
+        assert!(panel.is_inert(RowId::Field(Field::CompactionProviderNative)));
         assert!(panel.is_inert(RowId::Field(Field::CompactionSummarizer)));
         assert!(panel.is_inert(RowId::Field(Field::CompactionWorkerInput)));
         assert!(!panel.is_inert(RowId::Field(Field::CompactionEnabled)));
@@ -3219,6 +3416,11 @@ mod tests {
     fn dial_snaps_an_off_ladder_value_into_the_ladder() {
         let mut panel = panel();
         select_top(&mut panel, RowId::Field(Field::ContextTokenBudget));
+        // The budget sits at the active model's real window (232k): stepping
+        // right is capped at model truth and is a silent no-op.
+        assert_eq!(panel.handle_key(ModalKey::Right), ModalOutcome::Ignore);
+        // A larger model window frees the climb to the next detent.
+        panel.snap.model_context_window = Some(1_000_000);
         assert_eq!(
             panel.handle_key(ModalKey::Right),
             ModalOutcome::Emit(ModalAction::SaveSetting {
@@ -4189,6 +4391,37 @@ mod tests {
         assert_eq!(compact_value(1_000_000), "1m");
         assert_eq!(compact_value(3), "3");
         assert_eq!(compact_value(12_500), "12.5k");
+    }
+
+    #[test]
+    fn context_cap_never_displays_or_edits_above_the_model_window() {
+        let mut panel = panel();
+        panel.snap.context_token_budget = 1_000_000;
+        panel.snap.model_context_window = Some(127_808);
+        assert_eq!(panel.snap.dial_value(Field::ContextTokenBudget), 127_808);
+        let rendered = text(&[panel.control_line(
+            &PanelRow::Top(RowId::Field(Field::ContextTokenBudget)),
+            false,
+            100,
+        )]);
+        assert!(rendered.contains("127k tokens"), "{rendered}");
+        assert!(!rendered.contains("1m tokens"), "{rendered}");
+
+        select_top(&mut panel, RowId::Field(Field::ContextTokenBudget));
+        panel.handle_key(ModalKey::Enter);
+        panel.edit.as_mut().expect("numeric edit").buffer = "1000000".to_string();
+        assert_eq!(
+            panel.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::ContextTokenBudget,
+                value: Some("127808".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn native_compaction_description_discloses_the_portable_fallback() {
+        assert!(describe(RowId::Field(Field::CompactionProviderNative)).contains("fall back"),);
     }
 
     // --- entry cursors (§4.1) ---

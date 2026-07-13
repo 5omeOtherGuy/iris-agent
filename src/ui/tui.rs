@@ -7471,7 +7471,7 @@ mod tests {
             faceplate_snapshot(),
             HatchTarget::Scope,
         ))));
-        let rendered = rendered_text(&mut screen, 80, 18);
+        let rendered = rendered_text(&mut screen, 80, 19);
         assert!(
             rendered.contains("SETTINGS"),
             "masthead pinned:\n{rendered}"
@@ -7500,7 +7500,7 @@ mod tests {
             snap,
             HatchTarget::Permissions,
         ))));
-        let rendered = rendered_text(&mut screen, 90, 30);
+        let rendered = rendered_text(&mut screen, 90, 32);
         assert!(
             rendered.contains(crate::ui::symbols::EXPANDED),
             "▾:\n{rendered}"
@@ -7594,6 +7594,7 @@ mod tests {
             compaction_reactive: true,
             compaction_worker_input: "transcript".to_string(),
             resolved_ladder: None,
+            compaction_provider_native: "off".to_string(),
             compaction_summarizer: "subagent".to_string(),
             microcompaction: true,
             microcompaction_watermark: 32_000,
@@ -7601,6 +7602,9 @@ mod tests {
             compaction_cache_timing: "cacheAware".to_string(),
             semantic_retain_per_path: 1,
             tool_clearing_keep_recent: 8,
+            semantic_dedupe_enabled: true,
+            tool_clearing_enabled: false,
+            model_context_window: Some(232_000),
             prompt_cache_retention: "short".to_string(),
             web_search_backend: "off".to_string(),
             read_web_page_backend: "off".to_string(),
@@ -7643,8 +7647,7 @@ mod tests {
         for section in [
             "ENGINE",
             "SAFETY",
-            "AUTO COMPACT",
-            "MEMORY",
+            "COMPACTION",
             "WEB",
             "CHECKS",
             "PANEL",
@@ -7677,7 +7680,7 @@ mod tests {
         // session bar) and the window scrolls with the house position row.
         assert!(rendered.contains("SETTINGS"), "{rendered}");
         assert!(rendered.contains("ENGINE"), "{rendered}");
-        assert!(rendered.contains("(1/42)"), "{rendered}");
+        assert!(rendered.contains("(1/43)"), "{rendered}");
         assert!(!rendered.contains("worktree root"), "windowed:\n{rendered}");
         assert!(rendered.contains("Give Iris a task"), "{rendered}");
     }

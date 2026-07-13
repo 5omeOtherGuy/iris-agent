@@ -466,7 +466,8 @@ fn settings_snapshot<P: ChatProvider>(
     // The dim resolved line reuses the live harness ladder (`/context`
     // diagnostics) resolved against the active model window rather than
     // recomputing the model-aware arithmetic on the panel.
-    let resolved_ladder = harness.context_diagnostics().map(|diag| {
+    let diagnostics = harness.context_diagnostics();
+    let resolved_ladder = diagnostics.as_ref().map(|diag| {
         let ladder = diag.ladder;
         settings_menu::ResolvedLadder {
             warn: ladder.warn,
@@ -477,6 +478,13 @@ fn settings_snapshot<P: ChatProvider>(
             effective_window: ladder.effective_window,
         }
     });
+    // The model's own effective window (pre-clamp), from the same resolved
+    // budget facts /context prints — caps the `context cap` dial at model truth.
+    let model_context_window = diagnostics
+        .as_ref()
+        .and_then(|diag| diag.budget_facts)
+        .and_then(|facts| facts.window)
+        .map(|window| window.effective);
     settings_menu::Snapshot {
         default_model,
         reasoning_levels,
@@ -504,6 +512,10 @@ fn settings_snapshot<P: ChatProvider>(
         compaction_reactive: trigger.reactive,
         compaction_worker_input: worker_input,
         resolved_ladder,
+        compaction_provider_native: match settings.compaction_provider_native() {
+            Ok(crate::config::ProviderNativeMode::Auto) => "auto".to_string(),
+            _ => "off".to_string(),
+        },
         compaction_summarizer: settings
             .compaction_summarizer
             .clone()
@@ -514,6 +526,9 @@ fn settings_snapshot<P: ChatProvider>(
         compaction_cache_timing: compaction.cache_timing.as_str().to_string(),
         semantic_retain_per_path: compaction.semantic_dedupe.retain_per_path,
         tool_clearing_keep_recent: compaction.tool_clearing.keep_recent_tool_uses,
+        semantic_dedupe_enabled: compaction.semantic_dedupe.enabled,
+        tool_clearing_enabled: compaction.tool_clearing.enabled,
+        model_context_window,
         prompt_cache_retention: settings
             .prompt_cache_retention
             .clone()
@@ -702,6 +717,9 @@ fn save_setting_field(
         }
         Field::CompactionSummarizer => {
             config::save_compaction_summarizer(value.unwrap_or("subagent"))
+        }
+        Field::CompactionProviderNative => {
+            config::save_compaction_provider_native(value.unwrap_or("off"))
         }
         Field::Microcompaction => config::save_tool_result_compaction_enabled(parse_bool(value)),
         Field::MicrocompactionWatermark => {
@@ -976,6 +994,13 @@ pub(crate) fn apply_action<P: ChatProvider>(
                         // Summarizer changes affect only the next worker job.
                         if let Ok(settings) = config::Settings::load(harness.workspace()) {
                             harness.set_summarizer(settings.compaction_summarizer());
+                        }
+                    } else if field == settings_menu::Field::CompactionProviderNative {
+                        // Routing changes affect only the next worker job.
+                        if let Ok(settings) = config::Settings::load(harness.workspace())
+                            && let Ok(mode) = settings.compaction_provider_native()
+                        {
+                            harness.set_provider_native(mode == config::ProviderNativeMode::Auto);
                         }
                     } else if field == settings_menu::Field::CompactionWorkerInput {
                         // Worker-input changes affect only the next worker job.
@@ -1350,6 +1375,9 @@ mod tests {
         ));
         assert!(!is_auto_compaction_trigger_field(
             Field::CompactionWorkerInput
+        ));
+        assert!(!is_auto_compaction_trigger_field(
+            Field::CompactionProviderNative
         ));
         // The context cap clamps the window, so it re-resolves the ladder live.
         assert!(is_auto_compaction_trigger_field(Field::ContextTokenBudget));
