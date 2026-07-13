@@ -2582,7 +2582,7 @@ impl Transcript {
                         "Context compacted — {} → {} tokens via {}",
                         super::screen::compact_count(original_tokens_estimate),
                         super::screen::compact_count(summary_tokens_estimate),
-                        origin.as_str(),
+                        origin.display_label(),
                     ),
                 );
             }

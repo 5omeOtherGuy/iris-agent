@@ -623,6 +623,17 @@ impl CompactionOrigin {
             Self::ProviderNative => "providerNative",
         }
     }
+
+    /// Human-facing route name for PROSE surfaces (apply notices, the transcript
+    /// line). Identical to [`as_str`](Self::as_str) except `ProviderNative`
+    /// reads `provider-native` instead of the camelCase `providerNative` that
+    /// the machine-facing `/compaction` inspector and session log keep verbatim.
+    pub(crate) const fn display_label(self) -> &'static str {
+        match self {
+            Self::ProviderNative => "provider-native",
+            _ => self.as_str(),
+        }
+    }
 }
 
 impl CompactionLifecycleState {

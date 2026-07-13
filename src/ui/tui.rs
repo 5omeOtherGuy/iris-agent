@@ -6218,6 +6218,34 @@ mod tests {
         );
     }
 
+    /// The provider-native route reads `provider-native` in this PROSE
+    /// transcript line (via `CompactionOrigin::display_label`), never the
+    /// camelCase `providerNative` the machine-facing `/compaction` inspector and
+    /// session log keep verbatim.
+    #[test]
+    fn compaction_event_names_provider_native_origin_hyphenated() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::CompactionApplied {
+            compaction_id: "c3".to_string(),
+            covered_from: "m1".to_string(),
+            covered_to: "m9".to_string(),
+            covered_messages: 9,
+            original_tokens_estimate: 3_400,
+            summary_tokens_estimate: 442,
+            budget: 80_000,
+            origin: crate::nexus::CompactionOrigin::ProviderNative,
+        });
+        let rendered = rendered_text(&mut screen, 100, 12);
+        assert!(
+            rendered.contains("┊ Context compacted — 3.4k → 442 tokens via provider-native"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("providerNative"),
+            "prose must not leak the camelCase machine label: {rendered}"
+        );
+    }
+
     #[test]
     fn thinking_header_gains_token_telemetry_when_usage_arrives() {
         let mut screen = Screen::new();

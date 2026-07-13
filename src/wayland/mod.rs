@@ -1890,7 +1890,7 @@ impl<P: ChatProvider> Harness<P> {
             );
         }
 
-        match ladder.tier(measurement.tokens) {
+        let relief = match ladder.tier(measurement.tokens) {
             ContextPressureTier::Normal | ContextPressureTier::Warn => Ok(()),
             ContextPressureTier::Start => {
                 if self.compaction.background.is_some() {
@@ -1931,11 +1931,21 @@ impl<P: ChatProvider> Harness<P> {
                 self.resolve_hard_background(obs)?;
                 let current = self.context_measurement(pending_tokens);
                 if ladder.tier(current.tokens) != ContextPressureTier::Hard {
-                    return Ok(());
+                    // A background summary landed inside `resolve_hard_background`
+                    // and already relieved pressure; fall through to the post-
+                    // apply re-emission so the footer drops off Hard.
+                    Ok(())
+                } else {
+                    self.apply_deterministic_ladder(ladder, pending_tokens, obs)
                 }
-                self.apply_deterministic_ladder(ladder, pending_tokens, obs)
             }
-        }
+        };
+        relief?;
+        // After any relief work at this boundary, surface the post-apply tier so
+        // the footer -- and the meter's stalled predicate -- see current reality
+        // rather than the pre-apply tier that triggered relief.
+        self.emit_post_compaction_pressure(pending_tokens, obs);
+        Ok(())
     }
 
     async fn maybe_auto_compact_legacy(
@@ -1996,7 +2006,7 @@ impl<P: ChatProvider> Harness<P> {
         obs.on_event(AgentEvent::Notice(format!(
             "compacted {} earlier message(s) via {} to stay within the {budget}-token context budget.",
             outcome.covered,
-            outcome.origin.as_str(),
+            outcome.origin.display_label(),
         )))
     }
 
@@ -2027,6 +2037,44 @@ impl<P: ChatProvider> Harness<P> {
                     message_count,
                 });
         measure_context(self.agent.messages(), anchor, pending_tokens)
+    }
+
+    /// Re-measure context after compaction work at a turn boundary and surface a
+    /// fresh [`AgentEvent::ContextPressure`], so the footer tier -- and the
+    /// context meter's stalled-pressure predicate that keys off it -- reflect
+    /// POST-apply reality rather than the pre-apply tier that triggered relief.
+    ///
+    /// The pre-turn Hard ladder resolves synchronously and emits its
+    /// `CompactionApplied` before the inner submit emits round-1
+    /// `ProviderTurnStarted`; without this re-emission the footer stayed at the
+    /// stale pre-apply tier for the whole turn, so relief that dropped below
+    /// Hard still read as an unrelieved stall, and cap-exhausted relief could
+    /// not be told apart from it. Routed through the same [`PressureTracker`] as
+    /// the pre-work emit: `crossing()` keeps this to a genuine tier move (relief
+    /// that dropped below Hard lowers the footer; cap-exhausted hard pressure
+    /// produces no event and stays honestly Hard) and keeps the tracker coherent
+    /// for the next boundary's crossing.
+    fn emit_post_compaction_pressure(&mut self, pending_tokens: u64, obs: &dyn AgentObserver) {
+        let Some(ladder) = self.compaction.ladder else {
+            return;
+        };
+        let measurement = self.context_measurement(pending_tokens);
+        if let Some(tier) = self
+            .compaction
+            .pressure
+            .crossing(measurement.tokens, &ladder)
+        {
+            emit_context_event(
+                obs,
+                AgentEvent::ContextPressure {
+                    tier,
+                    measured: measurement.tokens,
+                    effective_window: ladder.effective_window,
+                    source: measurement.source,
+                },
+                "post-compaction context pressure",
+            );
+        }
     }
 
     fn apply_excerpts_plan(
@@ -2250,9 +2298,14 @@ impl<P: ChatProvider> Harness<P> {
                     self.agent.replace_messages(replacement);
                     let (covered, original, origin) =
                         covered.unwrap_or((0, 0, CompactionOrigin::Excerpts));
+                    // Refresh the footer tier post-apply (no pending prompt at a
+                    // manual boundary) so a `/compact` that clears pressure drops
+                    // the meter off Hard, and one that leaves Hard is not wedged
+                    // out of the stall warning (Finding 7).
+                    self.emit_post_compaction_pressure(0, obs);
                     return obs.on_event(AgentEvent::Notice(format!(
                         "compacted {covered} earlier message(s) via {}: ~{original} tokens replaced; context is now ~{after} tokens.",
-                        origin.as_str(),
+                        origin.display_label(),
                     )));
                 }
                 if self.compaction.background.is_none() {
@@ -2270,10 +2323,13 @@ impl<P: ChatProvider> Harness<P> {
         let Some(outcome) = self.compact_range(&messages, plan, obs, token).await? else {
             return obs.on_event(AgentEvent::Notice("compaction cancelled.".to_string()));
         };
+        // Refresh the footer tier post-apply (no pending prompt at a manual
+        // boundary), same rationale as the background-drain branch above.
+        self.emit_post_compaction_pressure(0, obs);
         obs.on_event(AgentEvent::Notice(format!(
             "compacted {} earlier message(s) via {}: ~{} tokens replaced by a ~{}-token summary.",
             outcome.covered,
-            outcome.origin.as_str(),
+            outcome.origin.display_label(),
             outcome.original_tokens,
             outcome.summary_tokens
         )))
