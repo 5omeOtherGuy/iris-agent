@@ -181,6 +181,111 @@ impl OpenAiCodexResponsesProvider {
             .map(|output| output.block)
     }
 
+    /// LIVE capability probe for #475: send one structured-output summary
+    /// request over the real Codex OAuth lane and report whether the lane
+    /// honoured it. Reuses the production token store, headers, endpoint, and
+    /// SSE parser so the wire request matches what the compaction summarizer
+    /// would send. `ProbeMode::Native` sets `text.format` json_schema;
+    /// `ProbeMode::ForcedTool` sends the single forced `emit_compaction_summary`
+    /// tool. Never executes any tool.
+    #[cfg(test)]
+    pub(crate) fn probe_compaction_summary(
+        &self,
+        mode: crate::structured_summary_probe::ProbeMode,
+        cancel: &CancellationToken,
+    ) -> Result<crate::structured_summary_probe::ProbeOutcome> {
+        use crate::structured_summary_probe::{
+            ProbeMode, ProbeOutcome, VIRTUAL_TOOL_NAME, canonical_compaction_schema, toy_transcript,
+        };
+        let lane = format!("openai-codex/{}", self.model);
+        let messages = vec![Message::user(&toy_transcript())];
+        let mut request = build_codex_request(
+            &self.model,
+            &self.system_prompt,
+            &messages,
+            &Tools::new(Vec::new()),
+            None,
+            None,
+            None,
+            self.cache_retention,
+        );
+        // NOTE: the ChatGPT backend-api `/codex/responses` lane rejects
+        // `max_output_tokens` (`400 Unsupported parameter`), unlike the OpenAI
+        // platform Responses API that #475 modeled. Production `build_codex_request`
+        // never sends it, so the probe follows production and omits it.
+        match mode {
+            ProbeMode::Native => {
+                request["tools"] = json!([]);
+                request["text"] = json!({
+                    "verbosity": "low",
+                    "format": {
+                        "type": "json_schema",
+                        "name": "compaction_summary",
+                        "strict": true,
+                        "schema": canonical_compaction_schema(),
+                    }
+                });
+            }
+            ProbeMode::ForcedTool => {
+                request["tools"] = json!([{
+                    "type": "function",
+                    "name": VIRTUAL_TOOL_NAME,
+                    "description": "Return the compaction summary.",
+                    "parameters": canonical_compaction_schema(),
+                    "strict": true,
+                }]);
+                request["tool_choice"] = json!({ "type": "function", "name": VIRTUAL_TOOL_NAME });
+            }
+        }
+
+        let token = self.tokens.access_token(&self.client)?;
+        let response = self
+            .client
+            .post(resolve_codex_url(&self.base_url)?)
+            .headers(codex_headers(&token)?)
+            .json(&request)
+            .send()
+            .context("failed to send Codex structured-summary probe")?;
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        if !status.is_success() {
+            let error_type =
+                extract_error_field(&body, "type").or_else(|| extract_error_field(&body, "code"));
+            let error_message = extract_error_field(&body, "message");
+            return Ok(ProbeOutcome::rejected(
+                lane,
+                &self.model,
+                mode,
+                status.as_u16(),
+                error_type,
+                error_message,
+                &body,
+            ));
+        }
+        let turn = parse_response_stream(&body)?;
+        let summary = match mode {
+            ProbeMode::Native => turn
+                .text
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .and_then(|text| serde_json::from_str::<Value>(text).ok()),
+            ProbeMode::ForcedTool => turn
+                .tool_calls
+                .iter()
+                .find(|call| call.name == VIRTUAL_TOOL_NAME)
+                .map(|call| call.arguments.clone()),
+        };
+        let _ = cancel;
+        Ok(ProbeOutcome::succeeded(
+            lane,
+            &self.model,
+            mode,
+            status.as_u16(),
+            summary,
+        ))
+    }
+
     fn compact_context_blocking(
         &self,
         messages: &[Message],

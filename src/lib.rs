@@ -34,6 +34,9 @@ mod tools;
 mod ui;
 mod wayland;
 
+#[cfg(test)]
+mod structured_summary_probe;
+
 pub mod harness;
 
 /// Binary entry point, exposed on the library so the thin `src/main.rs` shim

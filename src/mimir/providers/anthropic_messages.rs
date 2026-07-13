@@ -160,6 +160,155 @@ impl AnthropicProvider {
             retry_policy,
         })
     }
+
+    /// LIVE capability probe for #475: send one structured-output summary
+    /// request over the real Anthropic Messages OAuth lane and report whether
+    /// the lane honoured it. Reuses the production token store, OAuth/beta
+    /// headers, endpoint, and request builder so the wire request matches what
+    /// the compaction summarizer would send. `ProbeMode::Native` sets
+    /// `output_config.format` json_schema; `ProbeMode::ForcedTool` sends the
+    /// single forced `emit_compaction_summary` tool. Never executes any tool.
+    #[cfg(test)]
+    pub(crate) fn probe_compaction_summary(
+        &self,
+        mode: crate::structured_summary_probe::ProbeMode,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<crate::structured_summary_probe::ProbeOutcome> {
+        use crate::structured_summary_probe::{
+            ProbeMode, ProbeOutcome, VIRTUAL_TOOL_NAME, canonical_compaction_schema,
+            collect_anthropic_sse, toy_transcript,
+        };
+        let lane = format!("anthropic/{}", self.model);
+        let messages = vec![Message::user(&toy_transcript())];
+        let mut request = build_anthropic_request(
+            &self.model,
+            &self.system_prompt,
+            &messages,
+            &Tools::new(Vec::new()),
+            None,
+            self.cache_retention,
+            &self.context_management,
+        );
+        request["max_tokens"] = json!(2048);
+        match mode {
+            ProbeMode::Native => {
+                request["tools"] = json!([]);
+                // No adaptive effort was requested (reasoning=None), so no
+                // `output_config` exists yet; merge `format` into whatever is
+                // present, preserving `effort` per #475.
+                if let Some(config) = request
+                    .get_mut("output_config")
+                    .and_then(Value::as_object_mut)
+                {
+                    config.insert(
+                        "format".to_string(),
+                        json!({ "type": "json_schema", "schema": canonical_compaction_schema() }),
+                    );
+                } else {
+                    request["output_config"] = json!({
+                        "format": { "type": "json_schema", "schema": canonical_compaction_schema() }
+                    });
+                }
+            }
+            ProbeMode::ForcedTool => {
+                request["tools"] = json!([{
+                    "name": VIRTUAL_TOOL_NAME,
+                    "description": "Return the compaction summary.",
+                    "input_schema": canonical_compaction_schema(),
+                    "strict": true,
+                }]);
+                request["tool_choice"] = json!({ "type": "tool", "name": VIRTUAL_TOOL_NAME });
+            }
+        }
+
+        let auth = match &self.auth {
+            AnthropicAuthSource::OAuth(tokens) => {
+                AnthropicAuth::OAuthBearer(tokens.access_token(&self.client)?)
+            }
+            AnthropicAuthSource::ApiKey(key) => AnthropicAuth::ApiKey(key.clone()),
+        };
+        let headers = anthropic_headers_for_auth(&auth, &request)?;
+        let url = format!("{}{ENDPOINT_PATH}", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .map_err(|error| {
+                anyhow!("failed to send Anthropic structured-summary probe: {error}")
+            })?;
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        if !status.is_success() {
+            let parsed = serde_json::from_str::<Value>(&body).ok();
+            let error = parsed
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .cloned();
+            let error_type = error
+                .as_ref()
+                .and_then(|error| error.get("type"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let error_message = error
+                .as_ref()
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            return Ok(ProbeOutcome::rejected(
+                lane,
+                &self.model,
+                mode,
+                status.as_u16(),
+                error_type,
+                error_message,
+                &body,
+            ));
+        }
+        let parts = collect_anthropic_sse(&body);
+        if let Some(error) = parts.stream_error {
+            let error_type = error
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let error_message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            return Ok(ProbeOutcome::rejected(
+                lane,
+                &self.model,
+                mode,
+                status.as_u16(),
+                error_type,
+                error_message,
+                &body,
+            ));
+        }
+        let summary = match mode {
+            ProbeMode::Native => {
+                let text = parts.text.trim();
+                (!text.is_empty())
+                    .then(|| serde_json::from_str::<Value>(text).ok())
+                    .flatten()
+            }
+            ProbeMode::ForcedTool => {
+                let json = parts.tool_json.trim();
+                (!json.is_empty())
+                    .then(|| serde_json::from_str::<Value>(json).ok())
+                    .flatten()
+            }
+        };
+        let _ = cancel;
+        Ok(ProbeOutcome::succeeded(
+            lane,
+            &self.model,
+            mode,
+            status.as_u16(),
+            summary,
+        ))
+    }
 }
 
 fn resolve_anthropic_auth() -> Result<AnthropicAuthSource> {
