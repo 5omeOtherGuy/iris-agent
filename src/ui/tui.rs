@@ -8471,42 +8471,30 @@ mod tests {
     // --- reactive density: the prose measure (spec §3) ---
 
     #[test]
-    fn prose_wraps_at_the_measure_while_code_keeps_full_width() {
-        // Criterion 3: on a 200-column pane an assistant paragraph rags at the
-        // 96-column measure (+ text-column indent) while a wide code fence in the
-        // SAME message keeps the full pane width (mechanical never reflows).
+    fn assistant_and_user_messages_use_the_available_pane_width() {
         let mut screen = Screen::new();
         screen.start_turn();
         let _ = rendered_lines(&mut screen, 200, 40);
-        let para = "lorem ".repeat(40); // ~240 cols, spaces let it wrap freely
-        let code_line = format!("XCODE{}", "x".repeat(120)); // 125 cols
-        let md = format!("{para}\n\n```\n{code_line}\n```");
-        screen.apply(UiEvent::AssistantText(md));
+        screen.apply(UiEvent::UserMessage("USERWORD ".repeat(30)));
+        screen.apply(UiEvent::AssistantText("ASSISTANTWORD ".repeat(24)));
         let lines: Vec<String> = rendered_lines(&mut screen, 200, 40)
             .iter()
             .map(line_text)
             .collect();
-        let prose: Vec<&String> = lines.iter().filter(|l| l.contains("lorem")).collect();
-        assert!(
-            prose.len() >= 2,
-            "paragraph should wrap to several rows: {lines:?}"
-        );
-        for row in &prose {
+
+        for (needle, role) in [("USERWORD", "user"), ("ASSISTANTWORD", "assistant")] {
+            let widest = lines
+                .iter()
+                .filter(|line| line.contains(needle))
+                .map(|line| display_width(line))
+                .max()
+                .unwrap_or_else(|| panic!("missing {role} message: {lines:?}"));
             assert!(
-                row.chars().count() <= PROSE_MEASURE + TEXT_COLUMN_X_PADDING,
-                "prose row exceeds the measure ({} cols): {row:?}",
-                row.chars().count()
+                widest > 96 + TEXT_COLUMN_X_PADDING,
+                "{role} message stayed capped at the old prose measure: {lines:?}"
             );
+            assert!(widest <= 200, "{role} message overflowed the pane: {lines:?}");
         }
-        let code = lines
-            .iter()
-            .find(|l| l.contains(&code_line))
-            .unwrap_or_else(|| panic!("wide code line not intact: {lines:?}"));
-        assert!(
-            code.chars().count() > PROSE_MEASURE,
-            "code row should exceed the measure ({} cols)",
-            code.chars().count()
-        );
     }
 
     #[test]
