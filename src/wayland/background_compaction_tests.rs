@@ -206,6 +206,34 @@ impl Recorder {
             _ => None,
         })
     }
+
+    /// Every `AgentEvent::ContextPressure` tier recorded, in order. Used to
+    /// check the runtime re-emits a fresh post-apply tier so the footer (and the
+    /// meter's stalled predicate) never idles on the stale pre-apply tier
+    /// (Findings 6/7).
+    fn pressures(&self) -> Vec<ContextPressureTier> {
+        self.events
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ContextPressure { tier, .. } => Some(*tier),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every plain `AgentEvent::Notice` text recorded, in order. Used to check
+    /// the user-visible apply notice names its route (audit F11c/F20).
+    fn notices(&self) -> Vec<String> {
+        self.events
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -1431,6 +1459,14 @@ fn manual_compact_uses_worker_pipeline_and_records_focus() {
     assert_eq!(
         entries[0]["instructions"],
         "Manual focus: preserve the exact flag"
+    );
+    // Audit F11c/F20: the apply notice names the route (here `subagent`, since
+    // `set_summarizer(SummarizerKind::Subagent)` above selects it) instead of
+    // leaving it discoverable only via `/compaction`.
+    let notices = obs.notices();
+    assert!(
+        notices.iter().any(|text| text.contains("via subagent")),
+        "{notices:?}"
     );
 }
 
@@ -2722,5 +2758,168 @@ fn hard_apply_survives_cancellation_racing_after_the_durable_mutation() {
     assert_eq!(
         live_json, rebuilt_json,
         "live context and resume rebuild diverged after post-apply cancellation"
+    );
+}
+
+/// A persisted multi-turn transcript parked at hard pressure at a safe TURN
+/// BOUNDARY (no open turn), summarized deterministically with excerpts so a
+/// pre-turn `maybe_auto_compact` relieves synchronously via the hard ladder.
+/// `hard` sets the hard threshold directly: a small value makes the seeded
+/// content Hard, and `hard = 1` forces a cap-exhausted transcript that stays
+/// Hard no matter how much the ladder excerpts.
+fn hard_boundary_excerpts_harness(
+    root: &Path,
+    workspace: &Path,
+    hard: u64,
+) -> (Harness<SilentProvider>, PathBuf) {
+    let mut log = SessionLog::create_in(root, workspace).unwrap();
+    let big = format!("{OLD_NEEDLE} :: {}", "long covered context. ".repeat(500));
+    let second = format!("second covered turn {}", "with more content ".repeat(80));
+    for message in [
+        Message::user(&big),
+        Message::assistant("ok"),
+        Message::user(&second),
+        Message::assistant("ok2"),
+        Message::user("small retained turn"),
+        Message::assistant("ok3"),
+    ] {
+        log.append(&message).unwrap();
+    }
+    let path = log.path().to_path_buf();
+    drop(log);
+
+    let store = SessionStore::with_root(root.to_path_buf());
+    let meta = store
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|m| m.path == path)
+        .unwrap();
+    let stored = store.open(&meta).unwrap();
+    let log = SessionLog::resume(&path).unwrap();
+    let agent = Agent::resumed(SilentProvider, built_in_tools(), stored.messages);
+    let mut harness = Harness::resumed(
+        agent,
+        workspace.to_path_buf(),
+        ToolState::new(),
+        Some(log),
+        stored.entry_ids,
+        Some(131_072),
+    );
+    harness.set_compaction_trigger(
+        131_072.into(),
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.85,
+            keep_recent_tokens: 200,
+            hard_wait_ms: 20,
+            max_consecutive_failures: 3,
+            reactive: true,
+        },
+    );
+    harness.set_summarizer(SummarizerKind::Excerpts);
+    let ladder = harness.compaction.ladder.as_mut().unwrap();
+    ladder.warn = (hard / 2).max(1);
+    ladder.start = (hard * 3 / 4).max(1);
+    ladder.hard = hard;
+    ladder.keep_recent_tokens = 200;
+    // Pure deterministic excerpts: no background worker, so the hard ladder
+    // applies synchronously on this thread and the post-apply re-emission is
+    // observable in one `maybe_auto_compact` call.
+    ladder.deterministic_only = true;
+    (harness, path)
+}
+
+/// Finding 6 precondition: a pre-turn hard auto-compaction that RELIEVES
+/// pressure must re-emit a fresh sub-Hard `ContextPressure` after applying, so
+/// the footer drops off Hard within the same turn instead of idling on the
+/// stale pre-apply tier that triggered relief.
+#[test]
+fn pre_turn_hard_relief_reemits_fresh_subhard_pressure() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let (mut harness, _path) = hard_boundary_excerpts_harness(&root.path, &workspace.path, 1_500);
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    block_on(harness.maybe_auto_compact(&obs, &token, false)).unwrap();
+
+    assert!(obs.applied() >= 1, "the hard ladder must apply excerpts");
+    let pressures = obs.pressures();
+    assert_eq!(
+        pressures.first(),
+        Some(&ContextPressureTier::Hard),
+        "the pre-apply emit must report hard pressure: {pressures:?}"
+    );
+    assert!(
+        pressures
+            .iter()
+            .any(|tier| !matches!(tier, ContextPressureTier::Hard)),
+        "relief must re-emit a fresh sub-hard tier post-apply: {pressures:?}"
+    );
+    assert!(
+        super::context_tokens(harness.messages()) < 1_500,
+        "measured context must actually drop below the hard threshold"
+    );
+}
+
+/// Finding 6 honest case: a pre-turn hard auto-compaction that APPLIES but does
+/// NOT clear hard pressure (cap-exhausted) must NOT re-emit a sub-Hard tier --
+/// the footer stays honestly at Hard so the meter's stall warning is truthful.
+#[test]
+fn pre_turn_cap_exhausted_hard_pressure_never_reemits_below_hard() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    // hard = 1: any non-empty context reads Hard, so the ladder can excerpt but
+    // never drop the tier.
+    let (mut harness, _path) = hard_boundary_excerpts_harness(&root.path, &workspace.path, 1);
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    block_on(harness.maybe_auto_compact(&obs, &token, false)).unwrap();
+
+    assert!(
+        obs.applied() >= 1,
+        "the hard ladder must still apply excerpts"
+    );
+    let pressures = obs.pressures();
+    assert!(
+        !pressures.is_empty()
+            && pressures
+                .iter()
+                .all(|tier| matches!(tier, ContextPressureTier::Hard)),
+        "cap-exhausted hard pressure must stay Hard with no sub-hard re-emission: {pressures:?}"
+    );
+}
+
+/// Finding 7 precondition: a manual `/compact` that CLEARS pressure re-emits a
+/// fresh sub-Hard `ContextPressure` after applying (no provider turn is
+/// involved), so the meter drops off Hard.
+#[test]
+fn manual_compact_clearing_pressure_reemits_fresh_subhard_pressure() {
+    let root = temp_dir();
+    let workspace = temp_dir();
+    let (mut harness, _path) = hard_boundary_excerpts_harness(&root.path, &workspace.path, 1_500);
+    let obs = Recorder::default();
+    let token = CancellationToken::new();
+
+    // Prime the pressure tracker at Hard the way a live session would (an
+    // earlier boundary already crossed up), so the manual clear registers as a
+    // downward crossing.
+    let measured = super::context_tokens(harness.messages());
+    let ladder = harness.compaction.ladder.unwrap();
+    let _ = harness.compaction.pressure.crossing(measured, &ladder);
+
+    block_on(harness.compact_now(&obs, &token)).unwrap();
+
+    assert!(obs.applied() >= 1, "manual compaction must apply");
+    let pressures = obs.pressures();
+    assert!(
+        pressures
+            .iter()
+            .any(|tier| !matches!(tier, ContextPressureTier::Hard)),
+        "a clearing /compact must re-emit a fresh sub-hard tier: {pressures:?}"
     );
 }

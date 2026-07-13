@@ -3,8 +3,9 @@ use std::cell::RefCell;
 use anyhow::Result;
 
 use crate::nexus::{
-    AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, InteractionFuture,
-    InteractionOutcome, ProviderUsage, ReviewContext, ToolCall, VerificationOutcome,
+    AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, CompactionOrigin,
+    InteractionFuture, InteractionOutcome, ProviderUsage, ReviewContext, ToolCall,
+    VerificationOutcome,
 };
 
 /// Maximum characters of failing verification output carried into a notice, so
@@ -192,6 +193,10 @@ pub(crate) enum UiEvent {
         original_tokens_estimate: u64,
         summary_tokens_estimate: u64,
         budget: u64,
+        /// Summary source (provider / subagent / excerpts / provider-native),
+        /// so the apply-time notice can name the route inline instead of
+        /// leaving it discoverable only via `/compaction`.
+        origin: CompactionOrigin,
     },
     CompactionLifecycle {
         job_id: String,
@@ -395,7 +400,12 @@ impl UiEvent {
                 // Carry count (ADR-0044) is event/benchmark instrumentation, not
                 // a display field; drop it in the display mapping too.
                 carried_paths: _,
-                origin: _,
+                origin,
+                // Realized summarizer usage is instrumentation surfaced today
+                // only via the pull-based `/compaction` inspector; the apply
+                // notice shows `origin` (the must-have route) without also
+                // duplicating token accounting the notice already reports via
+                // `original_tokens_estimate`/`summary_tokens_estimate`.
                 worker_usage: _,
             } => UiEvent::CompactionApplied {
                 compaction_id,
@@ -405,6 +415,7 @@ impl UiEvent {
                 original_tokens_estimate,
                 summary_tokens_estimate,
                 budget,
+                origin,
             },
             AgentEvent::CompactionLifecycle {
                 job_id,
@@ -657,6 +668,50 @@ mod tests {
                 chunk: "partial output".to_string(),
             }
         );
+    }
+
+    /// Audit F11c/F20: `AgentEvent::CompactionApplied` carries `origin`, but the
+    /// conversion used to drop it (`origin: _`). Each accepted origin must
+    /// survive the conversion so the apply notice/transcript line can name the
+    /// route (provider / subagent / excerpts / provider-native) instead of
+    /// leaving it discoverable only via the pull-based `/compaction` inspector.
+    #[test]
+    fn maps_compaction_applied_preserving_origin() {
+        for origin in [
+            CompactionOrigin::Provider,
+            CompactionOrigin::Subagent,
+            CompactionOrigin::Excerpts,
+            CompactionOrigin::ProviderNative,
+        ] {
+            let mapped = UiEvent::from_agent_event(AgentEvent::CompactionApplied {
+                compaction_id: "c1".to_string(),
+                covered_from: "m1".to_string(),
+                covered_to: "m9".to_string(),
+                covered_messages: 9,
+                original_tokens_estimate: 3_400,
+                summary_tokens_estimate: 442,
+                context_tokens_after_apply: 107_231,
+                budget: 80_000,
+                generation: 1,
+                carried_paths: 0,
+                origin,
+                worker_usage: None,
+            });
+            assert_eq!(
+                mapped,
+                UiEvent::CompactionApplied {
+                    compaction_id: "c1".to_string(),
+                    covered_from: "m1".to_string(),
+                    covered_to: "m9".to_string(),
+                    covered_messages: 9,
+                    original_tokens_estimate: 3_400,
+                    summary_tokens_estimate: 442,
+                    budget: 80_000,
+                    origin,
+                },
+                "origin {origin:?} must survive the AgentEvent -> UiEvent conversion"
+            );
+        }
     }
 
     #[test]

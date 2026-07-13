@@ -2566,18 +2566,23 @@ impl Transcript {
             UiEvent::CompactionApplied {
                 original_tokens_estimate,
                 summary_tokens_estimate,
+                origin,
                 ..
             } => {
                 // A runtime event, not the assistant speaking: a quiet `┊` info
-                // notice with honest (runtime-measured) token counts.
+                // notice with honest (runtime-measured) token counts. The
+                // route (provider/subagent/excerpts/provider-native) rides
+                // inline (audit F11c/F20) instead of being visible only via
+                // the pull-based `/compaction` inspector.
                 self.finish_stream();
                 self.push_notice_row(
                     crate::ui::symbols::SEP,
                     dim_style(),
                     &format!(
-                        "Context compacted — {} → {} tokens",
+                        "Context compacted — {} → {} tokens via {}",
                         super::screen::compact_count(original_tokens_estimate),
                         super::screen::compact_count(summary_tokens_estimate),
+                        origin.display_label(),
                     ),
                 );
             }

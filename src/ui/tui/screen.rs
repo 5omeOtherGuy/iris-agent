@@ -2476,6 +2476,27 @@ pub(super) fn filler_lines(screen: &Screen, filler_rows: usize, width: u16) -> V
     lines
 }
 
+/// Whether the context meter should show the "pressure without relief"
+/// warning (audit F20): the current context tier is at or over the hard
+/// pressure threshold (`ContextPressureTier::Hard`, computed by the runtime —
+/// no threshold math here) while no background compaction is relieving it.
+///
+/// This keys purely off the LATEST runtime tier, not any turn-scoped "a
+/// compaction landed this turn" flag. The runtime re-emits `ContextPressure`
+/// after every apply (see `Harness::emit_post_compaction_pressure`), so relief
+/// that dropped the tier lowers `tier` here and clears the warning on its own,
+/// while relief that did NOT clear hard pressure (cap-exhausted, compaction
+/// disabled, breaker tripped) leaves `tier` honestly at `Hard` and the warning
+/// stands. A turn flag was wrong twice: the pre-turn Hard auto-compaction lands
+/// its `CompactionApplied` in the same event burst as round-1's
+/// `ProviderTurnStarted`, which reset it; and a manual `/compact` (no provider
+/// turn) never reset it, wedging the warning off while the user idled. Keying
+/// off the fresh tier avoids both. Ordinary hard pressure a background job is
+/// actively relieving is not a stall and does not warn.
+fn context_meter_stalled(tier: ContextPressureTier, compaction_running: bool) -> bool {
+    matches!(tier, ContextPressureTier::Hard) && !compaction_running
+}
+
 /// Number of dots in the top-frame context meter; each dot is ~10% usage.
 const CONTEXT_METER_DOTS: u64 = 10;
 
@@ -2773,12 +2794,15 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
 
     // The context readout, fullest form first: used/cap + meter, then used/cap,
     // then used alone, then nothing.
+    let stalled = context_meter_stalled(footer.context_pressure, screen.compaction_running);
     let ctx_spans = |with_cap: bool, with_meter: bool| -> Vec<Span<'static>> {
         let pressure = !matches!(footer.context_pressure, ContextPressureTier::Normal);
         let mut spans = vec![
             Span::styled(
                 if pressure { "CTX! " } else { "CTX " }.to_string(),
-                if pressure {
+                if stalled {
+                    err_style()
+                } else if pressure {
                     border_style()
                 } else {
                     dim_style()
@@ -2801,6 +2825,14 @@ pub(super) fn session_bar(screen: &Screen, width: u16) -> Option<Line<'static>> 
                 screen.detents.meter > 0,
                 exhale_top,
             ));
+        }
+        // Pressure without relief (audit F20): no background job running and
+        // nothing applied this turn to bring the hard tier down. A short
+        // suffix names the stall instead of leaving hard pressure that reads
+        // identically to hard pressure a job is already resolving.
+        if stalled {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled("stalled", err_style()));
         }
         spans
     };
@@ -3547,8 +3579,8 @@ mod tests {
     use super::{
         ApprovalPolicy, CONTEXT_METER_DOTS, FLASH_TICKS, FLOW_FULL_SCALE, FLOW_PEAK_HOLD_TICKS,
         FLOW_QUANTA, FlowMeter, Screen, Spinner, SwitchCacheStatus, SwitchStatus,
-        composer_statusline, context_meter_filled, dim_style, display_width, flow_level, line_text,
-        prompt_style, session_bar, switch_status_line, truncate_cwd_middle,
+        composer_statusline, context_meter_filled, context_meter_stalled, dim_style, display_width,
+        flow_level, line_text, prompt_style, session_bar, switch_status_line, truncate_cwd_middle,
         working_indicator_line_with_activity,
     };
     use crate::nexus::{ContextPressureTier, ToolCall};
@@ -3662,6 +3694,7 @@ mod tests {
             original_tokens_estimate: original,
             summary_tokens_estimate: summary,
             budget: 4096,
+            origin: crate::nexus::CompactionOrigin::Provider,
         }
     }
 
@@ -4583,6 +4616,157 @@ mod tests {
         assert!(!bar.contains("CTX!"), "{bar:?}");
     }
 
+    /// Audit F20: the meter's stalled-pressure predicate is pure state
+    /// selection, deterministically testable without rendering anything.
+    #[test]
+    fn context_meter_stalled_predicate_selects_state_correctly() {
+        // Over hard threshold with no background job relieving it: warn. The
+        // runtime keeps `tier` fresh post-apply, so a `Hard` reading here is a
+        // genuine unrelieved stall (cap-exhausted, compaction disabled, breaker
+        // tripped), not a stale pre-apply tier.
+        assert!(context_meter_stalled(ContextPressureTier::Hard, false));
+        // Over hard, but a background job is actively relieving it: no warning.
+        assert!(!context_meter_stalled(ContextPressureTier::Hard, true));
+        // Under the hard tier: never a stall, regardless of job state. Relief
+        // that dropped the tier shows up here as a sub-`Hard` reading.
+        assert!(!context_meter_stalled(ContextPressureTier::Normal, false));
+        assert!(!context_meter_stalled(ContextPressureTier::Warn, false));
+        assert!(!context_meter_stalled(ContextPressureTier::Start, false));
+    }
+
+    #[test]
+    fn session_bar_shows_stalled_when_hard_pressure_has_no_relief() {
+        let mut screen = footer_screen("~/repo");
+        screen.apply(UiEvent::ContextPressure {
+            tier: ContextPressureTier::Hard,
+            measured: 280_000,
+            effective_window: 300_000,
+            source: crate::nexus::ContextMeasurementSource::Estimated,
+        });
+        let bar = bar_text(&screen, 100);
+        assert!(bar.contains("CTX! 280k"), "{bar:?}");
+        assert!(bar.contains("stalled"), "{bar:?}");
+    }
+
+    #[test]
+    fn session_bar_omits_stalled_while_a_compaction_job_is_running() {
+        let mut screen = footer_screen("~/repo");
+        screen.apply(UiEvent::ContextPressure {
+            tier: ContextPressureTier::Hard,
+            measured: 280_000,
+            effective_window: 300_000,
+            source: crate::nexus::ContextMeasurementSource::Estimated,
+        });
+        screen.set_compaction_running(true);
+        let bar = bar_text(&screen, 100);
+        assert!(bar.contains("CTX! 280k"), "{bar:?}");
+        assert!(!bar.contains("stalled"), "{bar:?}");
+    }
+
+    /// Acceptance trace 1: a pre-turn Hard auto-compaction that RELIEVES
+    /// pressure. The runtime lands `CompactionApplied` and then a fresh
+    /// sub-Hard `ContextPressure` (its post-apply re-emission), all in the same
+    /// event burst as round-1's `ProviderTurnStarted`. The meter must NOT read
+    /// stalled during that turn: the fresh tier dropped below Hard.
+    #[test]
+    fn session_bar_omits_stalled_when_pre_turn_hard_compaction_relieves() {
+        let mut screen = footer_screen("~/repo");
+        // Top-of-turn pressure emission at the pre-compaction measurement.
+        screen.apply(UiEvent::ContextPressure {
+            tier: ContextPressureTier::Hard,
+            measured: 280_000,
+            effective_window: 300_000,
+            source: crate::nexus::ContextMeasurementSource::Estimated,
+        });
+        // Synchronous pre-turn ladder applies, then the runtime re-measures and
+        // re-emits the relieved tier BEFORE round-1's ProviderTurnStarted.
+        screen.apply(compaction(100_000, 10_000));
+        screen.apply(UiEvent::ContextPressure {
+            tier: ContextPressureTier::Normal,
+            measured: 120_000,
+            effective_window: 300_000,
+            source: crate::nexus::ContextMeasurementSource::Estimated,
+        });
+        // Round 1 of the SAME turn opens. The old turn-flag reset fired here and
+        // would have been harmless, but keying off the fresh tier is what makes
+        // this correct: pressure is genuinely relieved.
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "turn_1".to_string(),
+        });
+        let bar = bar_text(&screen, 100);
+        assert!(!bar.contains("stalled"), "{bar:?}");
+    }
+
+    /// Acceptance trace 2 (Finding 6 correction): a pre-turn Hard auto-
+    /// compaction that APPLIES but does NOT relieve (cap-exhausted). No sub-Hard
+    /// re-emission follows, and round-1's `ProviderTurnStarted` arrives in the
+    /// same burst as the `CompactionApplied`. The meter MUST read stalled: the
+    /// fresh tier is still Hard and nothing is in flight. The prior test keyed
+    /// this off a different turn_id and accidentally validated the broken
+    /// ordering; this models the real same-turn sequence.
+    #[test]
+    fn session_bar_shows_stalled_when_pre_turn_hard_compaction_does_not_relieve() {
+        let mut screen = footer_screen("~/repo");
+        screen.apply(UiEvent::ContextPressure {
+            tier: ContextPressureTier::Hard,
+            measured: 280_000,
+            effective_window: 300_000,
+            source: crate::nexus::ContextMeasurementSource::Estimated,
+        });
+        // A compaction landed but pressure is still Hard: the runtime re-measure
+        // stays at Hard, so no fresh sub-Hard ContextPressure is emitted.
+        screen.apply(compaction(100_000, 90_000));
+        // Round 1 of the SAME turn opens right after the applied compaction.
+        screen.apply(UiEvent::ProviderTurnStarted {
+            turn_id: "turn_1".to_string(),
+        });
+        let bar = bar_text(&screen, 100);
+        assert!(bar.contains("stalled"), "{bar:?}");
+    }
+
+    /// Acceptance trace 3 (Finding 7): a manual `/compact` that APPLIES but
+    /// leaves pressure Hard, then the user idles. `/compact` emits no provider
+    /// turn, so the old "applied this turn" flag latched true forever and wedged
+    /// the warning off. Keying off the fresh tier, the meter MUST read stalled.
+    #[test]
+    fn session_bar_shows_stalled_after_manual_compact_leaves_hard_pressure() {
+        let mut screen = footer_screen("~/repo");
+        screen.apply(UiEvent::ContextPressure {
+            tier: ContextPressureTier::Hard,
+            measured: 280_000,
+            effective_window: 300_000,
+            source: crate::nexus::ContextMeasurementSource::Estimated,
+        });
+        // Manual compaction lands but does not clear Hard; no provider turn and
+        // no sub-Hard re-emission follow while the user idles.
+        screen.apply(compaction(100_000, 90_000));
+        let bar = bar_text(&screen, 100);
+        assert!(bar.contains("stalled"), "{bar:?}");
+    }
+
+    /// Acceptance trace 4: a manual `/compact` that CLEARS pressure. The runtime
+    /// re-emits a sub-Hard `ContextPressure` after applying. The meter must not
+    /// read stalled.
+    #[test]
+    fn session_bar_omits_stalled_after_manual_compact_clears_pressure() {
+        let mut screen = footer_screen("~/repo");
+        screen.apply(UiEvent::ContextPressure {
+            tier: ContextPressureTier::Hard,
+            measured: 280_000,
+            effective_window: 300_000,
+            source: crate::nexus::ContextMeasurementSource::Estimated,
+        });
+        screen.apply(compaction(100_000, 10_000));
+        screen.apply(UiEvent::ContextPressure {
+            tier: ContextPressureTier::Normal,
+            measured: 90_000,
+            effective_window: 300_000,
+            source: crate::nexus::ContextMeasurementSource::Estimated,
+        });
+        let bar = bar_text(&screen, 100);
+        assert!(!bar.contains("stalled"), "{bar:?}");
+    }
+
     #[test]
     fn session_bar_task_badge_degrades_to_count_then_follows_drop_order() {
         // ADR-0031 Unit 2: an unsettled Iris task shows an explicit badge
@@ -5235,6 +5419,7 @@ mod tests {
             original_tokens_estimate: 40_000,
             summary_tokens_estimate: 4_000,
             budget: 80_000,
+            origin: crate::nexus::CompactionOrigin::Provider,
         });
         screen.apply(UiEvent::ProviderTurnCompleted {
             turn_id: "turn_1".to_string(),

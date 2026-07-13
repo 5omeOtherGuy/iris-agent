@@ -6184,14 +6184,66 @@ mod tests {
             original_tokens_estimate: 128_000,
             summary_tokens_estimate: 41_000,
             budget: 300_000,
+            origin: crate::nexus::CompactionOrigin::Subagent,
         });
         let rendered = rendered_text(&mut screen, 100, 12);
         assert!(
-            rendered.contains("┊ Context compacted — 128k → 41k tokens"),
+            rendered.contains("┊ Context compacted — 128k → 41k tokens via subagent"),
             "{rendered}"
         );
         // No undo keybind exists, so no undo hint is asserted into the UI.
         assert!(!rendered.contains("ctrl+r"), "{rendered}");
+    }
+
+    /// Audit F11c/F20: the route must name itself for every origin, not just
+    /// one -- covers a second origin (`provider`) alongside the `subagent`
+    /// case above so the transcript line is not accidentally hardcoded.
+    #[test]
+    fn compaction_event_names_provider_origin() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::CompactionApplied {
+            compaction_id: "c2".to_string(),
+            covered_from: "m1".to_string(),
+            covered_to: "m5".to_string(),
+            covered_messages: 5,
+            original_tokens_estimate: 3_400,
+            summary_tokens_estimate: 442,
+            budget: 80_000,
+            origin: crate::nexus::CompactionOrigin::Provider,
+        });
+        let rendered = rendered_text(&mut screen, 100, 12);
+        assert!(
+            rendered.contains("┊ Context compacted — 3.4k → 442 tokens via provider"),
+            "{rendered}"
+        );
+    }
+
+    /// The provider-native route reads `provider-native` in this PROSE
+    /// transcript line (via `CompactionOrigin::display_label`), never the
+    /// camelCase `providerNative` the machine-facing `/compaction` inspector and
+    /// session log keep verbatim.
+    #[test]
+    fn compaction_event_names_provider_native_origin_hyphenated() {
+        let mut screen = Screen::new();
+        screen.apply(UiEvent::CompactionApplied {
+            compaction_id: "c3".to_string(),
+            covered_from: "m1".to_string(),
+            covered_to: "m9".to_string(),
+            covered_messages: 9,
+            original_tokens_estimate: 3_400,
+            summary_tokens_estimate: 442,
+            budget: 80_000,
+            origin: crate::nexus::CompactionOrigin::ProviderNative,
+        });
+        let rendered = rendered_text(&mut screen, 100, 12);
+        assert!(
+            rendered.contains("┊ Context compacted — 3.4k → 442 tokens via provider-native"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("providerNative"),
+            "prose must not leak the camelCase machine label: {rendered}"
+        );
     }
 
     #[test]

@@ -707,3 +707,16 @@ feeds an aggregate metric.
 
 The goal is met: two consecutive full protocol runs satisfy G1–G5 on both
 lanes with one total permitted flaky exclusion, recorded verbatim above.
+
+## Metric note: "worker cache hit" measures covered-range front-overlap — 2026-07-13
+
+The worker cache-hit column is `cache_read / input` for the summarizer worker's
+own request. The bench worker's system prompt is ~10 tokens (below any provider
+minimum cacheable prefix) and its tools are empty, so the only cacheable
+segment is the covered-message prefix. The ratio is therefore nonzero only when
+two consecutive summarizer requests share a long front-prefix of covered
+messages — i.e. when the planner redundantly re-covers overlapping ranges.
+The historical 0.999/0.538 readings were symptoms of that pre-#608 planner
+defect; after #608's non-overlapping mass-ranked coverage, ~0.000 is the
+expected healthy value. Read this column as an overlap detector (lower is
+better), not as production cache economics.

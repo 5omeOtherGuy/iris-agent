@@ -86,6 +86,10 @@ pub(super) struct CompactionOutcome {
     pub(super) covered: usize,
     pub(super) original_tokens: u64,
     pub(super) summary_tokens: u64,
+    /// Summary source, carried so callers can name the route (provider /
+    /// subagent / excerpts / provider-native) in the user-visible apply
+    /// notice instead of leaving it discoverable only via `/compaction`.
+    pub(super) origin: CompactionOrigin,
 }
 
 #[derive(Debug, Clone)]
@@ -489,6 +493,7 @@ impl CompactionEngine {
                 covered,
                 original_tokens,
                 summary_tokens: body_tokens,
+                origin: summary.origin,
             },
             new_messages,
         )))

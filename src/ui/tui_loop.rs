@@ -4396,6 +4396,7 @@ mod tests {
             original_tokens_estimate: 4000,
             summary_tokens_estimate: 400,
             budget: 8000,
+            origin: crate::nexus::CompactionOrigin::Provider,
         });
         let accounting = &screen.context_accounting;
         assert_eq!(accounting.fold_batches, vec![("A2", 2, 900), ("C", 1, 300)]);
