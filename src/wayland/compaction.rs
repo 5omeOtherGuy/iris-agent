@@ -178,6 +178,22 @@ pub(super) struct CompactionPlan {
     pub(super) to_id: String,
 }
 
+/// Parent-derived facts a background compaction job carries alongside its
+/// covered message range, needed only to build the structured-summary input
+/// (issue #475): the durable range ids and deterministic carry paths
+/// (ADR-0044) the input renderer's `F` lines report, plus the covered range's
+/// token estimate. `start_background` computes these from the same
+/// `CompactionPlan`/`covered` slice `apply_summary` uses later; this struct
+/// never feeds back into planner/apply-range logic, it only rides along to
+/// the worker thread for rendering.
+#[derive(Clone)]
+pub(super) struct CompactionRangeContext {
+    pub(super) from_id: String,
+    pub(super) to_id: String,
+    pub(super) carry_paths: Vec<String>,
+    pub(super) original_tokens: u64,
+}
+
 /// Whether the planner protects the current (in-flight) assistant turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlanTurnMode {
@@ -540,6 +556,7 @@ pub(super) fn run_compaction_worker(
     covered: Vec<Message>,
     config: CompactionWorkerConfig,
     mode: SummarizerKind,
+    range: CompactionRangeContext,
     token: CancellationToken,
 ) -> BackgroundSummaryResult {
     if token.is_cancelled() {
@@ -548,15 +565,31 @@ pub(super) fn run_compaction_worker(
     let covered_messages = covered.len();
     let result = match config.input {
         CompactionWorkerInput::Transcript => factory().and_then(|provider| {
-            run_transcript_summary(provider, covered, &config, &token).map(|(text, usage)| {
-                let origin = match mode {
-                    SummarizerKind::Subagent => CompactionOrigin::Subagent,
-                    SummarizerKind::Provider | SummarizerKind::Excerpts => {
-                        CompactionOrigin::Provider
-                    }
-                };
-                (text, origin, usage)
-            })
+            // Issue #475 / ADR-0061: the portable provider summarizer
+            // (`SummarizerKind::Provider`) sends the deterministic rendered
+            // snapshot through the structured-output fallback ladder instead
+            // of replaying the full native transcript, whenever the
+            // constructed provider reports native structured-summary support.
+            // Every other combination (Subagent, Excerpts, or a provider
+            // without the capability) keeps today's full-transcript-replay
+            // path unchanged -- this does not change default route selection,
+            // only a capable provider's behavior on the existing route.
+            if mode == SummarizerKind::Provider
+                && provider.structured_summary_capability() == StructuredSummaryCapability::Native
+            {
+                run_structured_summary_worker(provider.as_ref(), &covered, &range, &token)
+                    .map(|(text, usage)| (text, CompactionOrigin::Provider, usage))
+            } else {
+                run_transcript_summary(provider, covered, &config, &token).map(|(text, usage)| {
+                    let origin = match mode {
+                        SummarizerKind::Subagent => CompactionOrigin::Subagent,
+                        SummarizerKind::Provider | SummarizerKind::Excerpts => {
+                            CompactionOrigin::Provider
+                        }
+                    };
+                    (text, origin, usage)
+                })
+            }
         }),
         CompactionWorkerInput::Investigator => {
             let prompt = append_compaction_instructions(summary_worker_prompt(&covered), &config);
@@ -615,6 +648,100 @@ pub(super) fn run_compaction_worker(
         Ok(_) => BackgroundSummaryResult::Failed("summarizer returned empty text".to_string()),
         Err(error) => BackgroundSummaryResult::Failed(format!("{error:#}")),
     }
+}
+
+/// Structured-output compaction-summary fallback ladder (issue #475,
+/// ADR-0061), used by [`run_compaction_worker`] in place of
+/// [`run_transcript_summary`] whenever the constructed provider reports
+/// [`StructuredSummaryCapability::Native`]. Fallback order:
+///
+/// 1. Native structured output.
+/// 2. The forced virtual tool, retried exactly once, only when native was
+///    rejected as a deterministic unsupported-structured-output error
+///    ([`StructuredSummaryError::Unsupported`]).
+/// 3. Any other failure, or a local-validation/extraction rejection, returns
+///    `Err`; the caller (`run_compaction_worker`) turns that into
+///    `BackgroundSummaryResult::Failed`, which
+///    `CompactionEngine::apply_job_fallback` (in `compaction_background`,
+///    unchanged by this slice) already routes to the existing
+///    deterministic-excerpts terminal rung -- no separate excerpts call is
+///    needed here.
+/// 4. Cancellation ([`StructuredSummaryError::Cancelled`]) bails; the
+///    `token.is_cancelled()` check the caller already runs after this
+///    function returns turns that into `BackgroundSummaryResult::Cancelled`
+///    (no fallback, no `append_compaction`), exactly like every other
+///    summarizer path in this file.
+///
+/// Sends a single rendered snapshot -- the deterministic, parent-owned
+/// `F/U/A/R/TC/TR` line-oriented text from
+/// [`crate::wayland::structured_summary::render_compact_input`] -- as one
+/// user message: never a native-turn replay of `covered`, never verbose JSON,
+/// and no normal Iris tools advertised (the provider request builders force
+/// `tools: []` or the single virtual tool). Only safe metadata (no bodies, no
+/// credentials) is logged on the native-to-forced-tool fallback.
+fn run_structured_summary_worker(
+    provider: &dyn ChatProvider,
+    covered: &[Message],
+    range: &CompactionRangeContext,
+    token: &CancellationToken,
+) -> Result<SummaryResult> {
+    use crate::wayland::structured_summary::{
+        CompactInputRange, extract_forced_tool_summary, extract_native_summary,
+        render_compact_input, render_durable_summary,
+    };
+    if token.is_cancelled() {
+        anyhow::bail!("summarization cancelled");
+    }
+    let rendered = render_compact_input(&CompactInputRange {
+        from_id: &range.from_id,
+        to_id: &range.to_id,
+        covered,
+        carry_paths: &range.carry_paths,
+        original_tokens: range.original_tokens,
+    });
+    let messages = [Message::user(&rendered)];
+
+    let (turn, mode) = match futures::executor::block_on(provider.run_structured_summary(
+        &messages,
+        StructuredSummaryMode::Native,
+        token,
+    )) {
+        Ok(turn) => (turn, StructuredSummaryMode::Native),
+        Err(StructuredSummaryError::Cancelled) => anyhow::bail!("summarization cancelled"),
+        Err(StructuredSummaryError::Unsupported) => {
+            tracing::info!(
+                "structured-output compaction summary unsupported for this lane/model/auth kind; \
+                 retrying once with the forced virtual tool"
+            );
+            match futures::executor::block_on(provider.run_structured_summary(
+                &messages,
+                StructuredSummaryMode::ForcedTool,
+                token,
+            )) {
+                Ok(turn) => (turn, StructuredSummaryMode::ForcedTool),
+                Err(StructuredSummaryError::Cancelled) => {
+                    anyhow::bail!("summarization cancelled")
+                }
+                Err(StructuredSummaryError::Unsupported) => anyhow::bail!(
+                    "forced-tool structured summary request was itself rejected as unsupported"
+                ),
+                Err(StructuredSummaryError::Other(error)) => {
+                    anyhow::bail!("forced-tool structured summary request failed: {error:#}")
+                }
+            }
+        }
+        Err(StructuredSummaryError::Other(error)) => {
+            anyhow::bail!("structured summary request failed: {error:#}")
+        }
+    };
+
+    let summary = match mode {
+        StructuredSummaryMode::Native => extract_native_summary(&turn),
+        StructuredSummaryMode::ForcedTool => extract_forced_tool_summary(&turn),
+    }
+    .map_err(|error| anyhow::anyhow!("structured summary extraction/validation failed: {error}"))?;
+
+    Ok((render_durable_summary(&summary), turn.usage))
 }
 
 pub(super) fn run_provider_native_worker(

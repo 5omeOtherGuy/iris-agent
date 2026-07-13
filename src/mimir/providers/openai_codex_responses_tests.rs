@@ -1519,3 +1519,214 @@ fn developer_context_keeps_its_native_responses_role() {
     assert_eq!(item["content"][0]["type"], json!("input_text"));
     assert_eq!(item["content"][0]["text"], json!("skill catalog"));
 }
+
+// -- issue #475 / ADR-0061: structured-output compaction summary request
+// plumbing --------------------------------------------------------------
+
+#[test]
+fn native_summary_request_sets_json_schema_format_and_no_tools() {
+    use crate::wayland::structured_summary::canonical_compaction_schema;
+
+    let request = build_codex_summary_request(
+        "gpt-test",
+        "summarize sessions",
+        &[Message::user("F range=msg_1..msg_5\nU hi")],
+        PromptCacheRetention::Short,
+    );
+
+    assert_eq!(request["tools"], json!([]));
+    assert_eq!(request["text"]["verbosity"], json!("low"));
+    assert_eq!(request["text"]["format"]["type"], json!("json_schema"));
+    assert_eq!(
+        request["text"]["format"]["name"],
+        json!("compaction_summary")
+    );
+    assert_eq!(request["text"]["format"]["strict"], json!(true));
+    assert_eq!(
+        request["text"]["format"]["schema"],
+        canonical_compaction_schema()
+    );
+    // ADR-0061: the ChatGPT backend-api `/codex/responses` OAuth lane 400s on
+    // a top-level `max_output_tokens` (`Unsupported parameter`), unlike the
+    // OpenAI platform Responses API #475's literal JSON was modeled on.
+    // Token bounding relies on `text.verbosity` plus the model's own output
+    // cap instead, so the summary request must never add it.
+    assert!(
+        request.get("max_output_tokens").is_none(),
+        "must omit max_output_tokens (ADR-0061 probe: 400 Unsupported parameter)"
+    );
+    // Unrelated request shaping is unchanged: still the normal Codex envelope.
+    assert_eq!(request["model"], json!("gpt-test"));
+    assert_eq!(request["store"], json!(false));
+    assert_eq!(request["stream"], json!(true));
+    assert_eq!(request["instructions"], json!("summarize sessions"));
+    assert_eq!(request["input"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn forced_tool_fallback_summary_request_forces_the_single_virtual_tool() {
+    use crate::wayland::structured_summary::{VIRTUAL_TOOL_NAME, canonical_compaction_schema};
+
+    let request = build_codex_summary_fallback_request(
+        "gpt-test",
+        "summarize sessions",
+        &[Message::user("hi")],
+        PromptCacheRetention::Short,
+    );
+
+    let tools = request["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["type"], json!("function"));
+    assert_eq!(tools[0]["name"], json!(VIRTUAL_TOOL_NAME));
+    assert_eq!(tools[0]["strict"], json!(true));
+    assert_eq!(tools[0]["parameters"], canonical_compaction_schema());
+    assert_eq!(
+        request["tool_choice"],
+        json!({ "type": "function", "name": VIRTUAL_TOOL_NAME })
+    );
+}
+
+#[test]
+fn summary_requests_reuse_the_unchanged_oauth_headers_and_endpoint() -> Result<()> {
+    // Neither summary request builder touches headers or endpoint resolution
+    // -- both still flow through the same `codex_headers`/`resolve_codex_url`
+    // every other Codex request uses. Assert that path directly so a future
+    // change to header/endpoint construction cannot silently diverge for the
+    // summary path.
+    let token = AccessToken {
+        bearer: "secret-token".to_string(),
+        account_id: "acct_123".to_string(),
+    };
+    let headers = codex_headers(&token)?;
+    assert_eq!(
+        headers.get(AUTHORIZATION.as_str()).unwrap(),
+        "Bearer secret-token"
+    );
+    assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct_123");
+    assert_eq!(headers.get("originator").unwrap(), "iris");
+    assert_eq!(headers.get(USER_AGENT.as_str()).unwrap(), "iris-agent");
+    assert_eq!(
+        headers.get("OpenAI-Beta").unwrap(),
+        "responses=experimental"
+    );
+    assert_eq!(
+        headers.get(CONTENT_TYPE.as_str()).unwrap(),
+        "application/json"
+    );
+    assert_eq!(
+        resolve_codex_url("https://chatgpt.com/backend-api")?.path(),
+        "/backend-api/codex/responses"
+    );
+    Ok(())
+}
+
+#[test]
+fn provider_builds_native_and_fallback_summary_requests_from_its_own_state() -> Result<()> {
+    let provider = OpenAiCodexResponsesProvider::new(
+        "gpt-test",
+        "https://chatgpt.com/backend-api",
+        None,
+        "summarize sessions",
+        "prompt-cache-key",
+        PromptCacheRetention::Short,
+        crate::mimir::retry::RetryPolicy::default(),
+        crate::mimir::selection::CodexTransport::Sse,
+    )?;
+    let messages = [Message::user("hi")];
+
+    let native = provider.build_summary_request(&messages);
+    assert_eq!(native["tools"], json!([]));
+    assert_eq!(native["text"]["format"]["type"], json!("json_schema"));
+
+    let fallback = provider.build_summary_fallback_request(&messages);
+    assert_eq!(
+        fallback["tool_choice"]["name"],
+        json!(crate::wayland::structured_summary::VIRTUAL_TOOL_NAME)
+    );
+    Ok(())
+}
+
+#[test]
+fn extracts_a_native_summary_from_a_real_response_completed_sse_shape() -> Result<()> {
+    use crate::wayland::structured_summary::extract_native_summary;
+
+    let summary_json = json!({
+        "goal": "Ship #475 structured summaries",
+        "state": ["renderer written"],
+        "decisions": ["native first, forced-tool fallback second"],
+        "key_facts": ["src/wayland/structured_summary/ holds the new modules"],
+        "next_steps": ["wire provider request plumbing"],
+        "preserved_identifiers": []
+    })
+    .to_string();
+    let escaped = summary_json.replace('\\', "\\\\").replace('"', "\\\"");
+    let stream = format!(
+        "event: response.output_item.done\n\
+         data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"message\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{escaped}\"}}]}}}}\n\n\
+         event: response.completed\n\
+         data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\"}}}}\n\n"
+    );
+
+    let turn = parse_response_stream(&stream)?;
+    let summary = extract_native_summary(&turn).expect("schema-valid native summary");
+    assert_eq!(summary.goal, "Ship #475 structured summaries");
+    assert_eq!(summary.next_steps, vec!["wire provider request plumbing"]);
+    Ok(())
+}
+
+#[test]
+fn extracts_a_forced_tool_summary_from_a_real_function_call_sse_shape() -> Result<()> {
+    use crate::wayland::structured_summary::{VIRTUAL_TOOL_NAME, extract_forced_tool_summary};
+
+    let arguments = json!({
+        "goal": "Ship #475 structured summaries",
+        "state": [],
+        "decisions": [],
+        "key_facts": [],
+        "next_steps": ["wire provider request plumbing"],
+        "preserved_identifiers": []
+    })
+    .to_string();
+    let escaped = arguments.replace('\\', "\\\\").replace('"', "\\\"");
+    let stream = format!(
+        "event: response.output_item.done\n\
+         data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"{VIRTUAL_TOOL_NAME}\",\"arguments\":\"{escaped}\"}}}}\n\n\
+         event: response.completed\n\
+         data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\"}}}}\n\n"
+    );
+
+    let turn = parse_response_stream(&stream)?;
+    let summary = extract_forced_tool_summary(&turn).expect("schema-valid forced-tool summary");
+    assert_eq!(summary.goal, "Ship #475 structured summaries");
+    Ok(())
+}
+
+#[test]
+fn rejects_a_forced_tool_response_with_an_extra_tool_call() -> Result<()> {
+    use crate::wayland::structured_summary::{
+        SummaryExtractionError, VIRTUAL_TOOL_NAME, extract_forced_tool_summary,
+    };
+
+    let arguments = json!({
+        "goal": "g", "state": [], "decisions": [], "key_facts": [], "next_steps": [],
+        "preserved_identifiers": []
+    })
+    .to_string();
+    let escaped = arguments.replace('\\', "\\\\").replace('"', "\\\"");
+    let stream = format!(
+        "event: response.output_item.done\n\
+         data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"{VIRTUAL_TOOL_NAME}\",\"arguments\":\"{escaped}\"}}}}\n\n\
+         event: response.output_item.done\n\
+         data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_2\",\"name\":\"read\",\"arguments\":\"{{}}\"}}}}\n\n\
+         event: response.completed\n\
+         data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\"}}}}\n\n"
+    );
+
+    let turn = parse_response_stream(&stream)?;
+    let error = extract_forced_tool_summary(&turn).unwrap_err();
+    assert_eq!(
+        error,
+        SummaryExtractionError::UnexpectedToolCalls(vec!["read".to_string()])
+    );
+    Ok(())
+}

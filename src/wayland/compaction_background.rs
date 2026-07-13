@@ -89,6 +89,16 @@ impl CompactionEngine {
         let covered = messages[plan.start..plan.end].to_vec();
         let covered_messages = covered.len();
         let original_tokens = context_tokens(&covered);
+        // Issue #475: parent-derived facts the structured-summary input
+        // renderer needs, computed once here from the same plan/covered slice
+        // `apply_summary` uses later (never fed back into planner/apply-range
+        // logic). Cheap and pure regardless of which worker ends up running.
+        let range_context = CompactionRangeContext {
+            from_id: plan.from_id.clone(),
+            to_id: plan.to_id.clone(),
+            carry_paths: derive_carry_paths(&covered, workspace),
+            original_tokens,
+        };
         let native_factory = if self.provider_native {
             self.provider_compaction_factory
                 .as_ref()
@@ -166,6 +176,7 @@ impl CompactionEngine {
                             covered,
                             worker,
                             mode,
+                            range_context,
                             worker_token,
                         );
                         let _ = tx.send(result);

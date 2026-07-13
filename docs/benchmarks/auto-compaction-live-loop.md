@@ -720,3 +720,21 @@ The historical 0.999/0.538 readings were symptoms of that pre-#608 planner
 defect; after #608's non-overlapping mass-ranked coverage, ~0.000 is the
 expected healthy value. Read this column as an overlap detector (lower is
 better), not as production cache economics.
+
+## Field-wise G3 scoring and the credential needle — audit F17/F21
+
+Every G3 needle was innocuous-shaped, so a summarizer that silently scrubbed a
+credential-shaped fact the user explicitly asked to keep (F17: a planted
+deploy password dropped by injection-defense framing) would still pass every
+gate. G3 now also plants a session-scoped, explicitly user-sourced credential
+needle ("remember the deploy password is `korium-9741-<session>` — I'll need
+it after compaction") and requires it answered (`credential_answered`) as a
+hard gate alongside the existing flag needle. Where the summary under test is
+a structured durable text (issue #475/ADR-0061's `Goal`/`State`/`Decisions`/
+`Key facts`/`Next steps`/`Preserved identifiers` sections), scoring is now
+field-wise per section (`tools::bench_support::assert_survives_fieldwise`,
+exercised against the real structured-summary fallback ladder in
+`wayland::background_compaction_tests`) instead of whole-text; this lane's own
+`SummarizerKind::Subagent` summarizer still produces free-form legacy text, so
+it keeps the unchanged whole-text fallback. Session count, gate ordering, and
+the exclusion-budget rule are unchanged.

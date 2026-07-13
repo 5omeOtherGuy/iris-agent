@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use anyhow::{Error, Result, bail};
+use anyhow::{Error, Result, anyhow, bail};
 use futures::Stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -720,6 +720,55 @@ pub(crate) type ProviderStream<'a> = Pin<Box<dyn Stream<Item = Result<ProviderEv
 pub(crate) type ProviderCompactionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ProviderCompactionOutput>> + 'a>>;
 
+/// Structured-output compaction-summary support for the current
+/// provider/model/auth combination (issue #475, ADR-0061). Mimir decides this
+/// from adapter capability; upper tiers never inspect provider ids or wire
+/// fields -- mirrors [`ProviderCompactionCapability`], but for the portable
+/// `wayland::compaction` summarizer route rather than the opt-in
+/// provider-native `compact_context` axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum StructuredSummaryCapability {
+    /// This provider/model/auth combination does not support the #475
+    /// structured-output summary path; the caller keeps the existing
+    /// full-transcript-replay summarizer instead. Default for every provider
+    /// that does not opt in.
+    #[default]
+    None,
+    /// Native structured output (`text.format`/`output_config.format`) should
+    /// be attempted first.
+    Native,
+}
+
+/// Which request shape a structured-output compaction-summary call sends
+/// (issue #475).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StructuredSummaryMode {
+    /// Provider-native structured output.
+    Native,
+    /// The forced single virtual tool (`emit_compaction_summary`) fallback,
+    /// sent only after `Native` is rejected as deterministically unsupported.
+    ForcedTool,
+}
+
+/// Why [`ChatProvider::run_structured_summary`] did not produce an
+/// `AssistantTurn` for `wayland::structured_summary` to extract/validate.
+#[derive(Debug)]
+pub(crate) enum StructuredSummaryError {
+    /// The active lane/model/auth kind deterministically rejected the request
+    /// shape as unsupported (e.g. a 400 that is not a context-overflow body).
+    /// Callers retry exactly once with [`StructuredSummaryMode::ForcedTool`].
+    Unsupported,
+    /// The turn was cancelled; callers must not fall back further (issue #475
+    /// fallback order 4: skip compaction entirely on cancellation).
+    Cancelled,
+    /// Any other provider/transport failure; callers fall back to the
+    /// existing deterministic excerpts.
+    Other(Error),
+}
+
+pub(crate) type StructuredSummaryFuture<'a> =
+    Pin<Box<dyn Future<Output = std::result::Result<AssistantTurn, StructuredSummaryError>> + 'a>>;
+
 /// A `!Send` boxed tool-execution future, so `Box<dyn Tool>` stays object-safe
 /// while `execute` is async.
 pub(crate) type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput>> + 'a>>;
@@ -1419,6 +1468,32 @@ pub(crate) trait ChatProvider {
     ) -> ProviderCompactionFuture<'a> {
         Box::pin(async { bail!("provider-native compaction is not supported") })
     }
+
+    /// Structured-output compaction-summary capability for this provider/model
+    /// (issue #475, ADR-0061). Default: unsupported, so the compaction
+    /// summarizer route (`wayland::compaction`) keeps its existing
+    /// full-transcript-replay path unless a provider opts in explicitly.
+    fn structured_summary_capability(&self) -> StructuredSummaryCapability {
+        StructuredSummaryCapability::None
+    }
+
+    /// Send one structured-output compaction-summary request (native or
+    /// forced-virtual-tool, per `mode`) and return the resulting
+    /// `AssistantTurn` for `wayland::structured_summary` extraction. Default:
+    /// a typed unsupported error so adapters opt in explicitly, mirroring
+    /// [`ChatProvider::compact_context`].
+    fn run_structured_summary<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _mode: StructuredSummaryMode,
+        _cancel: &'a CancellationToken,
+    ) -> StructuredSummaryFuture<'a> {
+        Box::pin(async {
+            Err(StructuredSummaryError::Other(anyhow!(
+                "structured-output compaction summaries are not supported by this provider"
+            )))
+        })
+    }
 }
 
 /// Forward the contract through a boxed provider so the front-end can select
@@ -1449,6 +1524,19 @@ impl ChatProvider for Box<dyn ChatProvider> {
         cancel: &'a CancellationToken,
     ) -> ProviderCompactionFuture<'a> {
         (**self).compact_context(messages, instructions, cancel)
+    }
+
+    fn structured_summary_capability(&self) -> StructuredSummaryCapability {
+        (**self).structured_summary_capability()
+    }
+
+    fn run_structured_summary<'a>(
+        &'a self,
+        messages: &'a [Message],
+        mode: StructuredSummaryMode,
+        cancel: &'a CancellationToken,
+    ) -> StructuredSummaryFuture<'a> {
+        (**self).run_structured_summary(messages, mode, cancel)
     }
 }
 

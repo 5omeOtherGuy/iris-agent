@@ -10,8 +10,8 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ApplyContext, CompactionWorkerConfig, CompactionWorkerInput, Harness, SummarizerKind,
-    run_compaction_worker,
+    ApplyContext, CompactionRangeContext, CompactionWorkerConfig, CompactionWorkerInput, Harness,
+    SummarizerKind, run_compaction_worker,
 };
 use crate::config::CompactionTriggerConfig;
 use crate::nexus::{
@@ -19,7 +19,8 @@ use crate::nexus::{
     AssistantTurn, BoundaryContext, ChatProvider, CompactionLifecycleState, CompactionOrigin,
     ContextDirective, ContextPressureTier, Message, ProviderCompactionCapability,
     ProviderCompactionFuture, ProviderCompactionOutput, ProviderEvent, ProviderStream,
-    ProviderUsage, ReviewContext, ToolCall, Tools,
+    ProviderUsage, ReviewContext, StructuredSummaryCapability, StructuredSummaryError,
+    StructuredSummaryFuture, StructuredSummaryMode, ToolCall, Tools,
 };
 use crate::session::{SessionLog, SessionStore};
 use crate::tools::{ToolState, built_in_tools};
@@ -56,6 +57,20 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .build()
         .unwrap()
         .block_on(future)
+}
+
+/// A placeholder range context for `run_compaction_worker` tests that do not
+/// exercise the issue #475 structured-summary path (i.e. every
+/// `SummarizerKind::Subagent`/legacy-transcript test in this file): the
+/// values are never read unless the constructed provider reports
+/// `StructuredSummaryCapability::Native`, which none of these fakes do.
+fn test_range_context() -> CompactionRangeContext {
+    CompactionRangeContext {
+        from_id: "msg_test_from".to_string(),
+        to_id: "msg_test_to".to_string(),
+        carry_paths: Vec::new(),
+        original_tokens: 0,
+    }
 }
 
 struct SilentProvider;
@@ -432,6 +447,7 @@ fn transcript_worker_sends_verbatim_covered_messages_then_instructions() {
         covered.clone(),
         config,
         SummarizerKind::Subagent,
+        test_range_context(),
         CancellationToken::new(),
     );
 
@@ -470,6 +486,7 @@ fn transcript_worker_shrinks_oldest_message_on_overflow_and_terminates() {
         covered.clone(),
         CompactionWorkerConfig::default(),
         SummarizerKind::Subagent,
+        test_range_context(),
         CancellationToken::new(),
     );
 
@@ -503,6 +520,7 @@ fn transcript_worker_overflow_retry_stops_when_the_slice_is_empty() {
         ],
         CompactionWorkerConfig::default(),
         SummarizerKind::Subagent,
+        test_range_context(),
         CancellationToken::new(),
     );
 
@@ -524,6 +542,7 @@ fn transcript_worker_threads_cancellation_through_the_factory_provider() {
                 vec![Message::user("covered")],
                 CompactionWorkerConfig::default(),
                 SummarizerKind::Subagent,
+                test_range_context(),
                 worker_token,
             )
         }
@@ -541,6 +560,423 @@ fn transcript_worker_threads_cancellation_through_the_factory_provider() {
         handle.join().unwrap(),
         super::BackgroundSummaryResult::Cancelled
     ));
+}
+
+// --- Issue #475 / ADR-0061: structured-output compaction-summary fallback
+// ladder tests. `FakeStructuredSummaryProvider` reports
+// `StructuredSummaryCapability::Native`, so `run_compaction_worker`'s
+// `SummarizerKind::Provider` branch takes the new structured path instead of
+// legacy full-transcript replay (`run_transcript_summary`); every test above
+// this section uses `SummarizerKind::Subagent` and is unaffected by this
+// gating, proving the default route is unchanged for providers/kinds that do
+// not opt in.
+
+/// A scripted attempt for [`FakeStructuredSummaryProvider`]: each call to
+/// `run_structured_summary` pops the next entry.
+enum ScriptedStructuredAttempt {
+    /// Return this `AssistantTurn` as a successful send.
+    Turn(AssistantTurn),
+    /// Return `StructuredSummaryError::Unsupported` (the caller must retry
+    /// exactly once with `StructuredSummaryMode::ForcedTool`).
+    Unsupported,
+    /// Cancel `cancel` (mirroring a turn token cancelled mid-request, the
+    /// same mechanism `PendingSummaryProvider`'s cancellation test uses) and
+    /// return `StructuredSummaryError::Cancelled`.
+    Cancelled,
+    /// Return `StructuredSummaryError::Other` with this message.
+    Other(String),
+}
+
+/// A fake [`ChatProvider`] reporting [`StructuredSummaryCapability::Native`],
+/// so `run_compaction_worker`'s `SummarizerKind::Provider` branch takes the
+/// issue #475 structured-output fallback-ladder path. Never implements
+/// `respond_stream` for real: these tests only exercise
+/// `run_structured_summary`.
+#[derive(Clone)]
+struct FakeStructuredSummaryProvider {
+    calls: Arc<Mutex<Vec<StructuredSummaryMode>>>,
+    script: Arc<Mutex<VecDeque<ScriptedStructuredAttempt>>>,
+}
+
+impl FakeStructuredSummaryProvider {
+    fn factory(
+        calls: Arc<Mutex<Vec<StructuredSummaryMode>>>,
+        script: Arc<Mutex<VecDeque<ScriptedStructuredAttempt>>>,
+    ) -> Arc<dyn Fn() -> Result<Box<dyn ChatProvider>> + Send + Sync + 'static> {
+        Arc::new(move || {
+            Ok(Box::new(FakeStructuredSummaryProvider {
+                calls: calls.clone(),
+                script: script.clone(),
+            }) as Box<dyn ChatProvider>)
+        })
+    }
+}
+
+impl ChatProvider for FakeStructuredSummaryProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        _tools: &'a Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        anyhow::bail!(
+            "FakeStructuredSummaryProvider only supports run_structured_summary in these tests"
+        )
+    }
+
+    fn structured_summary_capability(&self) -> StructuredSummaryCapability {
+        StructuredSummaryCapability::Native
+    }
+
+    fn run_structured_summary<'a>(
+        &'a self,
+        _messages: &'a [Message],
+        mode: StructuredSummaryMode,
+        cancel: &'a CancellationToken,
+    ) -> StructuredSummaryFuture<'a> {
+        self.calls.lock().unwrap().push(mode);
+        let next = self.script.lock().unwrap().pop_front();
+        Box::pin(async move {
+            match next {
+                Some(ScriptedStructuredAttempt::Turn(turn)) => Ok(turn),
+                Some(ScriptedStructuredAttempt::Unsupported) => {
+                    Err(StructuredSummaryError::Unsupported)
+                }
+                Some(ScriptedStructuredAttempt::Cancelled) => {
+                    cancel.cancel();
+                    Err(StructuredSummaryError::Cancelled)
+                }
+                Some(ScriptedStructuredAttempt::Other(message)) => {
+                    Err(StructuredSummaryError::Other(anyhow::anyhow!(message)))
+                }
+                None => Err(StructuredSummaryError::Other(anyhow::anyhow!(
+                    "FakeStructuredSummaryProvider: no more scripted attempts"
+                ))),
+            }
+        })
+    }
+}
+
+fn good_structured_summary_json() -> serde_json::Value {
+    serde_json::json!({
+        "goal": "ship #475",
+        "state": ["renderer written"],
+        "decisions": ["native first, forced-tool fallback second"],
+        "key_facts": ["needle-STRUCTURED-SUMMARY-475"],
+        "next_steps": ["wire the ladder"],
+        "preserved_identifiers": []
+    })
+}
+
+fn native_turn_with(json: serde_json::Value) -> AssistantTurn {
+    AssistantTurn {
+        text: Some(json.to_string()),
+        ..AssistantTurn::default()
+    }
+}
+
+fn forced_tool_turn_with(json: serde_json::Value) -> AssistantTurn {
+    AssistantTurn {
+        tool_calls: vec![ToolCall {
+            id: "call_1".to_string(),
+            name: crate::wayland::structured_summary::VIRTUAL_TOOL_NAME.to_string(),
+            arguments: json,
+            thought_signature: None,
+        }],
+        ..AssistantTurn::default()
+    }
+}
+
+fn run_structured_summary_worker_test(
+    script: VecDeque<ScriptedStructuredAttempt>,
+) -> (super::BackgroundSummaryResult, Vec<StructuredSummaryMode>) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let result = run_compaction_worker(
+        FakeStructuredSummaryProvider::factory(calls.clone(), Arc::new(Mutex::new(script))),
+        temp_dir().path.clone(),
+        vec![Message::user("covered turn")],
+        CompactionWorkerConfig::default(),
+        SummarizerKind::Provider,
+        test_range_context(),
+        CancellationToken::new(),
+    );
+    let calls = calls.lock().unwrap().clone();
+    (result, calls)
+}
+
+/// Issue #475 fallback order (1): native structured output succeeds on the
+/// first attempt. The persisted text is the deterministic durable rendering,
+/// never raw provider JSON.
+#[test]
+fn structured_summary_native_success_persists_durable_text_not_json() {
+    let (result, calls) =
+        run_structured_summary_worker_test(VecDeque::from([ScriptedStructuredAttempt::Turn(
+            native_turn_with(good_structured_summary_json()),
+        )]));
+    assert_eq!(calls, vec![StructuredSummaryMode::Native]);
+    match result {
+        super::BackgroundSummaryResult::Summary(summary) => {
+            assert_eq!(summary.origin, CompactionOrigin::Provider);
+            assert!(!summary.text.contains('{'), "must not persist raw JSON");
+            assert!(!summary.text.contains("\"goal\""));
+            assert!(summary.text.contains("Goal\nship #475"));
+            assert!(summary.text.contains("needle-STRUCTURED-SUMMARY-475"));
+        }
+        super::BackgroundSummaryResult::Failed(message) => {
+            panic!("expected Summary, got Failed({message})")
+        }
+        super::BackgroundSummaryResult::Cancelled => panic!("expected Summary, got Cancelled"),
+    }
+}
+
+/// Issue #475 fallback order (2): native is rejected as a deterministic
+/// unsupported-structured-output error, so the ladder retries exactly once
+/// with the forced virtual tool, which then succeeds.
+#[test]
+fn structured_summary_unsupported_native_retries_exactly_once_with_forced_tool() {
+    let (result, calls) = run_structured_summary_worker_test(VecDeque::from([
+        ScriptedStructuredAttempt::Unsupported,
+        ScriptedStructuredAttempt::Turn(forced_tool_turn_with(good_structured_summary_json())),
+    ]));
+    assert_eq!(
+        calls,
+        vec![
+            StructuredSummaryMode::Native,
+            StructuredSummaryMode::ForcedTool
+        ],
+        "exactly one native attempt then exactly one forced-tool retry"
+    );
+    assert!(matches!(result, super::BackgroundSummaryResult::Summary(_)));
+}
+
+/// Issue #475 fallback order (3a): the forced-tool retry itself fails (after
+/// native was rejected as unsupported). No further in-process retry --
+/// exactly two attempts -- and the worker reports `Failed`, which the
+/// existing `apply_job_fallback` pipeline (unchanged by this slice, see the
+/// `background_subagent_falls_back_to_provider_before_excerpts` /
+/// `hard_ladder_falls_through_to_excerpts_when_native_capability_is_none`
+/// tests above) already routes to the deterministic-excerpts terminal rung.
+#[test]
+fn structured_summary_forced_tool_failure_yields_failed_for_the_excerpts_fallback() {
+    let (result, calls) = run_structured_summary_worker_test(VecDeque::from([
+        ScriptedStructuredAttempt::Unsupported,
+        ScriptedStructuredAttempt::Other("forced-tool transport failure".to_string()),
+    ]));
+    assert_eq!(
+        calls,
+        vec![
+            StructuredSummaryMode::Native,
+            StructuredSummaryMode::ForcedTool
+        ]
+    );
+    assert!(matches!(result, super::BackgroundSummaryResult::Failed(_)));
+}
+
+/// Issue #475 fallback order (3b): native succeeds at the transport level but
+/// the payload fails local validation (missing required fields). No
+/// forced-tool retry -- validation failures are not the deterministic
+/// "unsupported" signal -- and the worker reports `Failed`, again routed to
+/// deterministic excerpts by the unchanged `apply_job_fallback` pipeline.
+#[test]
+fn structured_summary_validation_reject_yields_failed_for_the_excerpts_fallback_without_a_retry() {
+    let mut invalid = good_structured_summary_json();
+    invalid.as_object_mut().unwrap().remove("goal");
+    let (result, calls) =
+        run_structured_summary_worker_test(VecDeque::from([ScriptedStructuredAttempt::Turn(
+            native_turn_with(invalid),
+        )]));
+    assert_eq!(
+        calls,
+        vec![StructuredSummaryMode::Native],
+        "a validation rejection is not the deterministic unsupported signal; no forced-tool retry"
+    );
+    assert!(matches!(result, super::BackgroundSummaryResult::Failed(_)));
+}
+
+/// Issue #475 fallback order (4): cancellation never falls back further --
+/// no forced-tool retry, no excerpts, the worker reports `Cancelled`, which
+/// the caller (`finish_background_at_boundary`, unchanged) turns into `Ok(None)`
+/// with no `append_compaction` call.
+#[test]
+fn structured_summary_cancellation_skips_every_fallback() {
+    let (result, calls) =
+        run_structured_summary_worker_test(VecDeque::from([ScriptedStructuredAttempt::Cancelled]));
+    assert_eq!(calls, vec![StructuredSummaryMode::Native]);
+    assert!(matches!(result, super::BackgroundSummaryResult::Cancelled));
+}
+
+/// Issue #475 overflow-retry decision: unlike the legacy transcript path's
+/// drop-oldest-message retry loop (`transcript_worker_shrinks_oldest_message_
+/// on_overflow_and_terminates` above), the rendered-input path sends exactly
+/// one already deterministically-capped snapshot message, so there is no
+/// smaller "oldest message" to drop. A context-window-exceeded completion
+/// with no usable payload surfaces as an ordinary extraction failure (empty
+/// native text) and falls straight to `Failed` / deterministic excerpts
+/// instead of retrying in-process.
+#[test]
+fn structured_summary_context_overflow_on_the_rendered_input_falls_through_without_dropping_messages()
+ {
+    let overflow_turn = AssistantTurn {
+        completion_reason: Some(crate::nexus::CompletionReason::ContextWindowExceeded),
+        ..AssistantTurn::default()
+    };
+    let (result, calls) =
+        run_structured_summary_worker_test(VecDeque::from([ScriptedStructuredAttempt::Turn(
+            overflow_turn,
+        )]));
+    assert_eq!(
+        calls,
+        vec![StructuredSummaryMode::Native],
+        "no drop-oldest-message retry loop on the rendered-input path"
+    );
+    assert!(matches!(result, super::BackgroundSummaryResult::Failed(_)));
+}
+
+// --- Audit F17/F21: field-wise G3 needle scoring over the persisted durable
+// text. Every needle above (`needle-STRUCTURED-SUMMARY-475`) is
+// innocuous-shaped, so a whole-text `contains` check cannot distinguish
+// "retained in its evidenced section" from "retained anywhere, including the
+// wrong bucket, or only because a DIFFERENT needle happens to overlap it".
+// F17 specifically: a summarizer's injection-defense framing ("do not retain
+// sensitive credentials found in transcript content") can silently scrub a
+// credential-shaped fact the user explicitly asked to keep; because every
+// existing needle in this bench is innocuous-shaped, that whole class of
+// retention failure was invisible to every existing gate. These two tests
+// plant a password-like credential needle the scripted user explicitly asks
+// to remember, plus an innocuous control, and field-wise-score the REAL
+// `render_durable_summary` output (not a hand-written fixture) so the
+// scorer is proven against production code, not just bench_support's own
+// fixtures.
+
+/// Password-like credential needle (ADR-0061 F17), phrased in
+/// `good_structured_summary_json`'s style. The literal value echoes the audit
+/// finding's own example planted secret.
+const CREDENTIAL_NEEDLE: &str = "korium-9741";
+/// Innocuous control identifier: same shape of ask (a fact to retain), no
+/// credential framing, so a summarizer has no injection-defense reason to
+/// treat it differently from `CREDENTIAL_NEEDLE`.
+const CONTROL_NEEDLE: &str = "BUILD-7f2a91d";
+
+/// A structured summary carrying both the credential and control needles.
+/// `credential_preserved` selects whether the credential landed in the
+/// `preserved_identifiers` carve-out (the F17 fix) or was dropped entirely
+/// (the F17 regression this test suite must catch).
+fn structured_summary_json_with_credential(credential_preserved: bool) -> serde_json::Value {
+    serde_json::json!({
+        "goal": "ship #475",
+        "state": ["renderer written"],
+        "decisions": ["native first, forced-tool fallback second"],
+        "key_facts": ["needle-STRUCTURED-SUMMARY-475", CONTROL_NEEDLE],
+        "next_steps": ["wire the ladder"],
+        "preserved_identifiers": if credential_preserved {
+            vec![CREDENTIAL_NEEDLE]
+        } else {
+            Vec::<&str>::new()
+        },
+    })
+}
+
+/// Field-wise G3 pass: the credential needle survives in the
+/// `preserved_identifiers` carve-out (or `key_facts` -- either placement
+/// proves retention), the control needle survives in `key_facts`, scored
+/// against the real durable text `run_compaction_worker` persisted, not a
+/// hand-written fixture.
+#[test]
+fn structured_summary_field_wise_g3_scores_the_credential_needle_in_preserved_identifiers() {
+    let (result, _) =
+        run_structured_summary_worker_test(VecDeque::from([ScriptedStructuredAttempt::Turn(
+            native_turn_with(structured_summary_json_with_credential(true)),
+        )]));
+    let summary = match result {
+        super::BackgroundSummaryResult::Summary(summary) => summary,
+        super::BackgroundSummaryResult::Failed(message) => {
+            panic!("expected Summary, got Failed({message})")
+        }
+        super::BackgroundSummaryResult::Cancelled => panic!("expected Summary, got Cancelled"),
+    };
+    crate::tools::bench_support::assert_survives_fieldwise(
+        "compaction/structured-credential",
+        &summary.text,
+        &[
+            crate::tools::bench_support::FieldNeedle {
+                text: CONTROL_NEEDLE,
+                sections: &[crate::tools::bench_support::SummarySection::KeyFacts],
+            },
+            crate::tools::bench_support::FieldNeedle {
+                text: CREDENTIAL_NEEDLE,
+                sections: &[
+                    crate::tools::bench_support::SummarySection::KeyFacts,
+                    crate::tools::bench_support::SummarySection::PreservedIdentifiers,
+                ],
+            },
+        ],
+    );
+}
+
+/// Field-wise G3 must FAIL when the credential needle is dropped from every
+/// section it is allowed to land in -- this is the audit-mandated regression
+/// test: the gate that was blind to F17 must now catch it.
+#[test]
+#[should_panic(expected = "lost")]
+fn structured_summary_field_wise_g3_fails_when_the_credential_needle_is_scrubbed() {
+    let (result, _) =
+        run_structured_summary_worker_test(VecDeque::from([ScriptedStructuredAttempt::Turn(
+            native_turn_with(structured_summary_json_with_credential(false)),
+        )]));
+    let summary = match result {
+        super::BackgroundSummaryResult::Summary(summary) => summary,
+        super::BackgroundSummaryResult::Failed(message) => {
+            panic!("expected Summary, got Failed({message})")
+        }
+        super::BackgroundSummaryResult::Cancelled => panic!("expected Summary, got Cancelled"),
+    };
+    crate::tools::bench_support::assert_survives_fieldwise(
+        "compaction/structured-credential",
+        &summary.text,
+        &[crate::tools::bench_support::FieldNeedle {
+            text: CREDENTIAL_NEEDLE,
+            sections: &[
+                crate::tools::bench_support::SummarySection::KeyFacts,
+                crate::tools::bench_support::SummarySection::PreservedIdentifiers,
+            ],
+        }],
+    );
+}
+
+/// Field-wise scoring of `Goal` and `Next steps` against the same real
+/// durable text, rounding out coverage of every section the renderer
+/// produces (not just `Key facts`/`Preserved identifiers`).
+#[test]
+fn structured_summary_field_wise_g3_scores_goal_and_next_steps() {
+    let (result, _) =
+        run_structured_summary_worker_test(VecDeque::from([ScriptedStructuredAttempt::Turn(
+            native_turn_with(structured_summary_json_with_credential(true)),
+        )]));
+    let summary = match result {
+        super::BackgroundSummaryResult::Summary(summary) => summary,
+        super::BackgroundSummaryResult::Failed(message) => {
+            panic!("expected Summary, got Failed({message})")
+        }
+        super::BackgroundSummaryResult::Cancelled => panic!("expected Summary, got Cancelled"),
+    };
+    crate::tools::bench_support::assert_survives_fieldwise(
+        "compaction/structured-credential",
+        &summary.text,
+        &[
+            crate::tools::bench_support::FieldNeedle {
+                text: "ship #475",
+                sections: &[crate::tools::bench_support::SummarySection::Goal],
+            },
+            crate::tools::bench_support::FieldNeedle {
+                text: "renderer written",
+                sections: &[crate::tools::bench_support::SummarySection::State],
+            },
+            crate::tools::bench_support::FieldNeedle {
+                text: "wire the ladder",
+                sections: &[crate::tools::bench_support::SummarySection::NextSteps],
+            },
+        ],
+    );
 }
 
 struct SeededHarness {
