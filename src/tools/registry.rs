@@ -984,4 +984,132 @@ mod tests {
             pwd.content
         );
     }
+
+    /// Recursively check a schema (sub)tree for constructs outside the
+    /// provider-safe subset: a top-level combinator keyword or a `$ref`/
+    /// `$defs`/`definitions` anywhere. `at_top` is true only for the schema
+    /// object's own top level -- combinators are only checked there (a nested
+    /// property is free to use them; providers reject only the top-level
+    /// combinator), while the ref/defs ban applies everywhere in the tree.
+    fn find_schema_violation(value: &Value, at_top: bool) -> Option<String> {
+        if let Value::Object(map) = value {
+            if at_top {
+                for combinator in ["oneOf", "anyOf", "allOf", "not", "if", "then", "else"] {
+                    if map.contains_key(combinator) {
+                        return Some(format!("top-level `{combinator}`"));
+                    }
+                }
+            }
+            for banned in ["$ref", "$defs", "definitions"] {
+                if map.contains_key(banned) {
+                    return Some(format!("`{banned}` anywhere in the schema tree"));
+                }
+            }
+            for (key, child) in map {
+                // Only the schema object's own top level is "top" for the
+                // combinator check; every nested value (including each
+                // property's schema) is not.
+                let _ = key;
+                if let Some(found) = find_schema_violation(child, false) {
+                    return Some(found);
+                }
+            }
+        } else if let Value::Array(items) = value {
+            for item in items {
+                if let Some(found) = find_schema_violation(item, false) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// Assert one tool's `parameters()` schema stays in the subset every
+    /// configured provider (Anthropic, OpenAI/Codex) accepts as a tool
+    /// `input_schema`: object-typed at the top level, no top-level combinator
+    /// keyword (`oneOf`/`anyOf`/`allOf`/`not`/`if`/`then`/`else` -- Anthropic
+    /// rejects these with a 400 on the whole request), and no `$ref`/`$defs`/
+    /// `definitions` anywhere (this codebase never needs them; a stray one
+    /// would signal an accidental schema-generation dependency). Deliberately
+    /// does NOT enforce the fuller issue-#475 subset (e.g. no `minLength`/
+    /// `minimum`): existing tools legitimately use those and Anthropic accepts
+    /// them.
+    fn assert_provider_safe_schema(tool_name: &str, params: &Value) {
+        assert_eq!(
+            params.get("type"),
+            Some(&json!("object")),
+            "{tool_name}: parameters() must be top-level type:object, got {params}"
+        );
+        if let Some(violation) = find_schema_violation(params, true) {
+            panic!("{tool_name}: parameters() schema contains {violation}: {params}");
+        }
+    }
+
+    #[test]
+    fn all_tool_schemas_stay_in_provider_safe_subset() {
+        // Every registry configuration the CLI can build, plus the
+        // test-only-injectable `read_output` tool: PR #593 added a top-level
+        // `oneOf` to exactly one tool (`recall`) and it was invisible to every
+        // test that only exercised OpenAI/Codex, because Anthropic is the only
+        // provider that rejects it. This test walks every declared tool across
+        // every configuration so a future combinator regression on ANY tool
+        // fails here regardless of which provider it would break.
+        let mut registries: Vec<(&str, Tools)> = vec![
+            ("built_in_tools", built_in_tools()),
+            (
+                "built_in_tools_for(false, false)",
+                built_in_tools_for(false, false),
+            ),
+            (
+                "built_in_tools_for(true, false)",
+                built_in_tools_for(true, false),
+            ),
+            (
+                "built_in_tools_for(false, true)",
+                built_in_tools_for(false, true),
+            ),
+            (
+                "built_in_tools_for(true, true)",
+                built_in_tools_for(true, true),
+            ),
+        ];
+        // Both web tools are opt-in and otherwise unregistered (no prompt
+        // bloat when off, see `built_in_tools_with`), so cover them under a
+        // config with both backends selected.
+        let web_config = ToolsConfig {
+            bash_tool_mode: false,
+            model_compaction_tool: false,
+            web: WebToolsConfig {
+                web_search: Some(web::SearchBackend::Native),
+                read_web_page: Some(web::ReadBackend::Native),
+                ..WebToolsConfig::default()
+            },
+        };
+        registries.push((
+            "built_in_tools_with(web enabled)",
+            built_in_tools_with(&web_config),
+        ));
+
+        let mut checked_any = false;
+        for (config_name, tools) in &registries {
+            for tool in tools.iter() {
+                checked_any = true;
+                assert_provider_safe_schema(
+                    &format!("{config_name} -> {}", tool.name()),
+                    &tool.parameters(),
+                );
+            }
+        }
+        assert!(checked_any, "no tools were checked; test setup is broken");
+
+        // `read_output` is only reachable in the built-in sets above through
+        // `ReadOutputTool`, but exercise the dedicated test constructor too so
+        // this test stays the canonical place a new caller of that seam is
+        // guarded.
+        let read_output = read_output_tool();
+        assert_provider_safe_schema(
+            &format!("read_output_tool() -> {}", read_output.name()),
+            &read_output.parameters(),
+        );
+    }
 }
