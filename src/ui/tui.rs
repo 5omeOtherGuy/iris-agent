@@ -162,14 +162,6 @@ const TEXT_COLUMN_X_PADDING_U16: u16 = TEXT_COLUMN_X_PADDING as u16;
 /// before wrapping, so one pathological line cannot dominate the row budget.
 const MAX_TOOL_OUTPUT_LINE_CHARS: usize = 2000;
 
-/// Prose measure (reactive-density spec §3): prose-classed text wraps to
-/// `min(content_width, PROSE_MEASURE)` columns so an ultrawide pane does not
-/// stretch a paragraph past a readable line length (the eye loses the line on
-/// the way back). Mechanical output — code, tool bodies, diffs, tables, rules,
-/// session chrome — keeps the full pane width. On any pane ≤ 96 columns the
-/// measure is a no-op (`min` picks the pane), so nothing regresses there.
-const PROSE_MEASURE: usize = 96;
-
 /// Cap on the live exec stream buffer re-rendered under the gutter on each
 /// delta. Only the tail (flood-capped to `MAX_TOOL_OUTPUT_ROWS`) is shown and
 /// the authoritative full output arrives with the final `ToolResult`, so
@@ -8468,21 +8460,30 @@ mod tests {
         );
     }
 
-    // --- reactive density: the prose measure (spec §3) ---
+    // --- transcript rows use the available pane width ---
 
     #[test]
-    fn assistant_and_user_messages_use_the_available_pane_width() {
+    fn transcript_messages_use_the_available_pane_width() {
         let mut screen = Screen::new();
         screen.start_turn();
         let _ = rendered_lines(&mut screen, 200, 40);
         screen.apply(UiEvent::UserMessage("USERWORD ".repeat(30)));
         screen.apply(UiEvent::AssistantText("ASSISTANTWORD ".repeat(24)));
+        screen.apply(UiEvent::AssistantReasoning {
+            text: "THINKINGWORD ".repeat(24),
+            redacted: false,
+        });
+        assert!(screen.toggle_all_panels(), "thinking block should expand");
         let lines: Vec<String> = rendered_lines(&mut screen, 200, 40)
             .iter()
             .map(line_text)
             .collect();
 
-        for (needle, role) in [("USERWORD", "user"), ("ASSISTANTWORD", "assistant")] {
+        for (needle, role) in [
+            ("USERWORD", "user"),
+            ("ASSISTANTWORD", "assistant"),
+            ("THINKINGWORD", "thinking"),
+        ] {
             let widest = lines
                 .iter()
                 .filter(|line| line.contains(needle))
@@ -8493,15 +8494,15 @@ mod tests {
                 widest > 96 + TEXT_COLUMN_X_PADDING,
                 "{role} message stayed capped at the old prose measure: {lines:?}"
             );
-            assert!(widest <= 200, "{role} message overflowed the pane: {lines:?}");
+            assert!(
+                widest <= 200,
+                "{role} message overflowed the pane: {lines:?}"
+            );
         }
     }
 
     #[test]
-    fn prose_continuations_align_under_content_at_the_measure() {
-        // Criterion 4: a wrapped paragraph's continuation rows hang under the
-        // same text column as the first — the measure moves only the wrap point,
-        // never the marker/indent (no marker drift).
+    fn message_continuations_align_under_content_at_full_width() {
         let mut screen = Screen::new();
         screen.start_turn();
         let _ = rendered_lines(&mut screen, 200, 40);
@@ -8520,9 +8521,7 @@ mod tests {
     }
 
     #[test]
-    fn notice_wraps_at_the_prose_measure() {
-        // Criterion 3: a notice is prose — it wraps at the 96-col measure on a
-        // wide pane, not the full pane.
+    fn notice_uses_the_available_pane_width() {
         let mut screen = Screen::new();
         screen.start_turn();
         let _ = rendered_lines(&mut screen, 200, 40);
@@ -8532,26 +8531,20 @@ mod tests {
             .map(line_text)
             .filter(|l| l.contains("NOTICEWORD"))
             .collect();
-        assert!(notice.len() >= 2, "notice should wrap: {notice:?}");
-        for row in &notice {
-            assert!(
-                row.chars().count() <= PROSE_MEASURE + TEXT_COLUMN_X_PADDING,
-                "notice row exceeds the measure ({} cols): {row:?}",
-                row.chars().count()
-            );
-        }
+        let widest = notice.iter().map(|row| display_width(row)).max().unwrap();
+        assert!(
+            widest > 100,
+            "notice stayed capped at the old measure: {notice:?}"
+        );
+        assert!(widest <= 200, "notice overflowed the pane: {notice:?}");
     }
 
     #[test]
-    fn mechanical_output_uses_full_width_past_the_measure() {
-        // Criterion 3: a SHELL body line and a diff line keep the full pane
-        // width on a 200-column pane — mechanical content is never clamped to 96.
-        // Render the specific body rows directly so the assertion is independent
-        // of each block's arrival fold state.
+    fn tool_output_uses_the_available_pane_width() {
         let full_width = |row: &TranscriptRow| -> bool {
             row.render(200)
                 .iter()
-                .any(|l| line_text(l).chars().count() > PROSE_MEASURE)
+                .any(|l| display_width(&line_text(l)) > 100)
         };
 
         let wide = "S".repeat(150);
