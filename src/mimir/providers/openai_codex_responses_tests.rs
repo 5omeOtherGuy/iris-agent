@@ -53,12 +53,14 @@ fn test_system_prompt() -> String {
 #[test]
 fn codex_retry_auth_error_preserves_provider_and_safe_cause() {
     let cancel = CancellationToken::new();
+    let mut sink = RecordingSink::default();
     let err = run_with_retry(
         PROVIDER_ID,
         &crate::mimir::retry::RetryPolicy::default(),
         &cancel,
+        &mut sink,
         |_force| Ok(()),
-        |&()| Attempt::Reauth(anyhow!("HTTP 401 token rejected")),
+        |&(), _sink| Attempt::Reauth(anyhow!("HTTP 401 token rejected")),
     )
     .unwrap_err();
 

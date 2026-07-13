@@ -808,6 +808,7 @@ impl OpenAiCodexResponsesProvider {
             PROVIDER_ID,
             &self.retry_policy,
             cancel,
+            sink,
             |force_refresh| {
                 if force_refresh {
                     self.tokens.force_refresh(&self.client)
@@ -815,7 +816,7 @@ impl OpenAiCodexResponsesProvider {
                     self.tokens.access_token(&self.client)
                 }
             },
-            |token| self.send_once(url.clone(), token, request, sink, cancel),
+            |token, sink| self.send_once(url.clone(), token, request, sink, cancel),
         )
     }
 }

@@ -228,6 +228,7 @@ impl ChatProvider for AnthropicProvider {
                     "anthropic",
                     &provider.retry_policy,
                     cancel,
+                    sink,
                     |force| match &provider.auth {
                         AnthropicAuthSource::OAuth(tokens) => {
                             let token = if force {
@@ -240,7 +241,7 @@ impl ChatProvider for AnthropicProvider {
                         }
                         AnthropicAuthSource::ApiKey(key) => Ok(AnthropicAuth::ApiKey(key.clone())),
                     },
-                    |auth| {
+                    |auth, sink| {
                         let attempt = provider.send_once(auth, &request, sink, cancel);
                         if let Attempt::Fatal(ref error) = attempt
                             && error

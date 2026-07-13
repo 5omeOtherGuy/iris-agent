@@ -52,6 +52,13 @@ The idle guard is based on provider events, not text. Long legitimate reasoning
 or tool-call-input streams remain live as long as the provider continues sending
 SSE frames.
 
+**Amendment (2026-07-13)**: transient-retry backoff sleeps in `run_with_retry`
+emit `Activity` keepalives (immediately, then every 15s). Backoff honors server
+`Retry-After` hints up to 240s — past the 90s idle window — and the guard only
+sees channel events, so a rate-limited-but-healthy retry loop was previously
+misreported as `provider stream produced no events for 90s` and the turn was
+killed mid-backoff.
+
 ## Alternatives Considered
 
 ### Alternative 1: Keep only the whole-request timeout

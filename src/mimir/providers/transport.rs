@@ -44,6 +44,13 @@ const TOTAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// backstop. Streaming providers send SSE events/pings while alive, so this is
 /// an inactivity detector rather than a cap on long legitimate turns.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Cadence of [`ProviderEvent::Activity`] keepalives emitted while a retry
+/// backoff sleeps. Backoff honors server `Retry-After` hints up to 4x the 60s
+/// ceiling (240s), far past [`STREAM_IDLE_TIMEOUT`]; without keepalives the
+/// idle guard would misreport a rate-limited-but-healthy retry loop as
+/// "provider stream produced no events" and kill the turn mid-backoff. Well
+/// under the idle timeout so several missed ticks would be needed to trip it.
+const RETRY_BACKOFF_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// Keep pooled connections around across turns. Idle gaps between turns (the
 /// user reading/typing, long tool runs) routinely exceed reqwest's 90s default,
 /// which forced a fresh TCP+TLS handshake on the next turn's first token.
@@ -355,40 +362,48 @@ pub(super) fn run_with_reauth<T>(
 /// Drive a bounded transient-retry control flow with a one-shot reauth, for
 /// callers that classify transient HTTP / network / recoverable stream anomalies
 /// as [`Attempt::Retry`]. `get_token(force_refresh)` obtains a token (cached, or
-/// forcibly refreshed after an auth rejection); `send` performs one attempt.
+/// forcibly refreshed after an auth rejection); `send` performs one attempt with
+/// the provider's event sink.
 ///
 /// Termination is guaranteed: reauth fires at most once, transient retries are
 /// bounded by `policy.max_retries`, the reauth does NOT reset the transient
 /// budget, and every other branch returns. Backoff sleeps are sliced so a
-/// cancelled turn stops promptly instead of waiting out the full delay.
+/// cancelled turn stops promptly instead of waiting out the full delay, and
+/// emit [`TurnSink::on_activity`] keepalives so the consumer-side idle guard
+/// ([`STREAM_IDLE_TIMEOUT`]) does not misclassify a long `Retry-After` backoff
+/// as a stalled provider stream.
 pub(super) fn run_with_retry<T>(
     provider: &str,
     policy: &RetryPolicy,
     cancel: &CancellationToken,
+    sink: &mut dyn TurnSink,
     get_token: impl FnMut(bool) -> Result<T>,
-    send: impl FnMut(&T) -> Attempt,
+    send: impl FnMut(&T, &mut dyn TurnSink) -> Attempt,
 ) -> Result<AssistantTurn> {
     retry_loop(
         provider,
         policy,
+        sink,
         get_token,
         send,
-        // Sleep in slices so a turn-level cancel interrupts retry backoff.
-        |delay| sleep_cancellable(delay, cancel),
+        // Sleep in slices so a turn-level cancel interrupts retry backoff,
+        // emitting keepalives so the idle guard sees a live retry loop.
+        |delay, sink| sleep_cancellable(delay, cancel, sink),
         || cancel.is_cancelled(),
     )
 }
 
 /// Pure retry/reauth state machine, free of timing and the cancellation token so
-/// it can be unit-tested with scripted closures. `sleep` applies a backoff delay;
-/// `is_cancelled` reports turn cancellation (checked before each attempt and
-/// after each backoff sleep).
+/// it can be unit-tested with scripted closures. `sleep` applies a backoff delay
+/// (returning `Err` when the stream consumer is gone); `is_cancelled` reports
+/// turn cancellation (checked before each attempt and after each backoff sleep).
 fn retry_loop<T>(
     provider: &str,
     policy: &RetryPolicy,
+    sink: &mut dyn TurnSink,
     mut get_token: impl FnMut(bool) -> Result<T>,
-    mut send: impl FnMut(&T) -> Attempt,
-    mut sleep: impl FnMut(Duration),
+    mut send: impl FnMut(&T, &mut dyn TurnSink) -> Attempt,
+    mut sleep: impl FnMut(Duration, &mut dyn TurnSink) -> Result<()>,
     is_cancelled: impl Fn() -> bool,
 ) -> Result<AssistantTurn> {
     let mut transient_retries: u32 = 0;
@@ -408,7 +423,7 @@ fn retry_loop<T>(
         if is_cancelled() {
             bail!("turn cancelled");
         }
-        match send(&token) {
+        match send(&token, sink) {
             Attempt::Done(turn) => return Ok(*turn),
             Attempt::Reauth(error) => {
                 if reauth_used {
@@ -437,7 +452,7 @@ fn retry_loop<T>(
                     delay_ms = delay.as_millis() as u64,
                     "transient error; retrying"
                 );
-                sleep(delay);
+                sleep(delay, sink)?;
             }
             Attempt::Fatal(error) => return Err(error),
         }
@@ -464,17 +479,33 @@ pub(super) fn retry_after_hint(headers: &HeaderMap) -> Option<Duration> {
 }
 
 /// Sleep up to `delay`, but in slices so `cancel` is observed promptly; returns
-/// early once cancelled.
-fn sleep_cancellable(delay: Duration, cancel: &CancellationToken) {
+/// early once cancelled. Emits a [`TurnSink::on_activity`] keepalive immediately
+/// (the failed attempt before this sleep produced no events, so part of the
+/// idle budget is already spent) and then every
+/// [`RETRY_BACKOFF_KEEPALIVE_INTERVAL`], so the consumer-side idle guard sees a
+/// live retry loop instead of a stalled stream. Returns `Err` only when the
+/// stream consumer dropped (there is nobody left to retry for).
+fn sleep_cancellable(
+    delay: Duration,
+    cancel: &CancellationToken,
+    sink: &mut dyn TurnSink,
+) -> Result<()> {
     const SLICE: Duration = Duration::from_millis(100);
+    sink.on_activity()?;
     let deadline = Instant::now() + delay;
+    let mut next_keepalive = Instant::now() + RETRY_BACKOFF_KEEPALIVE_INTERVAL;
     while Instant::now() < deadline {
         if cancel.is_cancelled() {
-            return;
+            return Ok(());
+        }
+        if Instant::now() >= next_keepalive {
+            sink.on_activity()?;
+            next_keepalive += RETRY_BACKOFF_KEEPALIVE_INTERVAL;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         sleep(remaining.min(SLICE));
     }
+    Ok(())
 }
 
 /// Build an [`AuthError`](crate::errors::AuthError) that preserves the safe cause
@@ -733,15 +764,39 @@ mod tests {
         Attempt::Done(Box::new(AssistantTurn::text(text)))
     }
 
+    /// Sink that counts `on_activity` keepalives; other events are no-ops.
+    struct CountingSink {
+        activity: usize,
+    }
+
+    impl CountingSink {
+        fn new() -> Self {
+            Self { activity: 0 }
+        }
+    }
+
+    impl TurnSink for CountingSink {
+        fn on_activity(&mut self) -> Result<()> {
+            self.activity += 1;
+            Ok(())
+        }
+
+        fn on_text_delta(&mut self, _delta: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn retry_loop_retries_transient_then_succeeds() {
         let mut sends = 0u32;
         let mut slept = Vec::new();
+        let mut sink = CountingSink::new();
         let turn = retry_loop(
             "test",
             &RetryPolicy::default(),
+            &mut sink,
             |_force| Ok(()),
-            |&()| {
+            |&(), _sink| {
                 sends += 1;
                 if sends <= 2 {
                     Attempt::Retry(anyhow!("503"), None)
@@ -749,7 +804,10 @@ mod tests {
                     done_turn("ok")
                 }
             },
-            |delay| slept.push(delay),
+            |delay, _sink| {
+                slept.push(delay);
+                Ok(())
+            },
             || false,
         )
         .expect("retry then success");
@@ -763,15 +821,20 @@ mod tests {
         let max = RetryPolicy::default().max_retries;
         let mut sends = 0u32;
         let mut slept = 0u32;
+        let mut sink = CountingSink::new();
         let result = retry_loop(
             "test",
             &RetryPolicy::default(),
+            &mut sink,
             |_force| Ok(()),
-            |&()| {
+            |&(), _sink| {
                 sends += 1;
                 Attempt::Retry(anyhow!("persistent 500 protocol anomaly"), None)
             },
-            |_delay| slept += 1,
+            |_delay, _sink| {
+                slept += 1;
+                Ok(())
+            },
             || false,
         );
         let error = result.unwrap_err();
@@ -788,21 +851,23 @@ mod tests {
         let max = RetryPolicy::default().max_retries;
         let mut sends = 0u32;
         let mut tokens = Vec::new();
+        let mut sink = CountingSink::new();
         let result = retry_loop(
             "test",
             &RetryPolicy::default(),
+            &mut sink,
             |force| {
                 tokens.push(force);
                 Ok(())
             },
-            |&()| {
+            |&(), _sink| {
                 sends += 1;
                 match sends {
                     1 => Attempt::Reauth(anyhow!("401")),
                     _ => Attempt::Retry(anyhow!("503"), None),
                 }
             },
-            |_delay| {},
+            |_delay, _sink| Ok(()),
             || false,
         );
         assert!(result.is_err());
@@ -818,15 +883,20 @@ mod tests {
         // loop iteration, so the loop bails instead of retrying forever.
         let cancelled = std::cell::Cell::new(false);
         let mut sends = 0u32;
+        let mut sink = CountingSink::new();
         let result = retry_loop(
             "test",
             &RetryPolicy::default(),
+            &mut sink,
             |_force| Ok(()),
-            |&()| {
+            |&(), _sink| {
                 sends += 1;
                 Attempt::Retry(anyhow!("503"), None)
             },
-            |_delay| cancelled.set(true),
+            |_delay, _sink| {
+                cancelled.set(true);
+                Ok(())
+            },
             || cancelled.get(),
         );
         assert!(result.unwrap_err().to_string().contains("cancelled"));
@@ -834,12 +904,57 @@ mod tests {
     }
 
     #[test]
+    fn retry_loop_aborts_when_sleep_reports_dropped_consumer() {
+        // A dropped stream consumer surfaces from the backoff keepalive; the
+        // loop must stop retrying instead of burning the remaining budget.
+        let mut sends = 0u32;
+        let mut sink = CountingSink::new();
+        let result = retry_loop(
+            "test",
+            &RetryPolicy::default(),
+            &mut sink,
+            |_force| Ok(()),
+            |&(), _sink| {
+                sends += 1;
+                Attempt::Retry(anyhow!("503"), None)
+            },
+            |_delay, _sink| Err(anyhow!("response stream dropped by consumer")),
+            || false,
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("dropped by consumer")
+        );
+        assert_eq!(sends, 1, "no further attempts after the consumer is gone");
+    }
+
+    #[test]
     fn sleep_cancellable_returns_promptly_when_already_cancelled() {
         let cancel = CancellationToken::new();
         cancel.cancel();
+        let mut sink = CountingSink::new();
         let start = Instant::now();
-        sleep_cancellable(Duration::from_secs(30), &cancel);
+        sleep_cancellable(Duration::from_secs(30), &cancel, &mut sink)
+            .expect("counting sink never fails");
         assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            sink.activity, 1,
+            "the immediate keepalive fires even when the sleep is skipped"
+        );
+    }
+
+    #[test]
+    fn backoff_sleep_emits_keepalive_activity() {
+        // The idle guard only sees channel events; a backoff sleep must emit
+        // at least the immediate keepalive so a rate-limited retry loop is not
+        // misreported as a stalled provider stream.
+        let cancel = CancellationToken::new();
+        let mut sink = CountingSink::new();
+        sleep_cancellable(Duration::from_millis(50), &cancel, &mut sink)
+            .expect("counting sink never fails");
+        assert!(sink.activity >= 1, "keepalive emitted during backoff");
     }
 
     // Backoff growth/clamping/`Retry-After` behavior is covered by
