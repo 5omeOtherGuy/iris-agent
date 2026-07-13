@@ -27,7 +27,7 @@
 //! generator that gives permanent bit-exact reproducibility from a fixed seed,
 //! which is exactly what a regression-oriented property test wants.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -35,11 +35,12 @@ use anyhow::Result;
 use serde_json::json;
 
 use super::{
-    ApplyContext, CompactionEngine, CompactionSummary, PlanTurnMode, context_tokens,
-    fold_tail_start, summarize, valid_compaction_range,
+    ApplyContext, CompactionEngine, CompactionSummary, MANUAL_COMPACT_KEEP_TOKENS,
+    ManualBlockReason, PlanTurnMode, context_tokens, fold_tail_start, manual_no_compaction_notice,
+    splits_pair_by_id, summarize, valid_compaction_range,
 };
 use crate::config::{Settings, ToolResultCompactionPolicy};
-use crate::nexus::{AgentEvent, AgentObserver, Message, Role, ToolCall};
+use crate::nexus::{AgentEvent, AgentObserver, ContextPressureTier, Message, Role, ToolCall};
 use crate::session::{SessionLog, SessionStore, estimate_tokens};
 use crate::tools::test_support::{root_of, temp_dir};
 
@@ -179,32 +180,12 @@ fn generate_transcript(rng: &mut SplitMix64) -> Vec<Message> {
     messages
 }
 
-/// Independent oracle: does covering `[start, end)` sever any tool-call from
-/// its result? Keyed on `tool_call_id`, so it is not a restatement of the
-/// role-adjacency logic in `valid_compaction_range` / `plan`.
-fn splits_pair_by_id(messages: &[Message], start: usize, end: usize) -> bool {
-    let mut call_idx: HashMap<&str, usize> = HashMap::new();
-    let mut result_idx: HashMap<&str, usize> = HashMap::new();
-    for (i, m) in messages.iter().enumerate() {
-        if let Some(id) = m.tool_call_id.as_deref() {
-            match m.role {
-                Role::AssistantToolCall => {
-                    call_idx.insert(id, i);
-                }
-                Role::Tool => {
-                    result_idx.insert(id, i);
-                }
-                _ => {}
-            }
-        }
-    }
-    let covered = |i: usize| start <= i && i < end;
-    call_idx.iter().any(|(id, &ci)| {
-        result_idx
-            .get(id)
-            .is_some_and(|&ri| covered(ci) != covered(ri))
-    })
-}
+// `splits_pair_by_id` (does covering `[start, end)` sever any tool-call from
+// its result, keyed on `tool_call_id` rather than the role-adjacency logic in
+// `valid_compaction_range` / `plan`) lives in `super` and is imported above:
+// `plan_with_mode` now gates candidate runs on it directly, so the planner
+// and this test's oracle share one implementation instead of two that could
+// silently drift apart.
 
 /// After a rewrite, every tool-call id must still have its result id present
 /// and vice versa: a split pair leaves exactly one orphaned half.
@@ -581,72 +562,313 @@ fn plan_hard_mode_skips_turn_walk_back_and_covers_current_turn() {
     assert!(context_tokens(&messages[hard.end..]) <= keep);
 }
 
+// Rewritten from `respect_plan_skips_orphan_only_run_before_later_turn`.
+//
+// OLD intent: a run sitting before a newer summary was skipped wholesale as an
+// "orphan run" -- even a COMPLETE tool-call/result pair got trimmed away, so the
+// plan could only reach the post-summary suffix.
+// NEW intent (F19 (a)): a complete pair before the newest summary is coverable;
+// only a true DANGLING half (a tool-result whose call an earlier summary
+// absorbed) is skipped.
 #[test]
-fn respect_plan_skips_orphan_only_run_before_later_turn() {
-    let orphan_call = ToolCall {
-        id: "orphaned_by_prior_summary".to_string(),
+fn respect_plan_covers_complete_pair_before_summary_but_skips_dangling_half() {
+    // (1) A complete tool round ahead of a newer summary is coverable, not
+    // trimmed away as an orphan run.
+    let pair = ToolCall {
+        id: "complete_before_summary".to_string(),
         name: "read".to_string(),
         arguments: json!({ "path": "old.rs" }),
         thought_signature: None,
     };
-    let messages = vec![
+    let complete = vec![
         Message::user("[older compacted summary]"),
-        Message::assistant_tool_call(&orphan_call),
-        Message::tool_result(&orphan_call.id, "read", "old output"),
+        Message::assistant_tool_call(&pair),
+        Message::tool_result(&pair.id, "read", &"old read output ".repeat(200)),
         Message::user("[newer compacted summary]"),
-        Message::user(&"older complete request ".repeat(400)),
-        Message::assistant(&"older complete answer ".repeat(400)),
         Message::user("recent request"),
         Message::assistant("recent answer"),
     ];
-    let (mut engine, _sessions, _ws) = persisted_engine(&messages);
+    let (mut engine, _sessions, _ws) = persisted_engine(&complete);
     engine.entry_ids[0] = None;
     engine.entry_ids[3] = None;
-    let keep = context_tokens(&messages[6..]);
-
+    let keep = context_tokens(&complete[4..]);
     let plan = engine
-        .plan(&messages, keep)
-        .expect("turn-respecting planning must skip the orphan-only run");
-    assert_eq!((plan.start, plan.end), (4, 6));
-    assert!(valid_compaction_range(&messages, plan.start, plan.end));
+        .plan(&complete, keep)
+        .expect("the complete pair before the newer summary is coverable");
+    assert_eq!(
+        (plan.start, plan.end),
+        (1, 3),
+        "the complete pre-summary pair is covered, not skipped as an orphan run"
+    );
+    assert!(valid_compaction_range(&complete, plan.start, plan.end));
+    assert!(!splits_pair_by_id(&complete, plan.start, plan.end));
+
+    // (2) A dangling result-half (its call absorbed by the older summary) is
+    // still skipped; only true dangling halves are trimmed.
+    let dangling_id = "call_absorbed_by_summary";
+    let dangling = vec![
+        Message::user("[older compacted summary]"),
+        Message::tool_result(dangling_id, "read", "orphaned half"),
+        Message::user("[newer compacted summary]"),
+        Message::user(&"later request ".repeat(200)),
+        Message::assistant(&"later answer ".repeat(200)),
+        Message::user("recent request"),
+        Message::assistant("recent answer"),
+    ];
+    let (mut engine, _sessions, _ws) = persisted_engine(&dangling);
+    engine.entry_ids[0] = None;
+    engine.entry_ids[2] = None;
+    let keep = context_tokens(&dangling[5..]);
+    let plan = engine
+        .plan(&dangling, keep)
+        .expect("the post-summary run is coverable");
+    assert_eq!(
+        (plan.start, plan.end),
+        (3, 5),
+        "the dangling result-half is skipped; the later complete run is covered"
+    );
+    assert!(valid_compaction_range(&dangling, plan.start, plan.end));
+    assert!(!splits_pair_by_id(&dangling, plan.start, plan.end));
 }
 
+// Rewritten from `manual_plan_skips_orphan_run_and_covers_post_summary_suffix`.
+//
+// OLD intent: the complete pair before the newer summary was skipped, so
+// turn-respecting planning returned `None` (the /compact no-op reproduced at
+// 268% of the window) and only manual mode reached the post-summary suffix.
+// NEW intent (F19 (a)): turn-respecting planning now COVERS the complete
+// pre-summary pair (the no-op is fixed); manual mode drops the turn walk-back so
+// the larger post-summary run is also coverable, and mass ranking picks it.
 #[test]
-fn manual_plan_skips_orphan_run_and_covers_post_summary_suffix() {
-    let orphan_call = ToolCall {
-        id: "orphaned_by_prior_summary".to_string(),
+fn manual_plan_ranks_pre_and_post_summary_runs_by_mass() {
+    let pair = ToolCall {
+        id: "complete_before_summary".to_string(),
         name: "read".to_string(),
         arguments: json!({ "path": "old.rs" }),
         thought_signature: None,
     };
     let messages = vec![
         Message::user("[older compacted summary]"),
-        Message::assistant_tool_call(&orphan_call),
-        Message::tool_result(&orphan_call.id, "read", "old output"),
+        Message::assistant_tool_call(&pair),
+        Message::tool_result(&pair.id, "read", "small old output"),
         Message::user("[compacted summary containing this turn's opener]"),
         Message::assistant(&"older completed work ".repeat(400)),
         Message::assistant(&"recent retained work ".repeat(400)),
     ];
     let (mut engine, _sessions, _ws) = persisted_engine(&messages);
-    // Rebuilt summaries have no durable message ids and cannot be covered. The
-    // first coverable run is only tool fragments whose preceding assistant
-    // content was absorbed by a summary; the substantial assistant-only run
-    // follows another summary.
     engine.entry_ids[0] = None;
     engine.entry_ids[3] = None;
     let keep = context_tokens(&messages[5..]);
 
-    assert!(
-        engine
-            .plan_with_mode(&messages, keep, PlanTurnMode::Respect)
-            .is_none(),
-        "turn-respecting planning reproduces the /compact no-op"
+    // Turn-respecting planning now covers the complete pre-summary pair instead
+    // of returning None (the old /compact no-op).
+    let respect = engine
+        .plan_with_mode(&messages, keep, PlanTurnMode::Respect)
+        .expect("respect-mode now covers the complete pre-summary pair");
+    assert_eq!((respect.start, respect.end), (1, 3));
+
+    // Manual mode also reaches the larger post-summary run and mass ranking
+    // picks it over the small pre-summary pair.
+    let manual = engine
+        .plan_manual(&messages, keep)
+        .expect("manual compaction covers the larger later run");
+    assert_eq!((manual.start, manual.end), (4, 5));
+    assert!(valid_compaction_range(&messages, manual.start, manual.end));
+    assert!(!splits_pair_by_id(&messages, manual.start, manual.end));
+}
+
+/// F19 regression (a): a durable compaction entry landing AFTER a block of
+/// persisted-but-uncovered complete tool pairs (the "heavy multi-read" bulk).
+/// Before the fix the pre-entry bulk was trimmed away wholesale as an orphan run
+/// and only the post-entry suffix stayed coverable; now both the turn-respecting
+/// and hard-current-turn planners cover the bulk.
+#[test]
+fn plan_covers_complete_pair_bulk_before_newest_compaction_entry() {
+    let mut messages = Vec::new();
+    // Heavy multi-read bulk: several complete tool rounds, no interleaved text.
+    for round in 0..6 {
+        let id = format!("bulk_{round:02}");
+        messages.push(Message::assistant_tool_call(&ToolCall {
+            id: id.clone(),
+            name: "read".to_string(),
+            arguments: json!({ "path": format!("f{round}.rs") }),
+            thought_signature: None,
+        }));
+        messages.push(Message::tool_result(
+            &id,
+            "read",
+            &"heavy read output ".repeat(80),
+        ));
+    }
+    // The newest compaction entry (a summary) lands AFTER the bulk, then a small
+    // recent suffix that stays in the keep-tail.
+    messages.push(Message::user("[newest compacted summary]"));
+    messages.push(Message::user("recent request"));
+    messages.push(Message::assistant("recent answer"));
+
+    let (mut engine, _sessions, _ws) = persisted_engine(&messages);
+    let summary_index = messages.len() - 3;
+    engine.entry_ids[summary_index] = None;
+    let keep = context_tokens(&messages[messages.len() - 2..]);
+
+    for (mode, label) in [
+        (PlanTurnMode::Respect, "respect"),
+        (PlanTurnMode::HardCurrentTurn, "hard"),
+    ] {
+        let plan = engine
+            .plan_with_mode(&messages, keep, mode)
+            .unwrap_or_else(|| panic!("{label} plan must cover the pre-entry bulk"));
+        assert_eq!(
+            (plan.start, plan.end),
+            (0, summary_index),
+            "{label} plan must cover the whole complete-pair bulk before the newest entry"
+        );
+        assert!(valid_compaction_range(&messages, plan.start, plan.end));
+        assert!(!splits_pair_by_id(&messages, plan.start, plan.end));
+        assert!((plan.start..plan.end).all(|i| engine.entry_ids[i].is_some()));
+    }
+}
+
+/// F16 guard (b): a lone summary stub that (in the degraded id-carrying state)
+/// slipped past the `None` run delimiter is never re-compacted into a
+/// summary-of-a-summary; a range that MIXES the stub with a newer real turn is
+/// still allowed.
+#[test]
+fn plan_never_covers_a_summary_only_range_but_allows_mixed() {
+    let summary_body = format!(
+        "[compacted summary of 14 earlier message(s)]\n{}",
+        "prior summary prose ".repeat(60)
     );
+
+    // Only coverable content is the lone summary stub -> forbidden.
+    let summary_only = vec![
+        Message::user("[older compacted summary]"),
+        Message::user(&summary_body),
+        Message::user("recent request"),
+        Message::assistant("recent answer"),
+    ];
+    let (mut engine, _sessions, _ws) = persisted_engine(&summary_only);
+    engine.entry_ids[0] = None;
+    let keep = context_tokens(&summary_only[2..]);
+    assert!(
+        engine.plan(&summary_only, keep).is_none(),
+        "a covered range that is only a summary stub must be forbidden"
+    );
+    assert!(
+        engine.plan_manual(&summary_only, keep).is_none(),
+        "manual mode must forbid a summary-only range too"
+    );
+
+    // Mixing the stub with a real newer turn is allowed.
+    let mixed = vec![
+        Message::user("[older compacted summary]"),
+        Message::user(&summary_body),
+        Message::assistant(&"real new work ".repeat(300)),
+        Message::user("recent request"),
+        Message::assistant("recent answer"),
+    ];
+    let (mut engine, _sessions, _ws) = persisted_engine(&mixed);
+    engine.entry_ids[0] = None;
+    let keep = context_tokens(&mixed[3..]);
+    let plan = engine
+        .plan(&mixed, keep)
+        .expect("a range mixing the summary stub with a real turn is allowed");
+    assert!(
+        plan.start <= 1 && plan.end >= 3,
+        "covered range {}..{} must include the real turn at index 2",
+        plan.start,
+        plan.end
+    );
+    assert!(valid_compaction_range(&mixed, plan.start, plan.end));
+}
+
+/// F19 escalation (c): at hard pressure the turn-respecting planner can starve
+/// once a summary has absorbed the current turn's opener, leaving completed
+/// assistant-only work as an orphan bulk. The deterministic ladder escalates to
+/// the hard-current-turn planner; this pins that the escalation target is a
+/// valid, applicable excerpts plan over the orphaned bulk.
+#[test]
+fn hard_tier_starvation_escalates_to_manual_excerpts_over_orphan_bulk() {
+    let messages = vec![
+        Message::user("[older compacted summary]"),
+        Message::user("[summary that absorbed this turn's opener]"),
+        Message::assistant(&"completed orphan work ".repeat(400)),
+        Message::assistant(&"recent retained work ".repeat(400)),
+    ];
+    let (mut engine, _sessions, ws) = persisted_engine(&messages);
+    engine.entry_ids[0] = None;
+    engine.entry_ids[1] = None;
+    let keep = context_tokens(&messages[3..]);
+
+    // The turn-respecting planner starves: the ladder's first rung would no-op.
+    assert!(
+        engine.plan(&messages, keep).is_none(),
+        "respect-mode planner starves over an already-summarized prefix"
+    );
+    // Escalation target: the hard-current-turn planner covers the orphan bulk.
     let plan = engine
         .plan_manual(&messages, keep)
-        .expect("manual compaction must skip the orphan run and cover later history");
-    assert_eq!((plan.start, plan.end), (4, 5));
-    assert!(valid_compaction_range(&messages, plan.start, plan.end));
+        .expect("the escalated hard-current-turn plan covers the orphan bulk");
+    assert_eq!((plan.start, plan.end), (2, 3));
+
+    // The escalation applies as deterministic excerpts and shrinks the range.
+    let workspace = root_of(&ws);
+    let summary = CompactionSummary::excerpts(summarize(&messages[plan.start..plan.end]));
+    let observer = NoopObserver;
+    let cx = ApplyContext {
+        workspace: &workspace,
+        output_store: None,
+        task_state: None,
+        observer: &observer,
+    };
+    let (_, rewritten) = engine
+        .apply_summary(&messages, plan, summary, cx)
+        .unwrap()
+        .expect("excerpts over the orphan bulk must shrink and apply");
+    assert!(tool_pairs_balanced(&rewritten));
+}
+
+/// F19 notice (d): the `/compact` no-op notice states the measured context
+/// tokens, the pressure tier, and the reason -- for at least two distinct
+/// starvation reasons.
+#[test]
+fn manual_no_compaction_notice_states_tokens_tier_and_reason() {
+    // Reason 1: every persisted turn already covered by a summary.
+    let all_covered = vec![Message::user("[compacted summary]")];
+    let (mut engine, _sessions, _ws) = persisted_engine(&all_covered);
+    engine.entry_ids[0] = None;
+    let measured = context_tokens(&all_covered);
+    let r1 = engine.manual_block_reason(&all_covered, MANUAL_COMPACT_KEEP_TOKENS);
+    assert_eq!(r1, ManualBlockReason::AllCovered);
+    let notice1 = manual_no_compaction_notice(measured, Some(ContextPressureTier::Hard), r1);
+    assert!(
+        notice1.contains(&format!("~{measured} tokens")),
+        "notice must state measured tokens: {notice1}"
+    );
+    assert!(
+        notice1.contains("hard pressure"),
+        "notice must name the tier: {notice1}"
+    );
+    assert!(
+        notice1.contains("already covered by a summary"),
+        "notice must state the reason: {notice1}"
+    );
+
+    // Reason 2: the only coverable turns are inside the protected recent tail.
+    let tail_only = vec![
+        Message::user("recent request"),
+        Message::assistant("recent answer"),
+    ];
+    let (engine2, _sessions2, _ws2) = persisted_engine(&tail_only);
+    let r2 = engine2.manual_block_reason(&tail_only, MANUAL_COMPACT_KEEP_TOKENS);
+    assert_eq!(r2, ManualBlockReason::KeepTail);
+    let measured2 = context_tokens(&tail_only);
+    let notice2 = manual_no_compaction_notice(measured2, Some(ContextPressureTier::Start), r2);
+    assert!(notice2.contains(&format!("~{measured2} tokens")));
+    assert!(notice2.contains("start pressure"));
+    assert!(notice2.contains("protected recent tail"));
+
+    assert_ne!(r1, r2, "the two reasons must be distinct");
 }
 
 /// Hard mode still backs the covered range off a tool-call/result pair: even
@@ -675,4 +897,84 @@ fn plan_hard_mode_still_enforces_pair_trims() {
     );
     assert!(valid_compaction_range(&messages, hard.start, hard.end));
     assert!(!splits_pair_by_id(&messages, hard.start, hard.end));
+}
+
+/// Adversarial-review finding: `plan_with_mode` treats a `None` entry id as a
+/// run delimiter and assumes -- true only in the real pipeline, where live
+/// apply and rebuild both push `Message::user` for a summary -- that a `None`
+/// id only ever lands on a `Role::User` body. A fuzzer that instead injects a
+/// `None` id onto a tool-CALL message (the reviewer's seed-0 shape: call at
+/// index 1, its result at index 3) turned the call into an unreachable
+/// delimiter while its result stayed coverable in the next run, producing a
+/// plan that severed the pair. `apply_summary`'s `valid_compaction_range`
+/// caught it as a silent no-op, but that is exactly the starvation failure
+/// shape this branch exists to remove: the planner itself must never offer
+/// that range.
+#[test]
+fn plan_never_splits_pair_when_none_id_lands_on_a_tool_call() {
+    // (1) Adversarial shape: `None` forced onto the tool-CALL half.
+    let call_a = ToolCall {
+        id: "call_a".to_string(),
+        name: "read".to_string(),
+        arguments: json!({ "path": "a.rs" }),
+        thought_signature: None,
+    };
+    let call_b = ToolCall {
+        id: "call_b".to_string(),
+        name: "read".to_string(),
+        arguments: json!({ "path": "b.rs" }),
+        thought_signature: None,
+    };
+    let messages = vec![
+        Message::user("open the task"),                                    // 0
+        Message::assistant_tool_call(&call_a),                             // 1 (forced None)
+        Message::assistant_tool_call(&call_b),                             // 2
+        Message::tool_result(&call_a.id, "read", &"result a ".repeat(50)), // 3
+        Message::tool_result(&call_b.id, "read", &"result b ".repeat(50)), // 4
+        Message::user("later request"),                                    // 5
+        Message::assistant("later answer"),                                // 6
+    ];
+    let (mut engine, _sessions, _ws) = persisted_engine(&messages);
+    assert_eq!(messages[1].role, Role::AssistantToolCall);
+    engine.entry_ids[1] = None;
+
+    for &mode in &[PlanTurnMode::Respect, PlanTurnMode::HardCurrentTurn] {
+        let plan = engine.plan_with_mode(&messages, 0, mode);
+        // The planner must never emit the id-splitting range: either it falls
+        // through to another valid run, or it finds none and returns `None`.
+        if let Some(plan) = plan {
+            assert!(
+                !splits_pair_by_id(&messages, plan.start, plan.end),
+                "{mode:?}: plan {}..{} split the call_a/result_a pair behind \
+                 the None id injected on the call at index 1",
+                plan.start,
+                plan.end
+            );
+            assert!(valid_compaction_range(&messages, plan.start, plan.end));
+        }
+    }
+
+    // (2) Realistic shape: `None` lands only on a `Role::User` summary body,
+    // matching what live apply and rebuild actually produce. The id-keyed
+    // gate must not change today's behavior for this shape.
+    let realistic = vec![
+        Message::user("[older compacted summary]"),
+        Message::assistant_tool_call(&call_a),
+        Message::tool_result(&call_a.id, "read", &"old read output ".repeat(50)),
+        Message::user("recent request"),
+        Message::assistant("recent answer"),
+    ];
+    let (mut realistic_engine, _s2, _w2) = persisted_engine(&realistic);
+    realistic_engine.entry_ids[0] = None;
+    let keep = context_tokens(&realistic[3..]);
+    let plan = realistic_engine
+        .plan(&realistic, keep)
+        .expect("the complete pair after the summary is coverable");
+    assert_eq!(
+        (plan.start, plan.end),
+        (1, 3),
+        "the id-keyed gate must not change the plan for the realistic \
+         None-only-on-summary shape"
+    );
+    assert!(!splits_pair_by_id(&realistic, plan.start, plan.end));
 }

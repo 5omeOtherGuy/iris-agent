@@ -724,6 +724,32 @@ impl CompactionEngine {
         self.plan_with_mode(messages, keep_target, PlanTurnMode::Respect)
     }
 
+    /// Classify why a manual (`HardCurrentTurn`) plan found no coverable range,
+    /// so the `/compact` notice can explain the starvation instead of the flat
+    /// "only recent or not yet persisted" line (F19 (d)). `keep` is the manual
+    /// keep-tail budget the failing plan used, so the keep-tail reason is only
+    /// reported when dropping to `keep = 0` would actually unblock a range.
+    pub(super) fn manual_block_reason(&self, messages: &[Message], keep: u64) -> ManualBlockReason {
+        let n = self.persisted.min(messages.len());
+        if n == 0 {
+            return ManualBlockReason::NotPersisted;
+        }
+        if !self.entry_ids[..n].iter().any(Option::is_some) {
+            return ManualBlockReason::AllCovered;
+        }
+        // A coverable id exists but the manual plan starved. If discarding the
+        // keep-tail (keep = 0) would find one, the coverable content was inside
+        // the protected recent tail.
+        if keep > 0
+            && self
+                .plan_with_mode(messages, 0, PlanTurnMode::HardCurrentTurn)
+                .is_some()
+        {
+            return ManualBlockReason::KeepTail;
+        }
+        ManualBlockReason::DanglingHalves
+    }
+
     /// Manual compaction is an explicit inter-turn rewrite, so it may cover
     /// completed current-turn content. This is required after a hard compaction
     /// has already absorbed the turn's opening user message: the remaining
@@ -743,8 +769,9 @@ impl CompactionEngine {
     /// coverable when the keep-tail cut lands mid-turn -- the only way to relieve
     /// context once every pre-turn message is already compacted. Every other
     /// guard is identical in both modes: the keep-tail loop, the persisted bound
-    /// `k.min(n)`, entry-id contiguity, and the pair-safety trims (start skips
-    /// leading tool fragments; end backs off so no tool-call/result pair splits).
+    /// `k.min(n)`, entry-id contiguity, and the pair-safety trims (start skips a
+    /// leading dangling tool-result half; end backs off so no tool-call/result
+    /// pair splits).
     pub(super) fn plan_with_mode(
         &self,
         messages: &[Message],
@@ -776,6 +803,10 @@ impl CompactionEngine {
         // runs. Rank every pair-safe run by token mass instead of returning the
         // oldest one: a tiny but valid fragment before an existing summary must
         // not repeatedly block a later run that can reclaim meaningful context.
+        // A run that sits BEFORE the newest compaction entry is ranked on equal
+        // footing with the post-entry suffix (F19): complete tool-call/result
+        // pairs in that pre-entry bulk are coverable, and mass ranking reclaims
+        // whichever run holds the most context.
         let mut best: Option<(u64, CompactionPlan)> = None;
         let mut cursor = 0;
         while cursor < end_limit {
@@ -789,9 +820,14 @@ impl CompactionEngine {
                 .unwrap_or(end_limit);
             let next_cursor = end.saturating_add(1);
 
-            while start < end
-                && matches!(messages[start].role, Role::Tool | Role::AssistantToolCall)
-            {
+            // Trim only a leading DANGLING tool-result half (a `Tool` whose call
+            // was absorbed by an earlier summary); covering it alone would orphan
+            // it across the start boundary. A leading assistant tool-call is NOT
+            // trimmed: its result sits later in the same run, so the pair is
+            // complete and coverable. Trimming it here was the F19 starvation --
+            // an all-tool "heavy multi-read" run ahead of a summary got eaten
+            // whole and only the post-entry suffix stayed coverable.
+            while start < end && messages[start].role == Role::Tool {
                 start += 1;
             }
             while end > start
@@ -802,7 +838,25 @@ impl CompactionEngine {
             {
                 end -= 1;
             }
-            if start < end {
+            // (b) F16: never cannibalize an already-summarized prefix into a
+            // summary-of-a-summary. A run whose every covered message is itself a
+            // compaction stub (a summary body that, in the degraded id-carrying
+            // state, slipped past the `None` run delimiter) is not a coverable
+            // range; a valid plan must include at least one real turn.
+            //
+            // Pair-completeness by id is the final gate, independent of the
+            // role-adjacency trims above: it does not assume a `None` entry id
+            // only ever lands on a `Role::User` summary body. A run that would
+            // sever a tool-call/result pair by id (e.g. a `None` id landing on
+            // the call turns it into a delimiter no run covers, orphaning its
+            // result inside this one) is never a candidate; the loop falls
+            // through to the next run by mass rank instead of emitting a plan
+            // that `apply_summary`'s `valid_compaction_range` would silently
+            // no-op. This must hold in release, not just debug_assert.
+            if start < end
+                && !(start..end).all(|index| is_summary_body(&messages[index]))
+                && !splits_pair_by_id(messages, start, end)
+            {
                 let tokens = context_tokens(&messages[start..end]);
                 if best
                     .as_ref()
