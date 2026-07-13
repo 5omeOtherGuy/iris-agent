@@ -298,24 +298,33 @@ fn default_fragments() -> Vec<Fragment> {
 
 /// Discover project docs walking `cwd` -> filesystem root, deduping by path, and
 /// returning them root-to-leaf (pi order). Each directory contributes its first
-/// existing, non-empty, regular-file candidate. Additionally, `~/.iris/AGENTS.md`
-/// is prepended as the outermost user-level doc (before the root-to-leaf walk
-/// results) when it exists and is non-empty, so user-level instructions from
-/// onboarding or manual placement always appear first.
+/// existing, non-empty, regular-file candidate. Additionally, two user-level
+/// docs are prepended before the walk results, outermost first: the machine-local
+/// shared hub file `~/.agents/AGENTS.md`, then `~/.iris/AGENTS.md` so
+/// Iris-specific instructions can override the shared ones. Both are subject to
+/// the same non-empty and symlink-refusing read rules as walk docs.
 fn discover_project_docs(cwd: &Path) -> Vec<(String, String)> {
     let mut docs = Vec::new();
 
-    // Prepend ~/.iris/AGENTS.md as the outermost user-level doc.
-    if let Some(iris_path) = onboarding::iris_agents_path()
-        && let Some(content) = read_regular_bounded(&iris_path, MAX_DOC_BYTES)
-        && !content.trim().is_empty()
+    // Prepend user-level docs: shared hub first, then the Iris-specific file.
+    for path in [
+        onboarding::shared_agents_path(),
+        onboarding::iris_agents_path(),
+    ]
+    .into_iter()
+    .flatten()
     {
-        let path_str = iris_path.display().to_string();
-        docs.push((path_str, content));
+        if let Some(content) = read_regular_bounded(&path, MAX_DOC_BYTES)
+            && !content.trim().is_empty()
+        {
+            docs.push((path.display().to_string(), content));
+        }
     }
 
     // Each iteration shortens `current` via `parent()`, so every visited dir --
-    // and therefore every candidate path -- is unique; no dedup set is needed.
+    // and therefore every candidate path -- is unique within the walk. A walk
+    // that starts under `~/.agents` or `~/.iris` can still revisit a prepended
+    // user-level doc, so walk results are filtered against those by exact path.
     let mut walk_docs = Vec::new();
     let mut current = cwd.to_path_buf();
     loop {
@@ -328,6 +337,7 @@ fn discover_project_docs(cwd: &Path) -> Vec<(String, String)> {
         }
     }
     walk_docs.reverse(); // leaf-first collection -> root-to-leaf emission
+    walk_docs.retain(|(path, _)| docs.iter().all(|(seen, _)| seen != path));
     docs.extend(walk_docs);
     docs
 }

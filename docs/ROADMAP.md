@@ -138,9 +138,10 @@ Implemented today:
   ([#56](https://github.com/5omeOtherGuy/iris-agent/issues/56),
   [#74](https://github.com/5omeOtherGuy/iris-agent/pull/74)): the Tier-2
   Wayland `system_prompt::assemble` builds in-binary shipped fragments +
-  generated live-tool blocks + dynamic project docs (`AGENTS.md`/`CLAUDE.md`) +
-  runtime context in one place; fresh and resumed sessions feed the same
-  assembled string through the provider request path. Native filesystem skills
+  generated live-tool blocks + user instructions (`~/.agents/AGENTS.md`, then
+  `~/.iris/AGENTS.md`) + dynamic root-to-leaf project docs
+  (`AGENTS.md`/`CLAUDE.md`) + runtime context in one place; fresh and resumed
+  sessions feed the same assembled string through the provider request path. Native filesystem skills
   are implemented (issue #57); templates remain deferred, and named slots plus
   selector-driven assembly remain open (#76/#73). ADR-0026 made fragments fully
   internal (superseding the #202
