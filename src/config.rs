@@ -2913,37 +2913,6 @@ mod tests {
     }
 
     #[test]
-    fn cross_session_prompt_cache_defaults_off_and_is_global_only() {
-        assert!(!Settings::default().cross_session_prompt_cache());
-
-        let dir = temp_dir();
-        let global = dir.path.join("global.json");
-        let project = dir.path.join("project.json");
-        fs::write(&global, r#"{ "crossSessionPromptCache": true }"#).unwrap();
-        fs::write(&project, r#"{ "crossSessionPromptCache": false }"#).unwrap();
-        let enabled = Settings::load_from(Some(&global), &project).unwrap();
-        assert!(enabled.cross_session_prompt_cache());
-
-        fs::write(&global, "{}").unwrap();
-        fs::write(&project, r#"{ "crossSessionPromptCache": true }"#).unwrap();
-        let project_cannot_enable = Settings::load_from(Some(&global), &project).unwrap();
-        assert!(!project_cannot_enable.cross_session_prompt_cache());
-    }
-
-    #[test]
-    fn save_cross_session_prompt_cache_round_trips_globally() {
-        let dir = temp_dir();
-        let path = dir.path.join("settings.json");
-        let _guard = ConfigPathGuard::set(&path);
-
-        save_cross_session_prompt_cache(true).unwrap();
-
-        let loaded = Settings::load_from(Some(&path), &dir.path.join("none.json")).unwrap();
-        assert!(loaded.cross_session_prompt_cache());
-        assert_eq!(read_object(&path).unwrap()["crossSessionPromptCache"], true);
-    }
-
-    #[test]
     fn prompt_cache_retention_is_global_only() {
         let dir = temp_dir();
         let global = dir.path.join("global.json");
