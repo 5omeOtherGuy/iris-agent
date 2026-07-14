@@ -442,6 +442,59 @@ impl Transcript {
         self.mark_dirty_from(self.rows.len());
     }
 
+    /// Refresh elapsed labels for every running tool block. Active review blocks
+    /// share the same lifecycle records but have an empty elapsed label, so they
+    /// remain untimed until execution actually starts.
+    fn refresh_running_elapsed(&mut self) {
+        let now = Instant::now();
+        let exec = self
+            .active_exec
+            .as_ref()
+            .map(|active| (active.body_start + 1, active.started));
+        let tool = self
+            .active_tool
+            .as_ref()
+            .map(|active| (active.body_start + 1, active.started));
+        let edit = self.active_edit.as_ref().and_then(|active| {
+            active
+                .started
+                .map(|started| (active.body_start + 1, started))
+        });
+        let explore = if self.active_explorations.iter().any(|active| !active.done) {
+            self.active_explorations
+                .iter()
+                .map(|active| active.row)
+                .min()
+                .zip(
+                    self.active_explorations
+                        .iter()
+                        .map(|active| active.started)
+                        .min(),
+                )
+                .map(|(row, started)| (row.saturating_sub(1), started))
+        } else {
+            None
+        };
+
+        for (row, started) in [exec, tool, edit, explore].into_iter().flatten() {
+            let next = format_elapsed_compact(now.saturating_duration_since(started));
+            let changed = match self.rows.get_mut(row).and_then(|row| row.chrome.as_mut()) {
+                Some(ChromeRow::Header { elapsed, .. }) if !elapsed.is_empty() => {
+                    if *elapsed == next {
+                        false
+                    } else {
+                        *elapsed = next;
+                        true
+                    }
+                }
+                _ => false,
+            };
+            if changed {
+                self.mark_dirty_from(row);
+            }
+        }
+    }
+
     /// Append a blank separator row before a new top-level block, unless the
     /// transcript is empty or already ends in a real separator row.
     fn push_blank(&mut self) {
@@ -3430,6 +3483,7 @@ impl Transcript {
     /// `width`, refreshing the wrap cache. O(dirty suffix), O(1) once warm --
     /// the pager calls this every frame regardless of transcript length.
     pub(super) fn visible_total(&mut self, width: u16) -> usize {
+        self.refresh_running_elapsed();
         let width = usize::from(width);
         self.last_width = width
             .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
@@ -3504,6 +3558,7 @@ impl Transcript {
     }
 
     fn render_cached(&mut self, width: u16, suffix_only: bool) -> TranscriptRender {
+        self.refresh_running_elapsed();
         let width = usize::from(width);
         self.last_width = width
             .saturating_sub(TEXT_COLUMN_X_PADDING.saturating_mul(2))
@@ -3561,5 +3616,36 @@ impl Transcript {
             stable_prefix,
             total_lines,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn running_tool_elapsed_refreshes_during_render() {
+        let mut transcript = Transcript::default();
+        transcript.begin_exec(ToolCall {
+            id: "call-1".to_string(),
+            thought_signature: None,
+            name: "bash".to_string(),
+            arguments: serde_json::json!({ "command": "sleep 5" }),
+        });
+        transcript
+            .active_exec
+            .as_mut()
+            .expect("active shell")
+            .started = Instant::now() - Duration::from_millis(2_500);
+
+        let rendered = transcript.render(80);
+        let header = rendered
+            .lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.contains("SHELL"))
+            .expect("shell header");
+
+        assert!(header.trim_end().ends_with("2.5s"), "{header:?}");
     }
 }
