@@ -3623,29 +3623,81 @@ impl Transcript {
 mod tests {
     use super::*;
 
+    fn tool_call(name: &str) -> ToolCall {
+        ToolCall {
+            id: format!("call-{name}"),
+            thought_signature: None,
+            name: name.to_string(),
+            arguments: serde_json::json!({ "command": "sleep 5" }),
+        }
+    }
+
+    fn header_line(transcript: &mut Transcript, title: &str) -> String {
+        transcript
+            .render(80)
+            .lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.contains(title))
+            .unwrap_or_else(|| panic!("{title} header"))
+    }
+
+    fn begin_review(transcript: &mut Transcript, call: ToolCall) {
+        transcript.apply(UiEvent::ToolReview {
+            call,
+            allow_always: false,
+            allow_project: false,
+            dirty_gate: false,
+            reason: None,
+        });
+    }
+
     #[test]
     fn running_tool_elapsed_refreshes_during_render() {
         let mut transcript = Transcript::default();
-        transcript.begin_exec(ToolCall {
-            id: "call-1".to_string(),
-            thought_signature: None,
-            name: "bash".to_string(),
-            arguments: serde_json::json!({ "command": "sleep 5" }),
-        });
+        transcript.begin_exec(tool_call("bash"));
         transcript
             .active_exec
             .as_mut()
             .expect("active shell")
             .started = Instant::now() - Duration::from_millis(2_500);
 
-        let rendered = transcript.render(80);
-        let header = rendered
-            .lines
-            .iter()
-            .map(line_text)
-            .find(|line| line.contains("SHELL"))
-            .expect("shell header");
+        let header = header_line(&mut transcript, "SHELL");
 
         assert!(header.trim_end().ends_with("2.5s"), "{header:?}");
+    }
+
+    #[test]
+    fn shell_elapsed_excludes_time_awaiting_review() {
+        let mut transcript = Transcript::default();
+        let call = tool_call("bash");
+        begin_review(&mut transcript, call.clone());
+        transcript
+            .active_exec
+            .as_mut()
+            .expect("active shell review")
+            .started = Instant::now() - Duration::from_secs(5);
+
+        transcript.apply(UiEvent::ToolStarted(call));
+        let header = header_line(&mut transcript, "SHELL");
+
+        assert!(header.trim_end().ends_with("0.0s"), "{header:?}");
+    }
+
+    #[test]
+    fn generic_tool_elapsed_excludes_time_awaiting_review() {
+        let mut transcript = Transcript::default();
+        let call = tool_call("custom");
+        begin_review(&mut transcript, call.clone());
+        transcript
+            .active_tool
+            .as_mut()
+            .expect("active generic review")
+            .started = Instant::now() - Duration::from_secs(5);
+
+        transcript.apply(UiEvent::ToolStarted(call));
+        let header = header_line(&mut transcript, "TOOL");
+
+        assert!(header.trim_end().ends_with("0.0s"), "{header:?}");
     }
 }
