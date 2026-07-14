@@ -3450,6 +3450,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cross_session_prompt_cache_is_an_opt_in_engine_switch() {
+        let mut panel = panel();
+        assert!(
+            panel
+                .selectable()
+                .contains(&PanelRow::Top(RowId::Field(Field::CrossSessionPromptCache)))
+        );
+        assert_eq!(
+            panel.snap.switch_options(Field::CrossSessionPromptCache),
+            &["off", "on"]
+        );
+        assert_eq!(
+            panel.snap.switch_value(Field::CrossSessionPromptCache),
+            "off"
+        );
+
+        select_top(&mut panel, RowId::Field(Field::CrossSessionPromptCache));
+        assert_eq!(
+            panel.handle_key(ModalKey::Right),
+            ModalOutcome::Emit(ModalAction::SaveSetting {
+                field: Field::CrossSessionPromptCache,
+                value: Some("true".to_string()),
+            })
+        );
+        assert!(panel.snap.cross_session_prompt_cache);
+    }
+
+    #[test]
     fn bool_switches_persist_true_false_not_on_off() {
         let mut panel = panel();
         select_top(&mut panel, RowId::Field(Field::Microcompaction));

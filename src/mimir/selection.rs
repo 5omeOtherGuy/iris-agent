@@ -1255,6 +1255,23 @@ mod tests {
     }
 
     #[test]
+    fn cross_session_prompt_cache_resolves_default_off_and_explicit_on() {
+        let mut settings = settings(None, None, None, None);
+        assert!(
+            !ModelSelection::resolve(&settings)
+                .unwrap()
+                .cross_session_prompt_cache
+        );
+
+        settings.cross_session_prompt_cache = Some(true);
+        assert!(
+            ModelSelection::resolve(&settings)
+                .unwrap()
+                .cross_session_prompt_cache
+        );
+    }
+
+    #[test]
     fn cache_retention_parses_defaults_and_rejects_unknown_values() {
         let mut s = settings(None, None, None, None);
         // Default is short-lived prompt caching so stable prefixes are cacheable
