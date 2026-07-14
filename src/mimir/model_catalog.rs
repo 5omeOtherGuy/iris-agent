@@ -469,16 +469,16 @@ mod tests {
     }
 
     #[test]
-    fn effective_window_reserves_model_output_and_summary_capacity() {
+    fn official_cli_context_policies_reserve_output_and_summary_headroom() {
         let haiku = settings(Some("anthropic"), Some("claude-haiku-4-5"), None);
         let haiku = ModelSelection::resolve(&haiku).unwrap();
         assert_eq!(
             effective_context_window(&haiku, 8_192),
             Some(EffectiveContextWindow {
                 raw: 200_000,
-                max_output_reserve: 64_000,
-                summary_reserve: 8_192,
-                effective: 127_808,
+                max_output_reserve: 20_000,
+                summary_reserve: 13_000,
+                effective: 167_000,
                 source: ContextWindowSource::Catalog,
             })
         );
@@ -489,9 +489,9 @@ mod tests {
             effective_context_window(&codex, 8_192),
             Some(EffectiveContextWindow {
                 raw: 372_000,
-                max_output_reserve: 128_000,
-                summary_reserve: 8_192,
-                effective: 235_808,
+                max_output_reserve: 20_000,
+                summary_reserve: 17_200,
+                effective: 334_800,
                 source: ContextWindowSource::Catalog,
             })
         );

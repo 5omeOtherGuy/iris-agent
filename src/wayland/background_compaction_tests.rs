@@ -1478,14 +1478,31 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
 
     for _ in 0..500 {
         block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
-        if obs.applied() == 1 {
+        if obs.lifecycle(CompactionLifecycleState::Ready) == 1 {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    assert_eq!(obs.applied(), 1);
     assert_eq!(obs.lifecycle(CompactionLifecycleState::Ready), 1);
+    assert_eq!(
+        obs.applied(),
+        0,
+        "a prepared summary must wait for the hard application threshold"
+    );
+    assert!(
+        harness
+            .messages()
+            .iter()
+            .any(|message| message.content.contains(OLD_NEEDLE)),
+        "prepared context remains live before hard pressure"
+    );
+
+    harness.compaction.ladder.as_mut().unwrap().hard =
+        super::context_tokens(harness.messages()).saturating_sub(1);
+    block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
+
+    assert_eq!(obs.applied(), 1);
     assert_eq!(obs.lifecycle(CompactionLifecycleState::Applied), 1);
     let states = obs
         .events
