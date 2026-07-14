@@ -856,18 +856,39 @@ fn working_indicator_line_with_activity(
     let mut spans = led_frame_spans(frame);
     spans.push(Span::raw(" "));
     spans.push(Span::styled(format_elapsed_compact(elapsed), panel_style()));
+    // The flow meter's flanking `┊`s hug the bar with no interior padding
+    // (`┊██▊▏··┊`, unlike every other `┊`-joined field): the meter is a
+    // single dense instrument, not prose. `tight_sep` tracks the still-open
+    // closing `┊`, consumed (tight, no leading space) by whichever field
+    // follows the meter; if none does it is simply never emitted, so it can
+    // never dangle at the line's end.
+    let mut tight_sep = false;
     if let Some(flow) = flow {
-        spans.push(working_sep());
+        spans.push(Span::styled(
+            format!(" {}", crate::ui::symbols::SEP),
+            dim_style(),
+        ));
         spans.extend(flow.spans());
+        tight_sep = true;
     }
+    let push_sep = |spans: &mut Vec<Span<'static>>, tight_sep: &mut bool| {
+        if std::mem::take(tight_sep) {
+            spans.push(Span::styled(
+                crate::ui::symbols::SEP.to_string(),
+                dim_style(),
+            ));
+        } else {
+            spans.push(working_sep());
+        }
+    };
     if let Some(activity) = activity {
-        spans.push(working_sep());
+        push_sep(&mut spans, &mut tight_sep);
         spans.push(Span::styled(activity.to_string(), dim_style()));
     }
     // Surface queued steering/follow-up the user typed during the turn but the
     // loop has not injected yet, so submitted input visibly registers.
     if queued > 0 {
-        spans.push(working_sep());
+        push_sep(&mut spans, &mut tight_sep);
         let label = if queued == 1 {
             "1 queued".to_string()
         } else {
@@ -876,7 +897,7 @@ fn working_indicator_line_with_activity(
         spans.push(Span::styled(label, dim_style()));
     }
     if !flows.is_empty() {
-        spans.push(working_sep());
+        push_sep(&mut spans, &mut tight_sep);
         spans.push(Span::styled(
             format!(
                 "↑{} ↓{}",
@@ -4567,7 +4588,7 @@ mod tests {
         ));
         // The docs/TUI_DESIGN_LANGUAGE.md §7.7 example, byte for byte — the
         // doc example and this frame must move together.
-        assert_eq!(line.trim(), "●··· 1:27 ┊ ██▊▏·· ┊ Responding ┊ ↑177k ↓5.7k");
+        assert_eq!(line.trim(), "●··· 1:27 ┊██▊▏··┊Responding ┊ ↑177k ↓5.7k");
     }
 
     #[test]
