@@ -1,11 +1,5 @@
 # Iris
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="docs/assets/hero-light.svg">
-  <img alt="Iris terminal banner. A user asks: What are you? The thinking indicator pulses, and the answer is: A precise, token-efficient coding agent for the terminal." src="docs/assets/hero-dark.svg" width="640">
-</picture>
-
 A precise, token-efficient coding agent for the terminal.
 
 This is the owner's manual for humans and AI agents evaluating, operating, or
