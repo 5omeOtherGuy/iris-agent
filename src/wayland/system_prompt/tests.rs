@@ -8,13 +8,11 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::tools::{built_in_tools, built_in_tools_for};
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
@@ -23,12 +21,14 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn with_home(home: &Path) -> Self {
-        let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let guard = Self {
             _lock: lock,
             home: env::var_os("HOME"),
         };
-        // SAFETY: system_prompt env-sensitive tests run under ENV_LOCK and
+        // SAFETY: system_prompt env-sensitive tests run under TEST_ENV_LOCK and
         // restore HOME before releasing it.
         unsafe { env::set_var("HOME", home) };
         guard
@@ -37,7 +37,7 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // SAFETY: serialized under ENV_LOCK by EnvGuard and restored on drop.
+        // SAFETY: serialized under TEST_ENV_LOCK by EnvGuard and restored on drop.
         unsafe {
             match &self.home {
                 Some(value) => env::set_var("HOME", value),

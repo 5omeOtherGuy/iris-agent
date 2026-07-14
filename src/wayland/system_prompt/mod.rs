@@ -88,6 +88,10 @@ const DOC_CANDIDATES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 /// runaway or hostile file cannot balloon every request / OOM the process.
 const MAX_DOC_BYTES: u64 = 32 * 1024;
 
+/// Shared by Wayland tests that temporarily mutate process-global HOME.
+#[cfg(test)]
+pub(super) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug)]
 pub(crate) struct PromptAssembly {
     pub(crate) prompt: String,
