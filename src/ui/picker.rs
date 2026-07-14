@@ -475,16 +475,16 @@ pub(crate) fn settings_snapshot<P: ChatProvider>(
             hard: ladder.hard,
             effective_tail: ladder.keep_recent_tokens,
             configured_tail: trigger.keep_recent_tokens,
-            effective_window: ladder.effective_window,
+            effective_window: ladder.displayed_context_window,
         }
     });
-    // The model's own effective window (pre-clamp), from the same resolved
-    // budget facts /context prints — caps the `context cap` dial at model truth.
+    // The model's displayed context window (pre-clamp), from the same resolved
+    // policy /context prints, caps the `context cap` dial at model truth.
     let model_context_window = diagnostics
         .as_ref()
-        .and_then(|diag| diag.budget_facts)
-        .and_then(|facts| facts.window)
-        .map(|window| window.effective);
+        .and_then(|diag| diag.policy)
+        .and_then(|policy| policy.window)
+        .map(|window| window.displayed);
     settings_menu::Snapshot {
         default_model,
         reasoning_levels,

@@ -14,7 +14,7 @@ impl CompactionEngine {
         let measured_before = measure_context(messages, None, 0).tokens;
         let effective_window = self
             .ladder
-            .map(|ladder| ladder.effective_window)
+            .map(|ladder| ladder.displayed_context_window)
             .or(self.budget)
             .unwrap_or(0);
         if !self.reactive_enabled
@@ -246,16 +246,7 @@ impl CompactionEngine {
         let Some(ladder) = self.ladder else {
             return Ok(ContextDirective::Proceed);
         };
-        if let Some(mut replacement) = self.drain_background_at_boundary(cx.messages, apply_cx)? {
-            let plans = self.pending_folds(&replacement, workspace);
-            if !plans.is_empty() {
-                replacement =
-                    self.flush_folds(&replacement, &plans, FoldTrigger::CompactionBoundary, obs)?;
-            }
-            return Ok(ContextDirective::Replace {
-                messages: replacement,
-            });
-        }
+        self.poll_background_ready(obs)?;
 
         let anchor = cx.last_usage.map(|anchor| UsageAnchor {
             total_tokens: anchor.usage.total_tokens,
@@ -269,7 +260,7 @@ impl CompactionEngine {
                     AgentEvent::ContextPressure {
                         tier,
                         measured: measurement.tokens,
-                        effective_window: ladder.effective_window,
+                        effective_window: ladder.displayed_context_window,
                         source: measurement.source,
                     },
                     "context pressure",
@@ -281,7 +272,7 @@ impl CompactionEngine {
                     obs,
                     AgentEvent::Notice(format!(
                         "context window {} is too small for background summarization; automatic compaction will use deterministic excerpts.",
-                        ladder.effective_window
+                        ladder.displayed_context_window
                     )),
                     "small-window compaction notice",
                 );

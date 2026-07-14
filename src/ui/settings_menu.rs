@@ -503,10 +503,9 @@ pub(crate) struct Snapshot {
     /// Whether the RESOLVED tool-result policy runs tool clearing. Drives the
     /// `keep tool uses` inertness.
     pub(crate) tool_clearing_enabled: bool,
-    /// The active model's own effective context window (catalog raw minus
-    /// reserves), before the legacy `contextTokenBudget` clamp. `None` when the
-    /// catalog has no window fact. Caps the `context cap` dial so the setting
-    /// can never claim more window than the model really has.
+    /// The active model's displayed context window before the legacy
+    /// `contextTokenBudget` clamp. `None` when the catalog has no window fact.
+    /// Caps the `context cap` dial at the capacity shown by the provider CLI.
     pub(crate) model_context_window: Option<u64>,
     pub(crate) prompt_cache_retention: String,
     /// Web search tool backend (`off|native|brave|jina|searxng`). GLOBAL-ONLY;

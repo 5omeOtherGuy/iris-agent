@@ -144,6 +144,8 @@ pub(super) struct BackgroundCompaction {
     pub(super) covered_messages: usize,
     pub(super) original_tokens: u64,
     pub(super) receiver: Receiver<BackgroundSummaryResult>,
+    pub(super) result: Option<BackgroundSummaryResult>,
+    pub(super) ready_emitted: bool,
     pub(super) token: CancellationToken,
     pub(super) origin: CompactionOrigin,
     pub(super) trigger_tier: Option<ContextPressureTier>,
@@ -211,10 +213,10 @@ pub(super) struct CompactionEngine {
     pub(super) persisted: usize,
     pub(super) entry_ids: Vec<Option<String>>,
     pub(super) budget: Option<u64>,
-    /// Full provenance of `budget` (catalog window, reserves, legacy clamp)
-    /// when the Tier-3 app resolved it; `None` for bare-number installs
-    /// (benches, tests). Display-only: enforcement always uses `budget`.
-    pub(super) budget_facts: Option<crate::metrics::ResolvedContextBudget>,
+    /// Resolved model/provider policy installed by the Tier-3 app. `None` for
+    /// bare-number installs used by tests and benches. Enforcement and
+    /// diagnostics consume the same values.
+    pub(super) policy: Option<crate::metrics::ResolvedContextBudget>,
     pub(super) automatic_enabled: bool,
     pub(super) trigger_v2: bool,
     pub(super) ladder: Option<TriggerLadder>,
@@ -277,7 +279,7 @@ impl CompactionEngine {
             persisted,
             entry_ids,
             budget,
-            budget_facts: None,
+            policy: None,
             automatic_enabled: budget.is_some(),
             trigger_v2: false,
             ladder,

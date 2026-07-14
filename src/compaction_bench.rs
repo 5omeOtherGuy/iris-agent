@@ -1565,13 +1565,14 @@ fn build_v2_benchmark_harness(
         stored.entry_ids,
         Some(32_768),
     );
+    let initial_tokens = harness.context_token_estimate();
     harness.set_compaction_trigger(
         32_768.into(),
         CompactionTriggerConfig {
             enabled: true,
-            warn: TUNED_POLICY.warn,
-            start: TUNED_POLICY.start,
-            hard: TUNED_POLICY.hard,
+            warn: initial_tokens.saturating_sub(2) as f64 / 32_768.0,
+            start: initial_tokens.saturating_sub(1) as f64 / 32_768.0,
+            hard: initial_tokens.saturating_add(100) as f64 / 32_768.0,
             keep_recent_tokens: TUNED_POLICY.keep,
             hard_wait_ms: 10_000,
             max_consecutive_failures: 3,

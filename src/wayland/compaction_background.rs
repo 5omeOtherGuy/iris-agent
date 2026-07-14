@@ -191,6 +191,8 @@ impl CompactionEngine {
             covered_messages,
             original_tokens,
             receiver,
+            result: None,
+            ready_emitted: false,
             token,
             origin,
             trigger_tier,
@@ -210,38 +212,58 @@ impl CompactionEngine {
         Ok(BackgroundStart::Started)
     }
 
+    /// Poll a background worker without applying its result. A completed summary
+    /// remains attached to the frozen snapshot until hard pressure (or an
+    /// explicit manual compaction) consumes it.
+    pub(super) fn poll_background_ready(&mut self, obs: &dyn AgentObserver) -> Result<()> {
+        let Some(mut job) = self.background.take() else {
+            return Ok(());
+        };
+        if job.result.is_none() {
+            match job.receiver.try_recv() {
+                Ok(result) => {
+                    if let BackgroundSummaryResult::Summary(summary) = &result {
+                        self.emit_lifecycle(
+                            obs,
+                            &job,
+                            CompactionLifecycleState::Ready,
+                            summary.worker_usage.clone(),
+                            Some(
+                                "background compaction summary ready; waiting for hard pressure"
+                                    .to_string(),
+                            ),
+                        )?;
+                        job.ready_emitted = true;
+                    }
+                    job.result = Some(result);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    job.result = Some(BackgroundSummaryResult::Failed(
+                        "background compaction worker stopped before returning a summary"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        self.background = Some(job);
+        Ok(())
+    }
+
     pub(super) fn drain_background_at_boundary(
         &mut self,
         messages: &[Message],
         cx: ApplyContext<'_>,
     ) -> Result<Option<Vec<Message>>> {
-        let Some(job) = self.background.as_ref() else {
+        self.poll_background_ready(cx.observer)?;
+        let Some(mut job) = self.background.take() else {
             return Ok(None);
         };
-        match job.receiver.try_recv() {
-            Ok(result) => {
-                let job = self.background.take().expect("checked above");
-                // Non-blocking drain at a continuing boundary: no provider-native
-                // rung here (it blocks and is reserved for hard pressure).
-                self.finish_background_at_boundary(job, result, messages, cx, None)
-            }
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => {
-                let job = self.background.take().expect("checked above");
-                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-                self.emit_lifecycle(
-                    cx.observer,
-                    &job,
-                    CompactionLifecycleState::Failed,
-                    None,
-                    Some(
-                        "background compaction worker stopped before returning a summary"
-                            .to_string(),
-                    ),
-                )?;
-                self.apply_job_fallback(&job, messages, cx, None)
-            }
-        }
+        let Some(result) = job.result.take() else {
+            self.background = Some(job);
+            return Ok(None);
+        };
+        self.finish_background_at_boundary(job, result, messages, cx, None)
     }
 
     pub(super) async fn resolve_hard_at_boundary(
@@ -250,7 +272,7 @@ impl CompactionEngine {
         cx: ApplyContext<'_>,
         token: &CancellationToken,
     ) -> Result<Option<Vec<Message>>> {
-        let Some(job) = self.background.take() else {
+        let Some(mut job) = self.background.take() else {
             return Ok(None);
         };
         if token.is_cancelled() {
@@ -263,6 +285,9 @@ impl CompactionEngine {
                 Some("background compaction cancelled with the turn".to_string()),
             )?;
             return Ok(None);
+        }
+        if let Some(result) = job.result.take() {
+            return self.finish_background_at_boundary(job, result, messages, cx, Some(token));
         }
         let job_id = job.job_id.clone();
         let covered_messages = job.covered_messages;
@@ -365,13 +390,15 @@ impl CompactionEngine {
         match result {
             BackgroundSummaryResult::Summary(summary) => {
                 let usage = summary.worker_usage.clone();
-                self.emit_lifecycle(
-                    cx.observer,
-                    &job,
-                    CompactionLifecycleState::Ready,
-                    usage.clone(),
-                    Some("background compaction summary ready".to_string()),
-                )?;
+                if !job.ready_emitted {
+                    self.emit_lifecycle(
+                        cx.observer,
+                        &job,
+                        CompactionLifecycleState::Ready,
+                        usage.clone(),
+                        Some("background compaction summary ready".to_string()),
+                    )?;
+                }
                 if self.model_compaction_cap_reached(summary.origin) {
                     self.emit_lifecycle(
                         cx.observer,

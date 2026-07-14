@@ -209,7 +209,7 @@ fn disabling_auto_compaction_cancels_the_background_job_and_clears_diagnostics()
     harness.set_compaction_trigger(200_000.into(), trigger);
     let diag = harness.context_diagnostics().expect("ladder present");
     assert!(diag.automatic_enabled);
-    assert_eq!(diag.ladder.effective_window, 200_000);
+    assert_eq!(diag.ladder.displayed_context_window, 200_000);
 
     // Install a running background job so the chip would be lit.
     let (_sender, receiver) = mpsc::channel();
@@ -221,6 +221,8 @@ fn disabling_auto_compaction_cancels_the_background_job_and_clears_diagnostics()
         covered_messages: 2,
         original_tokens: 10,
         receiver,
+        result: None,
+        ready_emitted: false,
         token: CancellationToken::new(),
         origin: CompactionOrigin::Subagent,
         trigger_tier: Some(ContextPressureTier::Start),
@@ -270,6 +272,8 @@ fn disabling_auto_compaction_emits_a_cancelled_lifecycle_event() {
         covered_messages: 2,
         original_tokens: 10,
         receiver,
+        result: None,
+        ready_emitted: false,
         token: CancellationToken::new(),
         origin: CompactionOrigin::Subagent,
         trigger_tier: Some(ContextPressureTier::Start),
@@ -396,6 +400,8 @@ fn active_background_range_freezes_inside_folds_but_outside_folds_flush() {
         covered_messages: 4,
         original_tokens: 10,
         receiver,
+        result: None,
+        ready_emitted: false,
         token: CancellationToken::new(),
         origin: CompactionOrigin::Subagent,
         trigger_tier: Some(ContextPressureTier::Start),

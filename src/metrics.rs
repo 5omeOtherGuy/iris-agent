@@ -160,34 +160,31 @@ pub(crate) fn tokens_per_second(
     Some(output_tokens as f64 / generation.as_secs_f64())
 }
 
-/// Provider-neutral context-window facts: the raw window and the reserves
-/// subtracted from it. A plain-number contract so runtime tiers can carry
-/// budget provenance without depending on the catalog that resolved it
-/// (Tier-3 Mimir converts its catalog type into this).
+/// Provider/model context facts resolved by Mimir. Values stay numeric and
+/// provider-neutral so runtime tiers never branch on provider or model ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContextWindowFacts {
     pub(crate) raw: u64,
-    pub(crate) max_output_reserve: u64,
+    pub(crate) displayed: u64,
+    pub(crate) model_max_output_tokens: u64,
+    pub(crate) output_reserve: u64,
     pub(crate) summary_reserve: u64,
-    pub(crate) effective: u64,
+    pub(crate) hard_compaction_threshold: u64,
+    pub(crate) official_cli: bool,
+    pub(crate) configured_endpoint: bool,
 }
 
-/// The one resolved "how full am I" denominator: the context budget that
-/// actually governs behavior (compaction trigger ladder, overflow recovery,
-/// `/context`, and the session-bar meter all divide by this number).
-///
-/// Mirrors the trigger resolution rules: the legacy absolute
-/// `contextTokenBudget` setting clamps the model-derived effective window;
-/// with no catalog window the setting (or the caller's default) stands alone.
+/// One resolved context policy shared by enforcement, diagnostics, `/context`,
+/// and the session meter. Display capacity, preparation, and hard application
+/// are separate values because official CLIs do not use one overloaded window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResolvedContextBudget {
-    /// Catalog-derived window facts (raw, reserves, effective), when known.
     pub(crate) window: Option<ContextWindowFacts>,
-    /// The explicit legacy `contextTokenBudget` setting, when configured.
     pub(crate) clamp: Option<u64>,
-    /// The governing budget in tokens: `min(clamp, window.effective)` when
-    /// both exist, otherwise whichever exists, otherwise `fallback`.
-    pub(crate) resolved: u64,
+    pub(crate) displayed_context_window: u64,
+    pub(crate) warning_threshold: u64,
+    pub(crate) preparation_threshold: u64,
+    pub(crate) hard_compaction_threshold: u64,
 }
 
 impl ResolvedContextBudget {
@@ -196,40 +193,65 @@ impl ResolvedContextBudget {
         clamp: Option<u64>,
         fallback: u64,
     ) -> Self {
-        let resolved = match (clamp, window.map(|window| window.effective)) {
-            (Some(clamp), Some(effective)) => clamp.min(effective),
-            (Some(clamp), None) => clamp,
-            (None, Some(effective)) => effective,
-            (None, None) => fallback,
-        };
+        let provider_display = window.map_or(fallback, |window| window.displayed);
+        let provider_hard = window.map_or(fallback, |window| window.hard_compaction_threshold);
+        let displayed_context_window =
+            clamp.map_or(provider_display, |cap| cap.min(provider_display));
+        let hard_cap = clamp.map_or(provider_hard, |cap| cap.min(provider_hard));
         Self {
             window,
             clamp,
-            resolved,
+            displayed_context_window,
+            warning_threshold: 0,
+            preparation_threshold: 0,
+            hard_compaction_threshold: hard_cap,
         }
+        .with_thresholds(
+            crate::config::DEFAULT_COMPACTION_WARN,
+            crate::config::DEFAULT_COMPACTION_START,
+            crate::config::DEFAULT_COMPACTION_HARD,
+        )
     }
 
-    /// Whether the legacy setting is the binding constraint (it reduced the
-    /// budget below the model's own effective window). Drives the extra
-    /// clamp line in the `/context` derivation.
+    pub(crate) fn with_thresholds(mut self, warn: f64, start: f64, hard: f64) -> Self {
+        let fraction = |value: f64| ((self.displayed_context_window as f64) * value).floor() as u64;
+        if self.window.is_none() {
+            self.hard_compaction_threshold = fraction(hard);
+        }
+        self.preparation_threshold = fraction(start).min(self.hard_compaction_threshold);
+        self.warning_threshold = fraction(warn).min(self.preparation_threshold);
+        self
+    }
+
+    pub(crate) fn with_hard_threshold_fraction(mut self, hard: f64) -> Self {
+        let configured = ((self.displayed_context_window as f64) * hard).floor() as u64;
+        self.hard_compaction_threshold = configured.min(self.displayed_context_window);
+        self.preparation_threshold = self
+            .preparation_threshold
+            .min(self.hard_compaction_threshold);
+        self.warning_threshold = self.warning_threshold.min(self.preparation_threshold);
+        self
+    }
+
     pub(crate) fn clamped(&self) -> bool {
-        match (self.clamp, self.window.map(|window| window.effective)) {
-            (Some(clamp), Some(effective)) => clamp < effective,
-            (Some(_), None) => false,
+        match (self.clamp, self.window) {
+            (Some(clamp), Some(window)) => {
+                clamp < window.displayed || clamp < window.hard_compaction_threshold
+            }
             _ => false,
         }
     }
 }
 
-/// A bare enforced number with no catalog/setting provenance. For benches and
-/// tests that install a budget directly; real sessions resolve one instead.
+/// A direct numeric test/bench policy has no model authority, so all trigger
+/// thresholds remain the configured fractions of that displayed capacity.
 impl From<u64> for ResolvedContextBudget {
-    fn from(resolved: u64) -> Self {
-        Self {
-            window: None,
-            clamp: None,
-            resolved,
-        }
+    fn from(displayed_context_window: u64) -> Self {
+        Self::resolve(
+            None,
+            Some(displayed_context_window),
+            displayed_context_window,
+        )
     }
 }
 
@@ -253,12 +275,16 @@ mod tests {
         }
     }
 
-    fn window(raw: u64, max_output: u64, summary: u64) -> ContextWindowFacts {
+    fn window(raw: u64, displayed: u64, hard: u64) -> ContextWindowFacts {
         ContextWindowFacts {
             raw,
-            max_output_reserve: max_output,
-            summary_reserve: summary,
-            effective: raw - max_output - summary,
+            displayed,
+            model_max_output_tokens: 64_000,
+            output_reserve: 20_000,
+            summary_reserve: raw.saturating_sub(20_000).saturating_sub(hard),
+            hard_compaction_threshold: hard,
+            official_cli: true,
+            configured_endpoint: false,
         }
     }
 
@@ -359,28 +385,33 @@ mod tests {
     }
 
     #[test]
-    fn budget_resolution_mirrors_trigger_rules() {
-        let model = window(200_000, 64_000, 8_192); // effective 127_808
-        // Clamp binds when below the model window.
-        let clamped = ResolvedContextBudget::resolve(Some(model), Some(64_000), 100_000);
-        assert_eq!(clamped.resolved, 64_000);
+    fn budget_resolution_keeps_display_preparation_and_hard_separate() {
+        let model = window(372_000, 353_400, 334_800);
+        let policy = ResolvedContextBudget::resolve(Some(model), None, 100_000);
+        assert_eq!(policy.displayed_context_window, 353_400);
+        assert_eq!(policy.warning_threshold, 212_040);
+        assert_eq!(policy.preparation_threshold, 254_448);
+        assert_eq!(policy.hard_compaction_threshold, 334_800);
+        let start_only_override = policy.with_thresholds(0.60, 0.70, 0.90);
+        assert_eq!(start_only_override.preparation_threshold, 247_379);
+        assert_eq!(start_only_override.hard_compaction_threshold, 334_800);
+        assert_eq!(
+            policy
+                .with_hard_threshold_fraction(0.95)
+                .hard_compaction_threshold,
+            335_730
+        );
+
+        let clamped = ResolvedContextBudget::resolve(Some(model), Some(235_808), 100_000);
+        assert_eq!(clamped.displayed_context_window, 235_808);
+        assert_eq!(clamped.hard_compaction_threshold, 235_808);
         assert!(clamped.clamped());
-        // A clamp above the model window does not bind.
-        let loose = ResolvedContextBudget::resolve(Some(model), Some(500_000), 100_000);
-        assert_eq!(loose.resolved, 127_808);
-        assert!(!loose.clamped());
-        // Setting alone, window alone, then neither (fallback).
-        assert_eq!(
-            ResolvedContextBudget::resolve(None, Some(64_000), 100_000).resolved,
-            64_000
-        );
-        assert_eq!(
-            ResolvedContextBudget::resolve(Some(model), None, 100_000).resolved,
-            127_808
-        );
-        assert_eq!(
-            ResolvedContextBudget::resolve(None, None, 100_000).resolved,
-            100_000
-        );
+
+        let unknown = ResolvedContextBudget::resolve(None, None, 128_000);
+        assert_eq!(unknown.displayed_context_window, 128_000);
+        assert_eq!(unknown.hard_compaction_threshold, 115_200);
+
+        let direct = ResolvedContextBudget::from(128_000).with_thresholds(0.60, 0.72, 0.95);
+        assert_eq!(direct.hard_compaction_threshold, 121_600);
     }
 }

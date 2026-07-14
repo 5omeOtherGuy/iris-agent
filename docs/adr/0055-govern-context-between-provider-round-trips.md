@@ -1,6 +1,7 @@
 # ADR-0055: Govern context between provider round trips
 
 **Date**: 2026-07-10
+**Updated**: 2026-07-14
 **Status**: accepted
 **Deciders**: Iris maintainers
 
@@ -37,11 +38,12 @@ about compaction policy, storage, worker models, or provider selection.
 Wayland's `TurnContextController` implements the persistence and governor
 contracts over one `CompactionEngine`. At a governed boundary the engine:
 
-- drains a ready worker without waiting;
+- polls a worker and retains a ready result without mutation below `hard`;
 - measures the current context and emits pressure crossings;
 - starts one worker at `start` and immediately returns;
-- waits only at `hard`, bounded by `hardWaitMs`, then falls back through the
-  provider-native rung to deterministic relief (ADR-0057 refines this);
+- consumes a ready result at `hard`, or waits up to `hardWaitMs` before falling
+  back through the provider-native rung to deterministic relief (ADR-0057
+  refines this);
 - durably validates and appends through the same parent-owned apply function
   used at turn edges;
 - returns the rebuilt context for Nexus to install.
@@ -92,13 +94,14 @@ rewriting different versions of the same original range.
 
 ## Consequences
 
-- Ready summaries can apply before the next provider request in the same turn.
+- Ready summaries remain attached to their frozen snapshot until hard pressure
+  or explicit manual compaction.
 - Steering remains verbatim and post-summary because it is injected after the
   governor returns.
 - Completed tool-call/result groups are never split by a boundary or coverage
   plan.
-- Non-hard compaction work is measurable as event-to-next-request latency; the
-  live protocol requires it to stay below 200 ms per session.
+- Non-hard readiness polling is measurable as event-to-next-request latency;
+  the live protocol requires it to stay below 200 ms per session.
 - A provider context overflow can rewrite and resend once without leaking
   provider-specific policy into Nexus or duplicating visible assistant output.
 - The job slot remains process-local and at most one worker runs per session.

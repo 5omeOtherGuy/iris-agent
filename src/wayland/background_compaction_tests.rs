@@ -125,16 +125,17 @@ impl ChatProvider for MidTurnProvider {
             2 => AssistantTurn::text("finished after compaction"),
             _ => panic!("unexpected parent provider call {call}"),
         };
-        if call == 0 {
+        if matches!(call, 0 | 1) {
+            let total_tokens: u64 = if call == 0 { 60_000 } else { 70_000 };
             turn.usage = Some(ProviderUsage {
                 provider: "test-parent".to_string(),
                 model: "test-parent-model".to_string(),
-                input_tokens: 59_900,
+                input_tokens: total_tokens.saturating_sub(100),
                 output_tokens: 100,
                 cache_read_input_tokens: 0,
                 cache_write_input_tokens: 0,
                 reasoning_output_tokens: 0,
-                total_tokens: 60_000,
+                total_tokens,
                 cache_creation: None,
             });
         }
@@ -1448,6 +1449,24 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
         prompts,
         visible_tools,
     } = seeded;
+    harness.set_compaction_trigger(
+        131_072.into(),
+        CompactionTriggerConfig {
+            enabled: true,
+            warn: 0.55,
+            start: 0.65,
+            hard: 0.85,
+            keep_recent_tokens: 1_000,
+            hard_wait_ms: 10,
+            max_consecutive_failures: 3,
+            reactive: true,
+        },
+    );
+    let ladder = harness.compaction.ladder.as_mut().unwrap();
+    ladder.warn = 1;
+    ladder.start = 2;
+    ladder.hard = u64::MAX;
+    ladder.deterministic_only = false;
     harness.set_compaction_worker(CompactionWorkerConfig {
         input: CompactionWorkerInput::Investigator,
         ..CompactionWorkerConfig::default()
@@ -1478,14 +1497,31 @@ fn background_subagent_compaction_runs_read_only_and_parent_applies_result() {
 
     for _ in 0..500 {
         block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
-        if obs.applied() == 1 {
+        if obs.lifecycle(CompactionLifecycleState::Ready) == 1 {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    assert_eq!(obs.applied(), 1);
     assert_eq!(obs.lifecycle(CompactionLifecycleState::Ready), 1);
+    assert_eq!(
+        obs.applied(),
+        0,
+        "a prepared summary must wait for the hard application threshold"
+    );
+    assert!(
+        harness
+            .messages()
+            .iter()
+            .any(|message| message.content.contains(OLD_NEEDLE)),
+        "prepared context remains live before hard pressure"
+    );
+
+    harness.compaction.ladder.as_mut().unwrap().hard =
+        super::context_tokens(harness.messages()).saturating_sub(1);
+    block_on(harness.maybe_auto_compact(&obs, &token, true)).unwrap();
+
+    assert_eq!(obs.applied(), 1);
     assert_eq!(obs.lifecycle(CompactionLifecycleState::Applied), 1);
     let states = obs
         .events
@@ -1697,7 +1733,7 @@ fn provider_native_job_is_discarded_after_any_selection_change() {
 }
 
 #[test]
-fn ready_summary_applies_mid_turn_before_queued_steering_is_injected_verbatim() {
+fn prepared_summary_applies_at_hard_before_queued_steering_is_injected_verbatim() {
     let root = temp_dir();
     let workspace = temp_dir();
     std::fs::write(workspace.path.join("note.txt"), "mid-turn read\n").unwrap();
@@ -1750,7 +1786,7 @@ fn ready_summary_applies_mid_turn_before_queued_steering_is_injected_verbatim() 
     let ladder = harness.compaction.ladder.as_mut().unwrap();
     ladder.warn = 40_000;
     ladder.start = 50_000;
-    ladder.hard = 100_000;
+    ladder.hard = 66_000;
     ladder.deterministic_only = false;
     harness.set_summarizer(SummarizerKind::Subagent);
     harness.set_compaction_worker(CompactionWorkerConfig {
@@ -1776,7 +1812,7 @@ fn ready_summary_applies_mid_turn_before_queued_steering_is_injected_verbatim() 
     .unwrap();
 
     assert_eq!(obs.lifecycle(CompactionLifecycleState::Running), 1);
-    assert_eq!(obs.applied(), 1, "ready summary lands inside the turn");
+    assert_eq!(obs.applied(), 1, "prepared summary lands at hard pressure");
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
     assert!(
