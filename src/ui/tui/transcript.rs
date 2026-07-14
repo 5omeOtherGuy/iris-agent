@@ -195,6 +195,7 @@ struct ActiveExec {
 
 struct ActiveExploration {
     call_id: String,
+    header: usize,
     row: usize,
     started: Instant,
     duration: Option<Duration>,
@@ -463,15 +464,8 @@ impl Transcript {
         let explore = if self.active_explorations.iter().any(|active| !active.done) {
             self.active_explorations
                 .iter()
-                .map(|active| active.row)
-                .min()
-                .zip(
-                    self.active_explorations
-                        .iter()
-                        .map(|active| active.started)
-                        .min(),
-                )
-                .map(|(row, started)| (row.saturating_sub(1), started))
+                .min_by_key(|active| active.started)
+                .map(|active| (active.header, active.started))
         } else {
             None
         };
@@ -808,6 +802,9 @@ impl Transcript {
             edit.body_start += delta;
         }
         for expl in &mut self.active_explorations {
+            if expl.header >= at {
+                expl.header += delta;
+            }
             if expl.row >= at {
                 expl.row += delta;
             }
@@ -2475,12 +2472,16 @@ impl Transcript {
                 elapsed: Self::explore_elapsed(Some(Duration::ZERO)),
             }));
         }
+        let header = self
+            .current_explore_header_row()
+            .expect("explore header was created or already open");
         let row = self.rows.len();
         self.rows.push(body.with_fold(FoldVis::WhenExpanded));
         self.push_block_footer(PanelState::Running, Vec::new(), None, Some(&call.id));
         self.exploring_open = true;
         self.active_explorations.push(ActiveExploration {
             call_id: call.id.clone(),
+            header,
             row,
             started,
             duration: None,
