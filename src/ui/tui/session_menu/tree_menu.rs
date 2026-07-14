@@ -885,7 +885,10 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(root.join("src/ui")).unwrap();
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
         std::fs::write(root.join("src/ui/screen.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("ignored/screen.rs"), "ignored\n").unwrap();
 
         let mut tree = TreeMenu::new(root.clone(), true);
         for character in "screen".chars() {
@@ -893,9 +896,10 @@ mod tests {
         }
 
         let text = lines_text(&tree.render_lines(60, 16, false, None, &[]));
+        std::fs::remove_dir_all(root).unwrap();
         assert!(text.contains("screen.rs"), "{text}");
         assert!(text.contains("src/ui/"), "{text}");
-        std::fs::remove_dir_all(root).unwrap();
+        assert!(!text.contains("ignored/"), "{text}");
     }
 
     #[test]
