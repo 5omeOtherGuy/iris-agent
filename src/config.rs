@@ -75,10 +75,6 @@ pub(crate) struct Settings {
     /// Parsed by `mimir::selection`; absent -> the selection-layer default
     /// (`short`).
     pub(crate) prompt_cache_retention: Option<String>,
-    /// Opt into sharing a compatible Codex WebSocket request head across Iris
-    /// sessions. Default off and global-only because it changes provider-side
-    /// cache routing; a repository must not opt users in.
-    pub(crate) cross_session_prompt_cache: Option<bool>,
     /// Anthropic server-side context-management opt-in
     /// (`context_management.edits`). Stored as a raw JSON object and parsed into
     /// typed edits by `mimir::selection`; absent/empty -> disabled (no
@@ -530,9 +526,6 @@ impl Settings {
             // Prompt cache retention can affect privacy/cost, so keep it
             // global-only like provider/base-url and scoped model sets.
             prompt_cache_retention: self.prompt_cache_retention,
-            // Cross-session routing changes provider-side cache isolation and is
-            // opt-in, so a project file may neither enable nor disable it.
-            cross_session_prompt_cache: self.cross_session_prompt_cache,
             // Context management changes request behavior/cost server-side, so
             // it is likewise global-only and never taken from project config.
             anthropic_context_management: self.anthropic_context_management,
@@ -879,12 +872,6 @@ impl Settings {
             .unwrap_or(false)
     }
 
-    /// Whether compatible Codex WebSocket sessions may share their first request
-    /// head. Default off; deeper turns and non-WebSocket routes stay session-scoped.
-    pub(crate) fn cross_session_prompt_cache(&self) -> bool {
-        self.cross_session_prompt_cache.unwrap_or(false)
-    }
-
     /// Whether opt-in microcompaction is enabled (ADR-0048, #378). Default off
     /// (absent/false), so a session folds spent tool results only when the user
     /// (or a project file) turns it on. The harness reads this once at startup;
@@ -992,12 +979,6 @@ pub(crate) fn save_mutation_safety(enabled: bool) -> Result<()> {
 /// settings file. GLOBAL-ONLY, matching where the field is trusted on load.
 pub(crate) fn save_prompt_cache_retention(preset: &str) -> Result<()> {
     update_global(&[("promptCacheRetention", Value::String(preset.to_string()))])
-}
-
-/// Persist the opt-in cross-session Codex prompt-cache switch globally. Project
-/// settings cannot change this provider-side routing behavior.
-pub(crate) fn save_cross_session_prompt_cache(enabled: bool) -> Result<()> {
-    update_global(&[("crossSessionPromptCache", Value::Bool(enabled))])
 }
 
 /// Persist the `web_search` backend (`off|native|brave|jina|searxng`) in the

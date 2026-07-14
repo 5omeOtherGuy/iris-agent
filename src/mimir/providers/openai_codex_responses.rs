@@ -93,12 +93,7 @@ pub(crate) struct OpenAiCodexResponsesProvider {
     base_url: String,
     reasoning: Option<ReasoningEffort>,
     system_prompt: String,
-    /// Iris session identity used for WebSocket headers and all session-local
-    /// prompt-cache routes.
-    session_id: String,
-    /// Optional shared key consumed by one initial WebSocket request across all
-    /// clones of this provider instance.
-    shared_websocket_prompt_cache_key: Arc<Mutex<Option<String>>>,
+    prompt_cache_key: String,
     sse_prompt_cache_key: String,
     cache_retention: PromptCacheRetention,
     cache_prefix: Arc<Mutex<super::PromptCachePrefix>>,
@@ -132,7 +127,7 @@ impl OpenAiCodexResponsesProvider {
             base_url,
             reasoning,
             system_prompt,
-            None,
+            prompt_cache_key,
             prompt_cache_key,
             cache_retention,
             retry_policy,
@@ -140,17 +135,19 @@ impl OpenAiCodexResponsesProvider {
         )
     }
 
-    /// Build with an optional one-shot shared WebSocket head and an explicit Iris
-    /// session identity. The session id always owns transport headers, SSE,
-    /// retries, reconnects, native compaction, and every later request.
+    /// Build with separate WebSocket and SSE cache routing. WebSocket
+    /// continuation keeps each provider instance's deeper history independent,
+    /// so compatible sessions may share the workspace key there. SSE has no
+    /// connection-local continuation and retains the session key to prevent
+    /// concurrent histories from evicting one another.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_session_cache_key(
         model: &str,
         base_url: &str,
         reasoning: Option<ReasoningEffort>,
         system_prompt: &str,
-        shared_websocket_prompt_cache_key: Option<&str>,
-        session_id: &str,
+        prompt_cache_key: &str,
+        sse_prompt_cache_key: &str,
         cache_retention: PromptCacheRetention,
         retry_policy: crate::mimir::retry::RetryPolicy,
         codex_transport: CodexTransport,
@@ -164,11 +161,8 @@ impl OpenAiCodexResponsesProvider {
             base_url: base_url.to_string(),
             reasoning,
             system_prompt: system_prompt.to_string(),
-            session_id: session_id.to_string(),
-            shared_websocket_prompt_cache_key: Arc::new(Mutex::new(
-                shared_websocket_prompt_cache_key.map(str::to_string),
-            )),
-            sse_prompt_cache_key: session_id.to_string(),
+            prompt_cache_key: prompt_cache_key.to_string(),
+            sse_prompt_cache_key: sse_prompt_cache_key.to_string(),
             cache_retention,
             cache_prefix: Arc::new(Mutex::new(super::PromptCachePrefix::default())),
             tokens: OpenAiCodexTokenStore::from_env()?,
@@ -176,24 +170,6 @@ impl OpenAiCodexResponsesProvider {
             codex_transport,
             ws_state: Arc::new(tokio::sync::Mutex::new(CodexWsState::default())),
         })
-    }
-
-    /// Atomically consume the optional shared head. Provider clones share this
-    /// state, so concurrent callers cannot route more than one request through it.
-    fn next_websocket_prompt_cache_key(&self) -> String {
-        self.shared_websocket_prompt_cache_key
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take()
-            .unwrap_or_else(|| self.session_id.clone())
-    }
-
-    #[cfg(test)]
-    fn websocket_headers_for_test(
-        &self,
-        token: &AccessToken,
-    ) -> Result<tokio_tungstenite::tungstenite::http::HeaderMap> {
-        ws_headers_for_test(token, &self.session_id)
     }
 
     #[cfg(test)]
@@ -778,13 +754,18 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
                 "prompt cache prefix changed since the previous request; the cached prefix will not be reused this turn"
             );
         }
+        let prompt_cache_key = if self.codex_transport == CodexTransport::Sse {
+            &self.sse_prompt_cache_key
+        } else {
+            &self.prompt_cache_key
+        };
         let request = build_codex_request(
             &self.model,
             &self.system_prompt,
             messages,
             tools,
             self.reasoning,
-            Some(&self.sse_prompt_cache_key),
+            Some(prompt_cache_key),
             // store:false, so SSE never supplies previous_response_id. WebSocket
             // continuation adds it to the connection-local delta request.
             None,
@@ -872,27 +853,16 @@ impl OpenAiCodexResponsesProvider {
                 .await;
         }
         let ws_url = resolve_codex_ws_url_from_resolved(&url)?;
-        let first_prompt_cache_key = self.next_websocket_prompt_cache_key();
-        let full_request =
-            route_prompt_cache(full_request, &first_prompt_cache_key, self.cache_retention);
         let mut tried_limit_refresh = false;
         let mut tried_previous_full = false;
         let mut tried_reauth = false;
         let mut force_full = false;
-        let mut attempted = false;
         loop {
             let token = self.codex_token_off_thread(tried_reauth).await?;
-            let request = route_websocket_prompt_cache(
-                full_request.clone(),
-                &self.session_id,
-                attempted || force_full,
-                self.cache_retention,
-            );
-            attempted = true;
             match self
                 .run_ws_once(
                     ws_url.clone(),
-                    &request,
+                    &full_request,
                     &token,
                     &mut sink,
                     &cancel,
@@ -983,7 +953,7 @@ impl OpenAiCodexResponsesProvider {
                     WS_CONNECT_TIMEOUT,
                     cancel,
                     false,
-                    connect_codex_ws(ws_url, token, &self.session_id),
+                    connect_codex_ws(ws_url, token, &self.prompt_cache_key),
                 )
                 .await?,
                 opened_at: Instant::now(),
@@ -1374,21 +1344,6 @@ fn route_prompt_cache(
     request
 }
 
-/// Keep an initial shared route only for its first WebSocket attempt. Forced-full
-/// and all other retry attempts are explicitly returned to the Iris session key.
-fn route_websocket_prompt_cache(
-    request: Value,
-    session_id: &str,
-    use_session_key: bool,
-    cache_retention: PromptCacheRetention,
-) -> Value {
-    if use_session_key {
-        route_prompt_cache(request, session_id, cache_retention)
-    } else {
-        request
-    }
-}
-
 /// Build a compaction-summary request using OpenAI's native structured-
 /// output transport (issue #475 / ADR-0061): `text.format` json_schema
 /// strict, `tools: []`, `text.verbosity:"low"`, and deliberately no top-level
@@ -1769,10 +1724,6 @@ fn same_continuation_shape(current: &Value, previous: &Value) -> bool {
         if let Some(object) = value.as_object_mut() {
             object.remove("input");
             object.remove("previous_response_id");
-            // Cache routing metadata may intentionally transition from the
-            // one-shot shared head to the Iris session key without changing the
-            // semantic request shape or invalidating connection continuation.
-            object.remove("prompt_cache_key");
         }
         value
     }

@@ -533,7 +533,6 @@ pub(crate) fn settings_snapshot<P: ChatProvider>(
             .prompt_cache_retention
             .clone()
             .unwrap_or_else(|| "short".to_string()),
-        cross_session_prompt_cache: settings.cross_session_prompt_cache(),
         web_search_backend: settings
             .web_search_backend
             .clone()
@@ -741,9 +740,6 @@ pub(crate) fn persist_setting_field(
         }
         Field::PromptCacheRetention => {
             config::save_prompt_cache_retention(value.unwrap_or("short"))
-        }
-        Field::CrossSessionPromptCache => {
-            config::save_cross_session_prompt_cache(parse_bool(value))
         }
         Field::WebSearchBackend => config::save_web_search_backend(value.unwrap_or("off")),
         Field::ReadWebPageBackend => config::save_read_web_page_backend(value.unwrap_or("off")),

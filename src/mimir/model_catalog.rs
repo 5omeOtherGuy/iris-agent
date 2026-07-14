@@ -441,7 +441,6 @@ mod tests {
             max_read_response_bytes: None,
             max_read_output_bytes: None,
             prompt_cache_retention: None,
-            cross_session_prompt_cache: None,
             anthropic_context_management: None,
             enabled_models: None,
             max_tool_roundtrips: None,
