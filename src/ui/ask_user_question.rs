@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 
@@ -107,73 +107,96 @@ impl AskUserDialog {
 
     pub(crate) fn render(&self, width: u16) -> Vec<Line<'static>> {
         if self.review {
-            return self.render_review();
+            return self.render_review(width);
         }
         let question = &self.input.questions[self.current];
-        let mut lines = vec![Line::from(vec![
-            Span::styled(
-                format!("{}  ", question.header),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::raw(format!(
-                "Question {} of {}",
-                self.current + 1,
-                self.input.questions.len()
-            )),
-        ])];
-        lines.push(Line::from(question.question.clone()));
-        lines.push(Line::from(""));
+        let mut rows = Vec::new();
+        let body_width = usize::from(width).max(1);
+        for line in crate::ui::tui::wrap_to_width(&question.question, body_width) {
+            rows.push((Line::from(line), false));
+        }
+        rows.push((Line::default(), false));
 
         for (index, option) in question.options.iter().enumerate() {
             let focused = self.focused[self.current] == index;
             let checked = self.selected[self.current].contains(&index);
-            let marker = option_marker(question.multi_select, checked, focused);
-            lines.push(Line::from(format!("{marker} {}", option.label)));
-            lines.push(Line::styled(
-                format!("    {}", option.description),
-                Style::default().fg(Color::DarkGray),
+            rows.push((
+                choice_line(checked, &option.label, Some(&option.description), focused),
+                focused,
             ));
         }
 
         let other_index = question.options.len();
-        let other_marker = option_marker(
-            false,
-            self.free_text[self.current].is_some(),
-            self.focused[self.current] == other_index,
+        let other_focused = self.focused[self.current] == other_index;
+        let other_answer = self.free_text[self.current].as_deref();
+        let other_detail = other_answer
+            .filter(|answer| !answer.is_empty())
+            .unwrap_or("Write a different answer");
+        let mut other = choice_line(
+            other_answer.is_some(),
+            "Other",
+            Some(other_detail),
+            other_focused,
         );
-        let other = self.free_text[self.current]
-            .as_deref()
-            .unwrap_or("free-text answer");
-        lines.push(Line::from(format!("{other_marker} Other: {other}")));
-        let chat_focused = self.focused[self.current] == other_index + 1;
-        lines.push(Line::from(format!(
-            "{} Chat about this",
-            if chat_focused { ">" } else { " " }
-        )));
-
         if self.editing_other {
-            lines.push(Line::from(""));
-            lines.push(Line::styled(
-                "Type your answer and press Enter",
-                Style::default().fg(Color::Yellow),
+            other.spans.push(Span::styled(
+                "▋",
+                Style::default().fg(crate::ui::palette::orange()),
             ));
-        } else if let Some(preview) = self.focused_preview() {
-            lines.push(Line::from(""));
-            lines.push(Line::styled("Preview", Style::default().fg(Color::Cyan)));
-            lines.extend(preview.lines().map(|line| Line::from(line.to_string())));
+        }
+        rows.push((other, other_focused));
+
+        let discuss_focused = self.focused[self.current] == other_index + 1;
+        rows.push((
+            Line::from(vec![
+                Span::styled(
+                    "Discuss instead",
+                    if discuss_focused {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::raw("  "),
+                Span::styled("Return to chat before answering", crate::ui::modal::dim()),
+            ]),
+            discuss_focused,
+        ));
+
+        if let Some(preview) = self.focused_preview() {
+            rows.push((Line::default(), false));
+            rows.push((
+                Line::from(Span::styled(
+                    "PREVIEW",
+                    crate::ui::modal::dim().add_modifier(Modifier::BOLD),
+                )),
+                false,
+            ));
+            for line in preview.lines() {
+                rows.push((Line::from(line.to_string()), false));
+            }
         }
 
-        lines.push(Line::from(""));
-        let hint = if question.multi_select {
-            "↑/↓ move  Space select  Tab next  Esc cancel"
+        let title = format!(
+            "Ask · {} · {}/{}",
+            question.header,
+            self.current + 1,
+            self.input.questions.len()
+        );
+        let footer = if self.editing_other {
+            "type answer · ↵ save · esc discard"
+        } else if question.multi_select {
+            if self.current + 1 == self.input.questions.len() {
+                "↑↓ move · space toggle · tab review · esc cancel"
+            } else {
+                "↑↓ move · space toggle · tab next · esc cancel"
+            }
+        } else if self.input.questions.len() == 1 {
+            "↑↓ move · ↵ select · esc cancel"
         } else {
-            "↑/↓ move  Enter select  Tab next  Esc cancel"
+            "↑↓ move · ↵ select · tab next · esc cancel"
         };
-        lines.push(Line::styled(
-            truncate_hint(hint, width),
-            Style::default().fg(Color::DarkGray),
-        ));
-        lines
+        crate::ui::tui::overlay_menu(Some(&title), rows, Some(footer), usize::from(width))
     }
 
     fn handle_other_key(&mut self, key: ModalKey) -> Option<AskUserDialogOutcome> {
@@ -314,48 +337,67 @@ impl AskUserDialog {
             .and_then(|option| option.preview.as_deref())
     }
 
-    fn render_review(&self) -> Vec<Line<'static>> {
-        let mut lines = vec![Line::styled(
-            "Review your answers",
-            Style::default().fg(Color::Cyan),
-        )];
-        for (index, question) in self.input.questions.iter().enumerate() {
-            let answer = if let Some(free_text) = &self.free_text[index] {
-                free_text.clone()
-            } else {
-                self.selected[index]
-                    .iter()
-                    .map(|selected| question.options[*selected].label.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            lines.push(Line::from(format!("{}: {answer}", question.header)));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::styled(
-            "Enter submit  Shift-Tab edit  Esc cancel",
-            Style::default().fg(Color::DarkGray),
-        ));
-        lines
+    fn render_review(&self, width: u16) -> Vec<Line<'static>> {
+        let rows = self
+            .input
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(index, question)| {
+                let answer = if let Some(free_text) = &self.free_text[index] {
+                    free_text.clone()
+                } else {
+                    self.selected[index]
+                        .iter()
+                        .map(|selected| question.options[*selected].label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                (
+                    Line::from(vec![
+                        Span::styled(
+                            question.header.to_uppercase(),
+                            crate::ui::modal::dim().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                        Span::raw(answer),
+                    ]),
+                    false,
+                )
+            })
+            .collect();
+        let title = format!("Review answers · {}", self.input.questions.len());
+        crate::ui::tui::overlay_menu(
+            Some(&title),
+            rows,
+            Some("↵ submit · shift-tab edit · esc cancel"),
+            usize::from(width),
+        )
     }
 }
 
-fn option_marker(multi_select: bool, checked: bool, focused: bool) -> String {
-    let cursor = if focused { ">" } else { " " };
-    let mark = if multi_select {
-        if checked { "[x]" } else { "[ ]" }
-    } else if checked {
-        "(*)"
+fn choice_line(checked: bool, label: &str, detail: Option<&str>, focused: bool) -> Line<'static> {
+    let mark = if checked { "◉" } else { "○" };
+    let mark_style = if checked {
+        Style::default().fg(crate::ui::palette::cyan())
     } else {
-        "( )"
+        crate::ui::modal::dim()
     };
-    format!("{cursor} {mark}")
-}
-
-fn truncate_hint(hint: &str, width: u16) -> String {
-    hint.chars()
-        .take(width.saturating_sub(2) as usize)
-        .collect()
+    let label_style = if focused {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let mut spans = vec![
+        Span::styled(mark, mark_style),
+        Span::raw(" "),
+        Span::styled(label.to_string(), label_style),
+    ];
+    if let Some(detail) = detail {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(detail.to_string(), crate::ui::modal::dim()));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -434,7 +476,7 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(review.contains("Review your answers"));
+        assert!(review.contains("REVIEW ANSWERS · 2"));
         let Some(AskUserDialogOutcome::Submitted(arguments)) = dialog.handle_key(ModalKey::Enter)
         else {
             panic!("review did not submit")
