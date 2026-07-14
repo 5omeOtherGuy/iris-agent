@@ -1028,6 +1028,8 @@ Potential scope:
 - Reason-based context inclusion and eviction.
 - Diff-aware file context.
 - Cache-aware prompt layout for one or two providers.
+- Per-session Codex WebSocket startup prewarm, gated by measured first-turn benefit
+  ([#621](https://github.com/5omeOtherGuy/iris-agent/issues/621), ADR-0062).
 - Cache hit/miss and cost reporting where provider APIs expose it.
 
 Acceptance signal: Iris can explain why each major prompt item was included and
