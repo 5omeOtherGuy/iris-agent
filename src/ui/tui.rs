@@ -7650,6 +7650,7 @@ mod tests {
             tool_clearing_enabled: false,
             model_context_window: Some(232_000),
             prompt_cache_retention: "short".to_string(),
+            cross_session_prompt_cache: false,
             web_search_backend: "off".to_string(),
             read_web_page_backend: "off".to_string(),
             searxng_url: None,

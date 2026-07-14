@@ -418,12 +418,13 @@ fn websocket_create_frame_omits_stream_and_keeps_store_false() {
 
 #[test]
 fn websocket_continuation_sends_only_suffix_when_prefix_matches() {
+    let prior_user =
+        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"one"}]});
     let prior = json!({
         "model": "gpt-test",
         "store": false,
-        "input": [
-            {"type":"message","role":"user","content":[{"type":"input_text","text":"one"}]}
-        ],
+        "prompt_cache_key": "shared-head",
+        "input": [prior_user],
         "tools": []
     });
     let assistant = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"two"}]});
@@ -433,7 +434,8 @@ fn websocket_continuation_sends_only_suffix_when_prefix_matches() {
         "model": "gpt-test",
         "store": false,
         "stream": true,
-        "input": [prior["input"][0].clone(), assistant, next_user],
+        "prompt_cache_key": "session-a",
+        "input": [prior_user, assistant, next_user],
         "tools": []
     });
     let continuation = CodexContinuation {
@@ -445,6 +447,7 @@ fn websocket_continuation_sends_only_suffix_when_prefix_matches() {
     let frame = build_ws_create_frame(&current, Some(&continuation), false);
 
     assert_eq!(frame["previous_response_id"], "resp_1");
+    assert_eq!(frame["prompt_cache_key"], "session-a");
     assert_eq!(frame["input"], Value::Array(vec![next_user]));
 }
 

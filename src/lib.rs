@@ -1218,9 +1218,10 @@ fn log_resumable_sessions(cwd: &Path) {
 /// Precedence and the unsupported-provider error now live in `mimir::selection`
 /// (`ModelSelection::resolve`), so this only maps the resolved [`ProviderId`] to
 /// its concrete adapter. Reused at startup and on every `/model` `/reasoning`
-/// switch (rebuilds with the new selection + the same system prompt). Codex
-/// WebSocket sessions route matching workspace/system prefixes together; SSE
-/// fallback and OpenAI-compatible HTTP retain session-scoped keys.
+/// switch (rebuilds with the new selection + the same system prompt). Opted-in
+/// Codex WebSocket sessions may share one compatible initial request head; all
+/// transport identity, retries, reconnects, later turns, and HTTP routes remain
+/// session-scoped.
 fn build_provider(
     selection: &mimir::selection::ModelSelection,
     system_prompt: &str,
@@ -1233,15 +1234,16 @@ fn build_provider(
     let reasoning = selection.reasoning;
     let provider: Box<dyn ChatProvider> = match selection.provider {
         ProviderId::OpenAiCodex => {
-            let prompt_cache_key =
-                mimir::providers::openai_prompt_cache_key(workspace, system_prompt);
+            let shared_prompt_cache_key = selection
+                .cross_session_prompt_cache
+                .then(|| mimir::providers::openai_prompt_cache_key(workspace, system_prompt));
             Box::new(
                 mimir::providers::openai_codex_responses::OpenAiCodexResponsesProvider::new_with_session_cache_key(
                     model,
                     base_url,
                     reasoning,
                     system_prompt,
-                    &prompt_cache_key,
+                    shared_prompt_cache_key.as_deref(),
                     session_id,
                     selection.cache_retention,
                     selection.retry_policy,

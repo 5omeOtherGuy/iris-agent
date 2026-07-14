@@ -40,9 +40,9 @@
 //!
 //! All writes go to the user-global settings file via `config::save_*`;
 //! global-vs-project scope governs only load/merge precedence in
-//! [`crate::config::Settings::merged_with`]. Two fields are GLOBAL-ONLY so a
-//! cloned project cannot lower posture: `defaultApproval` and
-//! `promptCacheRetention`. Deliberately absent from the faceplate (service
+//! [`crate::config::Settings::merged_with`]. Three fields are GLOBAL-ONLY so a
+//! cloned project cannot lower posture or alter provider cache routing:
+//! `defaultApproval`, `promptCacheRetention`, and `crossSessionPromptCache`. Deliberately absent from the faceplate (service
 //! hatch: `settings.json` only): `bashToolMode`, `maxToolRoundtrips`, retry
 //! tuning, and the OpenAI-compatible endpoint block.
 
@@ -104,6 +104,7 @@ pub(crate) enum Field {
     SemanticRetainPerPath,
     ToolClearingKeepRecent,
     PromptCacheRetention,
+    CrossSessionPromptCache,
     WebSearchBackend,
     ReadWebPageBackend,
     SearxngUrl,
@@ -217,6 +218,7 @@ const SECTIONS: &[Section] = &[
             RowId::Scope,
             RowId::Providers,
             RowId::Field(Field::PromptCacheRetention),
+            RowId::Field(Field::CrossSessionPromptCache),
         ],
     },
     Section {
@@ -509,6 +511,8 @@ pub(crate) struct Snapshot {
     /// can never claim more window than the model really has.
     pub(crate) model_context_window: Option<u64>,
     pub(crate) prompt_cache_retention: String,
+    /// Global opt-in for one shared compatible Codex WebSocket request head.
+    pub(crate) cross_session_prompt_cache: bool,
     /// Web search tool backend (`off|native|brave|jina|searxng`). GLOBAL-ONLY;
     /// takes effect next session. `off` withholds the tool from the model.
     pub(crate) web_search_backend: String,
@@ -564,6 +568,7 @@ impl Snapshot {
             }
             Field::Theme => crate::ui::theme::available(),
             Field::Microcompaction
+            | Field::CrossSessionPromptCache
             | Field::CompactionEnabled
             | Field::CompactionReactive
             | Field::ReducedMotion
@@ -579,6 +584,7 @@ impl Snapshot {
             Field::AltScreen => self.alt_screen.clone(),
             Field::DefaultApproval => self.default_approval.clone(),
             Field::PromptCacheRetention => self.prompt_cache_retention.clone(),
+            Field::CrossSessionPromptCache => on_off(self.cross_session_prompt_cache),
             Field::WebSearchBackend => self.web_search_backend.clone(),
             Field::ReadWebPageBackend => self.read_web_page_backend.clone(),
             Field::CompactionSummarizer => self.compaction_summarizer.clone(),
@@ -602,6 +608,7 @@ impl Snapshot {
             Field::AltScreen => self.alt_screen = value.to_string(),
             Field::DefaultApproval => self.default_approval = value.to_string(),
             Field::PromptCacheRetention => self.prompt_cache_retention = value.to_string(),
+            Field::CrossSessionPromptCache => self.cross_session_prompt_cache = value == "on",
             Field::WebSearchBackend => self.web_search_backend = value.to_string(),
             Field::ReadWebPageBackend => self.read_web_page_backend = value.to_string(),
             Field::CompactionSummarizer => self.compaction_summarizer = value.to_string(),
@@ -731,6 +738,7 @@ fn archetype(row: RowId) -> Archetype {
             Field::AltScreen
             | Field::DefaultApproval
             | Field::PromptCacheRetention
+            | Field::CrossSessionPromptCache
             | Field::WebSearchBackend
             | Field::ReadWebPageBackend
             | Field::CompactionSummarizer
@@ -797,6 +805,9 @@ fn describe(row: RowId) -> &'static str {
         RowId::Field(field) => match field {
             Field::PromptCacheRetention => {
                 "provider cache hints: short = default ephemeral, long = 1h/24h, none = no hints"
+            }
+            Field::CrossSessionPromptCache => {
+                "opt in to sharing one compatible Codex WebSocket request head across sessions; global only"
             }
             Field::DefaultApproval => {
                 "strict always prompts; auto also runs provably-safe edits; never denies instead"
@@ -908,6 +919,7 @@ fn label(row: RowId) -> &'static str {
             Field::SemanticRetainPerPath => "retain/path",
             Field::ToolClearingKeepRecent => "keep tool uses",
             Field::PromptCacheRetention => "prompt cache",
+            Field::CrossSessionPromptCache => "cross-session cache",
             Field::WebSearchBackend => "web search",
             Field::ReadWebPageBackend => "read page",
             Field::SearxngUrl => "searxng url",
@@ -2978,6 +2990,7 @@ fn push_dial(
 fn save_token(field: Field, value: &str) -> String {
     match field {
         Field::Microcompaction
+        | Field::CrossSessionPromptCache
         | Field::CompactionEnabled
         | Field::CompactionReactive
         | Field::ReducedMotion
@@ -3113,6 +3126,7 @@ pub(crate) mod tests {
             tool_clearing_enabled: false,
             model_context_window: Some(232_000),
             prompt_cache_retention: "short".to_string(),
+            cross_session_prompt_cache: false,
             web_search_backend: "off".to_string(),
             read_web_page_backend: "off".to_string(),
             searxng_url: None,

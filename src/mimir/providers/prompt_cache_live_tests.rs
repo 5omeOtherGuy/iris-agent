@@ -193,7 +193,7 @@ fn openai_shares_system_prompt_without_breaking_concurrent_session_branches() ->
             "https://chatgpt.com/backend-api",
             None,
             &system_prompt,
-            &cache_key,
+            Some(&cache_key),
             session_key,
             PromptCacheRetention::DEFAULT,
             RetryPolicy::default(),
@@ -216,17 +216,13 @@ fn openai_sse_keeps_concurrent_session_branches_isolated() -> Result<()> {
         return Ok(());
     }
     let system_prompt = shared_system_prompt();
-    let cache_key = openai_prompt_cache_key(
-        Path::new("/tmp/iris-prompt-cache-live-workspace"),
-        &system_prompt,
-    );
     let build = |session_key: &str| {
         OpenAiCodexResponsesProvider::new_with_session_cache_key(
             "gpt-5.4-mini",
             "https://chatgpt.com/backend-api",
             None,
             &system_prompt,
-            &cache_key,
+            None,
             session_key,
             PromptCacheRetention::DEFAULT,
             RetryPolicy::default(),

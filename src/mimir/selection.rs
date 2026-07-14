@@ -430,6 +430,9 @@ pub(crate) struct ModelSelection {
     pub(crate) base_url: String,
     pub(crate) reasoning: Option<ReasoningEffort>,
     pub(crate) cache_retention: PromptCacheRetention,
+    /// Whether the first compatible Codex WebSocket request may use a shared
+    /// request-head cache key. Every later or non-WebSocket route is isolated.
+    pub(crate) cross_session_prompt_cache: bool,
     pub(crate) codex_transport: CodexTransport,
     /// Anthropic-only context-management opt-in; empty/default for other
     /// providers and when unconfigured.
@@ -528,6 +531,7 @@ impl ModelSelection {
             base_url,
             reasoning,
             cache_retention,
+            cross_session_prompt_cache: settings.cross_session_prompt_cache(),
             codex_transport,
             context_management: ContextManagement::default(),
             legacy_context_management,
@@ -808,6 +812,7 @@ mod tests {
             max_read_response_bytes: None,
             max_read_output_bytes: None,
             prompt_cache_retention: None,
+            cross_session_prompt_cache: None,
             anthropic_context_management: None,
             enabled_models: None,
             max_tool_roundtrips: None,
@@ -970,6 +975,7 @@ mod tests {
             base_url: String::new(),
             reasoning: None,
             cache_retention: retention,
+            cross_session_prompt_cache: false,
             codex_transport: CodexTransport::Auto,
             context_management: ContextManagement::default(),
             legacy_context_management: ContextManagement::default(),
