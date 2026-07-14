@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "iris-agent"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2024"
 autobins = false
 build = "build.rs"

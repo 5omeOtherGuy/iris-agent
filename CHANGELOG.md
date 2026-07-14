@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.6...iris-agent-v0.3.7) - 2026-07-14
+
+### Added
+
+- add provider-aware context policy ([#630](https://github.com/5omeOtherGuy/iris-agent/pull/630))
+
+### Fixed
+
+- load symlinked user AGENTS docs safely ([#631](https://github.com/5omeOtherGuy/iris-agent/pull/631))
+- refresh grouped explore elapsed time
+- start gated tool timer on execution
+- refresh running tool elapsed time
+- *(tui)* tighten flow meter separator padding ([#628](https://github.com/5omeOtherGuy/iris-agent/pull/628))
+
+### Other
+
+- reproduce grouped explore elapsed regression
+- reproduce gated tool elapsed timing
+- Update README.md
+- rewrite readmes as owner manuals ([#626](https://github.com/5omeOtherGuy/iris-agent/pull/626))
+
 ## [0.3.6](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.5...iris-agent-v0.3.6) - 2026-07-14
 
 ### Added
