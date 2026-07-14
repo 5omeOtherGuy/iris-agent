@@ -62,6 +62,7 @@
 | [0059](0059-web-search-returns-a-snippet-rich-list-not-a-server-summary.md) | web_search returns a snippet-rich result list, not a server summary | accepted | 2026-07-12 |
 | [0060](0060-harness-actor-keeps-tui-input-always-live.md) | Own turns in a harness actor so TUI input stays always live | proposed | 2026-07-12 |
 | [0061](0061-typed-structured-output-compaction-summaries.md) | Typed structured-output compaction summaries | accepted | 2026-07-13 |
+| [0062](0062-keep-codex-prompt-caches-session-scoped.md) | Keep Codex prompt caches session-scoped | accepted | 2026-07-14 |
 
 Note: ADR-0018 was not committed in repository history; numbering resumes at
 ADR-0019 to preserve existing file names and cross-references.
