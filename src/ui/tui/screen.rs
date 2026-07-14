@@ -947,12 +947,9 @@ pub(super) fn fresh_editor() -> TextArea<'static> {
 }
 
 pub(super) fn editor_visual_rows(editor: &TextArea<'_>, width: u16) -> u16 {
-    let box_width = width
-        .saturating_sub(BOX_X_PADDING_U16.saturating_mul(2))
-        .max(1);
     let inner_width = usize::from(
-        box_width
-            .saturating_sub(composer_text_x_offset(box_width))
+        width
+            .saturating_sub(BOX_X_PADDING_U16.saturating_mul(2))
             .max(1),
     );
     editor
@@ -3333,15 +3330,6 @@ fn chrome_heights(
     ChromeHeights { menu, editor }
 }
 
-fn composer_text_x_offset(box_width: u16) -> u16 {
-    // `ratatui-textarea` paints the empty-editor cursor one cell before the
-    // placeholder, so anchor the widget one cell left of the transcript text
-    // column; the visible `Give Iris...` indicator then starts with messages.
-    u16::try_from(TEXT_COLUMN_X_PADDING.saturating_sub(1))
-        .unwrap_or(u16::MAX)
-        .min(box_width.saturating_sub(1))
-}
-
 pub(super) fn render_editor_chrome(
     screen: &mut Screen,
     width: u16,
@@ -3448,14 +3436,13 @@ pub(super) fn render_editor_chrome(
             .max(1),
         height: editor_area.height,
     };
-    let text_x_offset = composer_text_x_offset(box_area.width);
     // Padding is preferred, not protected: at the minimum composer height the
     // input row wins over the soft bottom row.
     let pad_rows = bottom_padding_rows.min(editor_area.height.saturating_sub(MIN_EDITOR_H));
     let text_area = Rect {
-        x: box_area.x + text_x_offset,
+        x: box_area.x,
         y: editor_area.y + EDITOR_CHROME_ROWS_ABOVE.min(editor_area.height.saturating_sub(1)),
-        width: box_area.width.saturating_sub(text_x_offset).max(1),
+        width: box_area.width,
         height: editor_area
             .height
             .saturating_sub(EDITOR_VERTICAL_CHROME_ROWS)
