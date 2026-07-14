@@ -2272,6 +2272,37 @@ mod tests {
     }
 
     #[test]
+    fn codex_stream_idle_timeout_defaults_customizes_disables_and_stays_global_only() {
+        assert_eq!(
+            Settings::default().codex_stream_idle_timeout(),
+            Some(Duration::from_millis(300_000))
+        );
+
+        let custom: Settings =
+            serde_json::from_str(r#"{ "codexStreamIdleTimeoutMs": 456789 }"#).unwrap();
+        assert_eq!(
+            custom.codex_stream_idle_timeout(),
+            Some(Duration::from_millis(456_789))
+        );
+
+        let disabled: Settings =
+            serde_json::from_str(r#"{ "codexStreamIdleTimeoutMs": 0 }"#).unwrap();
+        assert_eq!(disabled.codex_stream_idle_timeout(), None);
+
+        let dir = temp_dir();
+        let global = dir.path.join("global.json");
+        let project = dir.path.join("project.json");
+        fs::write(&global, r#"{ "codexStreamIdleTimeoutMs": 654321 }"#).unwrap();
+        fs::write(&project, r#"{ "codexStreamIdleTimeoutMs": 1 }"#).unwrap();
+        let merged = Settings::load_from(Some(&global), &project).unwrap();
+        assert_eq!(
+            merged.codex_stream_idle_timeout(),
+            Some(Duration::from_millis(654_321)),
+            "project config cannot alter secret-bearing Codex transport recovery"
+        );
+    }
+
+    #[test]
     fn project_cannot_enable_web_tool_backends() {
         let dir = temp_dir();
         let global = dir.path.join("global.json");

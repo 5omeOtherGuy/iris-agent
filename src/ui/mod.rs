@@ -697,6 +697,28 @@ mod tests {
     }
 
     #[test]
+    fn maps_provider_reconnect_to_safe_progress_notice() {
+        let mapped = UiEvent::from_agent_event(AgentEvent::ProviderReconnect(
+            crate::nexus::ProviderReconnect {
+                transport: "websocket".to_string(),
+                retry: 2,
+                max_retries: 3,
+                delay_ms: 4_000,
+                reason: "read_idle".to_string(),
+                phase: "awaiting_next_frame".to_string(),
+            },
+        ));
+
+        let UiEvent::Notice(message) = mapped else {
+            panic!("reconnect status must render through the notice channel");
+        };
+        assert!(message.contains("WebSocket reconnect 2/3"), "{message}");
+        assert!(message.contains("4s"), "{message}");
+        assert!(message.contains("read_idle"), "{message}");
+        assert!(message.contains("awaiting_next_frame"), "{message}");
+    }
+
+    #[test]
     fn maps_provider_transport_fallback_to_an_actionable_notice() {
         let mapped = UiEvent::from_agent_event(AgentEvent::ProviderTransportFallback(
             crate::nexus::ProviderTransportFallback {
@@ -706,9 +728,9 @@ mod tests {
                 to_transport: "https_sse".to_string(),
                 reason: "read_idle".to_string(),
                 phase: "awaiting_next_frame".to_string(),
-                idle_ms: 75_000,
-                ws_attempt: 1,
-                reconnect_count: 0,
+                idle_ms: 300_000,
+                ws_attempt: 4,
+                reconnect_count: 3,
                 last_event: Some("response.created".to_string()),
             },
         ));
@@ -720,7 +742,8 @@ mod tests {
             message.contains("switched from WebSocket to SSE"),
             "{message}"
         );
-        assert!(message.contains("75s"), "{message}");
+        assert!(message.contains("300s"), "{message}");
+        assert!(message.contains("after 3 reconnects"), "{message}");
         assert!(message.contains("response.created"), "{message}");
         assert!(
             message.contains("$provider-stream-diagnostics"),

@@ -823,6 +823,37 @@ mod tests {
     }
 
     #[test]
+    fn codex_stream_idle_timeout_resolves_default_custom_and_disabled() {
+        let default = ModelSelection::resolve(&Settings::default()).unwrap();
+        assert_eq!(
+            default.codex_stream_idle_timeout,
+            Some(std::time::Duration::from_millis(300_000))
+        );
+
+        let custom: Settings = serde_json::from_value(serde_json::json!({
+            "codexStreamIdleTimeoutMs": 123_456
+        }))
+        .unwrap();
+        assert_eq!(
+            ModelSelection::resolve(&custom)
+                .unwrap()
+                .codex_stream_idle_timeout,
+            Some(std::time::Duration::from_millis(123_456))
+        );
+
+        let disabled: Settings = serde_json::from_value(serde_json::json!({
+            "codexStreamIdleTimeoutMs": 0
+        }))
+        .unwrap();
+        assert_eq!(
+            ModelSelection::resolve(&disabled)
+                .unwrap()
+                .codex_stream_idle_timeout,
+            None
+        );
+    }
+
+    #[test]
     fn clear_tool_uses_and_microcompaction_must_be_disjoint() {
         // Both enabled -> rejected, naming both settings (issue #400,
         // ADR-0022 addendum).
