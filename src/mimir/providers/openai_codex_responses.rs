@@ -27,8 +27,8 @@ use crate::mimir::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
 use crate::mimir::selection::{CodexTransport, PromptCacheRetention, ReasoningEffort};
 use crate::nexus::{
     AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderCompactionCapability,
-    ProviderCompactionFuture, ProviderCompactionOutput, ProviderStream, ProviderUsage,
-    ReasoningBlock, Role, StructuredSummaryCapability, StructuredSummaryError,
+    ProviderCompactionFuture, ProviderCompactionOutput, ProviderStream, ProviderTransportFallback,
+    ProviderUsage, ReasoningBlock, Role, StructuredSummaryCapability, StructuredSummaryError,
     StructuredSummaryFuture, StructuredSummaryMode, ToolCall, Tools,
 };
 
@@ -43,6 +43,7 @@ const API_ID: &str = "openai-codex-responses";
 static NATIVE_COMPACTION_UNSUPPORTED_MODELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+const WS_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 const WS_MAX_AGE: Duration = Duration::from_secs(55 * 60);
 const WS_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 type CodexWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -736,13 +737,25 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
         let url = resolve_codex_url(&self.base_url)?;
         let provider = self.clone();
         let cancel = cancel.clone();
+        let model = self.model.clone();
         if self.codex_transport == CodexTransport::Sse {
             return Ok(spawn_stream(
-                move |sink, cancel| provider.run_blocking(url, &request_for_stream, sink, cancel),
+                PROVIDER_ID,
+                &model,
+                "https_sse",
+                "request_dispatch",
+                move |sink, cancel| {
+                    sink.set_transport_phase("https_sse", "response_stream");
+                    provider.run_blocking(url, &request_for_stream, sink, cancel)
+                },
                 cancel,
             ));
         }
         Ok(spawn_async_stream(
+            PROVIDER_ID,
+            &model,
+            "websocket",
+            "connection_setup",
             move |sink, cancel| async move { provider.run_auto(url, request, sink, cancel).await },
             cancel,
         ))
@@ -805,6 +818,7 @@ impl OpenAiCodexResponsesProvider {
         cancel: CancellationToken,
     ) -> Result<AssistantTurn> {
         if self.ws_state.lock().await.disabled_for_session {
+            sink.set_transport_phase("https_sse", "response_stream");
             return self
                 .run_blocking_off_thread(url, full_request, sink, cancel)
                 .await;
@@ -814,7 +828,10 @@ impl OpenAiCodexResponsesProvider {
         let mut tried_previous_full = false;
         let mut tried_reauth = false;
         let mut force_full = false;
+        let mut ws_attempt = 0u32;
         loop {
+            ws_attempt = ws_attempt.saturating_add(1);
+            sink.set_transport_phase("websocket", "authentication");
             let token = self.codex_token_off_thread(tried_reauth).await?;
             match self
                 .run_ws_once(
@@ -823,33 +840,52 @@ impl OpenAiCodexResponsesProvider {
                     &token,
                     &mut sink,
                     &cancel,
-                    force_full,
+                    (force_full, ws_attempt),
                 )
                 .await
             {
                 Ok(turn) => return Ok(turn),
-                Err((policy, error)) => match policy {
-                    WsFallback::RetryWebSocket if !tried_limit_refresh => {
-                        tried_limit_refresh = true;
-                        self.drop_ws_socket().await;
+                Err((policy, error)) => {
+                    let reconnect_count = ws_attempt.saturating_sub(1);
+                    let diagnostic_model = safe_error_field(&self.model).unwrap_or("redacted");
+                    tracing::warn!(
+                        provider = PROVIDER_ID,
+                        model = diagnostic_model,
+                        transport = "websocket",
+                        ws_attempt,
+                        reconnect_count,
+                        policy = ?policy,
+                        error_class = websocket_error_class(&error),
+                        "Codex WebSocket attempt failed"
+                    );
+                    let error = anyhow!(
+                        "{error} [ws_attempt={ws_attempt} reconnect_count={reconnect_count}]"
+                    );
+                    match policy {
+                        WsFallback::RetryWebSocket if !tried_limit_refresh => {
+                            tried_limit_refresh = true;
+                            self.drop_ws_socket().await;
+                        }
+                        WsFallback::RetryFullWebSocket if !tried_previous_full => {
+                            tried_previous_full = true;
+                            force_full = true;
+                            self.clear_continuation().await;
+                        }
+                        WsFallback::ForceRefresh if !tried_reauth => {
+                            tried_reauth = true;
+                            self.drop_ws_socket().await;
+                        }
+                        WsFallback::FallbackSse => {
+                            self.disable_ws_for_session().await;
+                            sink.set_transport_phase("https_sse", "response_stream");
+                            sink.on_activity()?;
+                            return self
+                                .run_blocking_off_thread(url, full_request, sink, cancel)
+                                .await;
+                        }
+                        _ => return Err(error),
                     }
-                    WsFallback::RetryFullWebSocket if !tried_previous_full => {
-                        tried_previous_full = true;
-                        force_full = true;
-                        self.clear_continuation().await;
-                    }
-                    WsFallback::ForceRefresh if !tried_reauth => {
-                        tried_reauth = true;
-                        self.drop_ws_socket().await;
-                    }
-                    WsFallback::FallbackSse => {
-                        self.disable_ws_for_session().await;
-                        return self
-                            .run_blocking_off_thread(url, full_request, sink, cancel)
-                            .await;
-                    }
-                    _ => return Err(error),
-                },
+                }
             }
         }
     }
@@ -889,29 +925,34 @@ impl OpenAiCodexResponsesProvider {
         ws_url: Url,
         full_request: &Value,
         token: &AccessToken,
-        sink: &mut dyn TurnSink,
+        sink: &mut ChannelSink,
         cancel: &CancellationToken,
-        force_full: bool,
+        attempt: (bool, u32),
     ) -> std::result::Result<AssistantTurn, (WsFallback, anyhow::Error)> {
+        let (force_full, ws_attempt) = attempt;
         let frame = {
             let state = self.ws_state.lock().await;
             build_ws_create_frame(full_request, state.continuation.as_ref(), force_full)
         };
         let mut reusable = match self.take_ws_socket().await {
             Some(socket) => socket,
-            None => ReusableCodexWs {
-                stream: await_ws_setup(
-                    "connect",
-                    WS_CONNECT_TIMEOUT,
-                    cancel,
-                    false,
-                    connect_codex_ws(ws_url, token, &self.prompt_cache_key),
-                )
-                .await?,
-                opened_at: Instant::now(),
-                last_used: Instant::now(),
-            },
+            None => {
+                sink.set_transport_phase("websocket", "connection_handshake");
+                ReusableCodexWs {
+                    stream: await_ws_setup(
+                        "connect",
+                        WS_CONNECT_TIMEOUT,
+                        cancel,
+                        false,
+                        connect_codex_ws(ws_url, token, &self.prompt_cache_key),
+                    )
+                    .await?,
+                    opened_at: Instant::now(),
+                    last_used: Instant::now(),
+                }
+            }
         };
+        sink.set_transport_phase("websocket", "request_send");
         let text =
             serde_json::to_string(&frame).map_err(|error| (WsFallback::Fatal, error.into()))?;
         await_ws_setup("send", WS_SEND_TIMEOUT, cancel, false, async {
@@ -930,12 +971,53 @@ impl OpenAiCodexResponsesProvider {
 
         let mut parser = ResponseStreamParser::new(&self.model);
         loop {
-            let next = tokio::select! {
-                _ = cancel.cancelled() => {
-                    self.clear_continuation().await;
-                    return Err((WsFallback::Fatal, anyhow!("Codex WebSocket request cancelled")));
+            let phase = if parser.last_event_type.is_none() {
+                "awaiting_first_frame"
+            } else {
+                "awaiting_next_frame"
+            };
+            sink.set_transport_phase("websocket", phase);
+            let next = match await_ws_message(
+                WS_READ_IDLE_TIMEOUT,
+                cancel,
+                parser.emitted_visible_output(),
+                phase,
+                reusable.stream.next(),
+            )
+            .await
+            {
+                Ok(next) => next,
+                Err((policy, error)) => {
+                    if cancel.is_cancelled() {
+                        self.clear_continuation().await;
+                    }
+                    let model = safe_error_field(&self.model).unwrap_or("redacted");
+                    let last_event = parser
+                        .last_event_type
+                        .as_deref()
+                        .and_then(safe_error_field)
+                        .map(str::to_string);
+                    if policy == WsFallback::FallbackSse
+                        && error
+                            .to_string()
+                            .contains("classification=provider_transport_idle")
+                    {
+                        sink.on_transport_fallback(ws_idle_transport_fallback(
+                            &self.model,
+                            phase,
+                            ws_attempt,
+                            parser.last_event_type.as_deref(),
+                        ))
+                        .map_err(|send_error| (WsFallback::Fatal, send_error))?;
+                    }
+                    let last_event = last_event.as_deref().unwrap_or("none");
+                    return Err((
+                        policy,
+                        anyhow!(
+                            "{error} [provider={PROVIDER_ID} model={model} last_event={last_event}]"
+                        ),
+                    ));
                 }
-                message = reusable.stream.next() => message,
             };
             let Some(message) = next else {
                 let error: anyhow::Error = CodexStreamProtocolAnomaly::closed_before_completed(
@@ -949,6 +1031,7 @@ impl OpenAiCodexResponsesProvider {
             };
             match message {
                 Ok(WsMessage::Text(text)) => {
+                    sink.set_transport_phase("websocket", "processing_frame");
                     sink.on_activity()
                         .map_err(|error| (WsFallback::Fatal, error))?;
                     if let Err(error) = parser.ingest_event(&text, sink) {
@@ -957,6 +1040,7 @@ impl OpenAiCodexResponsesProvider {
                     }
                 }
                 Ok(WsMessage::Binary(bytes)) => {
+                    sink.set_transport_phase("websocket", "processing_frame");
                     sink.on_activity()
                         .map_err(|error| (WsFallback::Fatal, error))?;
                     let text = String::from_utf8(bytes.to_vec()).map_err(|_| {
@@ -975,6 +1059,7 @@ impl OpenAiCodexResponsesProvider {
                     }
                 }
                 Ok(WsMessage::Ping(payload)) => {
+                    sink.set_transport_phase("websocket", "pong_send");
                     sink.on_activity()
                         .map_err(|error| (WsFallback::Fatal, error))?;
                     await_ws_setup(
@@ -1001,11 +1086,10 @@ impl OpenAiCodexResponsesProvider {
                     sink.on_activity()
                         .map_err(|error| (WsFallback::Fatal, error))?;
                 }
-                Ok(WsMessage::Close(_)) => {
-                    let error: anyhow::Error = CodexStreamProtocolAnomaly::closed_before_completed(
-                        parser.last_event_type.clone(),
-                    )
-                    .into();
+                Ok(WsMessage::Close(frame)) => {
+                    let close = websocket_close_error(frame, parser.last_event_type.clone());
+                    let model = safe_error_field(&self.model).unwrap_or("redacted");
+                    let error = anyhow!("{close} [provider={PROVIDER_ID} model={model}]");
                     return Err((
                         classify_ws_error(&error, parser.emitted_visible_output()),
                         error,
@@ -1013,9 +1097,11 @@ impl OpenAiCodexResponsesProvider {
                 }
                 Ok(WsMessage::Frame(_)) => {}
                 Err(error) => {
+                    let model = safe_error_field(&self.model).unwrap_or("redacted");
                     let error = anyhow!(
-                        "Codex WebSocket read failed: {}",
-                        safe_transport_error(&error)
+                        "Codex WebSocket read failed [classification=websocket_read_error provider={PROVIDER_ID} model={model} transport=websocket phase={phase} last_event={} error={}]",
+                        safe_last_event(parser.last_event_type.as_deref()),
+                        safe_transport_error(&error),
                     );
                     let policy = classify_ws_error(&error, parser.emitted_visible_output());
                     return Err((policy, error));
@@ -1737,6 +1823,87 @@ fn normalize_reasoning_for_continuation(item: &Value) -> Option<Value> {
     }))
 }
 
+fn ws_idle_transport_fallback(
+    model: &str,
+    phase: &str,
+    ws_attempt: u32,
+    last_event: Option<&str>,
+) -> ProviderTransportFallback {
+    ProviderTransportFallback {
+        provider: PROVIDER_ID.to_string(),
+        model: safe_error_field(model).unwrap_or("redacted").to_string(),
+        from_transport: "websocket".to_string(),
+        to_transport: "https_sse".to_string(),
+        reason: "read_idle".to_string(),
+        phase: safe_error_field(phase).unwrap_or("unknown").to_string(),
+        idle_ms: WS_READ_IDLE_TIMEOUT.as_millis() as u64,
+        ws_attempt,
+        reconnect_count: ws_attempt.saturating_sub(1),
+        last_event: last_event.and_then(safe_error_field).map(str::to_string),
+    }
+}
+
+fn safe_last_event(last_event: Option<&str>) -> &str {
+    last_event.and_then(safe_error_field).unwrap_or("none")
+}
+
+async fn await_ws_message<T, Fut>(
+    timeout: Duration,
+    cancel: &CancellationToken,
+    emitted_visible_output: bool,
+    phase: &'static str,
+    future: Fut,
+) -> std::result::Result<T, (WsFallback, anyhow::Error)>
+where
+    Fut: Future<Output = T>,
+{
+    let result = tokio::select! {
+        _ = cancel.cancelled() => {
+            return Err((WsFallback::Fatal, anyhow!("Codex WebSocket request cancelled")));
+        }
+        result = tokio::time::timeout(timeout, future) => result,
+    };
+    match result {
+        Ok(value) => Ok(value),
+        Err(_) => Err((
+            if emitted_visible_output {
+                WsFallback::Fatal
+            } else {
+                WsFallback::FallbackSse
+            },
+            anyhow!(
+                "Codex WebSocket received no frame before the read deadline [classification=provider_transport_idle observed_at=websocket_read transport=websocket phase={} idle_ms={} visible_output={emitted_visible_output} upstream_frame_received=false]",
+                safe_error_field(phase).unwrap_or("unknown"),
+                timeout.as_millis(),
+            ),
+        )),
+    }
+}
+
+fn websocket_close_error(
+    frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+    last_event: Option<String>,
+) -> anyhow::Error {
+    let last_event = safe_last_event(last_event.as_deref());
+    match frame {
+        Some(frame) => {
+            let code: u16 = frame.code.into();
+            if let Some(reason) = safe_error_field(&frame.reason) {
+                anyhow!(
+                    "Codex WebSocket closed before response.completed [classification=websocket_close observed_at=websocket_read close_code={code} close_reason={reason} last_event={last_event}]"
+                )
+            } else {
+                anyhow!(
+                    "Codex WebSocket closed before response.completed [classification=websocket_close observed_at=websocket_read close_code={code} last_event={last_event}]"
+                )
+            }
+        }
+        None => anyhow!(
+            "Codex WebSocket closed before response.completed [classification=websocket_close observed_at=websocket_read close_code=none last_event={last_event}]"
+        ),
+    }
+}
+
 async fn await_ws_setup<T, Fut>(
     operation: &'static str,
     timeout: Duration,
@@ -1757,7 +1924,13 @@ where
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => {
             let policy = classify_ws_error(&error, emitted_visible_output);
-            Err((policy, error))
+            let detail = safe_transport_error(&error);
+            Err((
+                policy,
+                anyhow!(
+                    "Codex WebSocket setup failed [classification=websocket_setup_error observed_at=websocket_setup transport=websocket phase={operation} error={detail} visible_output={emitted_visible_output}]"
+                ),
+            ))
         }
         Err(_) => Err((
             if emitted_visible_output {
@@ -1766,8 +1939,8 @@ where
                 WsFallback::FallbackSse
             },
             anyhow!(
-                "Codex WebSocket {operation} timed out after {}s",
-                timeout.as_secs()
+                "Codex WebSocket setup timed out [classification=websocket_setup_timeout observed_at=websocket_setup transport=websocket phase={operation} timeout_ms={} visible_output={emitted_visible_output}]",
+                timeout.as_millis(),
             ),
         )),
     }
@@ -1809,6 +1982,27 @@ async fn connect_codex_ws(url: Url, token: &AccessToken, session_id: &str) -> Re
     let request = build_codex_ws_request(&url, token, session_id)?;
     let (stream, _) = tokio_tungstenite::connect_async(request).await?;
     Ok(stream)
+}
+
+fn websocket_error_class(error: &anyhow::Error) -> &'static str {
+    let text = error.to_string();
+    if text.contains("classification=provider_transport_idle") {
+        "read_idle"
+    } else if text.contains("classification=websocket_setup_timeout") {
+        "setup_timeout"
+    } else if text.contains("classification=websocket_setup_error") {
+        "setup_error"
+    } else if text.contains("classification=websocket_close") {
+        "close"
+    } else if text.contains("classification=websocket_read_error") {
+        "read_error"
+    } else if text.contains("classification=upstream_provider_error") {
+        "upstream_provider_error"
+    } else if error.downcast_ref::<CodexStreamProtocolAnomaly>().is_some() {
+        "protocol_anomaly"
+    } else {
+        "unknown"
+    }
 }
 
 fn classify_ws_error(error: &anyhow::Error, emitted_visible_output: bool) -> WsFallback {
@@ -2205,24 +2399,35 @@ fn safe_error_field(value: &str) -> Option<&str> {
 }
 
 fn response_error(value: &Value) -> String {
-    let error = value
-        .get("response")
-        .and_then(|response| response.get("error"));
-    format_error_fields(error, "response.failed event received")
+    let response = value.get("response");
+    let error = response.and_then(|response| response.get("error"));
+    let status = response
+        .and_then(|response| response.get("status"))
+        .and_then(Value::as_str)
+        .and_then(safe_error_field);
+    format_error_fields(error, "response.failed", status)
 }
 
 fn top_level_error(value: &Value) -> String {
-    format_error_fields(value.get("error"), "error event received")
+    format_error_fields(value.get("error"), "error", None)
 }
 
-fn format_error_fields(error: Option<&Value>, fallback: &str) -> String {
-    let mut fields = Vec::new();
+fn format_error_fields(error: Option<&Value>, event: &str, status: Option<&str>) -> String {
+    let mut fields = vec![
+        "classification=upstream_provider_error".to_string(),
+        "observed_at=provider_protocol_event".to_string(),
+        format!("provider_event={event}"),
+    ];
+    if let Some(status) = status {
+        fields.push(format!("provider_status={status}"));
+    }
     if let Some(kind) = error
         .and_then(|error| error.get("type"))
         .and_then(Value::as_str)
         .and_then(safe_error_field)
     {
         fields.push(format!("type={kind}"));
+        fields.push(format!("provider_type={kind}"));
     }
     if let Some(code) = error
         .and_then(|error| error.get("code"))
@@ -2230,12 +2435,16 @@ fn format_error_fields(error: Option<&Value>, fallback: &str) -> String {
         .and_then(safe_error_field)
     {
         fields.push(format!("code={code}"));
+        fields.push(format!("provider_code={code}"));
     }
-    if fields.is_empty() {
-        fallback.to_string()
-    } else {
-        fields.join(" ")
+    if let Some(message) = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .and_then(safe_error_field)
+    {
+        fields.push(format!("provider_message={message}"));
     }
+    fields.join(" ")
 }
 
 fn incomplete_reason(value: &Value) -> String {

@@ -83,9 +83,14 @@ impl ChatProvider for AntigravityProvider {
             self.reasoning,
         );
         let wire_slot = wire_model_slot(&self.model).to_string();
+        let model = self.model.clone();
         let provider = self.clone();
         let cancel = cancel.clone();
         Ok(spawn_stream(
+            "antigravity",
+            &model,
+            "https_sse",
+            "response_stream",
             move |sink, cancel| {
                 run_with_reauth(
                     "antigravity",

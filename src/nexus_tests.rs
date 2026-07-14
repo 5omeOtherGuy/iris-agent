@@ -1,5 +1,6 @@
 use super::*;
 use crate::cli::run_session;
+use crate::session::SessionLog;
 use crate::tools::ToolState;
 use crate::ui::text::TextUi;
 use crate::wayland::Harness;
@@ -659,6 +660,53 @@ fn persisted_reasoning_rows<P: ChatProvider>(harness: &Harness<P>) -> usize {
         .iter()
         .filter(|message| message.role == Role::AssistantReasoning)
         .count()
+}
+
+#[test]
+fn provider_transport_fallback_reaches_the_observer() -> Result<()> {
+    let workspace = test_workspace()?;
+    let fallback = ProviderTransportFallback {
+        provider: "openai-codex".to_string(),
+        model: "gpt-test".to_string(),
+        from_transport: "websocket".to_string(),
+        to_transport: "https_sse".to_string(),
+        reason: "read_idle".to_string(),
+        phase: "awaiting_next_frame".to_string(),
+        idle_ms: 75_000,
+        ws_attempt: 1,
+        reconnect_count: 0,
+        last_event: Some("response.created".to_string()),
+    };
+    let provider = ScriptedStreamProvider::new(vec![
+        ProviderEvent::TransportFallback(fallback.clone()),
+        ProviderEvent::Completed(AssistantTurn::text("Answer")),
+    ]);
+    let session_dir = test_workspace()?;
+    let session = SessionLog::create_in(&session_dir.path, &workspace.path)?;
+    let session_path = session.path().to_path_buf();
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(session),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(frontend.events.borrow().iter().any(
+        |event| matches!(event, AgentEvent::ProviderTransportFallback(actual) if actual == &fallback)
+    ));
+    let transcript = fs::read_to_string(session_path)?;
+    assert!(
+        transcript
+            .lines()
+            .any(|line| line.contains("\"type\":\"providerTransportFallback\"")),
+        "fallback metadata must be durable for the diagnostic skill"
+    );
+    Ok(())
 }
 
 #[test]

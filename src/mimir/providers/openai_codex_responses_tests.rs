@@ -327,6 +327,141 @@ fn websocket_setup_cancel_stops_before_connect_or_send_complete() {
 }
 
 #[test]
+fn websocket_setup_failure_is_classified_and_redacted() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+
+    let (policy, error) = runtime
+        .block_on(await_ws_setup(
+            "connect",
+            std::time::Duration::from_secs(1),
+            &cancel,
+            false,
+            async { Err::<(), _>(anyhow!("handshake failed /home/alice sk-secret prompt")) },
+        ))
+        .unwrap_err();
+    let message = error.to_string();
+
+    assert_eq!(policy, WsFallback::FallbackSse);
+    assert!(
+        message.contains("classification=websocket_setup_error"),
+        "{message}"
+    );
+    assert!(message.contains("phase=connect"), "{message}");
+    assert!(!message.contains("/home/alice"), "{message}");
+    assert!(!message.contains("sk-secret"), "{message}");
+    assert!(!message.contains("prompt"), "{message}");
+}
+
+#[test]
+fn websocket_idle_fallback_metadata_is_safe_and_complete() {
+    let fallback = ws_idle_transport_fallback(
+        "gpt-test /home/alice sk-secret",
+        "awaiting_next_frame",
+        3,
+        Some("response.created /tmp/secret"),
+    );
+
+    assert_eq!(fallback.provider, PROVIDER_ID);
+    assert_eq!(fallback.model, "redacted");
+    assert_eq!(fallback.from_transport, "websocket");
+    assert_eq!(fallback.to_transport, "https_sse");
+    assert_eq!(fallback.reason, "read_idle");
+    assert_eq!(fallback.phase, "awaiting_next_frame");
+    assert_eq!(fallback.idle_ms, 75_000);
+    assert_eq!(fallback.ws_attempt, 3);
+    assert_eq!(fallback.reconnect_count, 2);
+    assert_eq!(fallback.last_event, None);
+}
+
+#[test]
+fn websocket_read_idle_before_visible_output_falls_back_with_diagnostics() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+
+    let (policy, error) = runtime
+        .block_on(await_ws_message(
+            std::time::Duration::from_millis(1),
+            &cancel,
+            false,
+            "awaiting_first_frame",
+            std::future::pending::<()>(),
+        ))
+        .unwrap_err();
+    let message = error.to_string();
+
+    assert_eq!(policy, WsFallback::FallbackSse);
+    assert!(
+        message.contains("classification=provider_transport_idle"),
+        "{message}"
+    );
+    assert!(message.contains("transport=websocket"), "{message}");
+    assert!(message.contains("phase=awaiting_first_frame"), "{message}");
+    assert!(message.contains("visible_output=false"), "{message}");
+}
+
+#[test]
+fn websocket_read_idle_after_visible_output_is_fatal() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+
+    let (policy, error) = runtime
+        .block_on(await_ws_message(
+            std::time::Duration::from_millis(1),
+            &cancel,
+            true,
+            "awaiting_next_frame",
+            std::future::pending::<()>(),
+        ))
+        .unwrap_err();
+    let message = error.to_string();
+
+    assert_eq!(policy, WsFallback::Fatal);
+    assert!(message.contains("phase=awaiting_next_frame"), "{message}");
+    assert!(message.contains("visible_output=true"), "{message}");
+}
+
+#[test]
+fn websocket_close_diagnostics_keep_code_and_only_safe_reason() {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let safe = websocket_close_error(
+        Some(CloseFrame {
+            code: CloseCode::Away,
+            reason: "server_restart".into(),
+        }),
+        Some("response.created".to_string()),
+    )
+    .to_string();
+    assert!(safe.contains("close_code=1001"), "{safe}");
+    assert!(safe.contains("close_reason=server_restart"), "{safe}");
+    assert!(safe.contains("last_event=response.created"), "{safe}");
+
+    let hostile = websocket_close_error(
+        Some(CloseFrame {
+            code: CloseCode::Error,
+            reason: "leak /home/alice sk-secret prompt".into(),
+        }),
+        None,
+    )
+    .to_string();
+    assert!(hostile.contains("close_code=1011"), "{hostile}");
+    assert!(!hostile.contains("/home/alice"), "{hostile}");
+    assert!(!hostile.contains("sk-secret"), "{hostile}");
+    assert!(!hostile.contains("prompt"), "{hostile}");
+}
+
+#[test]
 fn websocket_create_frame_omits_stream_and_keeps_store_false() {
     let full = json!({
         "model": "gpt-test",

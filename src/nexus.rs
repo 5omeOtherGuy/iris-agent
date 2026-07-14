@@ -346,6 +346,23 @@ pub(crate) enum ContextMeasurementSource {
     Estimated,
 }
 
+/// Safe metadata captured when a provider adapter changes transport after a
+/// stalled attempt. Carries no request/response body, headers, credentials, or
+/// free-form provider error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderTransportFallback {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) from_transport: String,
+    pub(crate) to_transport: String,
+    pub(crate) reason: String,
+    pub(crate) phase: String,
+    pub(crate) idle_ms: u64,
+    pub(crate) ws_attempt: u32,
+    pub(crate) reconnect_count: u32,
+    pub(crate) last_event: Option<String>,
+}
+
 /// The semantic events the loop emits during a turn. Provider- and UI-neutral:
 /// a front-end maps these onto its own rendering. Mirrors pi's `AgentEvent`
 /// union (`packages/agent/src/types.ts`).
@@ -392,6 +409,10 @@ pub(crate) enum AgentEvent {
         turn_id: String,
         message: String,
     },
+    /// A provider adapter recovered from a stalled transport by switching to a
+    /// fallback transport. Safe operational metadata only; Tier 3 renders one
+    /// actionable notice and Wayland records it in the session audit stream.
+    ProviderTransportFallback(ProviderTransportFallback),
     /// Provider-neutral tool lifecycle metadata for observability. The existing
     /// display events remain for UI compatibility; this compact event carries
     /// only ids/state and never includes tool arguments, output, provider
@@ -673,6 +694,9 @@ pub(crate) enum ProviderEvent {
     /// The loop ignores it for transcript purposes, but it keeps transport idle
     /// detection from treating a live non-text stream as stalled.
     Activity,
+    /// The adapter recovered from an idle transport by selecting another one.
+    /// This is operational metadata, not model output or transcript content.
+    TransportFallback(ProviderTransportFallback),
     /// Incremental assistant text.
     TextDelta(String),
     /// Incremental reasoning-summary text (never raw chain-of-thought or
@@ -2609,6 +2633,9 @@ impl<P: ChatProvider> Agent<P> {
                             first_output.get_or_insert_with(Instant::now);
                         }
                         obs.on_event(AgentEvent::ToolInputDelta { call_id, delta })?;
+                    }
+                    Some(Ok(ProviderEvent::TransportFallback(fallback))) => {
+                        obs.on_event(AgentEvent::ProviderTransportFallback(fallback))?;
                     }
                     Some(Ok(ProviderEvent::Activity)) => {}
                     Some(Ok(ProviderEvent::Completed(turn))) => {

@@ -12,7 +12,7 @@
 //! reauth.
 
 use std::io::{BufRead, Error as IoError};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 use tokio_util::sync::CancellationToken;
 
 use crate::mimir::retry::RetryPolicy;
-use crate::nexus::{AssistantTurn, ProviderEvent, ProviderStream};
+use crate::nexus::{AssistantTurn, ProviderEvent, ProviderStream, ProviderTransportFallback};
 
 /// How long to wait for a TCP connect + TLS handshake before classifying the
 /// attempt as transient (the retry loop then backs off and retries).
@@ -63,6 +63,67 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+#[derive(Debug, Clone)]
+struct StreamDiagnostics {
+    state: Arc<Mutex<StreamDiagnosticState>>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamDiagnosticState {
+    provider: String,
+    model: String,
+    transport: String,
+    phase: String,
+}
+
+impl StreamDiagnostics {
+    fn new(provider: &str, model: &str, transport: &str, phase: &str) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(StreamDiagnosticState {
+                provider: diagnostic_label(provider),
+                model: diagnostic_label(model),
+                transport: diagnostic_label(transport),
+                phase: diagnostic_label(phase),
+            })),
+        }
+    }
+
+    fn set_transport_phase(&self, transport: &str, phase: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.transport = diagnostic_label(transport);
+        state.phase = diagnostic_label(phase);
+    }
+
+    fn snapshot(&self) -> StreamDiagnosticState {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+}
+
+fn diagnostic_label(value: &str) -> String {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    let sensitive = ["secret", "token", "password", "api_key", "prompt", "sk-"];
+    let is_safe = !value.is_empty()
+        && value.len() <= 96
+        && !value.starts_with(['/', '\\'])
+        && !value.contains("..")
+        && !sensitive.iter().any(|fragment| lower.contains(fragment))
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':'));
+    if is_safe {
+        value.to_string()
+    } else {
+        "redacted".to_string()
+    }
+}
 
 /// Process-wide HTTP client shared by every provider adapter (and their OAuth
 /// token refreshes). One client means one connection pool: switching models or
@@ -149,6 +210,22 @@ pub(super) trait TurnSink: Send {
 /// [`TurnSink`] that forwards each text delta onto the provider's event channel.
 pub(super) struct ChannelSink {
     tx: mpsc::UnboundedSender<Result<ProviderEvent>>,
+    diagnostics: StreamDiagnostics,
+}
+
+impl ChannelSink {
+    pub(super) fn set_transport_phase(&mut self, transport: &str, phase: &str) {
+        self.diagnostics.set_transport_phase(transport, phase);
+    }
+
+    pub(super) fn on_transport_fallback(
+        &mut self,
+        fallback: ProviderTransportFallback,
+    ) -> Result<()> {
+        self.tx
+            .unbounded_send(Ok(ProviderEvent::TransportFallback(fallback)))
+            .map_err(|_| anyhow!("response stream dropped by consumer"))
+    }
 }
 
 impl TurnSink for ChannelSink {
@@ -198,23 +275,47 @@ impl TurnSink for ChannelSink {
 /// Send`: capture an owned request `Value` and a cloned provider, never a borrow
 /// of `self`/`messages`/`tools`.
 pub(super) fn spawn_stream(
+    provider: &str,
+    model: &str,
+    transport: &str,
+    phase: &str,
     run: impl FnOnce(&mut ChannelSink, &CancellationToken) -> Result<AssistantTurn> + Send + 'static,
     cancel: CancellationToken,
 ) -> ProviderStream<'static> {
+    spawn_stream_inner(
+        run,
+        cancel,
+        StreamDiagnostics::new(provider, model, transport, phase),
+    )
+}
+
+fn spawn_stream_inner(
+    run: impl FnOnce(&mut ChannelSink, &CancellationToken) -> Result<AssistantTurn> + Send + 'static,
+    cancel: CancellationToken,
+    diagnostics: StreamDiagnostics,
+) -> ProviderStream<'static> {
     let (tx, rx) = mpsc::unbounded::<Result<ProviderEvent>>();
     let stream_cancel = cancel.clone();
+    let sink_diagnostics = diagnostics.clone();
     tokio::task::spawn_blocking(move || {
-        let mut sink = ChannelSink { tx: tx.clone() };
+        let mut sink = ChannelSink {
+            tx: tx.clone(),
+            diagnostics: sink_diagnostics,
+        };
         let terminal = match run(&mut sink, &cancel) {
             Ok(turn) => Ok(ProviderEvent::Completed(turn)),
             Err(error) => Err(error),
         };
         let _ = tx.unbounded_send(terminal);
     });
-    stream_with_idle_guard(rx, stream_cancel)
+    stream_with_idle_guard(rx, stream_cancel, diagnostics)
 }
 
 pub(super) fn spawn_async_stream<F, Fut>(
+    provider: &str,
+    model: &str,
+    transport: &str,
+    phase: &str,
     run: F,
     cancel: CancellationToken,
 ) -> ProviderStream<'static>
@@ -222,42 +323,98 @@ where
     F: FnOnce(ChannelSink, CancellationToken) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<AssistantTurn>> + Send + 'static,
 {
+    let diagnostics = StreamDiagnostics::new(provider, model, transport, phase);
+    let sink_diagnostics = diagnostics.clone();
     let (tx, rx) = mpsc::unbounded::<Result<ProviderEvent>>();
     let stream_cancel = cancel.clone();
     tokio::spawn(async move {
-        let sink = ChannelSink { tx: tx.clone() };
+        let sink = ChannelSink {
+            tx: tx.clone(),
+            diagnostics: sink_diagnostics,
+        };
         let terminal = match run(sink, cancel).await {
             Ok(turn) => Ok(ProviderEvent::Completed(turn)),
             Err(error) => Err(error),
         };
         let _ = tx.unbounded_send(terminal);
     });
-    stream_with_idle_guard(rx, stream_cancel)
+    stream_with_idle_guard(rx, stream_cancel, diagnostics)
 }
 
 fn stream_with_idle_guard(
     rx: mpsc::UnboundedReceiver<Result<ProviderEvent>>,
     stream_cancel: CancellationToken,
+    diagnostics: StreamDiagnostics,
+) -> ProviderStream<'static> {
+    stream_with_idle_guard_timeout(rx, stream_cancel, diagnostics, STREAM_IDLE_TIMEOUT)
+}
+
+fn stream_with_idle_guard_timeout(
+    rx: mpsc::UnboundedReceiver<Result<ProviderEvent>>,
+    stream_cancel: CancellationToken,
+    diagnostics: StreamDiagnostics,
+    idle_timeout: Duration,
 ) -> ProviderStream<'static> {
     Box::pin(futures::stream::unfold(
-        (rx, stream_cancel),
-        |(mut rx, cancel)| async move {
-            match tokio::time::timeout(STREAM_IDLE_TIMEOUT, rx.next()).await {
-                Ok(Some(item)) => Some((item, (rx, cancel))),
+        (rx, stream_cancel, diagnostics, 0u64, None),
+        move |(mut rx, cancel, diagnostics, mut events_seen, mut last_event)| async move {
+            match tokio::time::timeout(idle_timeout, rx.next()).await {
+                Ok(Some(item)) => {
+                    events_seen = events_seen.saturating_add(1);
+                    last_event = Some(provider_event_label(&item));
+                    Some((item, (rx, cancel, diagnostics, events_seen, last_event)))
+                }
                 Ok(None) => None,
                 Err(_) => {
                     cancel.cancel();
+                    let state = diagnostics.snapshot();
+                    let last_event = last_event.unwrap_or("none");
+                    tracing::error!(
+                        classification = "provider_transport_idle",
+                        provider = %state.provider,
+                        model = %state.model,
+                        transport = %state.transport,
+                        phase = %state.phase,
+                        idle_ms = idle_timeout.as_millis() as u64,
+                        events_seen,
+                        last_event,
+                        harness_channel = "open",
+                        observed_at = "harness_event_channel",
+                        producer_cancelled = true,
+                        "provider stream idle timeout"
+                    );
+                    let error = anyhow!(
+                        "provider stream idle timeout [classification=provider_transport_idle observed_at=harness_event_channel provider={} model={} transport={} phase={} idle_ms={} events_seen={} last_event={} harness_channel=open producer_cancelled=true]; no new provider event reached the harness during the idle window",
+                        state.provider,
+                        state.model,
+                        state.transport,
+                        state.phase,
+                        idle_timeout.as_millis(),
+                        events_seen,
+                        last_event,
+                    );
                     Some((
-                        Err(anyhow!(
-                            "provider stream produced no events for {}s",
-                            STREAM_IDLE_TIMEOUT.as_secs()
-                        )),
-                        (rx, cancel),
+                        Err(error),
+                        (rx, cancel, diagnostics, events_seen, Some(last_event)),
                     ))
                 }
             }
         },
     ))
+}
+
+fn provider_event_label(event: &Result<ProviderEvent>) -> &'static str {
+    match event {
+        Err(_) => "error",
+        Ok(ProviderEvent::Activity) => "activity",
+        Ok(ProviderEvent::TransportFallback(_)) => "transport_fallback",
+        Ok(ProviderEvent::TextDelta(_)) => "text_delta",
+        Ok(ProviderEvent::ReasoningDelta(_)) => "reasoning_delta",
+        Ok(ProviderEvent::RawReasoningDelta(_)) => "raw_reasoning_delta",
+        Ok(ProviderEvent::ReasoningSectionBreak) => "reasoning_section_break",
+        Ok(ProviderEvent::ToolInputDelta { .. }) => "tool_input_delta",
+        Ok(ProviderEvent::Completed(_)) => "completed",
+    }
 }
 
 /// Outcome of a single HTTP attempt, classified for [`run_with_reauth`] /
@@ -960,6 +1117,54 @@ mod tests {
     // Backoff growth/clamping/`Retry-After` behavior is covered by
     // `mimir::retry::tests` since the computation moved to the shared
     // `RetryPolicy`.
+
+    #[test]
+    fn idle_guard_error_reports_provider_transport_phase_and_cancels() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded::<Result<ProviderEvent>>();
+        let cancel = CancellationToken::new();
+        let diagnostics = StreamDiagnostics::new(
+            "openai-codex",
+            "gpt-test",
+            "websocket",
+            "awaiting_first_frame",
+        );
+        let mut stream = stream_with_idle_guard_timeout(
+            rx,
+            cancel.clone(),
+            diagnostics,
+            Duration::from_millis(1),
+        );
+
+        let error = runtime
+            .block_on(stream.next())
+            .expect("timeout event")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("classification=provider_transport_idle"),
+            "{error}"
+        );
+        assert!(error.contains("provider=openai-codex"), "{error}");
+        assert!(error.contains("model=gpt-test"), "{error}");
+        assert!(error.contains("transport=websocket"), "{error}");
+        assert!(error.contains("phase=awaiting_first_frame"), "{error}");
+        assert!(error.contains("events_seen=0"), "{error}");
+        assert!(error.contains("last_event=none"), "{error}");
+        assert!(cancel.is_cancelled(), "idle guard cancels the producer");
+        drop(tx);
+    }
+
+    #[test]
+    fn diagnostic_labels_keep_model_ids_and_redact_sensitive_values() {
+        assert_eq!(diagnostic_label("openai/gpt-5.4"), "openai/gpt-5.4");
+        assert_eq!(diagnostic_label("/home/alice/sk-secret"), "redacted");
+        assert_eq!(diagnostic_label("prompt_token"), "redacted");
+    }
 
     #[test]
     fn parse_retry_after_reads_integer_seconds_only() {

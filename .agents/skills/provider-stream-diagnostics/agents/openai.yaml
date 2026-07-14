@@ -1,0 +1,6 @@
+interface:
+  display_name: Provider Stream Diagnostics
+  short_description: Diagnose a saved OpenAI transport fallback
+  default_prompt: Inspect the latest provider transport fallback in this repository and attribute the observed failure boundary.
+policy:
+  allow_implicit_invocation: false

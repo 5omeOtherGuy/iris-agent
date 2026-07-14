@@ -323,6 +323,29 @@ pub(crate) enum TurnErrorKind {
     Auth,
 }
 
+fn provider_transport_fallback_notice(
+    fallback: &crate::nexus::ProviderTransportFallback,
+) -> String {
+    let from = match fallback.from_transport.as_str() {
+        "websocket" => "WebSocket",
+        other => other,
+    };
+    let to = match fallback.to_transport.as_str() {
+        "https_sse" => "SSE",
+        other => other,
+    };
+    let wait = if fallback.idle_ms.is_multiple_of(1_000) {
+        format!("{}s", fallback.idle_ms / 1_000)
+    } else {
+        format!("{}ms", fallback.idle_ms)
+    };
+    let last_event = fallback.last_event.as_deref().unwrap_or("none");
+    format!(
+        "{} `{}` received no {from} frames for {wait} during {}; switched from {from} to {to} for this session (last provider event: {last_event}). Invoke `$provider-stream-diagnostics` now to inspect the saved metadata.",
+        fallback.provider, fallback.model, fallback.phase
+    )
+}
+
 impl UiEvent {
     /// Map one Nexus `AgentEvent` onto its presentation event. Single-sourced so
     /// both the blocking text bridge and the async loop bridge agree.
@@ -359,6 +382,9 @@ impl UiEvent {
             }
             AgentEvent::ProviderTurnError { turn_id, message } => {
                 UiEvent::ProviderTurnError { turn_id, message }
+            }
+            AgentEvent::ProviderTransportFallback(fallback) => {
+                UiEvent::Notice(provider_transport_fallback_notice(&fallback))
             }
             AgentEvent::ToolLifecycle {
                 provider_turn_id,
@@ -667,6 +693,38 @@ mod tests {
                 call_id: "call_1".to_string(),
                 chunk: "partial output".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn maps_provider_transport_fallback_to_an_actionable_notice() {
+        let mapped = UiEvent::from_agent_event(AgentEvent::ProviderTransportFallback(
+            crate::nexus::ProviderTransportFallback {
+                provider: "openai-codex".to_string(),
+                model: "gpt-test".to_string(),
+                from_transport: "websocket".to_string(),
+                to_transport: "https_sse".to_string(),
+                reason: "read_idle".to_string(),
+                phase: "awaiting_next_frame".to_string(),
+                idle_ms: 75_000,
+                ws_attempt: 1,
+                reconnect_count: 0,
+                last_event: Some("response.created".to_string()),
+            },
+        ));
+
+        let UiEvent::Notice(message) = mapped else {
+            panic!("fallback must render through the notice channel");
+        };
+        assert!(
+            message.contains("switched from WebSocket to SSE"),
+            "{message}"
+        );
+        assert!(message.contains("75s"), "{message}");
+        assert!(message.contains("response.created"), "{message}");
+        assert!(
+            message.contains("$provider-stream-diagnostics"),
+            "{message}"
         );
     }
 

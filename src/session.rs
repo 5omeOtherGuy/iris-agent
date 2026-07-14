@@ -52,7 +52,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::nexus::{Message, ModelOrigin, Role};
+use crate::nexus::{Message, ModelOrigin, ProviderTransportFallback, Role};
 
 /// Durable detail for one range-compaction entry. This is an inspection view,
 /// not provider context: originals are counted from raw message rows and remain
@@ -488,6 +488,41 @@ impl SessionLog {
         write_line(&mut self.file, &entry).with_context(|| {
             format!(
                 "failed to append task-settled lifecycle to session {}",
+                self.path.display()
+            )
+        })?;
+        self.last_id = Some(id.clone());
+        Ok(id)
+    }
+
+    /// Append safe metadata for one provider transport fallback. This audit row is
+    /// chained like other session metadata but skipped during provider-context
+    /// rebuild; it exists so an explicitly invoked diagnostic skill can inspect
+    /// the incident without reading message bodies or credentials.
+    pub(crate) fn append_provider_transport_fallback(
+        &mut self,
+        fallback: &ProviderTransportFallback,
+    ) -> Result<String> {
+        let id = self.next_id();
+        let entry = json!({
+            "type": "providerTransportFallback",
+            "id": id,
+            "parentId": self.last_id.as_deref(),
+            "timestamp": now_ms(),
+            "provider": fallback.provider,
+            "model": fallback.model,
+            "fromTransport": fallback.from_transport,
+            "toTransport": fallback.to_transport,
+            "reason": fallback.reason,
+            "phase": fallback.phase,
+            "idleMs": fallback.idle_ms,
+            "wsAttempt": fallback.ws_attempt,
+            "reconnectCount": fallback.reconnect_count,
+            "lastEvent": fallback.last_event,
+        });
+        write_line(&mut self.file, &entry).with_context(|| {
+            format!(
+                "failed to append provider transport fallback to session {}",
                 self.path.display()
             )
         })?;
@@ -1214,11 +1249,12 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
             continue;
         };
         // `message`, `compaction`, `fold`, `modelSelection`, `taskLifecycle`,
-        // and `dangerousMode` entries all occupy the leaf chain and an
-        // entry-id slot, so a resumed append must link its `parentId` past,
-        // and count its `next_seq` beyond, whichever kind is the current leaf.
-        // (`fold`, `modelSelection`, `taskLifecycle`, and `dangerousMode` are
-        // audit records; the read/rebuild path skips them, but the chain must
+        // `providerTransportFallback`, and `dangerousMode` entries all occupy
+        // the leaf chain and an entry-id slot, so a resumed append must link its
+        // `parentId` past, and count its `next_seq` beyond, whichever kind is the
+        // current leaf. (`fold`, `modelSelection`, `taskLifecycle`,
+        // `providerTransportFallback`, and `dangerousMode` are audit records;
+        // the read/rebuild path skips them, but the chain must
         // still flow through them or `parentId` breaks -- and `append_fold`
         // consumes a seq, so ignoring `fold` here would let the next append
         // reuse the fold's id (issue #378).)
@@ -1228,6 +1264,7 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
             | Some("fold")
             | Some("modelSelection")
             | Some("taskLifecycle")
+            | Some("providerTransportFallback")
             | Some("dangerousMode") => {}
             _ => continue,
         }
@@ -2104,6 +2141,56 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("invalid session id"));
+    }
+
+    #[test]
+    fn append_provider_transport_fallback_writes_diagnostic_metadata() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let fallback = crate::nexus::ProviderTransportFallback {
+            provider: "openai-codex".to_string(),
+            model: "gpt-test".to_string(),
+            from_transport: "websocket".to_string(),
+            to_transport: "https_sse".to_string(),
+            reason: "read_idle".to_string(),
+            phase: "awaiting_first_frame".to_string(),
+            idle_ms: 75_000,
+            ws_attempt: 2,
+            reconnect_count: 1,
+            last_event: None,
+        };
+
+        let fallback_id = log.append_provider_transport_fallback(&fallback).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+        let mut resumed = SessionLog::resume(&path).unwrap();
+        let message_id = resumed.append(&Message::assistant("recovered")).unwrap();
+        drop(resumed);
+
+        let body = fs::read_to_string(&path).unwrap();
+        let entries = body
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let entry = &entries[0];
+
+        assert_eq!(entry["type"], "providerTransportFallback");
+        assert_eq!(entry["provider"], "openai-codex");
+        assert_eq!(entry["model"], "gpt-test");
+        assert_eq!(entry["fromTransport"], "websocket");
+        assert_eq!(entry["toTransport"], "https_sse");
+        assert_eq!(entry["reason"], "read_idle");
+        assert_eq!(entry["phase"], "awaiting_first_frame");
+        assert_eq!(entry["idleMs"], 75_000);
+        assert_eq!(entry["wsAttempt"], 2);
+        assert_eq!(entry["reconnectCount"], 1);
+        assert!(entry["lastEvent"].is_null());
+        assert_eq!(entries[1]["parentId"], fallback_id);
+        assert_ne!(
+            message_id, fallback_id,
+            "resume must not reuse the audit id"
+        );
     }
 
     #[test]
