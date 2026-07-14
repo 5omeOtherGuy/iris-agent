@@ -346,7 +346,10 @@ fn websocket_read_idle_before_visible_output_falls_back_with_diagnostics() {
     let message = error.to_string();
 
     assert_eq!(policy, WsFallback::FallbackSse);
-    assert!(message.contains("classification=provider_transport_idle"), "{message}");
+    assert!(
+        message.contains("classification=provider_transport_idle"),
+        "{message}"
+    );
     assert!(message.contains("transport=websocket"), "{message}");
     assert!(message.contains("phase=awaiting_first_frame"), "{message}");
     assert!(message.contains("visible_output=false"), "{message}");

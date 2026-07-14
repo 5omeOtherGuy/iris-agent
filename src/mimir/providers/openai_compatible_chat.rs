@@ -164,9 +164,15 @@ impl ChatProvider for OpenAiCompatibleChatProvider {
             },
         );
         let url = resolve_chat_url(&self.base_url)?;
+        let provider_id = self.provider.as_str().to_string();
+        let model = self.model.clone();
         let provider = self.clone();
         let cancel = cancel.clone();
         Ok(spawn_stream(
+            &provider_id,
+            &model,
+            "https_sse",
+            "response_stream",
             move |sink, cancel| {
                 run_with_retry(
                     provider.provider.as_str(),

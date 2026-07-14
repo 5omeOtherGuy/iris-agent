@@ -531,9 +531,14 @@ impl ChatProvider for AnthropicProvider {
                 auth_kind,
             },
         );
+        let model = self.model.clone();
         let provider = self.clone();
         let cancel = cancel.clone();
         Ok(spawn_stream(
+            PROVIDER_ID,
+            &model,
+            "https_sse",
+            "response_stream",
             move |sink, cancel| {
                 // Remember the token we last handed out so a forced refresh
                 // (after a 401) can tell the rejected token apart from one a
