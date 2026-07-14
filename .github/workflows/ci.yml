@@ -18,39 +18,86 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  scope:
+    name: Classify changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs-only: ${{ steps.scope.outputs.docs-only }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Classify change scope
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: echo "docs-only=$(bash scripts/change-scope.sh "$BASE_SHA" "$HEAD_SHA")" >>"$GITHUB_OUTPUT"
+
   test:
     name: Test (stable)
+    needs: scope
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check documentation whitespace
+        if: needs.scope.result == 'success' && needs.scope.outputs.docs-only == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: git diff --check "$BASE_SHA...$HEAD_SHA"
+
+      - name: Documentation-only gate summary
+        if: needs.scope.result == 'success' && needs.scope.outputs.docs-only == 'true'
+        run: echo "Documentation-only change; Rust checks are not required."
 
       - name: Install Rust toolchain
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo build
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         uses: Swatinem/rust-cache@v2
 
       - name: Format
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         run: cargo fmt --all --check
 
       - name: Clippy
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         run: cargo test --locked
 
-      - name: Test maintenance scripts
+      - name: Test change-scope script
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
+        run: bash scripts/change-scope-tests.sh
+
+      - name: Test sync-primary script
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         run: bash scripts/sync-primary-tests.sh
 
       - name: Build
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         run: cargo build --locked
 
   build-macos:
     name: Build (macOS)
+    needs: scope
+    if: always() && (needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true')
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
