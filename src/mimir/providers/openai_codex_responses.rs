@@ -847,9 +847,10 @@ impl OpenAiCodexResponsesProvider {
                 Ok(turn) => return Ok(turn),
                 Err((policy, error)) => {
                     let reconnect_count = ws_attempt.saturating_sub(1);
+                    let diagnostic_model = safe_error_field(&self.model).unwrap_or("redacted");
                     tracing::warn!(
                         provider = PROVIDER_ID,
-                        model = %self.model,
+                        model = diagnostic_model,
                         transport = "websocket",
                         ws_attempt,
                         reconnect_count,
