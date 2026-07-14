@@ -284,6 +284,7 @@ impl TreeMenu {
         let files = self.files.as_ref().unwrap_or_else(|| {
             self.filter_files.get_or_init(|| {
                 ignore::WalkBuilder::new(&self.root)
+                    .require_git(false)
                     .follow_links(false)
                     .build()
                     .filter_map(Result::ok)
