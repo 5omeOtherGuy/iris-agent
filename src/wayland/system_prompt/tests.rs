@@ -789,45 +789,42 @@ fn refused_user_level_symlink_targets_have_diagnostics() {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
 
-    let home = temp_dir();
-    let _env = EnvGuard::with_home(&home.path);
-    fs::create_dir_all(home.path.join(".agents")).unwrap();
-    fs::create_dir_all(home.path.join(".iris")).unwrap();
+    let root = temp_dir();
+    let user_dir = root.path.join(".iris");
+    fs::create_dir_all(&user_dir).unwrap();
+    let user_path = user_dir.join("AGENTS.md");
 
-    let missing = home.path.join("missing-target");
-    symlink(&missing, home.path.join(".agents/AGENTS.md")).unwrap();
-    let directory = home.path.join("directory-target");
+    let missing = root.path.join("missing-target");
+    symlink(&missing, &user_path).unwrap();
+    let ReadOutcome::Refused(missing_reason) =
+        read_bounded(&user_path, MAX_DOC_BYTES, LinkPolicy::Follow)
+    else {
+        panic!("missing symlink target must be refused");
+    };
+    assert!(refusal_notice(&user_path, missing_reason, false).contains("could not be read"));
+
+    fs::remove_file(&user_path).unwrap();
+    let directory = root.path.join("directory-target");
     fs::create_dir(&directory).unwrap();
-    symlink(&directory, home.path.join(".iris/AGENTS.md")).unwrap();
+    symlink(&directory, &user_path).unwrap();
+    let ReadOutcome::Refused(directory_reason) =
+        read_bounded(&user_path, MAX_DOC_BYTES, LinkPolicy::Follow)
+    else {
+        panic!("directory symlink target must be refused");
+    };
+    assert!(refusal_notice(&user_path, directory_reason, false).contains("not a regular file"));
 
-    let ws = temp_dir();
-    let discovery = discover_project_docs_with_warnings(&ws.path);
-    assert_eq!(discovery.notices.len(), 2);
-    assert!(
-        discovery
-            .notices
-            .iter()
-            .any(|line| line.contains("could not be read"))
-    );
-    assert!(
-        discovery
-            .notices
-            .iter()
-            .any(|line| line.contains("not a regular file"))
-    );
-
-    fs::remove_file(home.path.join(".iris/AGENTS.md")).unwrap();
-    let fifo = home.path.join("instructions.fifo");
+    fs::remove_file(&user_path).unwrap();
+    let fifo = root.path.join("instructions.fifo");
     let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-    symlink(&fifo, home.path.join(".iris/AGENTS.md")).unwrap();
-    let discovery = discover_project_docs_with_warnings(&ws.path);
-    assert!(
-        discovery
-            .notices
-            .iter()
-            .any(|line| line.contains(".iris/AGENTS.md") && line.contains("not a regular file"))
-    );
+    symlink(&fifo, &user_path).unwrap();
+    let ReadOutcome::Refused(fifo_reason) =
+        read_bounded(&user_path, MAX_DOC_BYTES, LinkPolicy::Follow)
+    else {
+        panic!("FIFO symlink target must be refused");
+    };
+    assert!(refusal_notice(&user_path, fifo_reason, false).contains("not a regular file"));
 }
 
 #[cfg(unix)]
@@ -861,20 +858,17 @@ fn walk_symlink_secret_is_refused_and_warned_once_per_assembler() {
 fn user_level_symlink_target_still_obeys_byte_cap() {
     use std::os::unix::fs::symlink;
 
-    let home = temp_dir();
-    let _env = EnvGuard::with_home(&home.path);
-    fs::create_dir_all(home.path.join(".iris")).unwrap();
-    let target = home.path.join("large-rules.md");
+    let root = temp_dir();
+    let user_dir = root.path.join(".iris");
+    fs::create_dir_all(&user_dir).unwrap();
+    let target = root.path.join("large-rules.md");
     fs::write(&target, "x".repeat(MAX_DOC_BYTES as usize + 128)).unwrap();
-    symlink(&target, home.path.join(".iris/AGENTS.md")).unwrap();
+    let user_path = user_dir.join("AGENTS.md");
+    symlink(&target, &user_path).unwrap();
 
-    let ws = temp_dir();
-    let discovery = discover_project_docs_with_warnings(&ws.path);
-    let content = discovery
-        .docs
-        .iter()
-        .find(|(path, _)| path.ends_with(".iris/AGENTS.md"))
-        .map(|(_, content)| content)
-        .expect("symlinked user-level doc loaded");
+    let ReadOutcome::Content(content) = read_bounded(&user_path, MAX_DOC_BYTES, LinkPolicy::Follow)
+    else {
+        panic!("symlinked user-level doc must load");
+    };
     assert_eq!(content.len(), MAX_DOC_BYTES as usize);
 }
