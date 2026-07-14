@@ -40,6 +40,7 @@ jobs:
   test:
     name: Test (stable)
     needs: scope
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -49,54 +50,54 @@ jobs:
           fetch-depth: 0
 
       - name: Check documentation whitespace
-        if: needs.scope.outputs.docs-only == 'true'
+        if: needs.scope.result == 'success' && needs.scope.outputs.docs-only == 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: git diff --check "$BASE_SHA...$HEAD_SHA"
 
       - name: Documentation-only gate summary
-        if: needs.scope.outputs.docs-only == 'true'
+        if: needs.scope.result == 'success' && needs.scope.outputs.docs-only == 'true'
         run: echo "Documentation-only change; Rust checks are not required."
 
       - name: Install Rust toolchain
-        if: needs.scope.outputs.docs-only != 'true'
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo build
-        if: needs.scope.outputs.docs-only != 'true'
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         uses: Swatinem/rust-cache@v2
 
       - name: Format
-        if: needs.scope.outputs.docs-only != 'true'
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         run: cargo fmt --all --check
 
       - name: Clippy
-        if: needs.scope.outputs.docs-only != 'true'
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        if: needs.scope.outputs.docs-only != 'true'
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         run: cargo test --locked
 
       - name: Test change-scope script
-        if: needs.scope.outputs.docs-only != 'true'
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         run: bash scripts/change-scope-tests.sh
 
       - name: Test sync-primary script
-        if: needs.scope.outputs.docs-only != 'true'
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         run: bash scripts/sync-primary-tests.sh
 
       - name: Build
-        if: needs.scope.outputs.docs-only != 'true'
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         run: cargo build --locked
 
   build-macos:
     name: Build (macOS)
     needs: scope
-    if: needs.scope.outputs.docs-only != 'true'
+    if: always() && (needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true')
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
