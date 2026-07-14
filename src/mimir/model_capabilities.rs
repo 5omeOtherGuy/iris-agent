@@ -717,6 +717,7 @@ mod tests {
             reasoning,
             cache_retention: PromptCacheRetention::Short,
             codex_transport: CodexTransport::Auto,
+            codex_stream_idle_timeout: Some(std::time::Duration::from_millis(300_000)),
             context_management: ContextManagement::default(),
             legacy_context_management: ContextManagement::default(),
             tool_result_compaction: crate::config::Settings::default()
@@ -989,6 +990,7 @@ mod tests {
                 reasoning: Some(ReasoningEffort::XHigh),
                 cache_retention: PromptCacheRetention::Short,
                 codex_transport: CodexTransport::Auto,
+                codex_stream_idle_timeout: Some(std::time::Duration::from_millis(300_000)),
                 context_management: ContextManagement::default(),
                 legacy_context_management: ContextManagement::default(),
                 tool_result_compaction: crate::config::Settings::default()

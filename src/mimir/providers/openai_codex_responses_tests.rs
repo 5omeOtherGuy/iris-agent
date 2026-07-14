@@ -260,7 +260,7 @@ fn codex_ws_headers_use_oauth_metadata_without_content_type() -> Result<()> {
 }
 
 #[test]
-fn websocket_setup_timeout_falls_back_before_visible_output() {
+fn websocket_setup_timeout_retries_before_visible_output() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -277,7 +277,7 @@ fn websocket_setup_timeout_falls_back_before_visible_output() {
         ))
         .unwrap_err();
 
-    assert_eq!(policy, WsFallback::FallbackSse);
+    assert_eq!(policy, WsFallback::RetryWebSocket);
     assert!(error.to_string().contains("timed out"), "{error}");
 }
 
@@ -345,7 +345,7 @@ fn websocket_setup_failure_is_classified_and_redacted() {
         .unwrap_err();
     let message = error.to_string();
 
-    assert_eq!(policy, WsFallback::FallbackSse);
+    assert_eq!(policy, WsFallback::RetryWebSocket);
     assert!(
         message.contains("classification=websocket_setup_error"),
         "{message}"
@@ -358,9 +358,11 @@ fn websocket_setup_failure_is_classified_and_redacted() {
 
 #[test]
 fn websocket_idle_fallback_metadata_is_safe_and_complete() {
-    let fallback = ws_idle_transport_fallback(
+    let fallback = ws_transport_fallback(
         "gpt-test /home/alice sk-secret",
+        "read_idle",
         "awaiting_next_frame",
+        300_000,
         3,
         Some("response.created /tmp/secret"),
     );
@@ -371,14 +373,14 @@ fn websocket_idle_fallback_metadata_is_safe_and_complete() {
     assert_eq!(fallback.to_transport, "https_sse");
     assert_eq!(fallback.reason, "read_idle");
     assert_eq!(fallback.phase, "awaiting_next_frame");
-    assert_eq!(fallback.idle_ms, 75_000);
+    assert_eq!(fallback.idle_ms, 300_000);
     assert_eq!(fallback.ws_attempt, 3);
     assert_eq!(fallback.reconnect_count, 2);
     assert_eq!(fallback.last_event, None);
 }
 
 #[test]
-fn websocket_read_idle_before_visible_output_falls_back_with_diagnostics() {
+fn websocket_read_idle_before_visible_output_retries_with_diagnostics() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -387,7 +389,7 @@ fn websocket_read_idle_before_visible_output_falls_back_with_diagnostics() {
 
     let (policy, error) = runtime
         .block_on(await_ws_message(
-            std::time::Duration::from_millis(1),
+            Some(std::time::Duration::from_millis(1)),
             &cancel,
             false,
             "awaiting_first_frame",
@@ -396,7 +398,7 @@ fn websocket_read_idle_before_visible_output_falls_back_with_diagnostics() {
         .unwrap_err();
     let message = error.to_string();
 
-    assert_eq!(policy, WsFallback::FallbackSse);
+    assert_eq!(policy, WsFallback::RetryWebSocket);
     assert!(
         message.contains("classification=provider_transport_idle"),
         "{message}"
@@ -416,7 +418,7 @@ fn websocket_read_idle_after_visible_output_is_fatal() {
 
     let (policy, error) = runtime
         .block_on(await_ws_message(
-            std::time::Duration::from_millis(1),
+            Some(std::time::Duration::from_millis(1)),
             &cancel,
             true,
             "awaiting_next_frame",
@@ -428,6 +430,252 @@ fn websocket_read_idle_after_visible_output_is_fatal() {
     assert_eq!(policy, WsFallback::Fatal);
     assert!(message.contains("phase=awaiting_next_frame"), "{message}");
     assert!(message.contains("visible_output=true"), "{message}");
+}
+
+#[test]
+fn websocket_raw_activity_resets_the_sliding_idle_timer() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+
+    runtime.block_on(async {
+        for frame in 0..3 {
+            let received = await_ws_message(
+                Some(std::time::Duration::from_millis(30)),
+                &cancel,
+                false,
+                "awaiting_next_frame",
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                    frame
+                },
+            )
+            .await
+            .expect("each raw frame arrives within its own sliding window");
+            assert_eq!(received, frame);
+        }
+    });
+}
+
+#[test]
+fn disabled_websocket_idle_timeout_still_honors_cancellation() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+
+    let (policy, error) = runtime
+        .block_on(async move {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                trigger.cancel();
+            });
+            await_ws_message(
+                None,
+                &cancel,
+                false,
+                "awaiting_first_frame",
+                std::future::pending::<()>(),
+            )
+            .await
+        })
+        .unwrap_err();
+
+    assert_eq!(policy, WsFallback::Fatal);
+    assert!(error.to_string().contains("cancelled"), "{error}");
+}
+
+#[test]
+fn async_sse_decoder_handles_split_chunks_and_multiline_events() -> Result<()> {
+    let mut decoder = CodexSseDecoder::default();
+    let mut events = Vec::new();
+
+    decoder.push(
+        b"event: response.output_text.delta\ndata: {\"type\":",
+        |data| {
+            events.push(data.to_string());
+            Ok(())
+        },
+    )?;
+    decoder.push(
+        b"\"response.output_text.delta\",\ndata: \"delta\":\"hi\"}\n\n",
+        |data| {
+            events.push(data.to_string());
+            Ok(())
+        },
+    )?;
+    decoder.finish(|data| {
+        events.push(data.to_string());
+        Ok(())
+    })?;
+
+    assert_eq!(
+        events,
+        ["{\"type\":\"response.output_text.delta\",\n\"delta\":\"hi\"}"]
+    );
+    Ok(())
+}
+
+#[test]
+fn websocket_special_recovery_uses_typed_provider_fields_not_message_text() {
+    let previous = ws_provider_error(
+        &json!({
+            "type": "error",
+            "error": {"code": "previous_response_not_found"}
+        }),
+        "error",
+        "safe diagnostics".to_string(),
+    );
+    assert_eq!(
+        classify_ws_error(&previous, false),
+        WsFallback::RetryFullWebSocket
+    );
+
+    let misleading = ws_provider_error(
+        &json!({
+            "type": "error",
+            "error": {"code": "other"}
+        }),
+        "error",
+        "message mentions previous_response_not_found and 401".to_string(),
+    );
+    assert_eq!(classify_ws_error(&misleading, false), WsFallback::Fatal);
+
+    let bad_request = ws_provider_error(
+        &json!({
+            "type": "response.failed",
+            "response": {"status": 400, "error": {"code": "invalid_request"}}
+        }),
+        "response.failed",
+        "safe diagnostics".to_string(),
+    );
+    assert_eq!(classify_ws_error(&bad_request, false), WsFallback::Fatal);
+
+    let rate_limited = ws_provider_error(
+        &json!({
+            "type": "response.failed",
+            "response": {"status": 429, "error": {"code": "rate_limited"}}
+        }),
+        "response.failed",
+        "safe diagnostics".to_string(),
+    );
+    assert_eq!(
+        classify_ws_error(&rate_limited, false),
+        WsFallback::RetryWebSocket
+    );
+
+    let unauthorized = ws_provider_error(
+        &json!({
+            "type": "response.failed",
+            "response": {"status": "403", "error": {"code": "forbidden"}}
+        }),
+        "response.failed",
+        "safe diagnostics".to_string(),
+    );
+    assert_eq!(
+        classify_ws_error(&unauthorized, false),
+        WsFallback::ForceRefresh
+    );
+
+    for (status, expected) in [
+        (400, WsFallback::Fatal),
+        (429, WsFallback::RetryWebSocket),
+        (503, WsFallback::RetryWebSocket),
+    ] {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(status)
+            .body(None)
+            .unwrap();
+        let error: anyhow::Error =
+            tokio_tungstenite::tungstenite::Error::Http(Box::new(response)).into();
+        assert_eq!(classify_ws_error(&error, false), expected);
+    }
+}
+
+#[test]
+fn websocket_reconnect_forces_full_context_on_the_new_connection() {
+    let mut recovery = WsRecoveryState::default();
+
+    let decision = recovery.on_failure(WsFallback::RetryWebSocket, 3);
+    assert_eq!(
+        decision,
+        WsRecoveryDecision::Retry {
+            reconnect_count: 1,
+            force_full: true,
+            force_refresh: false,
+        }
+    );
+
+    let full = json!({"model": "gpt-test", "input": [{"type": "message"}]});
+    let continuation = CodexContinuation {
+        last_full_body: full.clone(),
+        last_response_id: "response_from_dropped_socket".to_string(),
+        last_response_items: Vec::new(),
+    };
+    let force_full = match decision {
+        WsRecoveryDecision::Retry { force_full, .. } => force_full,
+        _ => unreachable!(),
+    };
+    let frame = build_ws_create_frame(&full, Some(&continuation), force_full);
+    assert!(frame.get("previous_response_id").is_none());
+    assert_eq!(frame["input"], full["input"]);
+}
+
+#[test]
+fn websocket_retry_budget_counts_special_recovery_and_exhausts_once() {
+    let mut recovery = WsRecoveryState::default();
+
+    assert_eq!(
+        recovery.on_failure(WsFallback::RetryFullWebSocket, 2),
+        WsRecoveryDecision::Retry {
+            reconnect_count: 1,
+            force_full: true,
+            force_refresh: false,
+        }
+    );
+    assert_eq!(
+        recovery.on_failure(WsFallback::ForceRefresh, 2),
+        WsRecoveryDecision::Retry {
+            reconnect_count: 2,
+            force_full: true,
+            force_refresh: true,
+        }
+    );
+    assert_eq!(
+        recovery.on_failure(WsFallback::RetryWebSocket, 2),
+        WsRecoveryDecision::FallbackSse,
+        "special retries consume rather than reset the transient budget"
+    );
+    assert_eq!(
+        recovery.on_failure(WsFallback::RetryWebSocket, 2),
+        WsRecoveryDecision::FallbackSse,
+        "exhaustion remains terminal and cannot ping-pong back to WebSocket"
+    );
+}
+
+#[test]
+fn cancellation_during_websocket_backoff_is_prompt() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let started = std::time::Instant::now();
+
+    let error = runtime
+        .block_on(sleep_ws_backoff(
+            std::time::Duration::from_secs(60),
+            &cancel,
+        ))
+        .unwrap_err();
+
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert!(error.to_string().contains("cancelled"), "{error}");
 }
 
 #[test]
@@ -1766,6 +2014,7 @@ fn provider_builds_native_and_fallback_summary_requests_from_its_own_state() -> 
         PromptCacheRetention::Short,
         crate::mimir::retry::RetryPolicy::default(),
         crate::mimir::selection::CodexTransport::Sse,
+        Some(std::time::Duration::from_secs(300)),
     )?;
     let messages = [Message::user("hi")];
 

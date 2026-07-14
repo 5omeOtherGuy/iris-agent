@@ -1222,6 +1222,7 @@ fn build_provider(
                 selection.cache_retention,
                 selection.retry_policy,
                 selection.codex_transport,
+                selection.codex_stream_idle_timeout,
             )?,
         ),
         ProviderId::OpenAi => {

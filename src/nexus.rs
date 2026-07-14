@@ -363,6 +363,18 @@ pub(crate) struct ProviderTransportFallback {
     pub(crate) last_event: Option<String>,
 }
 
+/// Safe provider-neutral metadata for a bounded transport reconnect. String
+/// fields are short classifications, never provider errors or payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderReconnect {
+    pub(crate) transport: String,
+    pub(crate) retry: u32,
+    pub(crate) max_retries: u32,
+    pub(crate) delay_ms: u64,
+    pub(crate) reason: String,
+    pub(crate) phase: String,
+}
+
 /// The semantic events the loop emits during a turn. Provider- and UI-neutral:
 /// a front-end maps these onto its own rendering. Mirrors pi's `AgentEvent`
 /// union (`packages/agent/src/types.ts`).
@@ -413,6 +425,9 @@ pub(crate) enum AgentEvent {
     /// fallback transport. Safe operational metadata only; Tier 3 renders one
     /// actionable notice and Wayland records it in the session audit stream.
     ProviderTransportFallback(ProviderTransportFallback),
+    /// A provider transport is reconnecting within its bounded retry budget.
+    /// Operational classifications only; no provider error text or payload.
+    ProviderReconnect(ProviderReconnect),
     /// Provider-neutral tool lifecycle metadata for observability. The existing
     /// display events remain for UI compatibility; this compact event carries
     /// only ids/state and never includes tool arguments, output, provider
@@ -697,6 +712,8 @@ pub(crate) enum ProviderEvent {
     /// The adapter recovered from an idle transport by selecting another one.
     /// This is operational metadata, not model output or transcript content.
     TransportFallback(ProviderTransportFallback),
+    /// The adapter is reconnecting a transport after a retryable failure.
+    Reconnect(ProviderReconnect),
     /// Incremental assistant text.
     TextDelta(String),
     /// Incremental reasoning-summary text (never raw chain-of-thought or
@@ -2636,6 +2653,9 @@ impl<P: ChatProvider> Agent<P> {
                     }
                     Some(Ok(ProviderEvent::TransportFallback(fallback))) => {
                         obs.on_event(AgentEvent::ProviderTransportFallback(fallback))?;
+                    }
+                    Some(Ok(ProviderEvent::Reconnect(reconnect))) => {
+                        obs.on_event(AgentEvent::ProviderReconnect(reconnect))?;
                     }
                     Some(Ok(ProviderEvent::Activity)) => {}
                     Some(Ok(ProviderEvent::Completed(turn))) => {

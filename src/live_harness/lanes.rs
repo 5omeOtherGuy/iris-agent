@@ -186,6 +186,7 @@ impl LaneSpec {
                 PromptCacheRetention::DEFAULT,
                 RetryPolicy::default(),
                 CodexTransport::Auto,
+                Some(std::time::Duration::from_secs(300)),
             )?)),
         }
     }

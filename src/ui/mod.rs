@@ -340,9 +340,35 @@ fn provider_transport_fallback_notice(
         format!("{}ms", fallback.idle_ms)
     };
     let last_event = fallback.last_event.as_deref().unwrap_or("none");
+    if fallback.reason != "read_idle" {
+        return format!(
+            "{} `{}` exhausted {from} recovery after {} reconnects during {} (reason: {}); switched from {from} to {to} for this session. Invoke `$provider-stream-diagnostics` now to inspect the saved metadata.",
+            fallback.provider,
+            fallback.model,
+            fallback.reconnect_count,
+            fallback.phase,
+            fallback.reason,
+        );
+    }
     format!(
-        "{} `{}` received no {from} frames for {wait} during {}; switched from {from} to {to} for this session (last provider event: {last_event}). Invoke `$provider-stream-diagnostics` now to inspect the saved metadata.",
-        fallback.provider, fallback.model, fallback.phase
+        "{} `{}` received no {from} frames for {wait} during {}; switched from {from} to {to} for this session after {} reconnects (last provider event: {last_event}). Invoke `$provider-stream-diagnostics` now to inspect the saved metadata.",
+        fallback.provider, fallback.model, fallback.phase, fallback.reconnect_count
+    )
+}
+
+fn provider_reconnect_notice(reconnect: &crate::nexus::ProviderReconnect) -> String {
+    let transport = match reconnect.transport.as_str() {
+        "websocket" => "WebSocket",
+        other => other,
+    };
+    let wait = if reconnect.delay_ms.is_multiple_of(1_000) {
+        format!("{}s", reconnect.delay_ms / 1_000)
+    } else {
+        format!("{}ms", reconnect.delay_ms)
+    };
+    format!(
+        "{transport} reconnect {}/{} in {wait} after {} during {}.",
+        reconnect.retry, reconnect.max_retries, reconnect.reason, reconnect.phase
     )
 }
 
@@ -385,6 +411,9 @@ impl UiEvent {
             }
             AgentEvent::ProviderTransportFallback(fallback) => {
                 UiEvent::Notice(provider_transport_fallback_notice(&fallback))
+            }
+            AgentEvent::ProviderReconnect(reconnect) => {
+                UiEvent::Notice(provider_reconnect_notice(&reconnect))
             }
             AgentEvent::ToolLifecycle {
                 provider_turn_id,
@@ -697,6 +726,28 @@ mod tests {
     }
 
     #[test]
+    fn maps_provider_reconnect_to_safe_progress_notice() {
+        let mapped = UiEvent::from_agent_event(AgentEvent::ProviderReconnect(
+            crate::nexus::ProviderReconnect {
+                transport: "websocket".to_string(),
+                retry: 2,
+                max_retries: 3,
+                delay_ms: 4_000,
+                reason: "read_idle".to_string(),
+                phase: "awaiting_next_frame".to_string(),
+            },
+        ));
+
+        let UiEvent::Notice(message) = mapped else {
+            panic!("reconnect status must render through the notice channel");
+        };
+        assert!(message.contains("WebSocket reconnect 2/3"), "{message}");
+        assert!(message.contains("4s"), "{message}");
+        assert!(message.contains("read_idle"), "{message}");
+        assert!(message.contains("awaiting_next_frame"), "{message}");
+    }
+
+    #[test]
     fn maps_provider_transport_fallback_to_an_actionable_notice() {
         let mapped = UiEvent::from_agent_event(AgentEvent::ProviderTransportFallback(
             crate::nexus::ProviderTransportFallback {
@@ -706,9 +757,9 @@ mod tests {
                 to_transport: "https_sse".to_string(),
                 reason: "read_idle".to_string(),
                 phase: "awaiting_next_frame".to_string(),
-                idle_ms: 75_000,
-                ws_attempt: 1,
-                reconnect_count: 0,
+                idle_ms: 300_000,
+                ws_attempt: 4,
+                reconnect_count: 3,
                 last_event: Some("response.created".to_string()),
             },
         ));
@@ -720,10 +771,42 @@ mod tests {
             message.contains("switched from WebSocket to SSE"),
             "{message}"
         );
-        assert!(message.contains("75s"), "{message}");
+        assert!(message.contains("300s"), "{message}");
+        assert!(message.contains("after 3 reconnects"), "{message}");
         assert!(message.contains("response.created"), "{message}");
         assert!(
             message.contains("$provider-stream-diagnostics"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn maps_non_idle_transport_fallback_without_claiming_frame_silence() {
+        let mapped = UiEvent::from_agent_event(AgentEvent::ProviderTransportFallback(
+            crate::nexus::ProviderTransportFallback {
+                provider: "openai-codex".to_string(),
+                model: "gpt-test".to_string(),
+                from_transport: "websocket".to_string(),
+                to_transport: "https_sse".to_string(),
+                reason: "setup_error".to_string(),
+                phase: "connection_setup".to_string(),
+                idle_ms: 0,
+                ws_attempt: 4,
+                reconnect_count: 3,
+                last_event: None,
+            },
+        ));
+
+        let UiEvent::Notice(message) = mapped else {
+            panic!("fallback must render through the notice channel");
+        };
+        assert!(
+            message.contains("exhausted WebSocket recovery"),
+            "{message}"
+        );
+        assert!(message.contains("setup_error"), "{message}");
+        assert!(
+            !message.contains("received no WebSocket frames"),
             "{message}"
         );
     }

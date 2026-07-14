@@ -380,6 +380,7 @@ mod tests {
                         PromptCacheRetention::DEFAULT,
                         RetryPolicy::default(),
                         CodexTransport::Sse,
+                        Some(std::time::Duration::from_secs(300)),
                     )?;
                 provider.probe_compaction_summary(mode, &cancel)
             }

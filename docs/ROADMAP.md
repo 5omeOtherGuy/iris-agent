@@ -80,9 +80,11 @@ Implemented today:
   transcript on abort.
 - Provider tool-call loop with optional configured round-trip cap,
   retry/backoff, and structured tool result/error messages.
-- OpenAI Codex WebSocket recovery: before visible output, 75 seconds without a
-  frame switches the session to HTTPS/SSE, emits a TUI notice, and saves only
-  allow-listed transport metadata. The repo skill
+- OpenAI Codex transport recovery: a global-only raw-read timeout defaults to
+  300 seconds for WebSocket and HTTPS/SSE (`0` disables it). Before visible
+  output, retryable WebSocket failures consume the shared retry budget; exhaustion makes
+  one sticky session switch to HTTPS/SSE, emits safe reconnect/fallback notices,
+  and persists only allow-listed fallback metadata. The repo skill
   `$provider-stream-diagnostics` reads that marker without exposing transcript
   content or credentials.
 - Mid-run steering and follow-up messages (pi-mono parity): the composer stays

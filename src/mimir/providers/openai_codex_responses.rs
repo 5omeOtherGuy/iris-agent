@@ -21,15 +21,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::transport::{
     Attempt, ChannelSink, HttpClass, StreamReadError, TurnSink, classify_http_status_retryable,
-    for_each_sse_event, retry_after_hint, run_with_retry, spawn_async_stream, spawn_stream,
+    for_each_sse_event, retry_after_hint, run_with_retry, spawn_async_stream_without_idle_guard,
 };
 use crate::mimir::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
 use crate::mimir::selection::{CodexTransport, PromptCacheRetention, ReasoningEffort};
 use crate::nexus::{
     AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderCompactionCapability,
-    ProviderCompactionFuture, ProviderCompactionOutput, ProviderStream, ProviderTransportFallback,
-    ProviderUsage, ReasoningBlock, Role, StructuredSummaryCapability, StructuredSummaryError,
-    StructuredSummaryFuture, StructuredSummaryMode, ToolCall, Tools,
+    ProviderCompactionFuture, ProviderCompactionOutput, ProviderReconnect, ProviderStream,
+    ProviderTransportFallback, ProviderUsage, ReasoningBlock, Role, StructuredSummaryCapability,
+    StructuredSummaryError, StructuredSummaryFuture, StructuredSummaryMode, ToolCall, Tools,
 };
 
 // Transport resilience for Codex requests. Transient failures (network, 429,
@@ -43,7 +43,6 @@ const API_ID: &str = "openai-codex-responses";
 static NATIVE_COMPACTION_UNSUPPORTED_MODELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
-const WS_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 const WS_MAX_AGE: Duration = Duration::from_secs(55 * 60);
 const WS_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 type CodexWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -53,8 +52,54 @@ enum WsFallback {
     RetryWebSocket,
     RetryFullWebSocket,
     ForceRefresh,
+    Fatal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WsRecoveryDecision {
+    Retry {
+        reconnect_count: u32,
+        force_full: bool,
+        force_refresh: bool,
+    },
     FallbackSse,
     Fatal,
+}
+
+#[derive(Debug, Default)]
+struct WsRecoveryState {
+    reconnect_count: u32,
+    force_full: bool,
+    tried_reauth: bool,
+    exhausted: bool,
+}
+
+impl WsRecoveryState {
+    fn on_failure(&mut self, policy: WsFallback, max_retries: u32) -> WsRecoveryDecision {
+        if self.exhausted {
+            return WsRecoveryDecision::FallbackSse;
+        }
+        if policy == WsFallback::Fatal || (policy == WsFallback::ForceRefresh && self.tried_reauth)
+        {
+            return WsRecoveryDecision::Fatal;
+        }
+        if self.reconnect_count >= max_retries {
+            self.exhausted = true;
+            return WsRecoveryDecision::FallbackSse;
+        }
+
+        self.reconnect_count = self.reconnect_count.saturating_add(1);
+        // `previous_response_id` is scoped to the WebSocket connection. Every
+        // reconnect opens a new connection and must send full context.
+        self.force_full = true;
+        let force_refresh = policy == WsFallback::ForceRefresh;
+        self.tried_reauth |= force_refresh;
+        WsRecoveryDecision::Retry {
+            reconnect_count: self.reconnect_count,
+            force_full: self.force_full,
+            force_refresh,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -90,6 +135,7 @@ impl std::fmt::Debug for CodexWsState {
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiCodexResponsesProvider {
     client: Client,
+    stream_client: reqwest::Client,
     model: String,
     base_url: String,
     reasoning: Option<ReasoningEffort>,
@@ -100,6 +146,7 @@ pub(crate) struct OpenAiCodexResponsesProvider {
     tokens: OpenAiCodexTokenStore,
     retry_policy: crate::mimir::retry::RetryPolicy,
     codex_transport: CodexTransport,
+    stream_idle_timeout: Option<Duration>,
     ws_state: Arc<tokio::sync::Mutex<CodexWsState>>,
 }
 
@@ -120,12 +167,11 @@ impl OpenAiCodexResponsesProvider {
         cache_retention: PromptCacheRetention,
         retry_policy: crate::mimir::retry::RetryPolicy,
         codex_transport: CodexTransport,
+        stream_idle_timeout: Option<Duration>,
     ) -> Result<Self> {
         Ok(Self {
-            // Shared process-wide client: warm pooled connections (HTTP/2 +
-            // keep-alive) survive across turns and model switches, so a turn
-            // does not pay a fresh TLS handshake after an idle gap.
             client: super::transport::shared_client(),
+            stream_client: super::transport::async_client_with_read_timeout(stream_idle_timeout),
             model: model.to_string(),
             base_url: base_url.to_string(),
             reasoning,
@@ -136,6 +182,7 @@ impl OpenAiCodexResponsesProvider {
             tokens: OpenAiCodexTokenStore::from_env()?,
             retry_policy,
             codex_transport,
+            stream_idle_timeout,
             ws_state: Arc::new(tokio::sync::Mutex::new(CodexWsState::default())),
         })
     }
@@ -739,19 +786,21 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
         let cancel = cancel.clone();
         let model = self.model.clone();
         if self.codex_transport == CodexTransport::Sse {
-            return Ok(spawn_stream(
+            return Ok(spawn_async_stream_without_idle_guard(
                 PROVIDER_ID,
                 &model,
                 "https_sse",
                 "request_dispatch",
-                move |sink, cancel| {
+                move |mut sink, cancel| async move {
                     sink.set_transport_phase("https_sse", "response_stream");
-                    provider.run_blocking(url, &request_for_stream, sink, cancel)
+                    provider
+                        .run_sse(url, request_for_stream, sink, cancel)
+                        .await
                 },
                 cancel,
             ));
         }
-        Ok(spawn_async_stream(
+        Ok(spawn_async_stream_without_idle_guard(
             PROVIDER_ID,
             &model,
             "websocket",
@@ -819,20 +868,17 @@ impl OpenAiCodexResponsesProvider {
     ) -> Result<AssistantTurn> {
         if self.ws_state.lock().await.disabled_for_session {
             sink.set_transport_phase("https_sse", "response_stream");
-            return self
-                .run_blocking_off_thread(url, full_request, sink, cancel)
-                .await;
+            return self.run_sse(url, full_request, sink, cancel).await;
         }
         let ws_url = resolve_codex_ws_url_from_resolved(&url)?;
-        let mut tried_limit_refresh = false;
-        let mut tried_previous_full = false;
-        let mut tried_reauth = false;
-        let mut force_full = false;
-        let mut ws_attempt = 0u32;
+        let mut recovery = WsRecoveryState::default();
+        let mut force_refresh = false;
         loop {
-            ws_attempt = ws_attempt.saturating_add(1);
+            let ws_attempt = recovery.reconnect_count.saturating_add(1);
             sink.set_transport_phase("websocket", "authentication");
-            let token = self.codex_token_off_thread(tried_reauth).await?;
+            let token = self
+                .codex_token_off_thread(std::mem::take(&mut force_refresh))
+                .await?;
             match self
                 .run_ws_once(
                     ws_url.clone(),
@@ -840,50 +886,66 @@ impl OpenAiCodexResponsesProvider {
                     &token,
                     &mut sink,
                     &cancel,
-                    (force_full, ws_attempt),
+                    (recovery.force_full, ws_attempt),
                 )
                 .await
             {
                 Ok(turn) => return Ok(turn),
                 Err((policy, error)) => {
-                    let reconnect_count = ws_attempt.saturating_sub(1);
+                    let reason = websocket_error_class(&error);
+                    let phase = websocket_error_phase(&error);
                     let diagnostic_model = safe_error_field(&self.model).unwrap_or("redacted");
                     tracing::warn!(
                         provider = PROVIDER_ID,
                         model = diagnostic_model,
                         transport = "websocket",
                         ws_attempt,
-                        reconnect_count,
+                        reconnect_count = recovery.reconnect_count,
                         policy = ?policy,
-                        error_class = websocket_error_class(&error),
+                        error_class = reason,
+                        phase,
                         "Codex WebSocket attempt failed"
                     );
-                    let error = anyhow!(
-                        "{error} [ws_attempt={ws_attempt} reconnect_count={reconnect_count}]"
-                    );
-                    match policy {
-                        WsFallback::RetryWebSocket if !tried_limit_refresh => {
-                            tried_limit_refresh = true;
+                    match recovery.on_failure(policy, self.retry_policy.max_retries) {
+                        WsRecoveryDecision::Retry {
+                            reconnect_count,
+                            force_full: _,
+                            force_refresh: refresh,
+                        } => {
                             self.drop_ws_socket().await;
+                            force_refresh = refresh;
+                            let delay = self.retry_policy.backoff_delay(reconnect_count, None);
+                            sink.on_reconnect(ProviderReconnect {
+                                transport: "websocket".to_string(),
+                                retry: reconnect_count,
+                                max_retries: self.retry_policy.max_retries,
+                                delay_ms: delay.as_millis() as u64,
+                                reason: reason.to_string(),
+                                phase: phase.to_string(),
+                            })?;
+                            sleep_ws_backoff(delay, &cancel).await?;
                         }
-                        WsFallback::RetryFullWebSocket if !tried_previous_full => {
-                            tried_previous_full = true;
-                            force_full = true;
-                            self.clear_continuation().await;
-                        }
-                        WsFallback::ForceRefresh if !tried_reauth => {
-                            tried_reauth = true;
-                            self.drop_ws_socket().await;
-                        }
-                        WsFallback::FallbackSse => {
+                        WsRecoveryDecision::FallbackSse => {
                             self.disable_ws_for_session().await;
                             sink.set_transport_phase("https_sse", "response_stream");
+                            let idle = error.downcast_ref::<WsReadIdleError>();
+                            sink.on_transport_fallback(ws_transport_fallback(
+                                &self.model,
+                                reason,
+                                phase,
+                                idle.map_or(0, |error| error.idle_ms),
+                                ws_attempt,
+                                idle.and_then(|error| error.last_event.as_deref()),
+                            ))?;
                             sink.on_activity()?;
-                            return self
-                                .run_blocking_off_thread(url, full_request, sink, cancel)
-                                .await;
+                            return self.run_sse(url, full_request, sink, cancel).await;
                         }
-                        _ => return Err(error),
+                        WsRecoveryDecision::Fatal => {
+                            return Err(error.context(format!(
+                                "ws_attempt={ws_attempt} reconnect_count={}",
+                                recovery.reconnect_count
+                            )));
+                        }
                     }
                 }
             }
@@ -904,20 +966,49 @@ impl OpenAiCodexResponsesProvider {
         .context("Codex token task failed")?
     }
 
-    async fn run_blocking_off_thread(
+    async fn run_sse(
         &self,
         url: Url,
         request: Value,
-        sink: ChannelSink,
+        mut sink: ChannelSink,
         cancel: CancellationToken,
     ) -> Result<AssistantTurn> {
-        let provider = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut sink = sink;
-            provider.run_blocking(url, &request, &mut sink, &cancel)
-        })
-        .await
-        .context("Codex SSE fallback task failed")?
+        let mut transient_retries = 0u32;
+        let mut reauth_used = false;
+        let mut force_refresh = false;
+        loop {
+            if cancel.is_cancelled() {
+                bail!("turn cancelled");
+            }
+            let token = self
+                .codex_token_off_thread(std::mem::take(&mut force_refresh))
+                .await?;
+            let attempt = self
+                .send_sse_once(url.clone(), &token, &request, &mut sink, &cancel)
+                .await;
+            match attempt {
+                Attempt::Done(turn) => return Ok(*turn),
+                Attempt::Reauth(error) => {
+                    if reauth_used {
+                        return Err(error);
+                    }
+                    reauth_used = true;
+                    force_refresh = true;
+                }
+                Attempt::Retry(error, retry_after) => {
+                    if transient_retries >= self.retry_policy.max_retries {
+                        return Err(error);
+                    }
+                    transient_retries = transient_retries.saturating_add(1);
+                    let delay = self
+                        .retry_policy
+                        .backoff_delay(transient_retries, retry_after);
+                    sink.on_activity()?;
+                    sleep_ws_backoff(delay, &cancel).await?;
+                }
+                Attempt::Fatal(error) => return Err(error),
+            }
+        }
     }
 
     async fn run_ws_once(
@@ -929,12 +1020,16 @@ impl OpenAiCodexResponsesProvider {
         cancel: &CancellationToken,
         attempt: (bool, u32),
     ) -> std::result::Result<AssistantTurn, (WsFallback, anyhow::Error)> {
-        let (force_full, ws_attempt) = attempt;
+        let (force_full, _ws_attempt) = attempt;
+        // Continuation ids live only on the socket that produced them. Resolve
+        // socket reuse before building the frame so a new connection cannot
+        // inherit a stale `previous_response_id`.
+        let reusable = self.take_ws_socket().await;
         let frame = {
             let state = self.ws_state.lock().await;
             build_ws_create_frame(full_request, state.continuation.as_ref(), force_full)
         };
-        let mut reusable = match self.take_ws_socket().await {
+        let mut reusable = match reusable {
             Some(socket) => socket,
             None => {
                 sink.set_transport_phase("websocket", "connection_handshake");
@@ -978,7 +1073,7 @@ impl OpenAiCodexResponsesProvider {
             };
             sink.set_transport_phase("websocket", phase);
             let next = match await_ws_message(
-                WS_READ_IDLE_TIMEOUT,
+                self.stream_idle_timeout,
                 cancel,
                 parser.emitted_visible_output(),
                 phase,
@@ -987,7 +1082,14 @@ impl OpenAiCodexResponsesProvider {
             .await
             {
                 Ok(next) => next,
-                Err((policy, error)) => {
+                Err((policy, mut error)) => {
+                    if let Some(idle) = error.downcast_mut::<WsReadIdleError>() {
+                        idle.last_event = parser
+                            .last_event_type
+                            .as_deref()
+                            .and_then(safe_error_field)
+                            .map(str::to_string);
+                    }
                     if cancel.is_cancelled() {
                         self.clear_continuation().await;
                     }
@@ -996,26 +1098,12 @@ impl OpenAiCodexResponsesProvider {
                         .last_event_type
                         .as_deref()
                         .and_then(safe_error_field)
-                        .map(str::to_string);
-                    if policy == WsFallback::FallbackSse
-                        && error
-                            .to_string()
-                            .contains("classification=provider_transport_idle")
-                    {
-                        sink.on_transport_fallback(ws_idle_transport_fallback(
-                            &self.model,
-                            phase,
-                            ws_attempt,
-                            parser.last_event_type.as_deref(),
-                        ))
-                        .map_err(|send_error| (WsFallback::Fatal, send_error))?;
-                    }
-                    let last_event = last_event.as_deref().unwrap_or("none");
+                        .unwrap_or("none");
                     return Err((
                         policy,
-                        anyhow!(
-                            "{error} [provider={PROVIDER_ID} model={model} last_event={last_event}]"
-                        ),
+                        error.context(format!(
+                            "provider={PROVIDER_ID} model={model} last_event={last_event}"
+                        )),
                     ));
                 }
             };
@@ -1133,11 +1221,19 @@ impl OpenAiCodexResponsesProvider {
 
     async fn take_ws_socket(&self) -> Option<ReusableCodexWs> {
         let mut state = self.ws_state.lock().await;
-        let reusable = state.socket.take()?;
+        let Some(reusable) = state.socket.take() else {
+            state.continuation = None;
+            return None;
+        };
         let now = Instant::now();
-        (now.duration_since(reusable.opened_at) < WS_MAX_AGE
-            && now.duration_since(reusable.last_used) < WS_IDLE_TTL)
-            .then_some(reusable)
+        if now.duration_since(reusable.opened_at) < WS_MAX_AGE
+            && now.duration_since(reusable.last_used) < WS_IDLE_TTL
+        {
+            Some(reusable)
+        } else {
+            state.continuation = None;
+            None
+        }
     }
 
     async fn put_ws_socket(&self, reusable: ReusableCodexWs) {
@@ -1145,7 +1241,9 @@ impl OpenAiCodexResponsesProvider {
     }
 
     async fn drop_ws_socket(&self) {
-        self.ws_state.lock().await.socket = None;
+        let mut state = self.ws_state.lock().await;
+        state.socket = None;
+        state.continuation = None;
     }
 
     async fn clear_continuation(&self) {
@@ -1171,8 +1269,6 @@ impl OpenAiCodexResponsesProvider {
         });
     }
 
-    /// `spawn_blocking` thread, forwarding text deltas through `sink` and
-    /// returning the assembled turn.
     fn run_blocking(
         &self,
         url: Url,
@@ -1195,13 +1291,11 @@ impl OpenAiCodexResponsesProvider {
                     self.tokens.access_token(&self.client)
                 }
             },
-            |token, sink| self.send_once(url.clone(), token, request, sink, cancel),
+            |token, sink| self.send_once_blocking(url.clone(), token, request, sink, cancel),
         )
     }
-}
 
-impl OpenAiCodexResponsesProvider {
-    fn send_once(
+    fn send_once_blocking(
         &self,
         url: Url,
         token: &AccessToken,
@@ -1222,7 +1316,6 @@ impl OpenAiCodexResponsesProvider {
                 );
             }
         };
-
         let status = response.status();
         if status.is_success() {
             let mut parser = ResponseStreamParser::new(&self.model);
@@ -1254,9 +1347,135 @@ impl OpenAiCodexResponsesProvider {
                 }
             };
         }
-
         let retry_after = retry_after_hint(response.headers());
         let body = response.text().unwrap_or_default();
+        let diag = CodexDiagnostics {
+            status: status.as_u16(),
+            error_type: extract_error_field(&body, "type"),
+            error_code: extract_error_field(&body, "code"),
+            model: self.model.clone(),
+            endpoint: "/codex/responses",
+            last_event_type: None,
+        };
+        let error = super::classified_http_error(
+            status.as_u16(),
+            &body,
+            format!("Codex request failed [{diag}]"),
+        );
+        match classify_http_status_retryable(status.as_u16()) {
+            HttpClass::Reauth => Attempt::Reauth(error),
+            HttpClass::Retry => Attempt::Retry(error, retry_after),
+            HttpClass::Fatal => Attempt::Fatal(error),
+        }
+    }
+}
+
+impl OpenAiCodexResponsesProvider {
+    async fn send_sse_once(
+        &self,
+        url: Url,
+        token: &AccessToken,
+        request: &Value,
+        sink: &mut dyn TurnSink,
+        cancel: &CancellationToken,
+    ) -> Attempt {
+        let headers = match codex_headers(token) {
+            Ok(headers) => headers,
+            Err(error) => return Attempt::Fatal(error),
+        };
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return Attempt::Fatal(anyhow!("provider stream cancelled")),
+            response = self.stream_client.post(url).headers(headers).json(request).send() => response,
+        };
+        let mut response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                return Attempt::Retry(
+                    anyhow::Error::new(error).context("failed to send Codex request"),
+                    None,
+                );
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            let mut parser = ResponseStreamParser::new(&self.model);
+            let mut decoder = CodexSseDecoder::default();
+            loop {
+                let chunk = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        return Attempt::Fatal(anyhow!("provider stream cancelled"));
+                    }
+                    chunk = response.chunk() => chunk,
+                };
+                match chunk {
+                    Ok(Some(chunk)) => {
+                        let decoded = decoder.push(&chunk, |data| {
+                            sink.on_activity()?;
+                            parser.ingest_event(data, sink)
+                        });
+                        if let Err(error) = decoded {
+                            return if protocol_anomaly_retryable(
+                                &error,
+                                parser.emitted_visible_output(),
+                            ) {
+                                Attempt::Retry(error, None)
+                            } else {
+                                Attempt::Fatal(error)
+                            };
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let error: anyhow::Error = CodexSseReadError {
+                            idle: error.is_timeout(),
+                            idle_ms: self
+                                .stream_idle_timeout
+                                .map_or(0, |timeout| timeout.as_millis() as u64),
+                            last_event: parser.last_event_type.clone(),
+                        }
+                        .into();
+                        return if parser.emitted_visible_output() {
+                            Attempt::Fatal(error)
+                        } else {
+                            Attempt::Retry(error, None)
+                        };
+                    }
+                }
+            }
+            if let Err(error) = decoder.finish(|data| {
+                sink.on_activity()?;
+                parser.ingest_event(data, sink)
+            }) {
+                return if protocol_anomaly_retryable(&error, parser.emitted_visible_output()) {
+                    Attempt::Retry(error, None)
+                } else {
+                    Attempt::Fatal(error)
+                };
+            }
+            let emitted_visible_output = parser.emitted_visible_output();
+            return match parser.finish() {
+                Ok(turn) => {
+                    if let Some(usage) = &turn.usage {
+                        self.record_usage(usage);
+                    }
+                    Attempt::Done(Box::new(turn))
+                }
+                Err(error) => {
+                    if protocol_anomaly_retryable(&error, emitted_visible_output) {
+                        Attempt::Retry(error, None)
+                    } else {
+                        Attempt::Fatal(error)
+                    }
+                }
+            };
+        }
+
+        let retry_after = retry_after_hint(response.headers());
+        let body = tokio::select! {
+            _ = cancel.cancelled() => return Attempt::Fatal(anyhow!("provider stream cancelled")),
+            body = response.text() => body.unwrap_or_default(),
+        };
         let diag = CodexDiagnostics {
             status: status.as_u16(),
             error_type: extract_error_field(&body, "type"),
@@ -1823,9 +2042,11 @@ fn normalize_reasoning_for_continuation(item: &Value) -> Option<Value> {
     }))
 }
 
-fn ws_idle_transport_fallback(
+fn ws_transport_fallback(
     model: &str,
+    reason: &str,
     phase: &str,
+    idle_ms: u64,
     ws_attempt: u32,
     last_event: Option<&str>,
 ) -> ProviderTransportFallback {
@@ -1834,9 +2055,11 @@ fn ws_idle_transport_fallback(
         model: safe_error_field(model).unwrap_or("redacted").to_string(),
         from_transport: "websocket".to_string(),
         to_transport: "https_sse".to_string(),
-        reason: "read_idle".to_string(),
+        reason: safe_error_field(reason)
+            .unwrap_or("transport_error")
+            .to_string(),
         phase: safe_error_field(phase).unwrap_or("unknown").to_string(),
-        idle_ms: WS_READ_IDLE_TIMEOUT.as_millis() as u64,
+        idle_ms,
         ws_attempt,
         reconnect_count: ws_attempt.saturating_sub(1),
         last_event: last_event.and_then(safe_error_field).map(str::to_string),
@@ -1847,8 +2070,54 @@ fn safe_last_event(last_event: Option<&str>) -> &str {
     last_event.and_then(safe_error_field).unwrap_or("none")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WsProviderErrorKind {
+    PreviousResponseNotFound,
+    ConnectionLimit,
+    Unauthorized,
+    Transient,
+    Fatal,
+}
+
+#[derive(Debug)]
+struct WsProviderError {
+    kind: WsProviderErrorKind,
+    message: String,
+}
+
+impl std::fmt::Display for WsProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for WsProviderError {}
+
+#[derive(Debug)]
+struct WsReadIdleError {
+    phase: &'static str,
+    idle_ms: u64,
+    visible_output: bool,
+    last_event: Option<String>,
+}
+
+impl std::fmt::Display for WsReadIdleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Codex WebSocket received no frame before the read deadline [classification=provider_transport_idle observed_at=websocket_read transport=websocket phase={} idle_ms={} visible_output={} upstream_frame_received=false last_event={}]",
+            self.phase,
+            self.idle_ms,
+            self.visible_output,
+            safe_last_event(self.last_event.as_deref()),
+        )
+    }
+}
+
+impl std::error::Error for WsReadIdleError {}
+
 async fn await_ws_message<T, Fut>(
-    timeout: Duration,
+    timeout: Option<Duration>,
     cancel: &CancellationToken,
     emitted_visible_output: bool,
     phase: &'static str,
@@ -1857,26 +2126,40 @@ async fn await_ws_message<T, Fut>(
 where
     Fut: Future<Output = T>,
 {
-    let result = tokio::select! {
-        _ = cancel.cancelled() => {
-            return Err((WsFallback::Fatal, anyhow!("Codex WebSocket request cancelled")));
+    let result = if let Some(timeout) = timeout {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err((WsFallback::Fatal, anyhow!("Codex WebSocket request cancelled")));
+            }
+            result = tokio::time::timeout(timeout, future) => result.map_err(|_| timeout),
         }
-        result = tokio::time::timeout(timeout, future) => result,
+    } else {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err((WsFallback::Fatal, anyhow!("Codex WebSocket request cancelled")));
+            }
+            value = future => return Ok(value),
+        }
     };
     match result {
         Ok(value) => Ok(value),
-        Err(_) => Err((
-            if emitted_visible_output {
-                WsFallback::Fatal
-            } else {
-                WsFallback::FallbackSse
-            },
-            anyhow!(
-                "Codex WebSocket received no frame before the read deadline [classification=provider_transport_idle observed_at=websocket_read transport=websocket phase={} idle_ms={} visible_output={emitted_visible_output} upstream_frame_received=false]",
-                safe_error_field(phase).unwrap_or("unknown"),
-                timeout.as_millis(),
-            ),
-        )),
+        Err(timeout) => {
+            let error: anyhow::Error = WsReadIdleError {
+                phase,
+                idle_ms: timeout.as_millis() as u64,
+                visible_output: emitted_visible_output,
+                last_event: None,
+            }
+            .into();
+            Err((
+                if emitted_visible_output {
+                    WsFallback::Fatal
+                } else {
+                    WsFallback::RetryWebSocket
+                },
+                error,
+            ))
+        }
     }
 }
 
@@ -1936,7 +2219,7 @@ where
             if emitted_visible_output {
                 WsFallback::Fatal
             } else {
-                WsFallback::FallbackSse
+                WsFallback::RetryWebSocket
             },
             anyhow!(
                 "Codex WebSocket setup timed out [classification=websocket_setup_timeout observed_at=websocket_setup transport=websocket phase={operation} timeout_ms={} visible_output={emitted_visible_output}]",
@@ -1984,11 +2267,61 @@ async fn connect_codex_ws(url: Url, token: &AccessToken, session_id: &str) -> Re
     Ok(stream)
 }
 
+fn ws_provider_error(value: &Value, event: &'static str, diagnostics: String) -> anyhow::Error {
+    let error = value
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| value.get("error"));
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str);
+    let status = [
+        error.and_then(|error| error.get("status")),
+        value.get("status"),
+        value
+            .get("response")
+            .and_then(|response| response.get("status")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|status| {
+        status
+            .as_u64()
+            .or_else(|| status.as_str().and_then(|value| value.parse().ok()))
+            .and_then(|status| u16::try_from(status).ok())
+    });
+    let kind = match code {
+        Some("previous_response_not_found") => WsProviderErrorKind::PreviousResponseNotFound,
+        Some("websocket_connection_limit_reached") => WsProviderErrorKind::ConnectionLimit,
+        _ => match status.map(classify_http_status_retryable) {
+            Some(HttpClass::Reauth) => WsProviderErrorKind::Unauthorized,
+            Some(HttpClass::Retry) => WsProviderErrorKind::Transient,
+            Some(HttpClass::Fatal) | None => WsProviderErrorKind::Fatal,
+        },
+    };
+    let label = match event {
+        "response.failed" => "response failed",
+        _ => "WebSocket error",
+    };
+    WsProviderError {
+        kind,
+        message: format!("Codex {label}: {diagnostics}"),
+    }
+    .into()
+}
+
 fn websocket_error_class(error: &anyhow::Error) -> &'static str {
+    if error.downcast_ref::<WsReadIdleError>().is_some() {
+        return "read_idle";
+    }
+    if error.downcast_ref::<WsProviderError>().is_some() {
+        return "upstream_provider_error";
+    }
+    if error.downcast_ref::<CodexStreamProtocolAnomaly>().is_some() {
+        return "protocol_anomaly";
+    }
     let text = error.to_string();
-    if text.contains("classification=provider_transport_idle") {
-        "read_idle"
-    } else if text.contains("classification=websocket_setup_timeout") {
+    if text.contains("classification=websocket_setup_timeout") {
         "setup_timeout"
     } else if text.contains("classification=websocket_setup_error") {
         "setup_error"
@@ -1996,12 +2329,20 @@ fn websocket_error_class(error: &anyhow::Error) -> &'static str {
         "close"
     } else if text.contains("classification=websocket_read_error") {
         "read_error"
-    } else if text.contains("classification=upstream_provider_error") {
-        "upstream_provider_error"
-    } else if error.downcast_ref::<CodexStreamProtocolAnomaly>().is_some() {
-        "protocol_anomaly"
     } else {
         "unknown"
+    }
+}
+
+fn websocket_error_phase(error: &anyhow::Error) -> &'static str {
+    if let Some(error) = error.downcast_ref::<WsReadIdleError>() {
+        error.phase
+    } else {
+        match websocket_error_class(error) {
+            "setup_timeout" | "setup_error" => "connection_setup",
+            "upstream_provider_error" | "protocol_anomaly" => "processing_frame",
+            _ => "websocket_read",
+        }
     }
 }
 
@@ -2009,15 +2350,32 @@ fn classify_ws_error(error: &anyhow::Error, emitted_visible_output: bool) -> WsF
     if emitted_visible_output {
         return WsFallback::Fatal;
     }
-    let text = error.to_string();
-    if text.contains("previous_response_not_found") {
-        WsFallback::RetryFullWebSocket
-    } else if text.contains("websocket_connection_limit_reached") {
-        WsFallback::RetryWebSocket
-    } else if text.contains("401") || text.contains("403") {
-        WsFallback::ForceRefresh
-    } else {
-        WsFallback::FallbackSse
+    if let Some(tokio_tungstenite::tungstenite::Error::Http(response)) =
+        error.downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+    {
+        return match classify_http_status_retryable(response.status().as_u16()) {
+            HttpClass::Reauth => WsFallback::ForceRefresh,
+            HttpClass::Retry => WsFallback::RetryWebSocket,
+            HttpClass::Fatal => WsFallback::Fatal,
+        };
+    }
+    match error
+        .downcast_ref::<WsProviderError>()
+        .map(|error| error.kind)
+    {
+        Some(WsProviderErrorKind::PreviousResponseNotFound) => WsFallback::RetryFullWebSocket,
+        Some(WsProviderErrorKind::ConnectionLimit) => WsFallback::RetryWebSocket,
+        Some(WsProviderErrorKind::Unauthorized) => WsFallback::ForceRefresh,
+        Some(WsProviderErrorKind::Transient) => WsFallback::RetryWebSocket,
+        Some(WsProviderErrorKind::Fatal) => WsFallback::Fatal,
+        None => WsFallback::RetryWebSocket,
+    }
+}
+
+async fn sleep_ws_backoff(delay: Duration, cancel: &CancellationToken) -> Result<()> {
+    tokio::select! {
+        _ = cancel.cancelled() => bail!("Codex WebSocket request cancelled"),
+        _ = tokio::time::sleep(delay) => Ok(()),
     }
 }
 
@@ -2080,6 +2438,103 @@ fn parse_response_stream_reader(
         parser.ingest_event(data, sink)
     })?;
     parser.finish()
+}
+
+#[derive(Debug)]
+struct CodexSseReadError {
+    idle: bool,
+    idle_ms: u64,
+    last_event: Option<String>,
+}
+
+impl std::fmt::Display for CodexSseReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let classification = if self.idle {
+            "provider_transport_idle"
+        } else {
+            "provider_transport_read_error"
+        };
+        write!(
+            f,
+            "Codex SSE read failed [classification={classification} observed_at=https_sse_read transport=https_sse idle_ms={} last_event={}]",
+            self.idle_ms,
+            safe_last_event(self.last_event.as_deref()),
+        )
+    }
+}
+
+impl std::error::Error for CodexSseReadError {}
+
+#[derive(Debug, Default)]
+struct CodexSseDecoder {
+    pending: Vec<u8>,
+    event: String,
+}
+
+impl CodexSseDecoder {
+    fn push(&mut self, bytes: &[u8], mut on_event: impl FnMut(&str) -> Result<()>) -> Result<()> {
+        self.pending.extend_from_slice(bytes);
+        let buffered = std::mem::take(&mut self.pending);
+        let mut start = 0;
+        while let Some(relative_end) = buffered[start..].iter().position(|byte| *byte == b'\n') {
+            let end = start + relative_end;
+            let mut line = &buffered[start..end];
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
+            }
+            let line = std::str::from_utf8(line).map_err(|_| CodexSseReadError {
+                idle: false,
+                idle_ms: 0,
+                last_event: None,
+            })?;
+            self.push_line(line, &mut on_event)?;
+            start = end + 1;
+        }
+        self.pending.extend_from_slice(&buffered[start..]);
+        Ok(())
+    }
+
+    fn finish(mut self, mut on_event: impl FnMut(&str) -> Result<()>) -> Result<()> {
+        if !self.pending.is_empty() {
+            let line = std::str::from_utf8(&self.pending).map_err(|_| CodexSseReadError {
+                idle: false,
+                idle_ms: 0,
+                last_event: None,
+            })?;
+            let line = line.trim_end_matches('\r').to_string();
+            self.pending.clear();
+            self.push_line(&line, &mut on_event)?;
+        }
+        self.dispatch(&mut on_event)
+    }
+
+    fn push_line(
+        &mut self,
+        line: &str,
+        on_event: &mut impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        if line.is_empty() {
+            return self.dispatch(on_event);
+        }
+        self.event.push_str(line);
+        self.event.push('\n');
+        Ok(())
+    }
+
+    fn dispatch(&mut self, on_event: &mut impl FnMut(&str) -> Result<()>) -> Result<()> {
+        let data = self
+            .event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.event.clear();
+        if !data.is_empty() {
+            on_event(&data)?;
+        }
+        Ok(())
+    }
 }
 
 struct ResponseStreamParser {
@@ -2233,8 +2688,16 @@ impl ResponseStreamParser {
                     self.response_id = Some(id.to_string());
                 }
             }
-            Some("error") => bail!("Codex WebSocket error: {}", top_level_error(&value)),
-            Some("response.failed") => bail!("Codex response failed: {}", response_error(&value)),
+            Some("error") => {
+                return Err(ws_provider_error(&value, "error", top_level_error(&value)));
+            }
+            Some("response.failed") => {
+                return Err(ws_provider_error(
+                    &value,
+                    "response.failed",
+                    response_error(&value),
+                ));
+            }
             Some("response.incomplete") => {
                 bail!("Codex response incomplete: {}", incomplete_reason(&value))
             }
@@ -2368,7 +2831,8 @@ impl std::error::Error for CodexStreamProtocolAnomaly {}
 fn protocol_anomaly_retryable(error: &anyhow::Error, emitted_visible_output: bool) -> bool {
     !emitted_visible_output
         && (error.downcast_ref::<CodexStreamProtocolAnomaly>().is_some()
-            || error.downcast_ref::<StreamReadError>().is_some())
+            || error.downcast_ref::<StreamReadError>().is_some()
+            || error.downcast_ref::<CodexSseReadError>().is_some())
 }
 
 fn extract_error_field(body: &str, field: &str) -> Option<String> {

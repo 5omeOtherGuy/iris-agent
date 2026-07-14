@@ -128,6 +128,7 @@ impl LiveLoopLane {
                     PromptCacheRetention::DEFAULT,
                     RetryPolicy::default(),
                     CodexTransport::Auto,
+                    Some(std::time::Duration::from_secs(300)),
                 )?,
             )),
         }
@@ -1212,6 +1213,7 @@ fn auto_compaction_native_probe_codex() -> Result<()> {
             PromptCacheRetention::DEFAULT,
             RetryPolicy::default(),
             CodexTransport::Sse,
+            Some(std::time::Duration::from_secs(300)),
         )?;
     let block = provider.probe_v2_compaction(&native_live_seed(), &CancellationToken::new())?;
     println!(
@@ -1882,6 +1884,7 @@ fn inferred_cold_flush_live_codex() {
             PromptCacheRetention::DEFAULT,
             RetryPolicy::default(),
             CodexTransport::Sse,
+            Some(std::time::Duration::from_secs(300)),
         )
     };
     let control = match build("iris-bench-cold-ctrl") {

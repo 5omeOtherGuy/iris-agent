@@ -615,6 +615,7 @@ pub(crate) fn candidate_for(
         reasoning,
         cache_retention: current.cache_retention,
         codex_transport: current.codex_transport,
+        codex_stream_idle_timeout: current.codex_stream_idle_timeout,
         context_management: current.context_management.clone(),
         legacy_context_management: current.legacy_context_management.clone(),
         tool_result_compaction: current.tool_result_compaction.clone(),
@@ -1604,6 +1605,7 @@ mod tests {
             reasoning: None,
             cache_retention: selection::PromptCacheRetention::Short,
             codex_transport: selection::CodexTransport::Auto,
+            codex_stream_idle_timeout: Some(std::time::Duration::from_millis(300_000)),
             context_management: selection::ContextManagement::default(),
             legacy_context_management: selection::ContextManagement::default(),
             tool_result_compaction: crate::config::Settings::default()
