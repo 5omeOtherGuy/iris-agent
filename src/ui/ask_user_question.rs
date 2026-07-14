@@ -443,20 +443,54 @@ mod tests {
         assert_eq!(arguments["answers"]["Which database?"], "SQLite");
     }
 
+    fn rendered_text(dialog: &AskUserDialog, width: u16) -> String {
+        dialog
+            .render(width)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
-    fn focused_option_renders_markdown_preview() {
+    fn question_uses_the_shared_frameless_overlay_grammar() {
         let dialog = AskUserDialog::from_arguments(&json!({
             "questions": [question("Which formatter?", "Formatter", false)]
         }))
         .unwrap();
-        let rendered = dialog
-            .render(80)
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains("Preview"));
-        assert!(rendered.contains("fn main() {}"));
+        let lines = dialog.render(80);
+        let rendered = rendered_text(&dialog, 80);
+
+        assert!(rendered.starts_with("ASK · FORMATTER · 1/1\nWhich formatter?"));
+        assert!(rendered.contains("○ Fmt  Use rustfmt"));
+        assert!(rendered.contains("○ Other  Write a different answer"));
+        assert!(rendered.contains("Discuss instead  Return to chat before answering"));
+        assert!(rendered.contains("PREVIEW\n```rust\nfn main() {}\n```"));
+        assert!(rendered.ends_with("↑↓ move · ↵ select · esc cancel"));
+        assert!(
+            lines
+                .iter()
+                .find(|line| line.to_string().contains("○ Fmt"))
+                .expect("focused option row")
+                .spans
+                .iter()
+                .all(|span| span.style.bg == Some(crate::ui::palette::surface())),
+            "focused row should use the house surface fill"
+        );
+    }
+
+    #[test]
+    fn multiselect_uses_house_choice_marks_and_keymap() {
+        let mut dialog = AskUserDialog::from_arguments(&json!({
+            "questions": [question("Which checks?", "Checks", true)]
+        }))
+        .unwrap();
+        dialog.handle_key(ModalKey::Enter);
+        let rendered = rendered_text(&dialog, 80);
+
+        assert!(rendered.contains("◉ Fmt  Use rustfmt"));
+        assert!(rendered.contains("○ Clippy  Use clippy"));
+        assert!(rendered.ends_with("↑↓ move · space toggle · tab review · esc cancel"));
     }
 
     #[test]
