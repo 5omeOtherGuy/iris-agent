@@ -216,7 +216,7 @@ impl ResolvedContextBudget {
     pub(crate) fn with_thresholds(mut self, warn: f64, start: f64, hard: f64) -> Self {
         let fraction = |value: f64| ((self.displayed_context_window as f64) * value).floor() as u64;
         if self.window.is_none() {
-            self.hard_compaction_threshold = fraction(hard).min(self.hard_compaction_threshold);
+            self.hard_compaction_threshold = fraction(hard);
         }
         self.preparation_threshold = fraction(start).min(self.hard_compaction_threshold);
         self.warning_threshold = fraction(warn).min(self.preparation_threshold);
@@ -410,5 +410,8 @@ mod tests {
         let unknown = ResolvedContextBudget::resolve(None, None, 128_000);
         assert_eq!(unknown.displayed_context_window, 128_000);
         assert_eq!(unknown.hard_compaction_threshold, 115_200);
+
+        let direct = ResolvedContextBudget::from(128_000).with_thresholds(0.60, 0.72, 0.95);
+        assert_eq!(direct.hard_compaction_threshold, 121_600);
     }
 }
