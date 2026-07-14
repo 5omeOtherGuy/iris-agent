@@ -2107,6 +2107,40 @@ mod tests {
     }
 
     #[test]
+    fn append_provider_transport_fallback_writes_diagnostic_metadata() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let fallback = crate::nexus::ProviderTransportFallback {
+            provider: "openai-codex".to_string(),
+            model: "gpt-test".to_string(),
+            from_transport: "websocket".to_string(),
+            to_transport: "https_sse".to_string(),
+            reason: "read_idle".to_string(),
+            phase: "awaiting_first_frame".to_string(),
+            idle_ms: 75_000,
+            ws_attempt: 2,
+            reconnect_count: 1,
+            last_event: None,
+        };
+
+        log.append_provider_transport_fallback(&fallback).unwrap();
+        let body = fs::read_to_string(log.path()).unwrap();
+        let entry: Value = serde_json::from_str(body.lines().nth(1).unwrap()).unwrap();
+
+        assert_eq!(entry["type"], "providerTransportFallback");
+        assert_eq!(entry["provider"], "openai-codex");
+        assert_eq!(entry["model"], "gpt-test");
+        assert_eq!(entry["fromTransport"], "websocket");
+        assert_eq!(entry["toTransport"], "https_sse");
+        assert_eq!(entry["reason"], "read_idle");
+        assert_eq!(entry["phase"], "awaiting_first_frame");
+        assert_eq!(entry["idleMs"], 75_000);
+        assert_eq!(entry["wsAttempt"], 2);
+        assert_eq!(entry["reconnectCount"], 1);
+        assert!(entry["lastEvent"].is_null());
+    }
+
+    #[test]
     fn append_dangerous_mode_writes_an_audit_entry() {
         // ADR-0049: the skip-permissions mode is recorded as transcript
         // metadata so a resumed/audited session shows it was active.

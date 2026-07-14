@@ -662,6 +662,36 @@ fn persisted_reasoning_rows<P: ChatProvider>(harness: &Harness<P>) -> usize {
 }
 
 #[test]
+fn provider_transport_fallback_reaches_the_observer() -> Result<()> {
+    let workspace = test_workspace()?;
+    let fallback = ProviderTransportFallback {
+        provider: "openai-codex".to_string(),
+        model: "gpt-test".to_string(),
+        from_transport: "websocket".to_string(),
+        to_transport: "https_sse".to_string(),
+        reason: "read_idle".to_string(),
+        phase: "awaiting_next_frame".to_string(),
+        idle_ms: 75_000,
+        ws_attempt: 1,
+        reconnect_count: 0,
+        last_event: Some("response.created".to_string()),
+    };
+    let provider = ScriptedStreamProvider::new(vec![
+        ProviderEvent::TransportFallback(fallback.clone()),
+        ProviderEvent::Completed(AssistantTurn::text("Answer")),
+    ]);
+    let mut harness = test_harness(provider, &workspace.path, crate::tools::built_in_tools());
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(frontend.events.borrow().iter().any(
+        |event| matches!(event, AgentEvent::ProviderTransportFallback(actual) if actual == &fallback)
+    ));
+    Ok(())
+}
+
+#[test]
 fn streamed_reasoning_suppresses_final_display_but_persists_once() -> Result<()> {
     // A turn that streams its reasoning summary live: the front-end already
     // showed the thinking block via deltas, so the terminal canonical display

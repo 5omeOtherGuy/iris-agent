@@ -670,6 +670,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn maps_provider_transport_fallback_to_an_actionable_notice() {
+        let mapped = UiEvent::from_agent_event(AgentEvent::ProviderTransportFallback(
+            crate::nexus::ProviderTransportFallback {
+                provider: "openai-codex".to_string(),
+                model: "gpt-test".to_string(),
+                from_transport: "websocket".to_string(),
+                to_transport: "https_sse".to_string(),
+                reason: "read_idle".to_string(),
+                phase: "awaiting_next_frame".to_string(),
+                idle_ms: 75_000,
+                ws_attempt: 1,
+                reconnect_count: 0,
+                last_event: Some("response.created".to_string()),
+            },
+        ));
+
+        let UiEvent::Notice(message) = mapped else {
+            panic!("fallback must render through the notice channel");
+        };
+        assert!(message.contains("switched from WebSocket to SSE"), "{message}");
+        assert!(message.contains("75s"), "{message}");
+        assert!(message.contains("response.created"), "{message}");
+        assert!(message.contains("$provider-stream-diagnostics"), "{message}");
+    }
+
     /// Audit F11c/F20: `AgentEvent::CompactionApplied` carries `origin`, but the
     /// conversion used to drop it (`origin: _`). Each accepted origin must
     /// survive the conversion so the apply notice/transcript line can name the
