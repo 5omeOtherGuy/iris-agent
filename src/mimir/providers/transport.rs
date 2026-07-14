@@ -962,6 +962,44 @@ mod tests {
     // `RetryPolicy`.
 
     #[test]
+    fn idle_guard_error_reports_provider_transport_phase_and_cancels() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded::<Result<ProviderEvent>>();
+        let cancel = CancellationToken::new();
+        let diagnostics = StreamDiagnostics::new(
+            "openai-codex",
+            "gpt-test",
+            "websocket",
+            "awaiting_first_frame",
+        );
+        let mut stream = stream_with_idle_guard_timeout(
+            rx,
+            cancel.clone(),
+            diagnostics,
+            Duration::from_millis(1),
+        );
+
+        let error = runtime
+            .block_on(stream.next())
+            .expect("timeout event")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("classification=provider_transport_idle"), "{error}");
+        assert!(error.contains("provider=openai-codex"), "{error}");
+        assert!(error.contains("model=gpt-test"), "{error}");
+        assert!(error.contains("transport=websocket"), "{error}");
+        assert!(error.contains("phase=awaiting_first_frame"), "{error}");
+        assert!(error.contains("events_seen=0"), "{error}");
+        assert!(error.contains("last_event=none"), "{error}");
+        assert!(cancel.is_cancelled(), "idle guard cancels the producer");
+        drop(tx);
+    }
+
+    #[test]
     fn parse_retry_after_reads_integer_seconds_only() {
         let mut headers = HeaderMap::new();
         assert!(parse_retry_after(&headers).is_none());

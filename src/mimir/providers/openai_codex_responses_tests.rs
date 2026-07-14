@@ -327,6 +327,56 @@ fn websocket_setup_cancel_stops_before_connect_or_send_complete() {
 }
 
 #[test]
+fn websocket_read_idle_before_visible_output_falls_back_with_diagnostics() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+
+    let (policy, error) = runtime
+        .block_on(await_ws_message(
+            std::time::Duration::from_millis(1),
+            &cancel,
+            false,
+            "awaiting_first_frame",
+            std::future::pending::<()>(),
+        ))
+        .unwrap_err();
+    let message = error.to_string();
+
+    assert_eq!(policy, WsFallback::FallbackSse);
+    assert!(message.contains("classification=provider_transport_idle"), "{message}");
+    assert!(message.contains("transport=websocket"), "{message}");
+    assert!(message.contains("phase=awaiting_first_frame"), "{message}");
+    assert!(message.contains("visible_output=false"), "{message}");
+}
+
+#[test]
+fn websocket_read_idle_after_visible_output_is_fatal() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+
+    let (policy, error) = runtime
+        .block_on(await_ws_message(
+            std::time::Duration::from_millis(1),
+            &cancel,
+            true,
+            "awaiting_next_frame",
+            std::future::pending::<()>(),
+        ))
+        .unwrap_err();
+    let message = error.to_string();
+
+    assert_eq!(policy, WsFallback::Fatal);
+    assert!(message.contains("phase=awaiting_next_frame"), "{message}");
+    assert!(message.contains("visible_output=true"), "{message}");
+}
+
+#[test]
 fn websocket_create_frame_omits_stream_and_keeps_store_false() {
     let full = json!({
         "model": "gpt-test",
