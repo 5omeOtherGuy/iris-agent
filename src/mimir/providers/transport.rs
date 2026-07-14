@@ -24,7 +24,9 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 use tokio_util::sync::CancellationToken;
 
 use crate::mimir::retry::RetryPolicy;
-use crate::nexus::{AssistantTurn, ProviderEvent, ProviderStream, ProviderTransportFallback};
+use crate::nexus::{
+    AssistantTurn, ProviderEvent, ProviderReconnect, ProviderStream, ProviderTransportFallback,
+};
 
 /// How long to wait for a TCP connect + TLS handshake before classifying the
 /// attempt as transient (the retry loop then backs off and retries).
@@ -142,23 +144,42 @@ fn diagnostic_label(value: &str) -> String {
 /// a cancelled turn stops consuming the stream immediately either way.
 pub(crate) fn shared_client() -> Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            Client::builder()
-                .timeout(TOTAL_REQUEST_TIMEOUT)
-                .connect_timeout(CONNECT_TIMEOUT)
-                .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-                .tcp_nodelay(true)
-                .tcp_keepalive(TCP_KEEPALIVE_IDLE)
-                .tcp_keepalive_interval(TCP_KEEPALIVE_INTERVAL)
-                .tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES)
-                .http2_adaptive_window(true)
-                .build()
-                // Static configuration over a compiled-in TLS backend: this
-                // cannot fail at runtime for environment-specific reasons.
-                .expect("failed to build shared HTTP client")
-        })
-        .clone()
+    CLIENT.get_or_init(build_client).clone()
+}
+
+/// Build a provider-owned asynchronous client with an optional sliding raw-read
+/// timeout. Reqwest resets this deadline after each successful socket read; the
+/// connect and whole-request bounds remain independent.
+pub(crate) fn async_client_with_read_timeout(read_timeout: Option<Duration>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .timeout(TOTAL_REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .tcp_nodelay(true)
+        .tcp_keepalive(TCP_KEEPALIVE_IDLE)
+        .tcp_keepalive_interval(TCP_KEEPALIVE_INTERVAL)
+        .tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES)
+        .http2_adaptive_window(true);
+    if let Some(timeout) = read_timeout {
+        builder = builder.read_timeout(timeout);
+    }
+    builder
+        .build()
+        .expect("failed to build provider HTTP client")
+}
+
+fn build_client() -> Client {
+    Client::builder()
+        .timeout(TOTAL_REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .tcp_nodelay(true)
+        .tcp_keepalive(TCP_KEEPALIVE_IDLE)
+        .tcp_keepalive_interval(TCP_KEEPALIVE_INTERVAL)
+        .tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES)
+        .http2_adaptive_window(true)
+        .build()
+        .expect("failed to build provider HTTP client")
 }
 
 /// Provider-internal seam for incremental assistant text. The streamed SSE
@@ -224,6 +245,12 @@ impl ChannelSink {
     ) -> Result<()> {
         self.tx
             .unbounded_send(Ok(ProviderEvent::TransportFallback(fallback)))
+            .map_err(|_| anyhow!("response stream dropped by consumer"))
+    }
+
+    pub(super) fn on_reconnect(&mut self, reconnect: ProviderReconnect) -> Result<()> {
+        self.tx
+            .unbounded_send(Ok(ProviderEvent::Reconnect(reconnect)))
             .map_err(|_| anyhow!("response stream dropped by consumer"))
     }
 }
@@ -311,7 +338,9 @@ fn spawn_stream_inner(
     stream_with_idle_guard(rx, stream_cancel, diagnostics)
 }
 
-pub(super) fn spawn_async_stream<F, Fut>(
+/// Spawn an asynchronous Codex transport without ADR-0043's translated-event
+/// idle guard. Codex enforces its configured timeout at each raw transport read.
+pub(super) fn spawn_async_stream_without_idle_guard<F, Fut>(
     provider: &str,
     model: &str,
     transport: &str,
@@ -324,13 +353,11 @@ where
     Fut: std::future::Future<Output = Result<AssistantTurn>> + Send + 'static,
 {
     let diagnostics = StreamDiagnostics::new(provider, model, transport, phase);
-    let sink_diagnostics = diagnostics.clone();
     let (tx, rx) = mpsc::unbounded::<Result<ProviderEvent>>();
-    let stream_cancel = cancel.clone();
     tokio::spawn(async move {
         let sink = ChannelSink {
             tx: tx.clone(),
-            diagnostics: sink_diagnostics,
+            diagnostics,
         };
         let terminal = match run(sink, cancel).await {
             Ok(turn) => Ok(ProviderEvent::Completed(turn)),
@@ -338,7 +365,7 @@ where
         };
         let _ = tx.unbounded_send(terminal);
     });
-    stream_with_idle_guard(rx, stream_cancel, diagnostics)
+    Box::pin(rx)
 }
 
 fn stream_with_idle_guard(
@@ -408,6 +435,7 @@ fn provider_event_label(event: &Result<ProviderEvent>) -> &'static str {
         Err(_) => "error",
         Ok(ProviderEvent::Activity) => "activity",
         Ok(ProviderEvent::TransportFallback(_)) => "transport_fallback",
+        Ok(ProviderEvent::Reconnect(_)) => "reconnect",
         Ok(ProviderEvent::TextDelta(_)) => "text_delta",
         Ok(ProviderEvent::ReasoningDelta(_)) => "reasoning_delta",
         Ok(ProviderEvent::RawReasoningDelta(_)) => "raw_reasoning_delta",
@@ -1164,6 +1192,41 @@ mod tests {
         assert_eq!(diagnostic_label("openai/gpt-5.4"), "openai/gpt-5.4");
         assert_eq!(diagnostic_label("/home/alice/sk-secret"), "redacted");
         assert_eq!(diagnostic_label("prompt_token"), "redacted");
+    }
+
+    #[test]
+    fn async_client_enforces_raw_read_timeout() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")
+                .unwrap();
+            socket.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let client = async_client_with_read_timeout(Some(Duration::from_millis(20)));
+            let response = client
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            let error = response.bytes().await.unwrap_err();
+            assert!(error.is_timeout(), "{error}");
+        });
+        server.join().unwrap();
     }
 
     #[test]

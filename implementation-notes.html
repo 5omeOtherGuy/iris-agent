@@ -11,7 +11,14 @@
 <li>Continuation state is memory-only per provider instance. A next WebSocket request is reduced to suffix input only when non-input request shape is unchanged and the new full input starts with prior full input plus normalized prior assistant output items; uncertainty clears continuation and sends full context.</li>
 <li>Fallback is allowed only before visible text, reasoning summary, or tool-input deltas are emitted. After visible output, WebSocket failures surface a sanitized fatal error to avoid duplicate visible replay.</li>
 <li>Cancellation abandons the active socket, clears continuation, and returns promptly; the implementation reuses sockets only while under a 55-minute age cap and 5-minute idle TTL.</li>
-<li>Deferred: public API-key Responses WebSocket, generate:false warmup, server-side compaction/replay, debug stats/UI controls, benchmarking, and async conversion of SSE fallback remain outside this OAuth Codex transport task.</li>
+<li>Deferred: public API-key Responses WebSocket, generate:false warmup, server-side compaction/replay, debug stats/UI controls, and benchmarking remain outside this OAuth Codex transport task.</li>
+<li>Idle policy choice: global-only <code>codexStreamIdleTimeoutMs</code> defaults to 300,000 ms, matching pi-mono and the first-party Codex client; <code>0</code> disables it. Project settings cannot alter this secret-bearing transport policy.</li>
+<li>Codex interactive HTTPS/SSE moved to reqwest's asynchronous client because blocking reqwest exposes no sliding read-timeout API. The async client's <code>read_timeout</code> resets on successful raw reads; WebSocket wraps each frame read with the same optional duration.</li>
+<li>Codex bypasses ADR-0043's generic 90-second translated-event watchdog. Other providers keep that guard. This avoids a harness-channel timeout preempting Codex's provider-owned raw transport policy.</li>
+<li>Every pre-output WebSocket recovery, including full-context retry and forced token refresh, consumes the shared retry budget. Backoff is cancellation-aware. Exhaustion disables WebSocket for the provider instance, emits one safe fallback marker, and continues over HTTPS/SSE.</li>
+<li>Reconnect events carry only transport, counters, delay, classification, and phase. Raw provider errors and payloads remain in Mimir; Nexus forwards neutral metadata and the UI renders progress. Only the final transport switch is persisted for diagnostics.</li>
+<li>The interactive SSE path uses a small incremental decoder rather than a new dependency. It preserves split UTF-8-safe line buffering and multi-line <code>data:</code> joining; focused tests cover chunk boundaries.</li>
+<li>Provider-native compaction and structured-summary helper requests retain their existing blocking transport. They do not pass through the interactive <code>ChatProvider</code> stream or ADR-0043 guard addressed by this change.</li>
 </ul>
 <h1>Configurable tool-result compaction</h1>
 <ul>

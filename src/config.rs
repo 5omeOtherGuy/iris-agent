@@ -188,6 +188,11 @@ pub(crate) struct Settings {
     /// HTTP/SSE fallback; `sse` forces the legacy HTTP/SSE route. GLOBAL-ONLY:
     /// it changes secret-bearing provider transport behavior and fallback policy.
     pub(crate) codex_transport: Option<String>,
+    /// Sliding raw-stream idle timeout for OpenAI Codex WebSocket and HTTPS/SSE
+    /// reads, in milliseconds. Absent -> 300,000; zero disables only raw idle
+    /// detection. GLOBAL-ONLY because it changes secret-bearing provider
+    /// transport and recovery behavior.
+    pub(crate) codex_stream_idle_timeout_ms: Option<u64>,
     /// Generic OpenAI-compatible model metadata. The provider/model/base-url are
     /// still resolved through the existing top-level defaults; this object holds
     /// capability/display flags for the configured custom endpoint.
@@ -388,6 +393,7 @@ pub(crate) struct RetrySettings {
     pub(crate) max_delay_ms: Option<u64>,
 }
 
+pub(crate) const DEFAULT_CODEX_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 /// Legacy fallback when neither an explicit budget nor a model window exists.
 const DEFAULT_CONTEXT_TOKEN_BUDGET: u64 = 128_000;
 pub(crate) const DEFAULT_SUMMARY_RESERVE: u64 = 8_192;
@@ -543,6 +549,7 @@ impl Settings {
             // Codex transport affects secret-bearing provider transport and
             // fallback behavior, so it is global-only like provider/base-url.
             codex_transport: self.codex_transport,
+            codex_stream_idle_timeout_ms: self.codex_stream_idle_timeout_ms,
             // Custom endpoint capability flags are global-only alongside the
             // base URL, so a cloned project cannot change how a secret-bearing
             // endpoint is called.
@@ -612,6 +619,15 @@ impl Settings {
     /// graceful Notice instead of a fatal error.
     pub(crate) fn max_tool_roundtrips(&self) -> Option<usize> {
         self.max_tool_roundtrips
+    }
+
+    /// Effective OpenAI Codex raw-stream idle policy. Zero disables only this
+    /// detector; connect, send, cancellation, and whole-request bounds remain.
+    pub(crate) fn codex_stream_idle_timeout(&self) -> Option<Duration> {
+        let timeout_ms = self
+            .codex_stream_idle_timeout_ms
+            .unwrap_or(DEFAULT_CODEX_STREAM_IDLE_TIMEOUT_MS);
+        (timeout_ms != 0).then(|| Duration::from_millis(timeout_ms))
     }
 
     /// Raw retry settings (or an all-default empty set when unconfigured). The

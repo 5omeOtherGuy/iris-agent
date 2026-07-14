@@ -59,6 +59,16 @@ sees channel events, so a rate-limited-but-healthy retry loop was previously
 misreported as `provider stream produced no events for 90s` and the turn was
 killed mid-backoff.
 
+**Amendment (2026-07-14)**: OpenAI Codex interactive response streams are an
+explicit exception to the shared 90-second translated-event guard. Codex owns a
+global-only `codexStreamIdleTimeoutMs` raw-read policy (300 seconds by default;
+`0` disables it) for both WebSocket frames and HTTPS/SSE reads. Before visible
+output, WebSocket idleness and transport failures consume the shared retry
+budget with cancellation-aware backoff; exhaustion switches the session once
+to HTTPS/SSE and records allow-listed fallback metadata. Once text, reasoning,
+or tool-input output is visible, transport failure remains fatal to prevent
+replay duplication. Other providers retain this ADR's 90-second guard.
+
 ## Alternatives Considered
 
 ### Alternative 1: Keep only the whole-request timeout
@@ -102,8 +112,9 @@ killed mid-backoff.
   transcript.
 - Every streaming provider adapter must remember to call `on_activity()` for
   parsed SSE frames.
-- A provider that legitimately sends no event for more than 90 seconds during a
-  turn now fails rather than waiting for the 30-minute total backstop.
+- A provider using the shared guard that legitimately sends no event for more
+  than 90 seconds during a turn now fails rather than waiting for the 30-minute
+  total backstop. Codex uses its provider-owned raw-read policy instead.
 
 ### Risks
 

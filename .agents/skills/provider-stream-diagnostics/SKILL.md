@@ -1,6 +1,6 @@
 ---
 name: provider-stream-diagnostics
-description: Diagnose a saved Iris provider-transport fallback immediately after the TUI says OpenAI switched from WebSocket to SSE. Use only when the user explicitly invokes $provider-stream-diagnostics.
+description: Diagnose a saved Iris provider-transport fallback immediately after the TUI says OpenAI exhausted WebSocket recovery and switched to SSE. Use only when the user explicitly invokes $provider-stream-diagnostics.
 user-invocable: true
 ---
 
@@ -21,12 +21,13 @@ Inspect the safe audit marker written by Iris for the current repository. Attrib
    ```bash
    iris --version
    git rev-parse --short HEAD
-   rg -n 'WS_READ_IDLE_TIMEOUT|STREAM_IDLE_TIMEOUT' src/mimir/providers src/nexus.rs
+   rg -n 'codex_stream_idle_timeout|STREAM_IDLE_TIMEOUT' src/config.rs src/mimir/providers src/nexus.rs
    ```
 
 3. Interpret the marker:
    - `phase=awaiting_first_frame`, `last_event=none`: the WebSocket handshake and request send completed, but Iris observed no provider frame before its deadline. Evidence localizes the silence to the WebSocket/upstream path; it does not distinguish OpenAI, an intermediary, or a dropped inbound frame.
-   - `phase=awaiting_next_frame`, `last_event=response.created`: OpenAI accepted the response before the silent interval. This can be an upstream stall, but it can also be legitimate long reasoning; call out that the 75-second Iris policy may be too aggressive.
+   - `phase=awaiting_next_frame`, `last_event=response.created`: OpenAI accepted the response before the silent interval. This can be an upstream stall or legitimate long reasoning. Report the configured raw-read deadline and reconnect count; do not call the default 300-second policy too aggressive from one occurrence.
+   - `reconnect_count>0`: Iris retried WebSocket within the shared bounded retry budget before making the recorded switch. The marker records only the final transition, not raw errors from each attempt.
    - Another safe `last_event`: report it verbatim and inspect the corresponding parser transition. Do not infer progress beyond that event.
    - `assistant_message_after_fallback=true`: SSE recovery completed far enough to persist an assistant message. This supports a WebSocket-path-specific failure, not a general provider outage.
    - `assistant_message_after_fallback=false`: recovery was not yet durably completed when inspected. Do not call fallback successful.

@@ -260,7 +260,7 @@ fn codex_ws_headers_use_oauth_metadata_without_content_type() -> Result<()> {
 }
 
 #[test]
-fn websocket_setup_timeout_falls_back_before_visible_output() {
+fn websocket_setup_timeout_retries_before_visible_output() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -380,7 +380,7 @@ fn websocket_idle_fallback_metadata_is_safe_and_complete() {
 }
 
 #[test]
-fn websocket_read_idle_before_visible_output_falls_back_with_diagnostics() {
+fn websocket_read_idle_before_visible_output_retries_with_diagnostics() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -487,6 +487,79 @@ fn disabled_websocket_idle_timeout_still_honors_cancellation() {
 
     assert_eq!(policy, WsFallback::Fatal);
     assert!(error.to_string().contains("cancelled"), "{error}");
+}
+
+#[test]
+fn async_sse_decoder_handles_split_chunks_and_multiline_events() -> Result<()> {
+    let mut decoder = CodexSseDecoder::default();
+    let mut events = Vec::new();
+
+    decoder.push(
+        b"event: response.output_text.delta\ndata: {\"type\":",
+        |data| {
+            events.push(data.to_string());
+            Ok(())
+        },
+    )?;
+    decoder.push(
+        b"\"response.output_text.delta\",\ndata: \"delta\":\"hi\"}\n\n",
+        |data| {
+            events.push(data.to_string());
+            Ok(())
+        },
+    )?;
+    decoder.finish(|data| {
+        events.push(data.to_string());
+        Ok(())
+    })?;
+
+    assert_eq!(
+        events,
+        ["{\"type\":\"response.output_text.delta\",\n\"delta\":\"hi\"}"]
+    );
+    Ok(())
+}
+
+#[test]
+fn websocket_special_recovery_uses_typed_provider_fields_not_message_text() {
+    let previous = ws_provider_error(
+        &json!({
+            "type": "error",
+            "error": {"code": "previous_response_not_found"}
+        }),
+        "error",
+        "safe diagnostics".to_string(),
+    );
+    assert_eq!(
+        classify_ws_error(&previous, false),
+        WsFallback::RetryFullWebSocket
+    );
+
+    let misleading = ws_provider_error(
+        &json!({
+            "type": "error",
+            "error": {"code": "other"}
+        }),
+        "error",
+        "message mentions previous_response_not_found and 401".to_string(),
+    );
+    assert_eq!(
+        classify_ws_error(&misleading, false),
+        WsFallback::RetryWebSocket
+    );
+
+    let unauthorized = ws_provider_error(
+        &json!({
+            "type": "response.failed",
+            "response": {"status": "403", "error": {"code": "forbidden"}}
+        }),
+        "response.failed",
+        "safe diagnostics".to_string(),
+    );
+    assert_eq!(
+        classify_ws_error(&unauthorized, false),
+        WsFallback::ForceRefresh
+    );
 }
 
 #[test]
@@ -1878,6 +1951,7 @@ fn provider_builds_native_and_fallback_summary_requests_from_its_own_state() -> 
         PromptCacheRetention::Short,
         crate::mimir::retry::RetryPolicy::default(),
         crate::mimir::selection::CodexTransport::Sse,
+        Some(std::time::Duration::from_secs(300)),
     )?;
     let messages = [Message::user("hi")];
 

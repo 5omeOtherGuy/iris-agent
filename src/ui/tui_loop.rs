@@ -6420,6 +6420,7 @@ mod tests {
             reasoning: None,
             cache_retention: crate::mimir::selection::PromptCacheRetention::Short,
             codex_transport: crate::mimir::selection::CodexTransport::Auto,
+            codex_stream_idle_timeout: Some(std::time::Duration::from_millis(300_000)),
             context_management: crate::mimir::selection::ContextManagement::default(),
             legacy_context_management: crate::mimir::selection::ContextManagement::default(),
             tool_result_compaction: crate::config::Settings::default()

@@ -431,6 +431,9 @@ pub(crate) struct ModelSelection {
     pub(crate) reasoning: Option<ReasoningEffort>,
     pub(crate) cache_retention: PromptCacheRetention,
     pub(crate) codex_transport: CodexTransport,
+    /// OpenAI Codex raw WebSocket/SSE read-idle policy. `None` disables idle
+    /// detection without changing connect, send, cancellation, or total bounds.
+    pub(crate) codex_stream_idle_timeout: Option<std::time::Duration>,
     /// Anthropic-only context-management opt-in; empty/default for other
     /// providers and when unconfigured.
     pub(crate) context_management: ContextManagement,
@@ -506,6 +509,7 @@ impl ModelSelection {
             Some(value) => CodexTransport::parse(value)?,
             None => CodexTransport::Auto,
         };
+        let codex_stream_idle_timeout = settings.codex_stream_idle_timeout();
         let legacy_context_management = match &settings.anthropic_context_management {
             Some(value) => {
                 serde_json::from_value::<ContextManagement>(value.clone()).map_err(|error| {
@@ -529,6 +533,7 @@ impl ModelSelection {
             reasoning,
             cache_retention,
             codex_transport,
+            codex_stream_idle_timeout,
             context_management: ContextManagement::default(),
             legacy_context_management,
             tool_result_compaction: configured_tool_result_compaction.clone(),
@@ -813,6 +818,7 @@ mod tests {
             max_tool_roundtrips: None,
             retry: None,
             codex_transport: None,
+            codex_stream_idle_timeout_ms: None,
             open_ai_compatible: None,
             verify: None,
             tui: None,
@@ -1002,6 +1008,7 @@ mod tests {
             reasoning: None,
             cache_retention: retention,
             codex_transport: CodexTransport::Auto,
+            codex_stream_idle_timeout: Some(std::time::Duration::from_millis(300_000)),
             context_management: ContextManagement::default(),
             legacy_context_management: ContextManagement::default(),
             tool_result_compaction: crate::config::Settings::default()
