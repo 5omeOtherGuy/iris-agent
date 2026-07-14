@@ -973,7 +973,7 @@ pub(super) fn editor_visual_rows(editor: &TextArea<'_>, width: u16) -> u16 {
         .max(1);
     let inner_width = usize::from(
         box_width
-            .saturating_sub(composer_text_x_offset(box_width))
+            .saturating_sub(composer_text_padding(box_width))
             .max(1),
     );
     editor
@@ -3354,10 +3354,9 @@ fn chrome_heights(
     ChromeHeights { menu, editor }
 }
 
-fn composer_text_x_offset(box_width: u16) -> u16 {
-    // `ratatui-textarea` paints the empty-editor cursor one cell before the
-    // placeholder, so anchor the widget one cell left of the transcript text
-    // column; the visible `Give Iris...` indicator then starts with messages.
+fn composer_text_padding(box_width: u16) -> u16 {
+    // Keep the empty placeholder on the transcript text column, but reserve the
+    // same width after typing so wrapping does not jump when input appears.
     u16::try_from(TEXT_COLUMN_X_PADDING.saturating_sub(1))
         .unwrap_or(u16::MAX)
         .min(box_width.saturating_sub(1))
@@ -3469,14 +3468,19 @@ pub(super) fn render_editor_chrome(
             .max(1),
         height: editor_area.height,
     };
-    let text_x_offset = composer_text_x_offset(box_area.width);
+    let text_padding = composer_text_padding(box_area.width);
+    let text_x_offset = if screen.editor_is_empty() {
+        text_padding
+    } else {
+        0
+    };
     // Padding is preferred, not protected: at the minimum composer height the
     // input row wins over the soft bottom row.
     let pad_rows = bottom_padding_rows.min(editor_area.height.saturating_sub(MIN_EDITOR_H));
     let text_area = Rect {
         x: box_area.x + text_x_offset,
         y: editor_area.y + EDITOR_CHROME_ROWS_ABOVE.min(editor_area.height.saturating_sub(1)),
-        width: box_area.width.saturating_sub(text_x_offset).max(1),
+        width: box_area.width.saturating_sub(text_padding).max(1),
         height: editor_area
             .height
             .saturating_sub(EDITOR_VERTICAL_CHROME_ROWS)
@@ -5794,6 +5798,27 @@ mod tests {
 
         assert_eq!(caret_column, left_edge);
         assert_eq!(reversed_columns, vec![left_edge]);
+    }
+
+    #[test]
+    fn typed_composer_text_aligns_with_empty_caret_and_left_edge() {
+        let mut screen = Screen::new();
+        screen.editor.insert_str("hello");
+
+        let lines = super::render_editor_chrome(&mut screen, 80, 13);
+        let left_edge = lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.trim().chars().all(|ch| ch == '─') && line.contains('─'))
+            .and_then(|line| line.find('─'))
+            .expect("composer top edge");
+        let text_column = lines
+            .iter()
+            .map(line_text)
+            .find_map(|line| line.find("hello"))
+            .expect("typed composer text");
+
+        assert_eq!(text_column, left_edge);
     }
 
     #[test]
