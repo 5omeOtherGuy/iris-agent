@@ -53,11 +53,24 @@ run_step() {
   return "$code"
 }
 
+check_untracked_whitespace() {
+  local path output failed=0
+  while IFS= read -r -d '' path; do
+    output=$(git diff --no-index --check -- /dev/null "$path" 2>&1 || :)
+    if [ -n "$output" ]; then
+      printf '%s\n' "$output"
+      failed=1
+    fi
+  done < <(git ls-files --others --exclude-standard -z)
+  return "$failed"
+}
+
 # Fast docs-only path; an empty or mixed change set stays on the full gate.
 if [ "$(bash scripts/change-scope.sh "${IRIS_GATE_BASE:-origin/main}" HEAD)" = true ]; then
   run_step "docs whitespace (branch)" git diff --check "${IRIS_GATE_BASE:-origin/main}...HEAD" || exit $?
   run_step "docs whitespace (staged)" git diff --cached --check                           || exit $?
   run_step "docs whitespace (working tree)" git diff --check                             || exit $?
+  run_step "docs whitespace (untracked)" check_untracked_whitespace                      || exit $?
   printf 'gate: PASS — documentation-only; whitespace OK (Rust checks skipped)\n'
   exit 0
 fi
