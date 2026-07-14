@@ -18,9 +18,11 @@ expect_scope() {
 }
 
 expect_scope true README.md docs/adr/0062-example.md docs/assets/hero-light.svg
-expect_scope true 'docs/example with spaces.md'
+expect_scope true 'docs/example with spaces.md' openwiki/provider-auth.md showcase/README.md
 expect_scope false
 expect_scope false src/lib.rs
+expect_scope false src/tools/web/testdata/excerpts_doc.md
+expect_scope false .agents/skills/example/SKILL.md
 expect_scope false README.md src/lib.rs
 expect_scope false docs/benchmarks/campaign.toml
 expect_scope false .github/workflows/ci.yml
