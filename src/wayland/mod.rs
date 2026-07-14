@@ -49,9 +49,10 @@ use crate::nexus::{
     CompactionLifecycleState, CompactionOrigin, ContextDirective, ContextGovernor,
     ContextGovernorFuture, ContextMeasurementSource, ContextOverflowFuture,
     ContextOverflowRecovery, ContextPressureTier, FoldTrigger, Message,
-    ProviderCompactionCapability, ProviderEvent, ProviderUsage, Role, SessionSpanReader,
-    SteeringSource, StructuredSummaryCapability, StructuredSummaryError, StructuredSummaryMode,
-    ToolEnv, Tools, TurnContextHooks, TurnInput, VerificationOutcome, VerifyRun,
+    ProviderCompactionCapability, ProviderEvent, ProviderTransportFallback, ProviderUsage, Role,
+    SessionSpanReader, SteeringSource, StructuredSummaryCapability, StructuredSummaryError,
+    StructuredSummaryMode, ToolEnv, Tools, TurnContextHooks, TurnInput, VerificationOutcome,
+    VerifyRun,
 };
 use crate::session::{
     CompactionTaskState, SessionLog, estimate_tokens, message_token_estimate, preview_line,
@@ -93,6 +94,11 @@ struct TurnContextController<'a> {
 
 impl AgentObserver for TurnContextController<'_> {
     fn on_event(&self, event: AgentEvent) -> Result<()> {
+        if let AgentEvent::ProviderTransportFallback(fallback) = &event
+            && let Some(engine) = self.compaction.borrow_mut().as_deref_mut()
+        {
+            engine.persist_transport_fallback(fallback);
+        }
         self.inner.on_event(event)
     }
 

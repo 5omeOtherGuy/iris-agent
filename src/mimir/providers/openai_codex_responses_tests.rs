@@ -357,6 +357,27 @@ fn websocket_setup_failure_is_classified_and_redacted() {
 }
 
 #[test]
+fn websocket_idle_fallback_metadata_is_safe_and_complete() {
+    let fallback = ws_idle_transport_fallback(
+        "gpt-test /home/alice sk-secret",
+        "awaiting_next_frame",
+        3,
+        Some("response.created /tmp/secret"),
+    );
+
+    assert_eq!(fallback.provider, PROVIDER_ID);
+    assert_eq!(fallback.model, "redacted");
+    assert_eq!(fallback.from_transport, "websocket");
+    assert_eq!(fallback.to_transport, "https_sse");
+    assert_eq!(fallback.reason, "read_idle");
+    assert_eq!(fallback.phase, "awaiting_next_frame");
+    assert_eq!(fallback.idle_ms, 75_000);
+    assert_eq!(fallback.ws_attempt, 3);
+    assert_eq!(fallback.reconnect_count, 2);
+    assert_eq!(fallback.last_event, None);
+}
+
+#[test]
 fn websocket_read_idle_before_visible_output_falls_back_with_diagnostics() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

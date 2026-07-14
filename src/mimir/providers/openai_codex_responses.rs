@@ -27,8 +27,8 @@ use crate::mimir::auth::openai_codex::{AccessToken, OpenAiCodexTokenStore};
 use crate::mimir::selection::{CodexTransport, PromptCacheRetention, ReasoningEffort};
 use crate::nexus::{
     AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderCompactionCapability,
-    ProviderCompactionFuture, ProviderCompactionOutput, ProviderStream, ProviderUsage,
-    ReasoningBlock, Role, StructuredSummaryCapability, StructuredSummaryError,
+    ProviderCompactionFuture, ProviderCompactionOutput, ProviderStream, ProviderTransportFallback,
+    ProviderUsage, ReasoningBlock, Role, StructuredSummaryCapability, StructuredSummaryError,
     StructuredSummaryFuture, StructuredSummaryMode, ToolCall, Tools,
 };
 
@@ -840,7 +840,7 @@ impl OpenAiCodexResponsesProvider {
                     &token,
                     &mut sink,
                     &cancel,
-                    force_full,
+                    (force_full, ws_attempt),
                 )
                 .await
             {
@@ -927,8 +927,9 @@ impl OpenAiCodexResponsesProvider {
         token: &AccessToken,
         sink: &mut ChannelSink,
         cancel: &CancellationToken,
-        force_full: bool,
+        attempt: (bool, u32),
     ) -> std::result::Result<AssistantTurn, (WsFallback, anyhow::Error)> {
+        let (force_full, ws_attempt) = attempt;
         let frame = {
             let state = self.ws_state.lock().await;
             build_ws_create_frame(full_request, state.continuation.as_ref(), force_full)
@@ -991,7 +992,25 @@ impl OpenAiCodexResponsesProvider {
                         self.clear_continuation().await;
                     }
                     let model = safe_error_field(&self.model).unwrap_or("redacted");
-                    let last_event = safe_last_event(parser.last_event_type.as_deref());
+                    let last_event = parser
+                        .last_event_type
+                        .as_deref()
+                        .and_then(safe_error_field)
+                        .map(str::to_string);
+                    if policy == WsFallback::FallbackSse
+                        && error
+                            .to_string()
+                            .contains("classification=provider_transport_idle")
+                    {
+                        sink.on_transport_fallback(ws_idle_transport_fallback(
+                            &self.model,
+                            phase,
+                            ws_attempt,
+                            parser.last_event_type.as_deref(),
+                        ))
+                        .map_err(|send_error| (WsFallback::Fatal, send_error))?;
+                    }
+                    let last_event = last_event.as_deref().unwrap_or("none");
                     return Err((
                         policy,
                         anyhow!(
@@ -1802,6 +1821,26 @@ fn normalize_reasoning_for_continuation(item: &Value) -> Option<Value> {
         "encrypted_content": encrypted,
         "summary": [],
     }))
+}
+
+fn ws_idle_transport_fallback(
+    model: &str,
+    phase: &str,
+    ws_attempt: u32,
+    last_event: Option<&str>,
+) -> ProviderTransportFallback {
+    ProviderTransportFallback {
+        provider: PROVIDER_ID.to_string(),
+        model: safe_error_field(model).unwrap_or("redacted").to_string(),
+        from_transport: "websocket".to_string(),
+        to_transport: "https_sse".to_string(),
+        reason: "read_idle".to_string(),
+        phase: safe_error_field(phase).unwrap_or("unknown").to_string(),
+        idle_ms: WS_READ_IDLE_TIMEOUT.as_millis() as u64,
+        ws_attempt,
+        reconnect_count: ws_attempt.saturating_sub(1),
+        last_event: last_event.and_then(safe_error_field).map(str::to_string),
+    }
 }
 
 fn safe_last_event(last_event: Option<&str>) -> &str {

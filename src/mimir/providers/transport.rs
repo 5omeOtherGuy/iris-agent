@@ -24,7 +24,7 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 use tokio_util::sync::CancellationToken;
 
 use crate::mimir::retry::RetryPolicy;
-use crate::nexus::{AssistantTurn, ProviderEvent, ProviderStream};
+use crate::nexus::{AssistantTurn, ProviderEvent, ProviderStream, ProviderTransportFallback};
 
 /// How long to wait for a TCP connect + TLS handshake before classifying the
 /// attempt as transient (the retry loop then backs off and retries).
@@ -217,6 +217,15 @@ impl ChannelSink {
     pub(super) fn set_transport_phase(&mut self, transport: &str, phase: &str) {
         self.diagnostics.set_transport_phase(transport, phase);
     }
+
+    pub(super) fn on_transport_fallback(
+        &mut self,
+        fallback: ProviderTransportFallback,
+    ) -> Result<()> {
+        self.tx
+            .unbounded_send(Ok(ProviderEvent::TransportFallback(fallback)))
+            .map_err(|_| anyhow!("response stream dropped by consumer"))
+    }
 }
 
 impl TurnSink for ChannelSink {
@@ -398,6 +407,7 @@ fn provider_event_label(event: &Result<ProviderEvent>) -> &'static str {
     match event {
         Err(_) => "error",
         Ok(ProviderEvent::Activity) => "activity",
+        Ok(ProviderEvent::TransportFallback(_)) => "transport_fallback",
         Ok(ProviderEvent::TextDelta(_)) => "text_delta",
         Ok(ProviderEvent::ReasoningDelta(_)) => "reasoning_delta",
         Ok(ProviderEvent::RawReasoningDelta(_)) => "raw_reasoning_delta",
