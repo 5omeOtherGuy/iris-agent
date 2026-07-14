@@ -3693,6 +3693,32 @@ mod tests {
     }
 
     #[test]
+    fn grouped_explore_elapsed_refreshes_for_later_tool() {
+        let mut transcript = Transcript::default();
+        let mut first = tool_call("read");
+        first.id = "call-read-1".to_string();
+        transcript.apply(UiEvent::ToolStarted(first.clone()));
+        transcript.apply(UiEvent::ToolResult {
+            call: first,
+            content: "first result".to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(10)),
+        });
+        let mut second = tool_call("read");
+        second.id = "call-read-2".to_string();
+        transcript.apply(UiEvent::ToolStarted(second));
+        transcript
+            .active_explorations
+            .last_mut()
+            .expect("second exploration")
+            .started = Instant::now() - Duration::from_millis(2_500);
+
+        let header = header_line(&mut transcript, "EXPLORE");
+
+        assert!(header.trim_end().ends_with("2.5s"), "{header:?}");
+    }
+
+    #[test]
     fn generic_tool_elapsed_excludes_time_awaiting_review() {
         let mut transcript = Transcript::default();
         let call = tool_call("custom");
