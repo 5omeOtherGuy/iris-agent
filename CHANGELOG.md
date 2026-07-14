@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.5...iris-agent-v0.3.6) - 2026-07-14
+
+### Added
+
+- recover Codex transport idleness ([#625](https://github.com/5omeOtherGuy/iris-agent/pull/625))
+- redesign ask user question menu ([#619](https://github.com/5omeOtherGuy/iris-agent/pull/619))
+
+### Fixed
+
+- diagnose and recover OpenAI stream stalls ([#622](https://github.com/5omeOtherGuy/iris-agent/pull/622))
+
+### Other
+
+- skip Rust checks for docs-only changes ([#624](https://github.com/5omeOtherGuy/iris-agent/pull/624))
+- keep Codex prompt caches session-scoped ([#623](https://github.com/5omeOtherGuy/iris-agent/pull/623))
+
 ## [0.3.5](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.4...iris-agent-v0.3.5) - 2026-07-14
 
 ### Fixed
