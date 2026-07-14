@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::env;
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -546,7 +546,7 @@ fn run_agent_inner(
     let session_id = session::new_session_id();
     let background_selection = Arc::new(Mutex::new(selection.clone()));
     let background_session_id = Arc::new(Mutex::new(session_id.clone()));
-    let provider = build_provider(&selection, &system_prompt, &session_id, &cwd)?;
+    let provider = build_provider(&selection, &system_prompt, &session_id)?;
     let agent = Agent::new(provider, tools)
         .with_max_tool_roundtrips(settings.max_tool_roundtrips())
         .with_project_policy(project_policy(&cwd), project_policy_sink(&cwd))
@@ -608,7 +608,6 @@ fn run_agent_inner(
             .transpose()?,
         system_prompt.clone(),
         background_session_id.clone(),
-        cwd.clone(),
     );
     harness.set_tool_result_compaction(selection.tool_result_compaction.clone());
     let _ = harness.set_task_workflow_enabled(settings.tasks());
@@ -632,9 +631,8 @@ fn run_agent_inner(
     // swap can point the provider builder at the swapped session's id.
     let session_cell = Rc::new(RefCell::new(session_id.clone()));
     let build_cell = session_cell.clone();
-    let provider_workspace = cwd.clone();
     let build = move |selection: &mimir::selection::ModelSelection, prompt: &str| {
-        build_provider(selection, prompt, &build_cell.borrow(), &provider_workspace)
+        build_provider(selection, prompt, &build_cell.borrow())
     };
     let mut switch_state = cli::ModelSwitch::new(
         selection,
@@ -780,7 +778,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     let session_id = session::new_session_id();
     let background_selection = Arc::new(Mutex::new(selection.clone()));
     let background_session_id = Arc::new(Mutex::new(session_id.clone()));
-    let provider = build_provider(&selection, &system_prompt, &session_id, &cwd)?;
+    let provider = build_provider(&selection, &system_prompt, &session_id)?;
     // The persisted project policy applies headless too (a granted tool/command
     // auto-approves), but the print gate cannot mint new grants, so no sink.
     let agent = Agent::new(provider, tools)
@@ -804,7 +802,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     let native_jj = wayland::trust::native_jj(&cwd).unwrap_or(false);
     let mut harness = wayland::Harness::new_configured(
         agent,
-        cwd.clone(),
+        cwd,
         tools::ToolState::new(),
         session,
         budget,
@@ -834,7 +832,6 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
             .transpose()?,
         system_prompt.clone(),
         background_session_id,
-        cwd.clone(),
     );
     harness.set_tool_result_compaction(selection.tool_result_compaction.clone());
     let _ = harness.set_task_workflow_enabled(settings.tasks());
@@ -950,12 +947,10 @@ fn install_compaction_summarizer_factory(
     dedicated_selection: Option<mimir::selection::ModelSelection>,
     system_prompt: String,
     session_id: Arc<Mutex<String>>,
-    workspace: PathBuf,
 ) {
     let native_selection = selection.clone();
     let native_system_prompt = system_prompt.clone();
     let native_session_id = session_id.clone();
-    let native_workspace = workspace.clone();
     harness.set_provider_compaction_factory(Arc::new(move || {
         let selection = native_selection
             .lock()
@@ -965,12 +960,7 @@ fn install_compaction_summarizer_factory(
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone();
-        build_provider(
-            &selection,
-            &native_system_prompt,
-            &session_id,
-            &native_workspace,
-        )
+        build_provider(&selection, &native_system_prompt, &session_id)
     }));
     harness.set_compaction_summarizer_factory(Arc::new(move || {
         let selection = dedicated_selection.clone().unwrap_or_else(|| {
@@ -983,12 +973,7 @@ fn install_compaction_summarizer_factory(
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone();
-        build_provider(
-            &selection,
-            wayland::SUMMARY_SYSTEM_PROMPT,
-            &session_id,
-            &workspace,
-        )
+        build_provider(&selection, wayland::SUMMARY_SYSTEM_PROMPT, &session_id)
     }));
 }
 
@@ -1063,7 +1048,7 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
     let session_id = meta.id.clone();
     let background_selection = Arc::new(Mutex::new(selection.clone()));
     let background_session_id = Arc::new(Mutex::new(session_id.clone()));
-    let provider = build_provider(&selection, &system_prompt, &session_id, &cwd)?;
+    let provider = build_provider(&selection, &system_prompt, &session_id)?;
     let agent = Agent::resumed(provider, tools, stored.messages)
         .with_max_tool_roundtrips(settings.max_tool_roundtrips())
         .with_project_policy(project_policy(&cwd), project_policy_sink(&cwd))
@@ -1113,7 +1098,6 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
             .transpose()?,
         system_prompt.clone(),
         background_session_id.clone(),
-        cwd.clone(),
     );
     harness.set_tool_result_compaction(selection.tool_result_compaction.clone());
     let _ = harness.set_task_workflow_enabled(settings.tasks());
@@ -1132,9 +1116,8 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
     harness.set_approval_mode(permission_defaults.approval_mode);
     let session_cell = Rc::new(RefCell::new(session_id.clone()));
     let build_cell = session_cell.clone();
-    let provider_workspace = cwd.clone();
     let build = move |selection: &mimir::selection::ModelSelection, prompt: &str| {
-        build_provider(selection, prompt, &build_cell.borrow(), &provider_workspace)
+        build_provider(selection, prompt, &build_cell.borrow())
     };
     let mut switch_state = cli::ModelSwitch::new(
         selection,
@@ -1218,37 +1201,29 @@ fn log_resumable_sessions(cwd: &Path) {
 /// Precedence and the unsupported-provider error now live in `mimir::selection`
 /// (`ModelSelection::resolve`), so this only maps the resolved [`ProviderId`] to
 /// its concrete adapter. Reused at startup and on every `/model` `/reasoning`
-/// switch (rebuilds with the new selection + the same system prompt). Codex
-/// WebSocket sessions route matching workspace/system prefixes together; SSE
-/// fallback and OpenAI-compatible HTTP retain session-scoped keys.
+/// switch (rebuilds with the new selection + the same system prompt).
 fn build_provider(
     selection: &mimir::selection::ModelSelection,
     system_prompt: &str,
     session_id: &str,
-    workspace: &Path,
 ) -> Result<Box<dyn ChatProvider>> {
     use mimir::selection::ProviderId;
     let model = selection.model.as_str();
     let base_url = selection.base_url.as_str();
     let reasoning = selection.reasoning;
     let provider: Box<dyn ChatProvider> = match selection.provider {
-        ProviderId::OpenAiCodex => {
-            let prompt_cache_key =
-                mimir::providers::openai_prompt_cache_key(workspace, system_prompt);
-            Box::new(
-                mimir::providers::openai_codex_responses::OpenAiCodexResponsesProvider::new_with_session_cache_key(
-                    model,
-                    base_url,
-                    reasoning,
-                    system_prompt,
-                    &prompt_cache_key,
-                    session_id,
-                    selection.cache_retention,
-                    selection.retry_policy,
-                    selection.codex_transport,
-                )?,
-            )
-        }
+        ProviderId::OpenAiCodex => Box::new(
+            mimir::providers::openai_codex_responses::OpenAiCodexResponsesProvider::new(
+                model,
+                base_url,
+                reasoning,
+                system_prompt,
+                session_id,
+                selection.cache_retention,
+                selection.retry_policy,
+                selection.codex_transport,
+            )?,
+        ),
         ProviderId::OpenAi => {
             let auth = mimir::auth::storage::AuthStore::from_env()?;
             let api_key = mimir::auth::api_key::api_key_for_provider(ProviderId::OpenAi, &auth)?;

@@ -19,10 +19,7 @@ mod prompt_cache_live_tests;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
 use std::sync::Mutex;
-
-use sha2::{Digest, Sha256};
 
 use crate::nexus::{Message, ProviderErrorKind, ProviderFailure, Tools};
 
@@ -68,31 +65,6 @@ fn clamp_openai_prompt_cache_key(key: &str) -> Option<String> {
             .take(OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH)
             .collect(),
     )
-}
-
-/// Builds the shared routing key used by Codex WebSocket sessions.
-///
-/// The workspace path is an explicit privacy/routing boundary. The system-prompt
-/// digest keeps incompatible project instructions out of the same bucket, while
-/// provider credentials supply the independent account boundary. Exact-prefix
-/// matching shares only byte-identical request heads; connection-local WebSocket
-/// continuation keeps each session's deeper history independent.
-pub(crate) fn openai_prompt_cache_key(workspace: &Path, system_prompt: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let mut hasher = Sha256::new();
-    hasher.update(b"iris-prompt-cache-v1\0");
-    hasher.update(workspace.as_os_str().as_encoded_bytes());
-    hasher.update(b"\0");
-    hasher.update(system_prompt.as_bytes());
-    let digest = hasher.finalize();
-    let mut key = String::with_capacity(OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH);
-    key.push_str("iris:v1:");
-    for byte in digest.iter().take(28) {
-        key.push(HEX[(byte >> 4) as usize] as char);
-        key.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    key
 }
 
 /// Stable-prefix fingerprint of a provider request: the request parts that
@@ -267,23 +239,6 @@ mod tests {
             hash_message(&Message::user("x")),
             hash_message(&Message::assistant("x"))
         );
-    }
-
-    #[test]
-    fn openai_cache_key_is_stable_across_sessions_for_the_same_prompt() {
-        let workspace = Path::new("/work/project-a");
-        let first = openai_prompt_cache_key(workspace, "stable prompt");
-        let second = openai_prompt_cache_key(workspace, "stable prompt");
-        let changed_prompt = openai_prompt_cache_key(workspace, "changed prompt");
-        let changed_workspace =
-            openai_prompt_cache_key(Path::new("/work/project-b"), "stable prompt");
-
-        assert_eq!(first, second);
-        assert_ne!(first, changed_prompt);
-        assert_ne!(first, changed_workspace);
-        assert!(first.starts_with("iris:v1:"));
-        assert!(first.len() <= OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH);
-        assert!(!first.contains("stable prompt"));
     }
 
     #[test]
