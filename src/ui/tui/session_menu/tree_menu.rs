@@ -852,6 +852,30 @@ mod tests {
     }
 
     #[test]
+    fn at_filter_finds_nested_files_outside_a_git_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "iris-tree-filter-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src/ui")).unwrap();
+        std::fs::write(root.join("src/ui/screen.rs"), "fn main() {}\n").unwrap();
+
+        let mut tree = TreeMenu::new(root.clone(), true);
+        for character in "screen".chars() {
+            tree.handle_key(MenuKey::Char(character), false);
+        }
+
+        let text = lines_text(&tree.render_lines(60, 16, false, None, &[]));
+        assert!(text.contains("screen.rs"), "{text}");
+        assert!(text.contains("src/ui/"), "{text}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn attribution_markers_render_from_the_status_partition() {
         let mut t = tree(FILES);
         // Expand src/ and src/ui/ so the marked files are visible.
