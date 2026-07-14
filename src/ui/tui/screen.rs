@@ -3476,6 +3476,14 @@ pub(super) fn render_editor_chrome(
     (&screen.editor).render(text_area, &mut buf);
     if screen.composer_focused() {
         cursor_cell = find_reversed_cell(&buf, text_area);
+        if screen.editor_is_empty()
+            && let Some((cursor_x, cursor_y)) = cursor_cell
+        {
+            let cursor_style = buf[(cursor_x, cursor_y)].style();
+            buf[(cursor_x, cursor_y)].reset();
+            buf[(box_area.x, cursor_y)].set_style(cursor_style);
+            cursor_cell = Some((box_area.x, cursor_y));
+        }
     }
     // The composer's chrome rows: the full-width hairline top edge above the
     // input, then — below the input — the lighter internal rule and the bottom
@@ -5726,6 +5734,7 @@ mod tests {
     #[test]
     fn empty_composer_caret_aligns_with_left_edge() {
         use crate::ui::terminal_surface::CURSOR_MARKER;
+        use ratatui::style::Modifier;
 
         let lines = super::render_editor_chrome(&mut Screen::new(), 80, 13);
         let left_edge = lines
@@ -5748,7 +5757,22 @@ mod tests {
             })
             .expect("focused composer caret marker");
 
+        let mut reversed_columns = Vec::new();
+        for line in &lines {
+            let mut column = 0;
+            for span in &line.spans {
+                if span.content.as_ref() == CURSOR_MARKER {
+                    continue;
+                }
+                if span.style.add_modifier.contains(Modifier::REVERSED) {
+                    reversed_columns.push(column);
+                }
+                column += display_width(span.content.as_ref());
+            }
+        }
+
         assert_eq!(caret_column, left_edge);
+        assert_eq!(reversed_columns, vec![left_edge]);
     }
 
     #[test]
