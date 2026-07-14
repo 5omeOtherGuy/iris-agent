@@ -543,8 +543,28 @@ fn websocket_special_recovery_uses_typed_provider_fields_not_message_text() {
         "error",
         "message mentions previous_response_not_found and 401".to_string(),
     );
+    assert_eq!(classify_ws_error(&misleading, false), WsFallback::Fatal);
+
+    let bad_request = ws_provider_error(
+        &json!({
+            "type": "response.failed",
+            "response": {"status": 400, "error": {"code": "invalid_request"}}
+        }),
+        "response.failed",
+        "safe diagnostics".to_string(),
+    );
+    assert_eq!(classify_ws_error(&bad_request, false), WsFallback::Fatal);
+
+    let rate_limited = ws_provider_error(
+        &json!({
+            "type": "response.failed",
+            "response": {"status": 429, "error": {"code": "rate_limited"}}
+        }),
+        "response.failed",
+        "safe diagnostics".to_string(),
+    );
     assert_eq!(
-        classify_ws_error(&misleading, false),
+        classify_ws_error(&rate_limited, false),
         WsFallback::RetryWebSocket
     );
 
@@ -560,6 +580,49 @@ fn websocket_special_recovery_uses_typed_provider_fields_not_message_text() {
         classify_ws_error(&unauthorized, false),
         WsFallback::ForceRefresh
     );
+
+    for (status, expected) in [
+        (400, WsFallback::Fatal),
+        (429, WsFallback::RetryWebSocket),
+        (503, WsFallback::RetryWebSocket),
+    ] {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(status)
+            .body(None)
+            .unwrap();
+        let error: anyhow::Error =
+            tokio_tungstenite::tungstenite::Error::Http(Box::new(response)).into();
+        assert_eq!(classify_ws_error(&error, false), expected);
+    }
+}
+
+#[test]
+fn websocket_reconnect_forces_full_context_on_the_new_connection() {
+    let mut recovery = WsRecoveryState::default();
+
+    let decision = recovery.on_failure(WsFallback::RetryWebSocket, 3);
+    assert_eq!(
+        decision,
+        WsRecoveryDecision::Retry {
+            reconnect_count: 1,
+            force_full: true,
+            force_refresh: false,
+        }
+    );
+
+    let full = json!({"model": "gpt-test", "input": [{"type": "message"}]});
+    let continuation = CodexContinuation {
+        last_full_body: full.clone(),
+        last_response_id: "response_from_dropped_socket".to_string(),
+        last_response_items: Vec::new(),
+    };
+    let force_full = match decision {
+        WsRecoveryDecision::Retry { force_full, .. } => force_full,
+        _ => unreachable!(),
+    };
+    let frame = build_ws_create_frame(&full, Some(&continuation), force_full);
+    assert!(frame.get("previous_response_id").is_none());
+    assert_eq!(frame["input"], full["input"]);
 }
 
 #[test]

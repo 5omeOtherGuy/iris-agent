@@ -89,9 +89,9 @@ impl WsRecoveryState {
         }
 
         self.reconnect_count = self.reconnect_count.saturating_add(1);
-        if policy == WsFallback::RetryFullWebSocket {
-            self.force_full = true;
-        }
+        // `previous_response_id` is scoped to the WebSocket connection. Every
+        // reconnect opens a new connection and must send full context.
+        self.force_full = true;
         let force_refresh = policy == WsFallback::ForceRefresh;
         self.tried_reauth |= force_refresh;
         WsRecoveryDecision::Retry {
@@ -909,13 +909,10 @@ impl OpenAiCodexResponsesProvider {
                     match recovery.on_failure(policy, self.retry_policy.max_retries) {
                         WsRecoveryDecision::Retry {
                             reconnect_count,
-                            force_full,
+                            force_full: _,
                             force_refresh: refresh,
                         } => {
                             self.drop_ws_socket().await;
-                            if force_full {
-                                self.clear_continuation().await;
-                            }
                             force_refresh = refresh;
                             let delay = self.retry_policy.backoff_delay(reconnect_count, None);
                             sink.on_reconnect(ProviderReconnect {
@@ -1024,11 +1021,15 @@ impl OpenAiCodexResponsesProvider {
         attempt: (bool, u32),
     ) -> std::result::Result<AssistantTurn, (WsFallback, anyhow::Error)> {
         let (force_full, _ws_attempt) = attempt;
+        // Continuation ids live only on the socket that produced them. Resolve
+        // socket reuse before building the frame so a new connection cannot
+        // inherit a stale `previous_response_id`.
+        let reusable = self.take_ws_socket().await;
         let frame = {
             let state = self.ws_state.lock().await;
             build_ws_create_frame(full_request, state.continuation.as_ref(), force_full)
         };
-        let mut reusable = match self.take_ws_socket().await {
+        let mut reusable = match reusable {
             Some(socket) => socket,
             None => {
                 sink.set_transport_phase("websocket", "connection_handshake");
@@ -1220,11 +1221,19 @@ impl OpenAiCodexResponsesProvider {
 
     async fn take_ws_socket(&self) -> Option<ReusableCodexWs> {
         let mut state = self.ws_state.lock().await;
-        let reusable = state.socket.take()?;
+        let Some(reusable) = state.socket.take() else {
+            state.continuation = None;
+            return None;
+        };
         let now = Instant::now();
-        (now.duration_since(reusable.opened_at) < WS_MAX_AGE
-            && now.duration_since(reusable.last_used) < WS_IDLE_TTL)
-            .then_some(reusable)
+        if now.duration_since(reusable.opened_at) < WS_MAX_AGE
+            && now.duration_since(reusable.last_used) < WS_IDLE_TTL
+        {
+            Some(reusable)
+        } else {
+            state.continuation = None;
+            None
+        }
     }
 
     async fn put_ws_socket(&self, reusable: ReusableCodexWs) {
@@ -1232,7 +1241,9 @@ impl OpenAiCodexResponsesProvider {
     }
 
     async fn drop_ws_socket(&self) {
-        self.ws_state.lock().await.socket = None;
+        let mut state = self.ws_state.lock().await;
+        state.socket = None;
+        state.continuation = None;
     }
 
     async fn clear_continuation(&self) {
@@ -2064,7 +2075,8 @@ enum WsProviderErrorKind {
     PreviousResponseNotFound,
     ConnectionLimit,
     Unauthorized,
-    Other,
+    Transient,
+    Fatal,
 }
 
 #[derive(Debug)]
@@ -2276,12 +2288,16 @@ fn ws_provider_error(value: &Value, event: &'static str, diagnostics: String) ->
         status
             .as_u64()
             .or_else(|| status.as_str().and_then(|value| value.parse().ok()))
+            .and_then(|status| u16::try_from(status).ok())
     });
     let kind = match code {
         Some("previous_response_not_found") => WsProviderErrorKind::PreviousResponseNotFound,
         Some("websocket_connection_limit_reached") => WsProviderErrorKind::ConnectionLimit,
-        _ if matches!(status, Some(401 | 403)) => WsProviderErrorKind::Unauthorized,
-        _ => WsProviderErrorKind::Other,
+        _ => match status.map(classify_http_status_retryable) {
+            Some(HttpClass::Reauth) => WsProviderErrorKind::Unauthorized,
+            Some(HttpClass::Retry) => WsProviderErrorKind::Transient,
+            Some(HttpClass::Fatal) | None => WsProviderErrorKind::Fatal,
+        },
     };
     let label = match event {
         "response.failed" => "response failed",
@@ -2334,11 +2350,14 @@ fn classify_ws_error(error: &anyhow::Error, emitted_visible_output: bool) -> WsF
     if emitted_visible_output {
         return WsFallback::Fatal;
     }
-    if let Some(error) = error.downcast_ref::<tokio_tungstenite::tungstenite::Error>()
-        && let tokio_tungstenite::tungstenite::Error::Http(response) = error
-        && matches!(response.status().as_u16(), 401 | 403)
+    if let Some(tokio_tungstenite::tungstenite::Error::Http(response)) =
+        error.downcast_ref::<tokio_tungstenite::tungstenite::Error>()
     {
-        return WsFallback::ForceRefresh;
+        return match classify_http_status_retryable(response.status().as_u16()) {
+            HttpClass::Reauth => WsFallback::ForceRefresh,
+            HttpClass::Retry => WsFallback::RetryWebSocket,
+            HttpClass::Fatal => WsFallback::Fatal,
+        };
     }
     match error
         .downcast_ref::<WsProviderError>()
@@ -2347,7 +2366,9 @@ fn classify_ws_error(error: &anyhow::Error, emitted_visible_output: bool) -> WsF
         Some(WsProviderErrorKind::PreviousResponseNotFound) => WsFallback::RetryFullWebSocket,
         Some(WsProviderErrorKind::ConnectionLimit) => WsFallback::RetryWebSocket,
         Some(WsProviderErrorKind::Unauthorized) => WsFallback::ForceRefresh,
-        Some(WsProviderErrorKind::Other) | None => WsFallback::RetryWebSocket,
+        Some(WsProviderErrorKind::Transient) => WsFallback::RetryWebSocket,
+        Some(WsProviderErrorKind::Fatal) => WsFallback::Fatal,
+        None => WsFallback::RetryWebSocket,
     }
 }
 

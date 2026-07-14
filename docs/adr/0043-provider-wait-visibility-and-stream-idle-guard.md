@@ -63,7 +63,7 @@ killed mid-backoff.
 explicit exception to the shared 90-second translated-event guard. Codex owns a
 global-only `codexStreamIdleTimeoutMs` raw-read policy (300 seconds by default;
 `0` disables it) for both WebSocket frames and HTTPS/SSE reads. Before visible
-output, WebSocket idleness and transport failures consume the shared retry
+output, WebSocket idleness and retryable transport failures consume the shared retry
 budget with cancellation-aware backoff; exhaustion switches the session once
 to HTTPS/SSE and records allow-listed fallback metadata. Once text, reasoning,
 or tool-input output is visible, transport failure remains fatal to prevent

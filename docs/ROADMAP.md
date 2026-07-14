@@ -82,7 +82,7 @@ Implemented today:
   retry/backoff, and structured tool result/error messages.
 - OpenAI Codex transport recovery: a global-only raw-read timeout defaults to
   300 seconds for WebSocket and HTTPS/SSE (`0` disables it). Before visible
-  output, WebSocket failures consume the shared retry budget; exhaustion makes
+  output, retryable WebSocket failures consume the shared retry budget; exhaustion makes
   one sticky session switch to HTTPS/SSE, emits safe reconnect/fallback notices,
   and persists only allow-listed fallback metadata. The repo skill
   `$provider-stream-diagnostics` reads that marker without exposing transcript
