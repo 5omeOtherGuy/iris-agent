@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Single pre-PR gate: run the required Rust checks (fmt, clippy, test) with one
-# combined, quiet-on-success output instead of three verbose command blocks.
-# This is the local mirror of .github/workflows/ci.yml so you validate before
-# pushing and rarely need to read CI logs.
+# Single pre-PR gate. Documentation-only changes run whitespace validation;
+# all other changes run the required Rust and maintenance-script checks. This
+# mirrors .github/workflows/ci.yml so you validate before pushing and rarely
+# need to read CI logs.
 #
 # On success: one summary line. On the first failure: that step's captured
 # output is printed and the gate stops with the step's exit code.
@@ -53,10 +53,20 @@ run_step() {
   return "$code"
 }
 
+# Fast docs-only path; an empty or mixed change set stays on the full gate.
+if [ "$(bash scripts/change-scope.sh "${IRIS_GATE_BASE:-origin/main}" HEAD)" = true ]; then
+  run_step "docs whitespace (branch)" git diff --check "${IRIS_GATE_BASE:-origin/main}...HEAD" || exit $?
+  run_step "docs whitespace (staged)" git diff --cached --check                           || exit $?
+  run_step "docs whitespace (working tree)" git diff --check                             || exit $?
+  printf 'gate: PASS — documentation-only; whitespace OK (Rust checks skipped)\n'
+  exit 0
+fi
+
 run_step "fmt (cargo fmt --all --check)"           cargo fmt --all --check                  || exit $?
 run_step "clippy (cargo clippy -D warnings)"       cargo clippy --all-targets -- -D warnings || exit $?
 run_step "test (cargo test --locked)"              cargo test --locked                      || exit $?
-run_step "script tests"                            bash scripts/sync-primary-tests.sh        || exit $?
+run_step "script tests (change scope)"             bash scripts/change-scope-tests.sh       || exit $?
+run_step "script tests (sync primary)"             bash scripts/sync-primary-tests.sh        || exit $?
 
 printf 'gate: PASS — fmt OK, clippy OK, test OK, scripts OK\n'
 exit 0

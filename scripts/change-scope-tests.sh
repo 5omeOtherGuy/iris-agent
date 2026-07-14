@@ -40,6 +40,30 @@ printf '\nMore docs.\n' >>"$TMP/repo/README.md"
 [ "$(cd "$TMP/repo" && bash "$CLASSIFIER" base HEAD)" = true ]
 printf '// code\n' >>"$TMP/repo/main.rs"
 [ "$(cd "$TMP/repo" && bash "$CLASSIFIER" base HEAD)" = false ]
+git -C "$TMP/repo" reset --hard --quiet base
+rm "$TMP/repo/README.md"
+[ "$(cd "$TMP/repo" && bash "$CLASSIFIER" base HEAD)" = true ]
+git -C "$TMP/repo" reset --hard --quiet base
+git -C "$TMP/repo" mv main.rs docs/main.md
+[ "$(cd "$TMP/repo" && bash "$CLASSIFIER" base HEAD)" = false ]
+[ "$(cd "$TMP/repo" && bash "$CLASSIFIER" missing-ref HEAD)" = false ]
+[ "$(cd "$TMP/repo" && bash "$CLASSIFIER" 0000000000000000000000000000000000000000 HEAD)" = false ]
+
+GATE_REPO="$TMP/gate-repo"
+git init --quiet -b main "$GATE_REPO"
+git -C "$GATE_REPO" config user.email test@example.invalid
+git -C "$GATE_REPO" config user.name test
+mkdir -p "$GATE_REPO/scripts"
+cp "$ROOT/scripts/gate.sh" "$CLASSIFIER" "$GATE_REPO/scripts/"
+printf '# docs\n' >"$GATE_REPO/README.md"
+git -C "$GATE_REPO" add .
+git -C "$GATE_REPO" commit --quiet -m initial
+git -C "$GATE_REPO" branch base
+printf '\nMore docs.\n' >>"$GATE_REPO/README.md"
+git -C "$GATE_REPO" add README.md
+git -C "$GATE_REPO" commit --quiet -m docs
+(cd "$GATE_REPO" && IRIS_GATE_BASE=base bash scripts/gate.sh) \
+  | grep -q 'documentation-only; whitespace OK (Rust checks skipped)'
 
 WORKFLOW="$ROOT/.github/workflows/ci.yml"
 GATE="$ROOT/scripts/gate.sh"
