@@ -69,6 +69,7 @@ WORKFLOW="$ROOT/.github/workflows/ci.yml"
 GATE="$ROOT/scripts/gate.sh"
 grep -q 'scripts/change-scope.sh' "$WORKFLOW"
 grep -q "needs.scope.outputs.docs-only != 'true'" "$WORKFLOW"
+grep -q "needs.scope.result != 'success'" "$WORKFLOW"
 grep -q 'scripts/change-scope.sh' "$GATE"
 grep -q 'docs-only' "$GATE"
 
