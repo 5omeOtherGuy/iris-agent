@@ -33,7 +33,7 @@ The explicit Codex WebSocket probe confirmed that both sessions remained on WebS
 ### Share a key on SSE or every turn
 
 - Requires less adapter state.
-- Rejected because divergent full histories would contend in one routing bucket, retries would keep using shared identity, and OpenAI recommends limiting traffic per cache key.
+- Rejected because divergent full histories would contend in one routing bucket, retries would keep using shared identity, and [OpenAI's prompt-caching guidance](https://developers.openai.com/api/docs/guides/prompt-caching) recommends keeping traffic below about 15 requests per minute per cache key.
 
 ## Consequences
 
