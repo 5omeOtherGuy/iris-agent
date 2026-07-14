@@ -377,6 +377,37 @@ fn websocket_read_idle_after_visible_output_is_fatal() {
 }
 
 #[test]
+fn websocket_close_diagnostics_keep_code_and_only_safe_reason() {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let safe = websocket_close_error(
+        Some(CloseFrame {
+            code: CloseCode::Away,
+            reason: "server_restart".into(),
+        }),
+        Some("response.created".to_string()),
+    )
+    .to_string();
+    assert!(safe.contains("close_code=1001"), "{safe}");
+    assert!(safe.contains("close_reason=server_restart"), "{safe}");
+    assert!(safe.contains("last_event=response.created"), "{safe}");
+
+    let hostile = websocket_close_error(
+        Some(CloseFrame {
+            code: CloseCode::Error,
+            reason: "leak /home/alice sk-secret prompt".into(),
+        }),
+        None,
+    )
+    .to_string();
+    assert!(hostile.contains("close_code=1011"), "{hostile}");
+    assert!(!hostile.contains("/home/alice"), "{hostile}");
+    assert!(!hostile.contains("sk-secret"), "{hostile}");
+    assert!(!hostile.contains("prompt"), "{hostile}");
+}
+
+#[test]
 fn websocket_create_frame_omits_stream_and_keeps_store_false() {
     let full = json!({
         "model": "gpt-test",
