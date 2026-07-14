@@ -1,6 +1,7 @@
 # ADR-0054: Use a model-aware auto-compaction trigger ladder
 
 **Date**: 2026-07-10
+**Updated**: 2026-07-14
 **Status**: accepted
 **Deciders**: Iris maintainers
 
@@ -17,19 +18,31 @@ provider ids inward.
 
 ## Decision
 
-Mimir resolves a numeric context window and maximum-output reserve for the active
-selection. Wayland subtracts that reserve and an 8,192-token summary reserve,
-then evaluates a three-rung ladder over the effective window:
+Mimir resolves one provider-neutral policy for the active selection: raw model
+capacity, displayed capacity, model output limit, Iris output reserve, summary
+headroom, and hard application threshold. Iris reserves
+`min(model output limit, 20,000)` tokens. Provider profiles are:
 
-- `warn`: 0.60;
-- `start`: 0.72;
-- `hard`: 0.90.
+- OpenAI Codex: display 95% of raw capacity and apply at 90% of raw capacity;
+  summary headroom is the space between that hard threshold and the
+  output-reserved ceiling;
+- Anthropic: display raw capacity and apply at raw capacity minus the Iris output
+  reserve and Claude Code's 13,000-token compaction headroom;
+- providers without an authoritative CLI profile: display catalog capacity and
+  preserve Iris's 8,192-token summary-headroom fallback. Diagnostics label this
+  as fallback policy rather than official behavior.
 
-Each threshold is `max(fraction * window, window - buffer)`. Buffers are six,
-four, and two summary reserves for `warn`, `start`, and `hard`. These multipliers
-make the spec's scaled-buffer rule concrete and keep two summary reserves at the
-hard boundary. Windows below four summary reserves use deterministic excerpts
-only. The retained tail is `min(keepRecentTokens, window / 4)`.
+Wayland evaluates pressure against that policy:
+
+- `warn`: 0.60 of displayed capacity;
+- `start`: 0.72 of displayed capacity;
+- `hard`: the provider profile's hard threshold.
+
+This removes the former `max(fraction * window, window - buffer)` rule, which
+could postpone preparation until close to hard pressure. An explicit hard
+fraction overrides the profile threshold. Windows below four summary reserves
+use deterministic excerpts only. The retained tail is
+`min(keepRecentTokens, displayed capacity / 4)`.
 
 Context measurement uses the last provider-reported total plus local estimates
 for messages appended after that response. A context rewrite invalidates the
@@ -39,17 +52,21 @@ a provider reports usage.
 At pre-turn, post-turn, and continuing between-round-trip boundaries:
 
 - `warn` emits `ContextPressure` without mutation;
-- `start` starts one background job, or applies deterministic excerpts when
-  model-backed work is unavailable;
-- `hard` waits at most `hardWaitMs` for the active job, then cancels it and runs
-  the deterministic ladder;
+- `start` starts at most one background job, or applies deterministic excerpts
+  when model-backed work is unavailable;
+- a completed background summary remains attached to its frozen snapshot and
+  does not apply before `hard` or an explicit manual compaction;
+- `hard` consumes a ready result, otherwise waits at most `hardWaitMs`, then
+  cancels the worker and runs the fallback ladder;
 - `maxConsecutiveFailures` opens a model-backed breaker while deterministic
   compaction remains available.
 
-An explicit `contextTokenBudget` clamps the model-derived effective window. If
-the model window is unknown, it is the effective window. If both are absent,
-the legacy 128,000-token fallback remains. Values below the summary reserve are
-invalid; `compaction.enabled=false` is the off switch.
+An explicit `contextTokenBudget` is an upper-bound clamp over displayed and hard
+capacity. If model metadata is unknown, it is the policy capacity. If both are
+absent, the legacy 128,000-token fallback remains. Persisted values, including
+the former 235,808-token generated default, remain explicit clamps rather than
+being rewritten. Values below the summary reserve are invalid;
+`compaction.enabled=false` is the off switch.
 
 The parent remains the only context mutation point. Automatic compaction errors
 emit a notice and never fail the user's turn.
@@ -82,9 +99,11 @@ committed evidence and regeneration commands are in
 
 ## Consequences
 
-- Unconfigured sessions use the selected model's effective window.
-- `/context` labels measurement provenance, ladder thresholds, and job state.
-- Model switches recompute the window before the next request.
+- Unconfigured sessions use the selected provider/model policy.
+- `/context` distinguishes raw capacity, displayed capacity, reserves,
+  preparation, hard application, clamp provenance, and fallback authority.
+- Model switches recompute the policy before the next request.
 - Tiny-window sessions trade summary quality for deterministic progress.
 - ADR-0055 supplies the provider-neutral mid-turn governor seam. Outside the
-  hard tier, worker start and ready-result drain do not wait for model traffic.
+  hard tier, worker start and readiness polling do not wait for model traffic or
+  mutate context.

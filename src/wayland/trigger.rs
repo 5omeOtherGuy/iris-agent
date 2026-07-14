@@ -23,7 +23,7 @@ impl Default for TriggerThresholds {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TriggerLadder {
-    pub(crate) effective_window: u64,
+    pub(crate) displayed_context_window: u64,
     pub(crate) warn: u64,
     pub(crate) start: u64,
     pub(crate) hard: u64,
@@ -33,24 +33,37 @@ pub(crate) struct TriggerLadder {
 
 impl TriggerLadder {
     pub(crate) fn resolve(
-        effective_window: u64,
+        displayed_context_window: u64,
         thresholds: TriggerThresholds,
         summary_reserve: u64,
         keep_recent_tokens: u64,
     ) -> Self {
-        let threshold = |fraction: f64, buffer_multiples: u64| {
-            let fractional = ((effective_window as f64) * fraction).floor() as u64;
-            let buffered =
-                effective_window.saturating_sub(summary_reserve.saturating_mul(buffer_multiples));
-            fractional.max(buffered)
-        };
+        let threshold =
+            |fraction: f64| ((displayed_context_window as f64) * fraction).floor() as u64;
         Self {
-            effective_window,
-            warn: threshold(thresholds.warn, 6),
-            start: threshold(thresholds.start, 4),
-            hard: threshold(thresholds.hard, 2),
-            keep_recent_tokens: keep_recent_tokens.min(effective_window / 4),
-            deterministic_only: effective_window < summary_reserve.saturating_mul(4),
+            displayed_context_window,
+            warn: threshold(thresholds.warn),
+            start: threshold(thresholds.start),
+            hard: threshold(thresholds.hard),
+            keep_recent_tokens: keep_recent_tokens.min(displayed_context_window / 4),
+            deterministic_only: displayed_context_window < summary_reserve.saturating_mul(4),
+        }
+    }
+
+    pub(crate) fn from_policy(
+        policy: crate::metrics::ResolvedContextBudget,
+        keep_recent_tokens: u64,
+    ) -> Self {
+        let summary_reserve = policy
+            .window
+            .map_or(DEFAULT_SUMMARY_RESERVE, |window| window.summary_reserve);
+        Self {
+            displayed_context_window: policy.displayed_context_window,
+            warn: policy.warning_threshold,
+            start: policy.preparation_threshold,
+            hard: policy.hard_compaction_threshold,
+            keep_recent_tokens: keep_recent_tokens.min(policy.displayed_context_window / 4),
+            deterministic_only: policy.displayed_context_window < summary_reserve.saturating_mul(4),
         }
     }
 

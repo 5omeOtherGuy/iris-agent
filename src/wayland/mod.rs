@@ -261,10 +261,10 @@ pub(crate) struct ContextDiagnostics {
     pub(crate) measured: u64,
     pub(crate) source: ContextMeasurementSource,
     pub(crate) ladder: TriggerLadder,
-    /// Provenance of the ladder's effective window (raw catalog window,
-    /// reserves, legacy clamp), when the Tier-3 app resolved it. `None` for
-    /// bare-number installs; display falls back to the enforced number alone.
-    pub(crate) budget_facts: Option<crate::metrics::ResolvedContextBudget>,
+    /// Resolved model/provider context policy, including display capacity,
+    /// preparation and hard thresholds, and legacy-clamp provenance. `None`
+    /// for bare-number installs used by tests and benches.
+    pub(crate) policy: Option<crate::metrics::ResolvedContextBudget>,
     pub(crate) automatic_enabled: bool,
     pub(crate) background_running: bool,
     pub(crate) background_job: Option<BackgroundJobDiagnostics>,
@@ -537,25 +537,15 @@ impl<P: ChatProvider> Harness<P> {
         budget: crate::metrics::ResolvedContextBudget,
         config: CompactionTriggerConfig,
     ) {
-        // One install point for the governing denominator: the enforced
-        // number and its provenance (catalog window, reserves, legacy clamp)
-        // arrive together, so diagnostics can never disclose facts that
-        // disagree with what the trigger actually enforces.
-        let effective_window = budget.resolved;
-        self.compaction.budget = Some(effective_window);
-        self.compaction.budget_facts = Some(budget);
+        let budget = budget.with_thresholds(config.warn, config.start, config.hard);
+        self.compaction.budget = Some(budget.hard_compaction_threshold);
+        self.compaction.policy = Some(budget);
         self.compaction.automatic_enabled = config.enabled;
         self.compaction.trigger_v2 = true;
         self.compaction.pressure = PressureTracker::default();
         self.compaction.tiny_notice_emitted = false;
-        self.compaction.ladder = Some(TriggerLadder::resolve(
-            effective_window,
-            TriggerThresholds {
-                warn: config.warn,
-                start: config.start,
-                hard: config.hard,
-            },
-            DEFAULT_SUMMARY_RESERVE,
+        self.compaction.ladder = Some(TriggerLadder::from_policy(
+            budget,
             config.keep_recent_tokens,
         ));
         self.compaction.hard_wait = std::time::Duration::from_millis(config.hard_wait_ms);
@@ -1153,7 +1143,7 @@ impl<P: ChatProvider> Harness<P> {
             measured: measured.tokens,
             source: measured.source,
             ladder,
-            budget_facts: self.compaction.budget_facts,
+            policy: self.compaction.policy,
             automatic_enabled: self.compaction.automatic_enabled,
             background_running: self.compaction.background.is_some(),
             background_job: self.compaction.background.as_ref().map(|job| {
@@ -1857,7 +1847,7 @@ impl<P: ChatProvider> Harness<P> {
                 .maybe_auto_compact_legacy(obs, _token, _post_turn)
                 .await;
         }
-        self.drain_background_compaction(obs)?;
+        self.compaction.poll_background_ready(obs)?;
         let Some(ladder) = self.compaction.ladder else {
             return Ok(());
         };
@@ -1880,7 +1870,7 @@ impl<P: ChatProvider> Harness<P> {
                 AgentEvent::ContextPressure {
                     tier,
                     measured: measurement.tokens,
-                    effective_window: ladder.effective_window,
+                    effective_window: ladder.displayed_context_window,
                     source: measurement.source,
                 },
                 "context pressure",
@@ -1892,7 +1882,7 @@ impl<P: ChatProvider> Harness<P> {
                 obs,
                 AgentEvent::Notice(format!(
                     "context window {} is too small for background summarization; automatic compaction will use deterministic excerpts.",
-                    ladder.effective_window
+                    ladder.displayed_context_window
                 )),
                 "small-window compaction notice",
             );
@@ -2077,7 +2067,7 @@ impl<P: ChatProvider> Harness<P> {
                 AgentEvent::ContextPressure {
                     tier,
                     measured: measurement.tokens,
-                    effective_window: ladder.effective_window,
+                    effective_window: ladder.displayed_context_window,
                     source: measurement.source,
                 },
                 "post-compaction context pressure",
@@ -2134,9 +2124,12 @@ impl<P: ChatProvider> Harness<P> {
     }
 
     fn resolve_hard_background(&mut self, obs: &dyn AgentObserver) -> Result<()> {
-        let Some(job) = self.compaction.background.take() else {
+        let Some(mut job) = self.compaction.background.take() else {
             return Ok(());
         };
+        if let Some(result) = job.result.take() {
+            return self.finish_background_compaction(job, result, obs);
+        }
         match job.receiver.recv_timeout(self.compaction.hard_wait) {
             Ok(result) => self.finish_background_compaction(job, result, obs),
             Err(RecvTimeoutError::Timeout) => {
@@ -2379,13 +2372,15 @@ impl<P: ChatProvider> Harness<P> {
         match result {
             BackgroundSummaryResult::Summary(summary) => {
                 let usage = summary.worker_usage.clone();
-                self.emit_compaction_lifecycle_with_usage(
-                    obs,
-                    &job,
-                    CompactionLifecycleState::Ready,
-                    usage.clone(),
-                    Some("background compaction summary ready".to_string()),
-                )?;
+                if !job.ready_emitted {
+                    self.emit_compaction_lifecycle_with_usage(
+                        obs,
+                        &job,
+                        CompactionLifecycleState::Ready,
+                        usage.clone(),
+                        Some("background compaction summary ready".to_string()),
+                    )?;
+                }
                 let Some(plan) = self.revalidate_background_plan(&job) else {
                     self.emit_compaction_lifecycle_with_usage(
                         obs,

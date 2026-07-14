@@ -707,6 +707,14 @@ impl Settings {
         })
     }
 
+    pub(crate) fn compaction_hard_threshold_is_explicit(&self) -> bool {
+        self.compaction
+            .as_ref()
+            .and_then(|value| value.thresholds.as_ref())
+            .and_then(|value| value.hard)
+            .is_some()
+    }
+
     /// Configured independent microcompaction watermark, or the built-in default
     /// when unset. The fold scheduler uses this as its Class C flush backstop.
     pub(crate) fn microcompaction_watermark(&self) -> u64 {

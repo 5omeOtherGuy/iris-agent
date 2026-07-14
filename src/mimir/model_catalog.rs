@@ -271,64 +271,107 @@ pub(crate) fn context_window_label(tokens: u64) -> String {
     }
 }
 
-/// Where the numeric context window came from. Kept in Mimir so Wayland never
-/// branches on provider or model ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ContextWindowSource {
-    Catalog,
-    OpenAiCompatible,
+pub(crate) enum ContextPolicyAuthority {
+    OfficialCli,
+    CatalogFallback,
+    ConfiguredEndpoint,
 }
 
-/// Provider-neutral window handed inward to the compaction trigger.
+/// Provider-neutral model facts used to resolve Iris's context policy. The
+/// displayed window and hard application threshold are deliberately separate:
+/// official CLIs do not necessarily compact at the capacity they display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EffectiveContextWindow {
     pub(crate) raw: u64,
-    pub(crate) max_output_reserve: u64,
+    pub(crate) displayed: u64,
+    pub(crate) model_max_output_tokens: u64,
+    pub(crate) output_reserve: u64,
     pub(crate) summary_reserve: u64,
-    pub(crate) effective: u64,
-    pub(crate) source: ContextWindowSource,
+    pub(crate) hard_compaction_threshold: u64,
+    pub(crate) authority: ContextPolicyAuthority,
 }
 
 /// Tier-3 owns the conversion into the provider-neutral facts the runtime
 /// carries: inner tiers depend on `metrics`, never on this catalog type.
 impl From<EffectiveContextWindow> for crate::metrics::ContextWindowFacts {
-    fn from(window: EffectiveContextWindow) -> Self {
+    fn from(policy: EffectiveContextWindow) -> Self {
         Self {
-            raw: window.raw,
-            max_output_reserve: window.max_output_reserve,
-            summary_reserve: window.summary_reserve,
-            effective: window.effective,
+            raw: policy.raw,
+            displayed: policy.displayed,
+            model_max_output_tokens: policy.model_max_output_tokens,
+            output_reserve: policy.output_reserve,
+            summary_reserve: policy.summary_reserve,
+            hard_compaction_threshold: policy.hard_compaction_threshold,
+            official_cli: policy.authority == ContextPolicyAuthority::OfficialCli,
+            configured_endpoint: policy.authority == ContextPolicyAuthority::ConfiguredEndpoint,
         }
     }
 }
 
-/// Resolve the active selection's enforced context capacity. Display labels
-/// remain generated from the same catalog facts; custom compatible endpoints
-/// use their configured numeric window and make no claim about an output cap.
+/// Resolve provider/model facts into the context policy exposed by the
+/// corresponding official CLI. For providers without an authoritative CLI,
+/// preserve Iris's catalog/default reserve behavior and mark it as fallback.
 pub(crate) fn effective_context_window(
     selection: &ModelSelection,
-    summary_reserve: u64,
+    fallback_summary_reserve: u64,
 ) -> Option<EffectiveContextWindow> {
-    let (raw, max_output_reserve, source) = if selection.provider == ProviderId::OpenAiCompatible {
-        (
-            selection.open_ai_compatible.context_window?,
-            0,
-            ContextWindowSource::OpenAiCompatible,
-        )
-    } else {
-        let qualified = format!("{}/{}", selection.provider.as_str(), selection.model);
-        let raw = catalog_context_window(&qualified)?;
-        let max_output = catalog_max_output_tokens(selection.provider, &selection.model);
-        (raw, max_output, ContextWindowSource::Catalog)
+    let (raw, model_max_output_tokens, authority) =
+        if selection.provider == ProviderId::OpenAiCompatible {
+            (
+                selection.open_ai_compatible.context_window?,
+                0,
+                ContextPolicyAuthority::ConfiguredEndpoint,
+            )
+        } else {
+            let qualified = format!("{}/{}", selection.provider.as_str(), selection.model);
+            (
+                catalog_context_window(&qualified)?,
+                catalog_max_output_tokens(selection.provider, &selection.model),
+                if matches!(
+                    selection.provider,
+                    ProviderId::OpenAiCodex | ProviderId::Anthropic
+                ) {
+                    ContextPolicyAuthority::OfficialCli
+                } else {
+                    ContextPolicyAuthority::CatalogFallback
+                },
+            )
+        };
+    let output_reserve = model_max_output_tokens.min(20_000);
+    let (displayed, summary_reserve, hard_compaction_threshold) = match selection.provider {
+        ProviderId::OpenAiCodex => {
+            let displayed = raw.saturating_mul(95) / 100;
+            let hard = raw.saturating_mul(90) / 100;
+            (
+                displayed,
+                raw.saturating_sub(output_reserve).saturating_sub(hard),
+                hard,
+            )
+        }
+        ProviderId::Anthropic => {
+            let summary = 13_000;
+            (
+                raw,
+                summary,
+                raw.saturating_sub(output_reserve).saturating_sub(summary),
+            )
+        }
+        _ => (
+            raw,
+            fallback_summary_reserve,
+            raw.saturating_sub(output_reserve)
+                .saturating_sub(fallback_summary_reserve),
+        ),
     };
     Some(EffectiveContextWindow {
         raw,
-        max_output_reserve,
+        displayed,
+        model_max_output_tokens,
+        output_reserve,
         summary_reserve,
-        effective: raw
-            .saturating_sub(max_output_reserve)
-            .saturating_sub(summary_reserve),
-        source,
+        hard_compaction_threshold,
+        authority,
     })
 }
 
@@ -476,10 +519,12 @@ mod tests {
             effective_context_window(&haiku, 8_192),
             Some(EffectiveContextWindow {
                 raw: 200_000,
-                max_output_reserve: 20_000,
+                displayed: 200_000,
+                model_max_output_tokens: 64_000,
+                output_reserve: 20_000,
                 summary_reserve: 13_000,
-                effective: 167_000,
-                source: ContextWindowSource::Catalog,
+                hard_compaction_threshold: 167_000,
+                authority: ContextPolicyAuthority::OfficialCli,
             })
         );
 
@@ -489,10 +534,12 @@ mod tests {
             effective_context_window(&codex, 8_192),
             Some(EffectiveContextWindow {
                 raw: 372_000,
-                max_output_reserve: 20_000,
+                displayed: 353_400,
+                model_max_output_tokens: 128_000,
+                output_reserve: 20_000,
                 summary_reserve: 17_200,
-                effective: 334_800,
-                source: ContextWindowSource::Catalog,
+                hard_compaction_threshold: 334_800,
+                authority: ContextPolicyAuthority::OfficialCli,
             })
         );
     }
@@ -505,10 +552,12 @@ mod tests {
             effective_context_window(&custom, 8_192),
             Some(EffectiveContextWindow {
                 raw: 131_072,
-                max_output_reserve: 0,
+                displayed: 131_072,
+                model_max_output_tokens: 0,
+                output_reserve: 0,
                 summary_reserve: 8_192,
-                effective: 122_880,
-                source: ContextWindowSource::OpenAiCompatible,
+                hard_compaction_threshold: 122_880,
+                authority: ContextPolicyAuthority::ConfiguredEndpoint,
             })
         );
 

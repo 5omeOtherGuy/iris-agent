@@ -125,6 +125,11 @@ Implemented today:
   reactive, summarizer, worker input) separately from tool-result compaction,
   with a dim resolved-ladder line, live application at the next boundary, and
   background-job cancellation when automatic compaction is turned off.
+- Context policy distinguishes provider CLI display capacity from hard
+  application: Codex displays 95% and applies at 90% of raw capacity; Anthropic
+  preserves Claude Code's output and 13,000-token compaction reserves. Iris
+  prepares at 72% of displayed capacity, retains ready work until hard pressure,
+  and labels catalog-only lanes as fallback policy.
 - Default-short provider-native prompt-cache settings and diagnostics: OpenAI
   prompt-cache keys/24h retention, Anthropic `cache_control`, provider
   usage/cache metadata, and cache-break warnings only when the stable prefix

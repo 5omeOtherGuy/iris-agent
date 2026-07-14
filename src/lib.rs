@@ -575,7 +575,7 @@ fn run_agent_inner(
     // agent. When the context token total exceeds the budget at a turn
     // boundary, the harness compacts before the provider request.
     let (context_budget, compaction_trigger) = resolved_compaction_trigger(&settings, &selection)?;
-    let budget = Some(context_budget.resolved);
+    let budget = Some(context_budget.hard_compaction_threshold);
     let native_jj = wayland::trust::native_jj(&cwd).unwrap_or(false);
     let mut harness = wayland::Harness::new_configured(
         agent,
@@ -798,7 +798,7 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     };
     announce_skip_permissions(permission_defaults.skip_permissions, session.as_mut());
     let (context_budget, compaction_trigger) = resolved_compaction_trigger(&settings, &selection)?;
-    let budget = Some(context_budget.resolved);
+    let budget = Some(context_budget.hard_compaction_threshold);
     let native_jj = wayland::trust::native_jj(&cwd).unwrap_or(false);
     let mut harness = wayland::Harness::new_configured(
         agent,
@@ -985,15 +985,18 @@ fn resolved_compaction_trigger(
     config::CompactionTriggerConfig,
 )> {
     let trigger = settings.compaction_trigger()?;
-    // One resolution for everything that divides by "the window": the trigger
-    // ladder, /context, and the session-bar meter all receive this same
-    // number, so no two surfaces can disagree on the denominator.
-    let budget = metrics::ResolvedContextBudget::resolve(
+    // Resolve one shared policy for enforcement, `/context`, diagnostics, and
+    // the session meter. Display capacity, preparation, and hard application
+    // remain distinct so each surface uses the value its label describes.
+    let mut budget = metrics::ResolvedContextBudget::resolve(
         mimir::model_catalog::effective_context_window(selection, config::DEFAULT_SUMMARY_RESERVE)
             .map(Into::into),
         settings.context_token_budget,
         settings.context_token_budget(),
     );
+    if settings.compaction_hard_threshold_is_explicit() {
+        budget = budget.with_hard_threshold_fraction(trigger.hard);
+    }
     Ok((budget, trigger))
 }
 
@@ -1044,7 +1047,7 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
     let (context_budget, compaction_trigger) = resolved_compaction_trigger(&settings, &selection)?;
-    let budget = Some(context_budget.resolved);
+    let budget = Some(context_budget.hard_compaction_threshold);
     let session_id = meta.id.clone();
     let background_selection = Arc::new(Mutex::new(selection.clone()));
     let background_session_id = Arc::new(Mutex::new(session_id.clone()));
@@ -1679,6 +1682,36 @@ mod tests {
             .unwrap()
             .unwrap()
             .path()
+    }
+
+    #[test]
+    fn codex_context_policy_uses_cli_defaults_and_preserves_explicit_legacy_clamps() {
+        let mut settings = config::Settings {
+            default_provider: Some("openai-codex".to_string()),
+            default_model: Some("gpt-5.6-sol".to_string()),
+            ..config::Settings::default()
+        };
+        let selection = mimir::selection::ModelSelection::resolve(&settings).unwrap();
+        let (policy, _) = resolved_compaction_trigger(&settings, &selection).unwrap();
+        assert_eq!(policy.displayed_context_window, 353_400);
+        assert_eq!(policy.preparation_threshold, 254_448);
+        assert_eq!(policy.hard_compaction_threshold, 334_800);
+
+        settings.compaction = Some(config::CompactionSettings {
+            thresholds: Some(config::CompactionThresholdSettings {
+                hard: Some(0.95),
+                ..config::CompactionThresholdSettings::default()
+            }),
+            ..config::CompactionSettings::default()
+        });
+        let (policy, _) = resolved_compaction_trigger(&settings, &selection).unwrap();
+        assert_eq!(policy.hard_compaction_threshold, 335_730);
+
+        settings.compaction = None;
+        settings.context_token_budget = Some(235_808);
+        let (policy, _) = resolved_compaction_trigger(&settings, &selection).unwrap();
+        assert_eq!(policy.displayed_context_window, 235_808);
+        assert_eq!(policy.hard_compaction_threshold, 235_808);
     }
 
     #[test]

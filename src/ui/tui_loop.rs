@@ -1304,8 +1304,8 @@ fn context_breakdown_lines<P: ChatProvider>(
     match harness.context_diagnostics() {
         Some(diagnostics) => {
             let total = diagnostics.measured;
-            let budget = diagnostics.ladder.effective_window;
-            let pct = crate::metrics::percent_of(total, budget).unwrap_or(0);
+            let displayed = diagnostics.ladder.displayed_context_window;
+            let pct = crate::metrics::percent_of(total, displayed).unwrap_or(0);
             let source = match diagnostics.source {
                 crate::nexus::ContextMeasurementSource::ProviderReportedPlusLocal => {
                     "provider-reported + local"
@@ -1313,44 +1313,65 @@ fn context_breakdown_lines<P: ChatProvider>(
                 crate::nexus::ContextMeasurementSource::Estimated => "estimated",
             };
             lines.push(format!(
-                "context: ~{total} of {budget} tokens ({pct}% of effective window; {source})"
+                "context: ~{total} of {displayed} tokens ({pct}% of displayed window; {source})"
             ));
             lines.push(format!(
-                "  free headroom      ~{} tokens",
-                budget.saturating_sub(total)
+                "  displayed capacity ~{} tokens free",
+                displayed.saturating_sub(total)
             ));
-            // Where the denominator comes from: the same resolved budget the
-            // session bar's CTX meter and the trigger ladder divide by. Facts
-            // are display-only provenance; enforcement always uses `budget`.
-            match diagnostics.budget_facts {
-                Some(facts) => {
-                    if let Some(window) = facts.window {
+            match diagnostics.policy {
+                Some(policy) => {
+                    if let Some(window) = policy.window {
+                        lines.push(format!("  raw model capacity {} tokens", window.raw));
                         lines.push(format!(
-                            "  window derivation  {} raw - {} max-output reserve - {} summary reserve = {} effective",
-                            window.raw,
-                            window.max_output_reserve,
-                            window.summary_reserve,
-                            window.effective
+                            "  displayed window   {} tokens{}",
+                            window.displayed,
+                            if window.official_cli {
+                                " (official CLI)"
+                            } else {
+                                " (Iris fallback)"
+                            }
+                        ));
+                        lines.push(format!(
+                            "  Iris output reserve {} tokens (model max output {}; capped at 20000)",
+                            window.output_reserve, window.model_max_output_tokens
+                        ));
+                        lines.push(format!(
+                            "  summary headroom   {} tokens",
+                            window.summary_reserve
+                        ));
+                        if !window.official_cli {
+                            let source = if window.configured_endpoint {
+                                "configured endpoint metadata"
+                            } else {
+                                "Iris catalog metadata"
+                            };
+                            lines.push(format!(
+                                "  policy source      fallback from {source}; no authoritative CLI policy"
+                            ));
+                        }
+                    } else if policy.clamp.is_none() {
+                        lines.push(format!(
+                            "  policy source      built-in fallback {} (no model metadata, no contextTokenBudget)",
+                            policy.displayed_context_window
                         ));
                     }
-                    match (facts.clamp, facts.clamped()) {
+                    match (policy.clamp, policy.clamped()) {
                         (Some(clamp), true) => lines.push(format!(
-                            "  budget clamp       contextTokenBudget {clamp} binds (below the model window)"
+                            "  budget clamp       contextTokenBudget {clamp} binds"
                         )),
-                        (Some(clamp), false) if facts.window.is_none() => lines.push(format!(
-                            "  budget source      contextTokenBudget {clamp} (no catalog window for this model)"
+                        (Some(clamp), false) if policy.window.is_none() => lines.push(format!(
+                            "  policy source      contextTokenBudget {clamp} (no model metadata)"
                         )),
                         _ => {}
                     }
-                    if facts.window.is_none() && facts.clamp.is_none() {
-                        lines.push(format!(
-                            "  budget source      built-in default {} (no catalog window, no contextTokenBudget)",
-                            facts.resolved
-                        ));
-                    }
+                    lines.push(format!(
+                        "  preparation        {} tokens; hard application {} tokens",
+                        policy.preparation_threshold, policy.hard_compaction_threshold
+                    ));
                 }
                 None => lines.push(
-                    "  budget source      installed directly (no derivation recorded)".to_string(),
+                    "  policy source      installed directly (no derivation recorded)".to_string(),
                 ),
             }
             let state = if diagnostics.automatic_enabled {
@@ -4497,9 +4518,13 @@ mod tests {
             .unwrap();
         let window = ContextWindowFacts {
             raw: 200_000,
-            max_output_reserve: 64_000,
-            summary_reserve: 8_192,
-            effective: 127_808,
+            displayed: 200_000,
+            model_max_output_tokens: 64_000,
+            output_reserve: 20_000,
+            summary_reserve: 13_000,
+            hard_compaction_threshold: 167_000,
+            official_cli: true,
+            configured_endpoint: false,
         };
         harness.set_compaction_trigger(
             crate::metrics::ResolvedContextBudget::resolve(Some(window), None, 64_000),
@@ -4542,9 +4567,22 @@ mod tests {
         )
         .join("\n");
         assert!(
+            lines.contains("raw model capacity 200000 tokens"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("displayed window   200000 tokens (official CLI)"),
+            "{lines}"
+        );
+        assert!(
             lines.contains(
-                "window derivation  200000 raw - 64000 max-output reserve - 8192 summary reserve = 127808 effective"
+                "Iris output reserve 20000 tokens (model max output 64000; capped at 20000)"
             ),
+            "{lines}"
+        );
+        assert!(lines.contains("summary headroom   13000 tokens"), "{lines}");
+        assert!(
+            lines.contains("preparation        144000 tokens; hard application 167000 tokens"),
             "{lines}"
         );
         assert!(lines.contains("session usage (this run):"), "{lines}");
@@ -4587,9 +4625,7 @@ mod tests {
         )
         .join("\n");
         assert!(
-            lines.contains(
-                "budget clamp       contextTokenBudget 64000 binds (below the model window)"
-            ),
+            lines.contains("budget clamp       contextTokenBudget 64000 binds"),
             "{lines}"
         );
         assert!(lines.contains("of 64000 tokens"), "{lines}");
