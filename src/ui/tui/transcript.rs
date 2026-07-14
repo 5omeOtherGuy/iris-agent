@@ -2768,6 +2768,10 @@ impl Transcript {
                             .is_some_and(|a| a.call.id == call.id)
                         {
                             self.review_gates.remove(&call.id);
+                            self.active_exec
+                                .as_mut()
+                                .expect("matched active shell above")
+                                .started = Instant::now();
                             self.relayout_active_running();
                         } else {
                             self.begin_exec(call);
@@ -2784,6 +2788,10 @@ impl Transcript {
                             .is_some_and(|a| a.call.id == call.id)
                         {
                             self.review_gates.remove(&call.id);
+                            self.active_tool
+                                .as_mut()
+                                .expect("matched active tool above")
+                                .started = Instant::now();
                             self.relayout_active_tool_running();
                         } else {
                             self.begin_tool(call);
