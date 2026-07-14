@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.4...iris-agent-v0.3.5) - 2026-07-14
+
+### Fixed
+
+- align empty composer caret with left edge ([#617](https://github.com/5omeOtherGuy/iris-agent/pull/617))
+
 ## [0.3.4](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.3...iris-agent-v0.3.4) - 2026-07-13
 
 ### Added
