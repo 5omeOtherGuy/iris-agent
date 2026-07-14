@@ -92,8 +92,14 @@ async fn run_probe(
     let first_a = completed_turn(provider_a.as_ref(), &messages_a, &tools).await?;
     tokio::time::sleep(Duration::from_secs(5)).await;
     let first_b = completed_turn(provider_b.as_ref(), &messages_b, &tools).await?;
-    let first_a_usage = first_a.usage.as_ref().context("first A turn omitted usage")?;
-    let first_b_usage = first_b.usage.as_ref().context("first B turn omitted usage")?;
+    let first_a_usage = first_a
+        .usage
+        .as_ref()
+        .context("first A turn omitted usage")?;
+    let first_b_usage = first_b
+        .usage
+        .as_ref()
+        .context("first B turn omitted usage")?;
     let first_a_input = first_a_usage.input_tokens;
     let first_a_read = first_a_usage.cache_read_input_tokens;
     let first_b_input = first_b_usage.input_tokens;
@@ -195,7 +201,10 @@ fn openai_shares_system_prompt_without_breaking_concurrent_session_branches() ->
         )
         .map(|provider| Box::new(provider) as Box<dyn ChatProvider>)
     };
-    let result = block_on(run_probe(build("live-session-a")?, build("live-session-b")?))?;
+    let result = block_on(run_probe(
+        build("live-session-a")?,
+        build("live-session-b")?,
+    ))?;
     assert_shared_head_and_independent_branches("openai-codex", &result);
     Ok(())
 }
@@ -246,7 +255,8 @@ fn openai_sse_keeps_concurrent_session_branches_isolated() -> Result<()> {
 #[test]
 #[ignore = "live Anthropic API calls; set IRIS_PROMPT_CACHE_LIVE=1 to run"]
 fn anthropic_shares_system_prompt_without_breaking_concurrent_session_branches() -> Result<()> {
-    if !live_enabled("anthropic_shares_system_prompt_without_breaking_concurrent_session_branches") {
+    if !live_enabled("anthropic_shares_system_prompt_without_breaking_concurrent_session_branches")
+    {
         return Ok(());
     }
     let system_prompt = shared_system_prompt();

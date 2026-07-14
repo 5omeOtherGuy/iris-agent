@@ -403,7 +403,7 @@ pub(crate) fn run_real_cell(
     let system_prompt = crate::wayland::system_prompt::assemble(&cwd, &tools);
     let settings = crate::config::Settings::load(&cwd).map_err(|e| e.to_string())?;
     let session_id = crate::session::new_session_id();
-    let provider = crate::build_provider(selection, &system_prompt, &session_id)
+    let provider = crate::build_provider(selection, &system_prompt, &session_id, &cwd)
         .map_err(|e| format!("build provider: {e}"))?;
     let mut agent = Agent::new(provider, built_in_tools())
         .with_max_tool_roundtrips(bench_max_roundtrips(&settings));

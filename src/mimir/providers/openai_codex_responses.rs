@@ -94,6 +94,7 @@ pub(crate) struct OpenAiCodexResponsesProvider {
     reasoning: Option<ReasoningEffort>,
     system_prompt: String,
     prompt_cache_key: String,
+    sse_prompt_cache_key: String,
     cache_retention: PromptCacheRetention,
     cache_prefix: Arc<Mutex<super::PromptCachePrefix>>,
     tokens: OpenAiCodexTokenStore,
@@ -109,6 +110,7 @@ impl OpenAiCodexResponsesProvider {
     /// resolved strings plus the optional reasoning level. `system_prompt` is the
     /// harness-assembled instruction string; the provider only forwards it into
     /// the request envelope.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         model: &str,
@@ -116,6 +118,36 @@ impl OpenAiCodexResponsesProvider {
         reasoning: Option<ReasoningEffort>,
         system_prompt: &str,
         prompt_cache_key: &str,
+        cache_retention: PromptCacheRetention,
+        retry_policy: crate::mimir::retry::RetryPolicy,
+        codex_transport: CodexTransport,
+    ) -> Result<Self> {
+        Self::new_with_session_cache_key(
+            model,
+            base_url,
+            reasoning,
+            system_prompt,
+            prompt_cache_key,
+            prompt_cache_key,
+            cache_retention,
+            retry_policy,
+            codex_transport,
+        )
+    }
+
+    /// Build with separate WebSocket and SSE cache routing. WebSocket
+    /// continuation keeps each provider instance's deeper history independent,
+    /// so compatible sessions may share the workspace key there. SSE has no
+    /// connection-local continuation and retains the session key to prevent
+    /// concurrent histories from evicting one another.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_session_cache_key(
+        model: &str,
+        base_url: &str,
+        reasoning: Option<ReasoningEffort>,
+        system_prompt: &str,
+        prompt_cache_key: &str,
+        sse_prompt_cache_key: &str,
         cache_retention: PromptCacheRetention,
         retry_policy: crate::mimir::retry::RetryPolicy,
         codex_transport: CodexTransport,
@@ -130,6 +162,7 @@ impl OpenAiCodexResponsesProvider {
             reasoning,
             system_prompt: system_prompt.to_string(),
             prompt_cache_key: prompt_cache_key.to_string(),
+            sse_prompt_cache_key: sse_prompt_cache_key.to_string(),
             cache_retention,
             cache_prefix: Arc::new(Mutex::new(super::PromptCachePrefix::default())),
             tokens: OpenAiCodexTokenStore::from_env()?,
@@ -478,7 +511,7 @@ impl OpenAiCodexResponsesProvider {
             &summary_messages,
             &Tools::new(Vec::new()),
             self.reasoning,
-            Some(&self.prompt_cache_key),
+            Some(&self.sse_prompt_cache_key),
             None,
             self.cache_retention,
         );
@@ -721,24 +754,29 @@ impl ChatProvider for OpenAiCodexResponsesProvider {
                 "prompt cache prefix changed since the previous request; the cached prefix will not be reused this turn"
             );
         }
+        let prompt_cache_key = if self.codex_transport == CodexTransport::Sse {
+            &self.sse_prompt_cache_key
+        } else {
+            &self.prompt_cache_key
+        };
         let request = build_codex_request(
             &self.model,
             &self.system_prompt,
             messages,
             tools,
             self.reasoning,
-            Some(&self.prompt_cache_key),
-            // store:false, so Iris never supplies previous_response_id in prod.
+            Some(prompt_cache_key),
+            // store:false, so SSE never supplies previous_response_id. WebSocket
+            // continuation adds it to the connection-local delta request.
             None,
             self.cache_retention,
         );
-        let request_for_stream = request.clone();
         let url = resolve_codex_url(&self.base_url)?;
         let provider = self.clone();
         let cancel = cancel.clone();
         if self.codex_transport == CodexTransport::Sse {
             return Ok(spawn_stream(
-                move |sink, cancel| provider.run_blocking(url, &request_for_stream, sink, cancel),
+                move |sink, cancel| provider.run_blocking(url, &request, sink, cancel),
                 cancel,
             ));
         }
@@ -805,8 +843,13 @@ impl OpenAiCodexResponsesProvider {
         cancel: CancellationToken,
     ) -> Result<AssistantTurn> {
         if self.ws_state.lock().await.disabled_for_session {
+            let request = route_prompt_cache(
+                full_request,
+                &self.sse_prompt_cache_key,
+                self.cache_retention,
+            );
             return self
-                .run_blocking_off_thread(url, full_request, sink, cancel)
+                .run_blocking_off_thread(url, request, sink, cancel)
                 .await;
         }
         let ws_url = resolve_codex_ws_url_from_resolved(&url)?;
@@ -844,8 +887,13 @@ impl OpenAiCodexResponsesProvider {
                     }
                     WsFallback::FallbackSse => {
                         self.disable_ws_for_session().await;
+                        let request = route_prompt_cache(
+                            full_request,
+                            &self.sse_prompt_cache_key,
+                            self.cache_retention,
+                        );
                         return self
-                            .run_blocking_off_thread(url, full_request, sink, cancel)
+                            .run_blocking_off_thread(url, request, sink, cancel)
                             .await;
                     }
                     _ => return Err(error),
@@ -1274,6 +1322,26 @@ fn build_codex_request(
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
     body
+}
+
+/// Replace the WebSocket workspace key before a request takes the SSE path.
+/// SSE lacks connection-local continuation, so retaining the session key keeps
+/// concurrent divergent histories in separate provider cache buckets.
+fn route_prompt_cache(
+    mut request: Value,
+    prompt_cache_key: &str,
+    cache_retention: PromptCacheRetention,
+) -> Value {
+    let Some(body) = request.as_object_mut() else {
+        return request;
+    };
+    body.remove("prompt_cache_key");
+    if cache_retention.caching_enabled()
+        && let Some(key) = super::clamp_openai_prompt_cache_key(prompt_cache_key)
+    {
+        body.insert("prompt_cache_key".to_string(), Value::String(key));
+    }
+    request
 }
 
 /// Build a compaction-summary request using OpenAI's native structured-
@@ -2422,6 +2490,21 @@ fn extract_output_text(value: &Value) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod cache_routing_tests {
+    use super::*;
+
+    #[test]
+    fn sse_fallback_replaces_shared_key_with_session_key() {
+        let request = json!({ "prompt_cache_key": "workspace-key", "input": [] });
+        let routed = route_prompt_cache(request, "session-key", PromptCacheRetention::Short);
+        assert_eq!(routed["prompt_cache_key"], "session-key");
+
+        let disabled = route_prompt_cache(routed, "session-key", PromptCacheRetention::None);
+        assert!(disabled.get("prompt_cache_key").is_none());
+    }
 }
 
 #[cfg(test)]
