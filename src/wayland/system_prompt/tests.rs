@@ -8,13 +8,11 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::tools::{built_in_tools, built_in_tools_for};
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
@@ -23,12 +21,14 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn with_home(home: &Path) -> Self {
-        let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let guard = Self {
             _lock: lock,
             home: env::var_os("HOME"),
         };
-        // SAFETY: system_prompt env-sensitive tests run under ENV_LOCK and
+        // SAFETY: system_prompt env-sensitive tests run under TEST_ENV_LOCK and
         // restore HOME before releasing it.
         unsafe { env::set_var("HOME", home) };
         guard
@@ -37,7 +37,7 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // SAFETY: serialized under ENV_LOCK by EnvGuard and restored on drop.
+        // SAFETY: serialized under TEST_ENV_LOCK by EnvGuard and restored on drop.
         unsafe {
             match &self.home {
                 Some(value) => env::set_var("HOME", value),
@@ -416,11 +416,19 @@ fn discover_prefers_agents_md_over_claude_md_per_dir() {
 fn discover_skips_empty_project_doc() {
     let dir = temp_dir();
     fs::write(dir.path.join("AGENTS.md"), "   \n\t\n").unwrap();
-    let docs = discover_project_docs(&dir.path);
+    let discovery = discover_project_docs_with_warnings(&dir.path);
     assert!(
-        docs.iter()
+        discovery
+            .docs
+            .iter()
             .all(|(p, _)| !p.contains("AGENTS.md")
                 || !p.starts_with(&dir.path.display().to_string()))
+    );
+    assert!(
+        discovery
+            .notices
+            .iter()
+            .any(|notice| notice.contains("empty after reading"))
     );
 }
 
@@ -673,22 +681,22 @@ fn discover_prepends_shared_hub_before_iris_and_project_docs() {
 
 #[cfg(unix)]
 #[test]
-fn discover_rejects_a_symlinked_shared_hub_doc() {
+fn discover_accepts_a_symlinked_shared_hub_doc() {
     use std::os::unix::fs::symlink;
     let home = temp_dir();
     let _env = EnvGuard::with_home(&home.path);
-    let secret = home.path.join("secret.txt");
-    fs::write(&secret, "TOP SECRET HOST FILE").unwrap();
+    let target = home.path.join("shared-rules.md");
+    fs::write(&target, "SHARED SYMLINK RULES").unwrap();
     let hub_dir = home.path.join(".agents");
     fs::create_dir_all(&hub_dir).unwrap();
-    symlink(&secret, hub_dir.join("AGENTS.md")).unwrap();
+    symlink(&target, hub_dir.join("AGENTS.md")).unwrap();
 
     let ws = temp_dir();
     let docs = discover_project_docs(&ws.path);
     assert!(
         docs.iter()
-            .all(|(_, c)| !c.contains("TOP SECRET HOST FILE")),
-        "a symlinked ~/.agents/AGENTS.md must not be read"
+            .any(|(_, content)| content.contains("SHARED SYMLINK RULES")),
+        "a symlinked ~/.agents/AGENTS.md must be read"
     );
 }
 
@@ -741,4 +749,126 @@ fn discover_works_without_iris_agents() {
         docs.iter().all(|(p, _)| !p.contains(".iris/AGENTS.md")),
         "no iris agents path when file is absent"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn user_level_symlinks_load_in_shared_then_iris_order() {
+    use std::os::unix::fs::symlink;
+
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    let targets = home.path.join("dotfiles");
+    fs::create_dir_all(&targets).unwrap();
+    fs::write(targets.join("shared.md"), "SHARED SYMLINK RULES").unwrap();
+    fs::write(targets.join("iris.md"), "IRIS SYMLINK RULES").unwrap();
+    fs::create_dir_all(home.path.join(".agents")).unwrap();
+    fs::create_dir_all(home.path.join(".iris")).unwrap();
+    symlink(
+        targets.join("shared.md"),
+        home.path.join(".agents/AGENTS.md"),
+    )
+    .unwrap();
+    symlink(targets.join("iris.md"), home.path.join(".iris/AGENTS.md")).unwrap();
+
+    let ws = temp_dir();
+    let assembly = PromptAssembler::default().assemble(&ws.path, &built_in_tools());
+    let shared = assembly.prompt.find("SHARED SYMLINK RULES").unwrap();
+    let iris = assembly.prompt.find("IRIS SYMLINK RULES").unwrap();
+    assert!(
+        shared < iris,
+        "shared user rules must precede Iris overrides"
+    );
+    assert!(assembly.notices.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_user_level_symlink_targets_have_diagnostics() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+
+    let root = temp_dir();
+    let user_dir = root.path.join(".iris");
+    fs::create_dir_all(&user_dir).unwrap();
+    let user_path = user_dir.join("AGENTS.md");
+
+    let missing = root.path.join("missing-target");
+    symlink(&missing, &user_path).unwrap();
+    let ReadOutcome::Refused(missing_reason) =
+        read_bounded(&user_path, MAX_DOC_BYTES, LinkPolicy::Follow)
+    else {
+        panic!("missing symlink target must be refused");
+    };
+    assert!(refusal_notice(&user_path, missing_reason, false).contains("could not be read"));
+
+    fs::remove_file(&user_path).unwrap();
+    let directory = root.path.join("directory-target");
+    fs::create_dir(&directory).unwrap();
+    symlink(&directory, &user_path).unwrap();
+    let ReadOutcome::Refused(directory_reason) =
+        read_bounded(&user_path, MAX_DOC_BYTES, LinkPolicy::Follow)
+    else {
+        panic!("directory symlink target must be refused");
+    };
+    assert!(refusal_notice(&user_path, directory_reason, false).contains("not a regular file"));
+
+    fs::remove_file(&user_path).unwrap();
+    let fifo = root.path.join("instructions.fifo");
+    let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    symlink(&fifo, &user_path).unwrap();
+    let ReadOutcome::Refused(fifo_reason) =
+        read_bounded(&user_path, MAX_DOC_BYTES, LinkPolicy::Follow)
+    else {
+        panic!("FIFO symlink target must be refused");
+    };
+    assert!(refusal_notice(&user_path, fifo_reason, false).contains("not a regular file"));
+}
+
+#[cfg(unix)]
+#[test]
+fn walk_symlink_secret_is_refused_and_warned_once_per_assembler() {
+    use std::os::unix::fs::symlink;
+
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    let outside = temp_dir();
+    let secret = outside.path.join("secret.txt");
+    fs::write(&secret, "NEVER FOLD THIS SECRET").unwrap();
+    let ws = temp_dir();
+    symlink(&secret, ws.path.join("AGENTS.md")).unwrap();
+
+    let mut assembler = PromptAssembler::default();
+    let first = assembler.assemble(&ws.path, &built_in_tools());
+    let second = assembler.assemble(&ws.path, &built_in_tools());
+    assert!(!first.prompt.contains("NEVER FOLD THIS SECRET"));
+    assert!(!second.prompt.contains("NEVER FOLD THIS SECRET"));
+    assert_eq!(first.notices.len(), 1);
+    assert!(first.notices[0].contains("possible exfiltration vector"));
+    assert!(
+        second.notices.is_empty(),
+        "warning must be deduplicated per session"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn user_level_symlink_target_still_obeys_byte_cap() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_dir();
+    let user_dir = root.path.join(".iris");
+    fs::create_dir_all(&user_dir).unwrap();
+    let target = root.path.join("large-rules.md");
+    fs::write(&target, "x".repeat(MAX_DOC_BYTES as usize + 128)).unwrap();
+    let user_path = user_dir.join("AGENTS.md");
+    symlink(&target, &user_path).unwrap();
+
+    let ReadOutcome::Content(content) = read_bounded(&user_path, MAX_DOC_BYTES, LinkPolicy::Follow)
+    else {
+        panic!("symlinked user-level doc must load");
+    };
+    assert_eq!(content.len(), MAX_DOC_BYTES as usize);
 }

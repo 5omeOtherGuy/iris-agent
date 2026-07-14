@@ -626,8 +626,10 @@ to `read`; it does not gain mutation access outside the workspace.
 
 System-prompt fragments themselves are compiled into Iris. Files under old
 `.iris/fragments` locations are not loaded. User/repository steering is the
-intentional `AGENTS.md`/`CLAUDE.md` channel. Each discovered instruction file is
-bounded to 32 KiB and symlinks are refused, including at open time.
+intentional `AGENTS.md`/`CLAUDE.md` channel. Each instruction file is bounded to
+32 KiB. The trusted user-level paths `~/.agents/AGENTS.md` and
+`~/.iris/AGENTS.md` may be symlinks to regular files; cwd-to-root project docs
+must themselves be regular files, and refused candidates produce a UI warning.
 
 ---
 

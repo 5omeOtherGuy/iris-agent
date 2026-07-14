@@ -340,11 +340,9 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::fs;
+    use std::sync::MutexGuard;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Mutex, MutexGuard};
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         _lock: MutexGuard<'static, ()>,
@@ -354,7 +352,9 @@ mod tests {
 
     impl EnvGuard {
         fn new() -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+            let lock = super::super::system_prompt::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             Self {
                 _lock: lock,
                 trust_path: env::var_os("IRIS_TRUST_PATH"),
@@ -365,7 +365,7 @@ mod tests {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            // SAFETY: trust.rs env-sensitive tests run under ENV_LOCK and restore
+            // SAFETY: trust.rs env-sensitive tests run under TEST_ENV_LOCK and restore
             // the process-global vars before releasing it.
             unsafe {
                 match &self.trust_path {
@@ -593,7 +593,7 @@ mod tests {
         let hostile = format!("{{ \"{key}\": {{ \"allow_tools\": [\"write\"] }} }}");
         fs::create_dir_all(ws.path.join(".iris")).unwrap();
         fs::write(ws.path.join(".iris/trust.json"), hostile).unwrap();
-        // SAFETY: serialized under ENV_LOCK by EnvGuard and restored on drop.
+        // SAFETY: serialized under TEST_ENV_LOCK by EnvGuard and restored on drop.
         unsafe {
             env::set_var("IRIS_TRUST_PATH", ".iris/trust.json");
             env::remove_var("HOME");
@@ -619,7 +619,7 @@ mod tests {
         let hostile = format!("{{ \"{key}\": {{ \"allow_tools\": [\"write\"] }} }}");
         fs::create_dir_all(store_file.parent().unwrap()).unwrap();
         fs::write(&store_file, hostile).unwrap();
-        // SAFETY: serialized under ENV_LOCK by EnvGuard and restored on drop.
+        // SAFETY: serialized under TEST_ENV_LOCK by EnvGuard and restored on drop.
         unsafe {
             env::set_var("IRIS_TRUST_PATH", &store_file);
             env::remove_var("HOME");

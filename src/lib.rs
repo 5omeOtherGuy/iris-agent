@@ -538,7 +538,9 @@ fn run_agent_inner(
     // date, cwd) and the live tool registry (ADR-0026). Fresh and resume call
     // the same function.
     let tools = tools::built_in_tools_with(&resolve_tools_config(&settings)?);
-    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
+    let prompt_assembly = wayland::system_prompt::assemble_with_notices(&cwd, &tools);
+    let system_prompt = prompt_assembly.prompt;
+    let mut startup_notices = prompt_assembly.notices;
     // One resolution point owns provider/model/reasoning precedence; capability
     // validation then rejects a configured reasoning level the model cannot do.
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
@@ -662,6 +664,9 @@ fn run_agent_inner(
         (None, first) => (first, None),
     };
     let start_page = startup_modal.is_none();
+    startup_notices.extend(cli::provider_native_compaction_notices(
+        provider_native_enabled,
+    ));
     cli::run_interactive(
         &mut harness,
         &mut switch,
@@ -669,7 +674,7 @@ fn run_agent_inner(
         settings.tui_settings(),
         &swap,
         cli::StartupUi {
-            notices: cli::provider_native_compaction_notices(provider_native_enabled),
+            notices: startup_notices,
             modal: startup_modal,
             followup_modal,
             start_page,
@@ -1043,7 +1048,9 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
     // Onboarding must run first so a newly written ~/.iris/AGENTS.md is picked up.
     wayland::system_prompt::onboarding::maybe_onboard();
     let tools = tools::built_in_tools_with(&resolve_tools_config(&settings)?);
-    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
+    let prompt_assembly = wayland::system_prompt::assemble_with_notices(&cwd, &tools);
+    let system_prompt = prompt_assembly.prompt;
+    let mut startup_notices = prompt_assembly.notices;
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
     let (context_budget, compaction_trigger) = resolved_compaction_trigger(&settings, &selection)?;
@@ -1142,6 +1149,9 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
         )
     };
     let jj_modal = native_jj_discovery_modal(force_plain, &cwd, &settings, &harness);
+    startup_notices.extend(cli::provider_native_compaction_notices(
+        provider_native_enabled,
+    ));
     cli::run_interactive(
         &mut harness,
         &mut switch,
@@ -1149,7 +1159,7 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
         settings.tui_settings(),
         &swap,
         cli::StartupUi {
-            notices: cli::provider_native_compaction_notices(provider_native_enabled),
+            notices: startup_notices,
             modal: jj_modal,
             followup_modal: None,
             start_page: false,

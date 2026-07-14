@@ -386,8 +386,9 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   ADR-0026), machine-local user instructions (`~/.agents/AGENTS.md` followed by
   Iris-specific `~/.iris/AGENTS.md`), root-to-leaf project docs
   (`AGENTS.md`/`CLAUDE.md`), runtime context, and generated live-tool blocks. All
-  instruction files use bounded, symlink-refusing reads. No `.md` fragment files
-  are loaded from disk. [Implemented]
+  instruction files use bounded reads. The two user-level paths may be symlinks
+  to regular files; cwd-to-root project docs refuse symlinks and surface skipped
+  candidates as notices. No `.md` fragment files are loaded from disk. [Implemented]
 - **Fragment ordering** — internal fragments use `name` for XML tags and
   numeric `slot` ordering (`slot: 0` disables). [Implemented]
 - **Named slots and selector schema** — replace numeric slots with named slots

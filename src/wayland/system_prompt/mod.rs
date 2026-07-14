@@ -45,16 +45,14 @@
 //!
 //! ## Path safety
 //!
-//! Project-doc discovery walks cwd -> filesystem root reading `AGENTS.md` /
-//! `CLAUDE.md` like pi/Codex. Ancestor docs are treated as user-owned trusted
-//! config (the same trust class as `~/.iris/settings.json`, which the harness
-//! already reads from `HOME`): a normal cloned repo only controls files inside
-//! the workspace, not ancestor directories. Every file folded into the prompt
-//! (the project docs) is read through [`read_regular_bounded`], which refuses
-//! symlinks (via `symlink_metadata`), opens the final component with
-//! `O_NOFOLLOW` to close the check/open race, and caps the bytes read. So a
-//! cloned repo cannot plant `AGENTS.md -> ~/.ssh/id_rsa` to exfiltrate host
-//! files into the prompt.
+//! Instruction-file trust follows provenance, not target location. The two
+//! hardcoded user-level paths (`~/.agents/AGENTS.md` and `~/.iris/AGENTS.md`)
+//! are trusted user config and may resolve through symlinks; their resolved
+//! targets must still be regular files and reads remain bounded. Every
+//! cwd-to-root walk candidate stays fail-closed: symlinks are refused via
+//! `symlink_metadata` plus `O_NOFOLLOW`, regardless of whether the directory is
+//! inside or above a repository. Refused existing candidates produce deduped
+//! user-facing notices instead of disappearing silently.
 
 mod defaults;
 pub(crate) mod onboarding;
@@ -90,6 +88,44 @@ const DOC_CANDIDATES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 /// runaway or hostile file cannot balloon every request / OOM the process.
 const MAX_DOC_BYTES: u64 = 32 * 1024;
 
+/// Shared by Wayland tests that temporarily mutate process-global HOME.
+#[cfg(test)]
+pub(super) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[derive(Debug)]
+pub(crate) struct PromptAssembly {
+    pub(crate) prompt: String,
+    pub(crate) notices: Vec<String>,
+}
+
+/// Session-scoped assembler. Keeping the emitted-notice set here makes repeated
+/// discovery safe without repeating the same warning every request.
+#[derive(Debug, Default)]
+pub(crate) struct PromptAssembler {
+    emitted_notices: HashSet<String>,
+}
+
+impl PromptAssembler {
+    pub(crate) fn assemble(&mut self, workspace: &Path, tools: &Tools) -> PromptAssembly {
+        let discovery = discover_project_docs_with_warnings(workspace);
+        let notices = discovery
+            .notices
+            .into_iter()
+            .filter(|notice| self.emitted_notices.insert(notice.clone()))
+            .collect();
+        PromptAssembly {
+            prompt: build_prompt(
+                default_fragments(),
+                tools,
+                workspace,
+                &discovery.docs,
+                &today_ymd(),
+            ),
+            notices,
+        }
+    }
+}
+
 /// One fragment: `name` (the xml tag), an optional `slot` sort key (`Some(0)`
 /// disables the fragment), and the body (surrounding whitespace trimmed).
 #[derive(Debug, Clone)]
@@ -107,8 +143,17 @@ struct Fragment {
 /// Both fresh and resumed sessions call this with the same workspace, so they
 /// assemble identical instructions.
 pub(crate) fn assemble(workspace: &Path, tools: &Tools) -> String {
-    let docs = discover_project_docs(workspace);
-    build_prompt(default_fragments(), tools, workspace, &docs, &today_ymd())
+    let assembly = assemble_with_notices(workspace, tools);
+    for notice in assembly.notices {
+        eprintln!("{notice}");
+    }
+    assembly.prompt
+}
+
+/// Assemble once for an interactive session, returning refusals for the UI's
+/// startup notice channel instead of relying on stderr.
+pub(crate) fn assemble_with_notices(workspace: &Path, tools: &Tools) -> PromptAssembly {
+    PromptAssembler::default().assemble(workspace, tools)
 }
 
 /// Test-only: assemble from the shipped defaults with no project docs or disk
@@ -296,17 +341,40 @@ fn default_fragments() -> Vec<Fragment> {
         .collect()
 }
 
-/// Discover project docs walking `cwd` -> filesystem root, deduping by path, and
-/// returning them root-to-leaf (pi order). Each directory contributes its first
-/// existing, non-empty, regular-file candidate. Additionally, two user-level
-/// docs are prepended before the walk results, outermost first: the machine-local
-/// shared hub file `~/.agents/AGENTS.md`, then `~/.iris/AGENTS.md` so
-/// Iris-specific instructions can override the shared ones. Both are subject to
-/// the same non-empty and symlink-refusing read rules as walk docs.
-fn discover_project_docs(cwd: &Path) -> Vec<(String, String)> {
-    let mut docs = Vec::new();
+/// Discovery output keeps prompt content and user-facing refusal notices
+/// together so callers cannot accidentally drop diagnostics.
+#[derive(Debug, Default)]
+struct ProjectDocDiscovery {
+    docs: Vec<(String, String)>,
+    notices: Vec<String>,
+}
 
-    // Prepend user-level docs: shared hub first, then the Iris-specific file.
+#[derive(Debug, Clone, Copy)]
+enum LinkPolicy {
+    Follow,
+    Refuse,
+}
+
+#[derive(Debug)]
+enum ReadRefusal {
+    Symlink,
+    NonRegular,
+    Unreadable(std::io::Error),
+}
+
+#[derive(Debug)]
+enum ReadOutcome {
+    Missing,
+    Content(String),
+    Refused(ReadRefusal),
+}
+
+/// Discover user and project docs with provenance-specific link handling.
+fn discover_project_docs_with_warnings(cwd: &Path) -> ProjectDocDiscovery {
+    let mut discovery = ProjectDocDiscovery::default();
+
+    // These exact HOME-derived paths are trusted user config. Their resolved
+    // targets may be symlinks, but still must be readable regular files.
     for path in [
         onboarding::shared_agents_path(),
         onboarding::iris_agents_path(),
@@ -314,21 +382,24 @@ fn discover_project_docs(cwd: &Path) -> Vec<(String, String)> {
     .into_iter()
     .flatten()
     {
-        if let Some(content) = read_regular_bounded(&path, MAX_DOC_BYTES)
-            && !content.trim().is_empty()
-        {
-            docs.push((path.display().to_string(), content));
+        match read_bounded(&path, MAX_DOC_BYTES, LinkPolicy::Follow) {
+            ReadOutcome::Missing => {}
+            ReadOutcome::Content(content) if content.trim().is_empty() => {
+                discovery.notices.push(empty_doc_notice(&path));
+            }
+            ReadOutcome::Content(content) => {
+                discovery.docs.push((path.display().to_string(), content));
+            }
+            ReadOutcome::Refused(reason) => {
+                discovery.notices.push(refusal_notice(&path, reason, false));
+            }
         }
     }
 
-    // Each iteration shortens `current` via `parent()`, so every visited dir --
-    // and therefore every candidate path -- is unique within the walk. A walk
-    // that starts under `~/.agents` or `~/.iris` can still revisit a prepended
-    // user-level doc, so walk results are filtered against those by exact path.
     let mut walk_docs = Vec::new();
     let mut current = cwd.to_path_buf();
     loop {
-        if let Some(doc) = read_doc_in_dir(&current) {
+        if let Some(doc) = read_doc_in_dir(&current, &mut discovery.notices) {
             walk_docs.push(doc);
         }
         match current.parent() {
@@ -336,65 +407,150 @@ fn discover_project_docs(cwd: &Path) -> Vec<(String, String)> {
             None => break,
         }
     }
-    walk_docs.reverse(); // leaf-first collection -> root-to-leaf emission
-    walk_docs.retain(|(path, _)| docs.iter().all(|(seen, _)| seen != path));
-    docs.extend(walk_docs);
-    docs
+    walk_docs.reverse();
+    walk_docs.retain(|(path, _)| discovery.docs.iter().all(|(seen, _)| seen != path));
+    discovery.docs.extend(walk_docs);
+    discovery
 }
 
-/// Read the first existing, non-empty project doc in `dir`. Only a regular file
-/// is read: a symlink is rejected (`symlink_metadata` does not follow it), so a
-/// planted symlink cannot exfiltrate a host file into the prompt. The read is
-/// bounded by [`MAX_DOC_BYTES`].
-fn read_doc_in_dir(dir: &Path) -> Option<(String, String)> {
+/// Compatibility helper for existing behavior tests. Production assembly uses
+/// the diagnostic-bearing result above.
+#[cfg(test)]
+fn discover_project_docs(cwd: &Path) -> Vec<(String, String)> {
+    discover_project_docs_with_warnings(cwd).docs
+}
+
+/// Read the first accepted project doc in `dir`. Every cwd-to-root candidate
+/// refuses symlinks, including candidates in ancestor directories.
+fn read_doc_in_dir(dir: &Path, notices: &mut Vec<String>) -> Option<(String, String)> {
     for candidate in DOC_CANDIDATES {
         let path = dir.join(candidate);
-        let Some(content) = read_regular_bounded(&path, MAX_DOC_BYTES) else {
-            continue;
-        };
-        if content.trim().is_empty() {
-            continue;
+        match read_bounded(&path, MAX_DOC_BYTES, LinkPolicy::Refuse) {
+            ReadOutcome::Missing => {}
+            ReadOutcome::Content(content) if content.trim().is_empty() => {
+                notices.push(empty_doc_notice(&path));
+            }
+            ReadOutcome::Content(content) => {
+                return Some((path.display().to_string(), content));
+            }
+            ReadOutcome::Refused(reason) => notices.push(refusal_notice(&path, reason, true)),
         }
-        return Some((path.display().to_string(), content));
     }
     None
 }
 
-/// Read a regular file's first `max` bytes as lossy UTF-8, refusing symlinks.
-/// The exfiltration guard (a planted symlink to a host secret) applies to every
-/// file folded into the prompt. `symlink_metadata` rejects a symlink/non-regular
-/// entry before opening, and the final component is opened with `O_NOFOLLOW`
-/// (Unix) so a check/open race cannot swap a regular file for a symlink between
-/// the type check and the read. `None` on any miss.
-fn read_regular_bounded(path: &Path, max: u64) -> Option<String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_file() => {}
-        _ => return None,
-    }
-    let file = open_no_follow(path).ok()?;
-    if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(max).read_to_end(&mut bytes).ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+fn empty_doc_notice(path: &Path) -> String {
+    format!(
+        "warning: skipping {}: instruction document is empty after reading the first {} KiB",
+        path.display(),
+        MAX_DOC_BYTES / 1024
+    )
 }
 
-/// Open a file for reading without following a final-component symlink.
+fn refusal_notice(path: &Path, reason: ReadRefusal, walk_discovered: bool) -> String {
+    match reason {
+        ReadRefusal::Symlink if walk_discovered => format!(
+            "warning: skipping {}: symlinked AGENTS.md/CLAUDE.md in a discovered directory is refused for security (possible exfiltration vector). Use a regular file.",
+            path.display()
+        ),
+        ReadRefusal::Symlink => format!(
+            "warning: skipping {}: instruction document symlink was refused",
+            path.display()
+        ),
+        ReadRefusal::NonRegular => format!(
+            "warning: skipping {}: instruction document is not a regular file",
+            path.display()
+        ),
+        ReadRefusal::Unreadable(error) => format!(
+            "warning: skipping {}: instruction document could not be read: {error}",
+            path.display()
+        ),
+    }
+}
+
+/// Read the first `max` bytes as lossy UTF-8 under the requested link policy.
+fn read_bounded(path: &Path, max: u64, link_policy: LinkPolicy) -> ReadOutcome {
+    let link_meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ReadOutcome::Missing;
+        }
+        Err(error) => return ReadOutcome::Refused(ReadRefusal::Unreadable(error)),
+    };
+
+    let file = match link_policy {
+        LinkPolicy::Refuse => {
+            if link_meta.file_type().is_symlink() {
+                return ReadOutcome::Refused(ReadRefusal::Symlink);
+            }
+            if !link_meta.is_file() {
+                return ReadOutcome::Refused(ReadRefusal::NonRegular);
+            }
+            open_no_follow(path)
+        }
+        LinkPolicy::Follow => {
+            match std::fs::metadata(path) {
+                Ok(meta) if meta.is_file() => {}
+                Ok(_) => return ReadOutcome::Refused(ReadRefusal::NonRegular),
+                Err(error) => return ReadOutcome::Refused(ReadRefusal::Unreadable(error)),
+            }
+            open_follow(path)
+        }
+    };
+    let file = match file {
+        Ok(file) => file,
+        Err(error) => return ReadOutcome::Refused(ReadRefusal::Unreadable(error)),
+    };
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return ReadOutcome::Refused(ReadRefusal::NonRegular),
+        Err(error) => return ReadOutcome::Refused(ReadRefusal::Unreadable(error)),
+    }
+
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(max).read_to_end(&mut bytes) {
+        return ReadOutcome::Refused(ReadRefusal::Unreadable(error));
+    }
+    ReadOutcome::Content(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Legacy symlink-refusing reader used by peer-tool onboarding discovery.
+fn read_regular_bounded(path: &Path, max: u64) -> Option<String> {
+    match read_bounded(path, max, LinkPolicy::Refuse) {
+        ReadOutcome::Content(content) => Some(content),
+        ReadOutcome::Missing | ReadOutcome::Refused(_) => None,
+    }
+}
+
+/// Open without following a final-component symlink. Nonblocking prevents a
+/// check/open race from hanging on a FIFO swapped into place.
 #[cfg(unix)]
 fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
 }
 
-// Iris targets Linux; this arm exists only so the crate still compiles on
-// non-Unix hosts. It is not a hardened path (no reparse-point handling), which
-// is acceptable because Iris does not ship a Windows target.
+#[cfg(unix)]
+fn open_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+// Iris targets Linux; these arms exist only so the crate still compiles on
+// non-Unix hosts. They are not hardened against reparse-point races.
 #[cfg(not(unix))]
 fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+#[cfg(not(unix))]
+fn open_follow(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
 
