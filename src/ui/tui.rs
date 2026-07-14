@@ -4875,7 +4875,7 @@ mod tests {
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         let working_idx = texts
             .iter()
-            .position(|line| line.contains("●···") && line.contains("┊ ······ ┊"))
+            .position(|line| line.contains("●···") && line.contains("┊······┊"))
             .expect("working indicator");
         let status_idx = texts
             .iter()
@@ -4926,7 +4926,7 @@ mod tests {
         assert!(!before.contains("Working…"), "{before}");
         assert!(before.contains("●···"), "{before}");
         assert!(!before.contains("┊ ESC ┊"), "{before}");
-        assert!(before.contains("┊ ······ ┊"), "{before}");
+        assert!(before.contains("┊······┊"), "{before}");
         assert!(before.contains("↑177k ↓5.7k"), "{before}");
         assert!(!before.contains('|'), "{before}");
         assert!(!before.contains("T+"), "{before}");
