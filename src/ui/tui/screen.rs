@@ -5776,6 +5776,27 @@ mod tests {
     }
 
     #[test]
+    fn typed_composer_text_aligns_with_empty_caret_and_left_edge() {
+        let mut screen = Screen::new();
+        screen.editor.insert_str("hello");
+
+        let lines = super::render_editor_chrome(&mut screen, 80, 13);
+        let left_edge = lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.trim().chars().all(|ch| ch == '─') && line.contains('─'))
+            .and_then(|line| line.find('─'))
+            .expect("composer top edge");
+        let text_column = lines
+            .iter()
+            .map(line_text)
+            .find_map(|line| line.find("hello"))
+            .expect("typed composer text");
+
+        assert_eq!(text_column, left_edge);
+    }
+
+    #[test]
     fn focused_composer_emits_cursor_marker_and_running_turn_does_not() {
         use super::{Screen, render_document_with_chrome_tail};
         use crate::ui::terminal_surface::CURSOR_MARKER;
