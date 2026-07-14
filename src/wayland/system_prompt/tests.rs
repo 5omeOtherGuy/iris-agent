@@ -742,3 +742,119 @@ fn discover_works_without_iris_agents() {
         "no iris agents path when file is absent"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn user_level_symlinks_load_in_shared_then_iris_order() {
+    use std::os::unix::fs::symlink;
+
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    let targets = home.path.join("dotfiles");
+    fs::create_dir_all(&targets).unwrap();
+    fs::write(targets.join("shared.md"), "SHARED SYMLINK RULES").unwrap();
+    fs::write(targets.join("iris.md"), "IRIS SYMLINK RULES").unwrap();
+    fs::create_dir_all(home.path.join(".agents")).unwrap();
+    fs::create_dir_all(home.path.join(".iris")).unwrap();
+    symlink(
+        targets.join("shared.md"),
+        home.path.join(".agents/AGENTS.md"),
+    )
+    .unwrap();
+    symlink(
+        targets.join("iris.md"),
+        home.path.join(".iris/AGENTS.md"),
+    )
+    .unwrap();
+
+    let ws = temp_dir();
+    let assembly = PromptAssembler::default().assemble(&ws.path, &built_in_tools());
+    let shared = assembly.prompt.find("SHARED SYMLINK RULES").unwrap();
+    let iris = assembly.prompt.find("IRIS SYMLINK RULES").unwrap();
+    assert!(shared < iris, "shared user rules must precede Iris overrides");
+    assert!(assembly.notices.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_user_level_symlink_targets_have_diagnostics() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    fs::create_dir_all(home.path.join(".agents")).unwrap();
+    fs::create_dir_all(home.path.join(".iris")).unwrap();
+
+    let missing = home.path.join("missing-target");
+    symlink(&missing, home.path.join(".agents/AGENTS.md")).unwrap();
+    let directory = home.path.join("directory-target");
+    fs::create_dir(&directory).unwrap();
+    symlink(&directory, home.path.join(".iris/AGENTS.md")).unwrap();
+
+    let ws = temp_dir();
+    let discovery = discover_project_docs_with_warnings(&ws.path);
+    assert_eq!(discovery.notices.len(), 2);
+    assert!(discovery.notices.iter().any(|line| line.contains("could not be read")));
+    assert!(discovery.notices.iter().any(|line| line.contains("not a regular file")));
+
+    fs::remove_file(home.path.join(".iris/AGENTS.md")).unwrap();
+    let fifo = home.path.join("instructions.fifo");
+    let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    symlink(&fifo, home.path.join(".iris/AGENTS.md")).unwrap();
+    let discovery = discover_project_docs_with_warnings(&ws.path);
+    assert!(
+        discovery
+            .notices
+            .iter()
+            .any(|line| line.contains(".iris/AGENTS.md") && line.contains("not a regular file"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn walk_symlink_secret_is_refused_and_warned_once_per_assembler() {
+    use std::os::unix::fs::symlink;
+
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    let outside = temp_dir();
+    let secret = outside.path.join("secret.txt");
+    fs::write(&secret, "NEVER FOLD THIS SECRET").unwrap();
+    let ws = temp_dir();
+    symlink(&secret, ws.path.join("AGENTS.md")).unwrap();
+
+    let mut assembler = PromptAssembler::default();
+    let first = assembler.assemble(&ws.path, &built_in_tools());
+    let second = assembler.assemble(&ws.path, &built_in_tools());
+    assert!(!first.prompt.contains("NEVER FOLD THIS SECRET"));
+    assert!(!second.prompt.contains("NEVER FOLD THIS SECRET"));
+    assert_eq!(first.notices.len(), 1);
+    assert!(first.notices[0].contains("possible exfiltration vector"));
+    assert!(second.notices.is_empty(), "warning must be deduplicated per session");
+}
+
+#[cfg(unix)]
+#[test]
+fn user_level_symlink_target_still_obeys_byte_cap() {
+    use std::os::unix::fs::symlink;
+
+    let home = temp_dir();
+    let _env = EnvGuard::with_home(&home.path);
+    fs::create_dir_all(home.path.join(".iris")).unwrap();
+    let target = home.path.join("large-rules.md");
+    fs::write(&target, "x".repeat(MAX_DOC_BYTES as usize + 128)).unwrap();
+    symlink(&target, home.path.join(".iris/AGENTS.md")).unwrap();
+
+    let ws = temp_dir();
+    let discovery = discover_project_docs_with_warnings(&ws.path);
+    let content = discovery
+        .docs
+        .iter()
+        .find(|(path, _)| path.ends_with(".iris/AGENTS.md"))
+        .map(|(_, content)| content)
+        .expect("symlinked user-level doc loaded");
+    assert_eq!(content.len(), MAX_DOC_BYTES as usize);
+}
