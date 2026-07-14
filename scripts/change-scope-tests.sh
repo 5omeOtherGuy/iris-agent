@@ -64,6 +64,12 @@ git -C "$GATE_REPO" add README.md
 git -C "$GATE_REPO" commit --quiet -m docs
 (cd "$GATE_REPO" && IRIS_GATE_BASE=base bash scripts/gate.sh) \
   | grep -q 'documentation-only; whitespace OK (Rust checks skipped)'
+git -C "$GATE_REPO" reset --hard --quiet base
+printf '# trailing whitespace \n' >"$GATE_REPO/untracked.md"
+if (cd "$GATE_REPO" && IRIS_GATE_BASE=base bash scripts/gate.sh >/dev/null 2>&1); then
+  printf 'change-scope-tests: untracked Markdown whitespace was not rejected\n' >&2
+  exit 1
+fi
 
 WORKFLOW="$ROOT/.github/workflows/ci.yml"
 GATE="$ROOT/scripts/gate.sh"
