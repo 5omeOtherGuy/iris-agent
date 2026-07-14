@@ -947,9 +947,12 @@ pub(super) fn fresh_editor() -> TextArea<'static> {
 }
 
 pub(super) fn editor_visual_rows(editor: &TextArea<'_>, width: u16) -> u16 {
+    let box_width = width
+        .saturating_sub(BOX_X_PADDING_U16.saturating_mul(2))
+        .max(1);
     let inner_width = usize::from(
-        width
-            .saturating_sub(BOX_X_PADDING_U16.saturating_mul(2))
+        box_width
+            .saturating_sub(composer_text_padding(box_width))
             .max(1),
     );
     editor
@@ -3330,6 +3333,14 @@ fn chrome_heights(
     ChromeHeights { menu, editor }
 }
 
+fn composer_text_padding(box_width: u16) -> u16 {
+    // Keep the empty placeholder on the transcript text column, but reserve the
+    // same width after typing so wrapping does not jump when input appears.
+    u16::try_from(TEXT_COLUMN_X_PADDING.saturating_sub(1))
+        .unwrap_or(u16::MAX)
+        .min(box_width.saturating_sub(1))
+}
+
 pub(super) fn render_editor_chrome(
     screen: &mut Screen,
     width: u16,
@@ -3436,13 +3447,19 @@ pub(super) fn render_editor_chrome(
             .max(1),
         height: editor_area.height,
     };
+    let text_padding = composer_text_padding(box_area.width);
+    let text_x_offset = if screen.editor_is_empty() {
+        text_padding
+    } else {
+        0
+    };
     // Padding is preferred, not protected: at the minimum composer height the
     // input row wins over the soft bottom row.
     let pad_rows = bottom_padding_rows.min(editor_area.height.saturating_sub(MIN_EDITOR_H));
     let text_area = Rect {
-        x: box_area.x,
+        x: box_area.x + text_x_offset,
         y: editor_area.y + EDITOR_CHROME_ROWS_ABOVE.min(editor_area.height.saturating_sub(1)),
-        width: box_area.width,
+        width: box_area.width.saturating_sub(text_padding).max(1),
         height: editor_area
             .height
             .saturating_sub(EDITOR_VERTICAL_CHROME_ROWS)
