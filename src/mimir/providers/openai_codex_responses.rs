@@ -847,6 +847,16 @@ impl OpenAiCodexResponsesProvider {
                 Ok(turn) => return Ok(turn),
                 Err((policy, error)) => {
                     let reconnect_count = ws_attempt.saturating_sub(1);
+                    tracing::warn!(
+                        provider = PROVIDER_ID,
+                        model = %self.model,
+                        transport = "websocket",
+                        ws_attempt,
+                        reconnect_count,
+                        policy = ?policy,
+                        error_class = websocket_error_class(&error),
+                        "Codex WebSocket attempt failed"
+                    );
                     let error = anyhow!(
                         "{error} [ws_attempt={ws_attempt} reconnect_count={reconnect_count}]"
                     );
@@ -865,19 +875,6 @@ impl OpenAiCodexResponsesProvider {
                             self.drop_ws_socket().await;
                         }
                         WsFallback::FallbackSse => {
-                            if error
-                                .to_string()
-                                .contains("classification=provider_transport_idle")
-                            {
-                                tracing::warn!(
-                                    provider = PROVIDER_ID,
-                                    model = %self.model,
-                                    transport = "websocket",
-                                    fallback_transport = "https_sse",
-                                    error = %error,
-                                    "Codex WebSocket became idle before producing output; falling back to SSE"
-                                );
-                            }
                             self.disable_ws_for_session().await;
                             sink.set_transport_phase("https_sse", "response_stream");
                             sink.on_activity()?;
@@ -1887,7 +1884,13 @@ where
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => {
             let policy = classify_ws_error(&error, emitted_visible_output);
-            Err((policy, error))
+            let detail = safe_transport_error(&error);
+            Err((
+                policy,
+                anyhow!(
+                    "Codex WebSocket setup failed [classification=websocket_setup_error observed_at=websocket_setup transport=websocket phase={operation} error={detail} visible_output={emitted_visible_output}]"
+                ),
+            ))
         }
         Err(_) => Err((
             if emitted_visible_output {
@@ -1939,6 +1942,27 @@ async fn connect_codex_ws(url: Url, token: &AccessToken, session_id: &str) -> Re
     let request = build_codex_ws_request(&url, token, session_id)?;
     let (stream, _) = tokio_tungstenite::connect_async(request).await?;
     Ok(stream)
+}
+
+fn websocket_error_class(error: &anyhow::Error) -> &'static str {
+    let text = error.to_string();
+    if text.contains("classification=provider_transport_idle") {
+        "read_idle"
+    } else if text.contains("classification=websocket_setup_timeout") {
+        "setup_timeout"
+    } else if text.contains("classification=websocket_setup_error") {
+        "setup_error"
+    } else if text.contains("classification=websocket_close") {
+        "close"
+    } else if text.contains("classification=websocket_read_error") {
+        "read_error"
+    } else if text.contains("classification=upstream_provider_error") {
+        "upstream_provider_error"
+    } else if error.downcast_ref::<CodexStreamProtocolAnomaly>().is_some() {
+        "protocol_anomaly"
+    } else {
+        "unknown"
+    }
 }
 
 fn classify_ws_error(error: &anyhow::Error, emitted_visible_output: bool) -> WsFallback {

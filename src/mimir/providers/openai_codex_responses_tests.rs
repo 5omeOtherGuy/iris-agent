@@ -327,6 +327,36 @@ fn websocket_setup_cancel_stops_before_connect_or_send_complete() {
 }
 
 #[test]
+fn websocket_setup_failure_is_classified_and_redacted() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancel = CancellationToken::new();
+
+    let (policy, error) = runtime
+        .block_on(await_ws_setup(
+            "connect",
+            std::time::Duration::from_secs(1),
+            &cancel,
+            false,
+            async { Err::<(), _>(anyhow!("handshake failed /home/alice sk-secret prompt")) },
+        ))
+        .unwrap_err();
+    let message = error.to_string();
+
+    assert_eq!(policy, WsFallback::FallbackSse);
+    assert!(
+        message.contains("classification=websocket_setup_error"),
+        "{message}"
+    );
+    assert!(message.contains("phase=connect"), "{message}");
+    assert!(!message.contains("/home/alice"), "{message}");
+    assert!(!message.contains("sk-secret"), "{message}");
+    assert!(!message.contains("prompt"), "{message}");
+}
+
+#[test]
 fn websocket_read_idle_before_visible_output_falls_back_with_diagnostics() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
