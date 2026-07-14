@@ -3,6 +3,8 @@ set -uo pipefail
 
 is_docs_path() {
   case "$1" in
+    docs/*.md|openwiki/*.md|showcase/*.md|.github/*.md) return 0 ;;
+    */*.md) return 1 ;;
     *.md) return 0 ;;
     docs/assets/*.svg|docs/assets/*.png|docs/assets/*.gif|docs/assets/*.jpg|docs/assets/*.jpeg|docs/assets/*.webp) return 0 ;;
     *) return 1 ;;
