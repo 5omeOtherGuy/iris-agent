@@ -828,7 +828,9 @@ impl OpenAiCodexResponsesProvider {
         let mut tried_previous_full = false;
         let mut tried_reauth = false;
         let mut force_full = false;
+        let mut ws_attempt = 0u32;
         loop {
+            ws_attempt = ws_attempt.saturating_add(1);
             sink.set_transport_phase("websocket", "authentication");
             let token = self.codex_token_off_thread(tried_reauth).await?;
             match self
@@ -843,43 +845,49 @@ impl OpenAiCodexResponsesProvider {
                 .await
             {
                 Ok(turn) => return Ok(turn),
-                Err((policy, error)) => match policy {
-                    WsFallback::RetryWebSocket if !tried_limit_refresh => {
-                        tried_limit_refresh = true;
-                        self.drop_ws_socket().await;
-                    }
-                    WsFallback::RetryFullWebSocket if !tried_previous_full => {
-                        tried_previous_full = true;
-                        force_full = true;
-                        self.clear_continuation().await;
-                    }
-                    WsFallback::ForceRefresh if !tried_reauth => {
-                        tried_reauth = true;
-                        self.drop_ws_socket().await;
-                    }
-                    WsFallback::FallbackSse => {
-                        if error
-                            .to_string()
-                            .contains("classification=provider_transport_idle")
-                        {
-                            tracing::warn!(
-                                provider = PROVIDER_ID,
-                                model = %self.model,
-                                transport = "websocket",
-                                fallback_transport = "https_sse",
-                                error = %error,
-                                "Codex WebSocket became idle before producing output; falling back to SSE"
-                            );
+                Err((policy, error)) => {
+                    let reconnect_count = ws_attempt.saturating_sub(1);
+                    let error = anyhow!(
+                        "{error} [ws_attempt={ws_attempt} reconnect_count={reconnect_count}]"
+                    );
+                    match policy {
+                        WsFallback::RetryWebSocket if !tried_limit_refresh => {
+                            tried_limit_refresh = true;
+                            self.drop_ws_socket().await;
                         }
-                        self.disable_ws_for_session().await;
-                        sink.set_transport_phase("https_sse", "response_stream");
-                        sink.on_activity()?;
-                        return self
-                            .run_blocking_off_thread(url, full_request, sink, cancel)
-                            .await;
+                        WsFallback::RetryFullWebSocket if !tried_previous_full => {
+                            tried_previous_full = true;
+                            force_full = true;
+                            self.clear_continuation().await;
+                        }
+                        WsFallback::ForceRefresh if !tried_reauth => {
+                            tried_reauth = true;
+                            self.drop_ws_socket().await;
+                        }
+                        WsFallback::FallbackSse => {
+                            if error
+                                .to_string()
+                                .contains("classification=provider_transport_idle")
+                            {
+                                tracing::warn!(
+                                    provider = PROVIDER_ID,
+                                    model = %self.model,
+                                    transport = "websocket",
+                                    fallback_transport = "https_sse",
+                                    error = %error,
+                                    "Codex WebSocket became idle before producing output; falling back to SSE"
+                                );
+                            }
+                            self.disable_ws_for_session().await;
+                            sink.set_transport_phase("https_sse", "response_stream");
+                            sink.on_activity()?;
+                            return self
+                                .run_blocking_off_thread(url, full_request, sink, cancel)
+                                .await;
+                        }
+                        _ => return Err(error),
                     }
-                    _ => return Err(error),
-                },
+                }
             }
         }
     }
