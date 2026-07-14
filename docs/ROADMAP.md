@@ -118,11 +118,10 @@ Implemented today:
   reactive, summarizer, worker input) separately from tool-result compaction,
   with a dim resolved-ladder line, live application at the next boundary, and
   background-job cancellation when automatic compaction is turned off.
-- Default-short provider-native prompt-cache settings and diagnostics: compatible
-  Codex WebSocket sessions reuse workspace/system-prompt heads while SSE and
-  OpenAI platform requests keep session-scoped routing; Anthropic uses native
-  `cache_control`. Provider usage/cache metadata is normalized, and cache-break
-  warnings appear only when the stable prefix provably changed.
+- Default-short provider-native prompt-cache settings and diagnostics: OpenAI
+  prompt-cache keys/24h retention, Anthropic `cache_control`, provider
+  usage/cache metadata, and cache-break warnings only when the stable prefix
+  provably changed.
 - Anthropic server-side context-management clear edits, a probe-only Anthropic
   compact adapter, and default-off, capability-gated native OpenAI compaction.
   Native entries persist portable summaries beside provider-owned replay blocks;
