@@ -416,11 +416,19 @@ fn discover_prefers_agents_md_over_claude_md_per_dir() {
 fn discover_skips_empty_project_doc() {
     let dir = temp_dir();
     fs::write(dir.path.join("AGENTS.md"), "   \n\t\n").unwrap();
-    let docs = discover_project_docs(&dir.path);
+    let discovery = discover_project_docs_with_warnings(&dir.path);
     assert!(
-        docs.iter()
+        discovery
+            .docs
+            .iter()
             .all(|(p, _)| !p.contains("AGENTS.md")
                 || !p.starts_with(&dir.path.display().to_string()))
+    );
+    assert!(
+        discovery
+            .notices
+            .iter()
+            .any(|notice| notice.contains("empty after reading"))
     );
 }
 
@@ -673,22 +681,22 @@ fn discover_prepends_shared_hub_before_iris_and_project_docs() {
 
 #[cfg(unix)]
 #[test]
-fn discover_rejects_a_symlinked_shared_hub_doc() {
+fn discover_accepts_a_symlinked_shared_hub_doc() {
     use std::os::unix::fs::symlink;
     let home = temp_dir();
     let _env = EnvGuard::with_home(&home.path);
-    let secret = home.path.join("secret.txt");
-    fs::write(&secret, "TOP SECRET HOST FILE").unwrap();
+    let target = home.path.join("shared-rules.md");
+    fs::write(&target, "SHARED SYMLINK RULES").unwrap();
     let hub_dir = home.path.join(".agents");
     fs::create_dir_all(&hub_dir).unwrap();
-    symlink(&secret, hub_dir.join("AGENTS.md")).unwrap();
+    symlink(&target, hub_dir.join("AGENTS.md")).unwrap();
 
     let ws = temp_dir();
     let docs = discover_project_docs(&ws.path);
     assert!(
         docs.iter()
-            .all(|(_, c)| !c.contains("TOP SECRET HOST FILE")),
-        "a symlinked ~/.agents/AGENTS.md must not be read"
+            .any(|(_, content)| content.contains("SHARED SYMLINK RULES")),
+        "a symlinked ~/.agents/AGENTS.md must be read"
     );
 }
 
@@ -761,17 +769,16 @@ fn user_level_symlinks_load_in_shared_then_iris_order() {
         home.path.join(".agents/AGENTS.md"),
     )
     .unwrap();
-    symlink(
-        targets.join("iris.md"),
-        home.path.join(".iris/AGENTS.md"),
-    )
-    .unwrap();
+    symlink(targets.join("iris.md"), home.path.join(".iris/AGENTS.md")).unwrap();
 
     let ws = temp_dir();
     let assembly = PromptAssembler::default().assemble(&ws.path, &built_in_tools());
     let shared = assembly.prompt.find("SHARED SYMLINK RULES").unwrap();
     let iris = assembly.prompt.find("IRIS SYMLINK RULES").unwrap();
-    assert!(shared < iris, "shared user rules must precede Iris overrides");
+    assert!(
+        shared < iris,
+        "shared user rules must precede Iris overrides"
+    );
     assert!(assembly.notices.is_empty());
 }
 
@@ -796,8 +803,18 @@ fn refused_user_level_symlink_targets_have_diagnostics() {
     let ws = temp_dir();
     let discovery = discover_project_docs_with_warnings(&ws.path);
     assert_eq!(discovery.notices.len(), 2);
-    assert!(discovery.notices.iter().any(|line| line.contains("could not be read")));
-    assert!(discovery.notices.iter().any(|line| line.contains("not a regular file")));
+    assert!(
+        discovery
+            .notices
+            .iter()
+            .any(|line| line.contains("could not be read"))
+    );
+    assert!(
+        discovery
+            .notices
+            .iter()
+            .any(|line| line.contains("not a regular file"))
+    );
 
     fs::remove_file(home.path.join(".iris/AGENTS.md")).unwrap();
     let fifo = home.path.join("instructions.fifo");
@@ -833,7 +850,10 @@ fn walk_symlink_secret_is_refused_and_warned_once_per_assembler() {
     assert!(!second.prompt.contains("NEVER FOLD THIS SECRET"));
     assert_eq!(first.notices.len(), 1);
     assert!(first.notices[0].contains("possible exfiltration vector"));
-    assert!(second.notices.is_empty(), "warning must be deduplicated per session");
+    assert!(
+        second.notices.is_empty(),
+        "warning must be deduplicated per session"
+    );
 }
 
 #[cfg(unix)]
