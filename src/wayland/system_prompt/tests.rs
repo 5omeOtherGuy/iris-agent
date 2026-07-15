@@ -12,7 +12,44 @@ use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::nexus::{Tool, ToolEnv, ToolFuture, ToolOutput};
 use crate::tools::{built_in_tools, built_in_tools_for};
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+struct NamedTool(&'static str);
+
+impl Tool for NamedTool {
+    fn name(&self) -> &str {
+        self.0
+    }
+
+    fn description(&self) -> &str {
+        "test tool"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async { Ok(ToolOutput::text("unused")) })
+    }
+}
+
+fn named_tools(names: &[&'static str]) -> Tools {
+    Tools::new(
+        names
+            .iter()
+            .map(|name| Box::new(NamedTool(name)) as Box<dyn Tool>)
+            .collect(),
+    )
+}
 
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
@@ -313,6 +350,40 @@ fn recall_fragment_renders_only_when_the_recall_tool_is_registered() {
         !without_recall.contains("<compaction_recall>"),
         "recall fragment must not render when the tool is absent"
     );
+}
+
+#[test]
+fn subagent_fragment_renders_only_with_the_live_spawn_tool() {
+    let workspace = Path::new("/tmp/subagent-fragment-test");
+    let without_subagents = assemble_defaults(workspace, &built_in_tools());
+    assert!(!without_subagents.contains("<subagent_delegation>"));
+
+    let tools = named_tools(&["recall", "spawn_subagent"]);
+    let with_subagents = assemble_defaults(workspace, &tools);
+    assert!(with_subagents.contains("<subagent_delegation>"));
+    for rule in [
+        "Delegate only when it has a clear payoff",
+        "one self-contained outcome",
+        "Treat worker output as evidence, not completion",
+        "Never claim the parent workspace changed until apply succeeds",
+    ] {
+        assert!(
+            with_subagents.contains(rule),
+            "missing subagent rule: {rule}"
+        );
+    }
+    assert!(at(&with_subagents, "compaction_recall") < at(&with_subagents, "subagent_delegation"));
+    assert!(at(&with_subagents, "subagent_delegation") < at(&with_subagents, "available_tools"));
+}
+
+#[test]
+fn no_other_tools_guardrail_mentions_subagents_only_when_they_are_absent() {
+    let without_subagents = available_tools_body(&built_in_tools());
+    assert!(without_subagents.contains("multi_tool wrappers, subagents, or hidden"));
+
+    let with_subagents = available_tools_body(&named_tools(&["spawn_subagent"]));
+    assert!(!with_subagents.contains("multi_tool wrappers, subagents"));
+    assert!(with_subagents.contains("multi_tool wrappers or hidden parallel tool APIs"));
 }
 
 #[test]

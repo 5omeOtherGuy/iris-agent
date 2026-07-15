@@ -2033,6 +2033,42 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing {expected}");
         }
+        for (name, description) in [
+            (
+                "spawn_subagent",
+                "Delegate a self-contained instruction to a fresh worker, or the same instruction to an independently scheduled group. Mutations stay in managed worktrees until separate apply.",
+            ),
+            (
+                "subagent_status",
+                "Return the current non-consuming snapshot for exactly one worker or group; group snapshots include every member.",
+            ),
+            (
+                "read_subagent_output",
+                "Read one UTF-8 byte page from an output artifact referenced by a terminal subagent result.",
+            ),
+            (
+                "cancel_subagent",
+                "Cancel exactly one worker or group cooperatively; the runtime hard-aborts work that exceeds its cancellation grace period.",
+            ),
+            (
+                "select_subagent_candidate",
+                "Select one successful member after every best-of-N group member is terminal. Mutable selection may change before apply; this tool never applies files.",
+            ),
+            (
+                "plan_subagent_apply",
+                "Create an immutable content-digested apply plan for a completed worker's isolated worktree. Group candidates must be selected first; parent files are not changed.",
+            ),
+            (
+                "apply_subagent",
+                "Apply one immutable plan to the parent workspace after revalidation. This separately approval-gated step requires explicit authorization for dirty, base-drifted, and escaping-symlink paths.",
+            ),
+        ] {
+            assert_eq!(
+                subagent_tools.by_name(name).unwrap().description(),
+                description,
+                "stale {name} description"
+            );
+        }
         assert!(
             names
                 .iter()
@@ -2050,15 +2086,187 @@ mod tests {
             "kind",
             "capability",
             "isolation",
+            "tools",
             "cwd",
+            "allow_outside_workspace",
             "background",
-            "resume_from",
+            "max_provider_rounds",
+            "max_tool_rounds",
+            "max_tokens",
+            "count",
         ] {
             assert!(
                 properties.contains_key(required_field),
                 "missing {required_field}"
             );
         }
+        assert!(
+            !properties.contains_key("resume_from"),
+            "unimplemented resume semantics must not be advertised"
+        );
+        for (field, description) in [
+            (
+                "prompt",
+                "Self-contained instruction for a fresh worker. Include the goal, relevant context, scope, constraints, verification, and expected result.",
+            ),
+            (
+                "description",
+                "Short operator-facing label; defaults to kind.",
+            ),
+            (
+                "kind",
+                "Worker category. explore and review force read_only capability; categories do not inject personas or role instructions.",
+            ),
+            (
+                "capability",
+                "Tool grant. read_only permits inspection; read_write adds edit/write; execute adds shell; all permits both writes and shell.",
+            ),
+            (
+                "isolation",
+                "Workspace mode. Omit to use none for read_only or worktree for mutation-capable workers. worktree and cwd are mutually exclusive.",
+            ),
+            (
+                "tools",
+                "Optional tool-name allowlist applied after capability. It can only narrow the grant; omitted or empty keeps every granted tool.",
+            ),
+            (
+                "cwd",
+                "Existing directory inside the parent workspace for a non-isolated read_only worker; incompatible with worktree isolation.",
+            ),
+            (
+                "allow_outside_workspace",
+                "Allow read-only tools to follow paths outside the worker workspace. Mutation remains confined.",
+            ),
+            (
+                "background",
+                "When true, return queued IDs immediately. When false, wait for every requested worker to become terminal. Defaults to true.",
+            ),
+            (
+                "max_provider_rounds",
+                "Optional provider-call limit; exceeding it fails the worker.",
+            ),
+            ("max_tool_rounds", "Optional tool round-trip limit."),
+            (
+                "max_tokens",
+                "Optional cumulative token limit; exceeding it fails the worker.",
+            ),
+            (
+                "count",
+                "Number of independent workers, from 1 through 8, that receive this identical request. Values above 1 return a group for best-of-N comparison.",
+            ),
+        ] {
+            assert_eq!(
+                properties[field]["description"],
+                json!(description),
+                "stale spawn_subagent.{field} description"
+            );
+        }
+        for (field, default) in [
+            ("kind", json!("general")),
+            ("capability", json!("read_only")),
+            ("allow_outside_workspace", json!(false)),
+            ("background", json!(true)),
+            ("count", json!(1)),
+        ] {
+            assert_eq!(
+                properties[field]["default"], default,
+                "missing spawn_subagent.{field} default"
+            );
+        }
+
+        for (tool_name, fields) in [
+            (
+                "subagent_status",
+                vec![
+                    ("worker_id", "Worker ID returned by spawn_subagent."),
+                    (
+                        "group_id",
+                        "Group ID returned when spawn_subagent count is greater than 1.",
+                    ),
+                ],
+            ),
+            (
+                "cancel_subagent",
+                vec![
+                    ("worker_id", "Worker ID returned by spawn_subagent."),
+                    (
+                        "group_id",
+                        "Group ID returned when spawn_subagent count is greater than 1.",
+                    ),
+                ],
+            ),
+            (
+                "select_subagent_candidate",
+                vec![
+                    ("group_id", "Completed group whose members were inspected."),
+                    (
+                        "worker_id",
+                        "Successful member of group_id to select; mutable selection may change before apply.",
+                    ),
+                ],
+            ),
+            (
+                "plan_subagent_apply",
+                vec![(
+                    "worker_id",
+                    "Completed worker with an isolated worktree; select grouped candidates first.",
+                )],
+            ),
+            (
+                "apply_subagent",
+                vec![
+                    (
+                        "plan_id",
+                        "Immutable plan ID returned by plan_subagent_apply.",
+                    ),
+                    (
+                        "approved_overwrites",
+                        "Dirty or base-drifted workspace-relative paths explicitly authorized for overwrite.",
+                    ),
+                    (
+                        "approved_escaping_symlinks",
+                        "Workspace-relative symlink paths explicitly authorized to target outside the parent workspace.",
+                    ),
+                    (
+                        "skipped_paths",
+                        "Workspace-relative plan paths to leave unapplied.",
+                    ),
+                ],
+            ),
+        ] {
+            let schema = subagent_tools.by_name(tool_name).unwrap().parameters();
+            for (field, description) in fields {
+                assert_eq!(
+                    schema["properties"][field]["description"],
+                    json!(description),
+                    "stale {tool_name}.{field} description"
+                );
+            }
+        }
+        let artifact_schema = subagent_tools
+            .by_name("read_subagent_output")
+            .unwrap()
+            .parameters();
+        for (field, description) in [
+            ("artifact_id", "Artifact ID from a terminal worker result."),
+            (
+                "offset",
+                "UTF-8 byte offset; continue with next_offset from the previous page. Defaults to 0.",
+            ),
+            (
+                "limit",
+                "Maximum bytes to return, from 1 through 50000. Defaults to 16000.",
+            ),
+        ] {
+            assert_eq!(
+                artifact_schema["properties"][field]["description"],
+                json!(description),
+                "stale read_subagent_output.{field} description"
+            );
+        }
+        assert_eq!(artifact_schema["properties"]["offset"]["default"], 0);
+        assert_eq!(artifact_schema["properties"]["limit"]["default"], 16_000);
+
         let state = std::cell::RefCell::new(ToolState::new());
         let env = bash_env(&subagent_workspace, &state, None);
         let spawn = subagent_tools.by_name("spawn_subagent").unwrap();
@@ -2090,6 +2298,26 @@ mod tests {
                 "unexpected validation error: {error:#}"
             );
         }
+        let worker_id = iris_subagent_runtime::WorkerId::new().to_string();
+        let group_id = iris_subagent_runtime::GroupId::new().to_string();
+        for tool_name in ["subagent_status", "cancel_subagent"] {
+            let tool = subagent_tools.by_name(tool_name).unwrap();
+            for invalid in [
+                json!({}),
+                json!({ "worker_id": worker_id, "group_id": group_id }),
+            ] {
+                let error = current_thread_runtime()
+                    .block_on(tool.execute(&invalid, &env, CancellationToken::new()))
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("requires exactly one of worker_id or group_id"),
+                    "unexpected {tool_name} selector error: {error:#}"
+                );
+            }
+        }
+
         let failed = current_thread_runtime()
             .block_on(spawn.execute(
                 &json!({
