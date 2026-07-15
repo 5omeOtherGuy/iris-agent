@@ -402,6 +402,177 @@ pub(crate) fn handle_tasks_command<P: ChatProvider>(
     }
 }
 
+/// Shared operator controls for independently scheduled subagents.
+pub(crate) fn handle_subagents_command<P: ChatProvider>(
+    line: &str,
+    harness: &Harness<P>,
+) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((cmd, rest)) => (cmd, rest.trim()),
+        None => (trimmed, ""),
+    };
+    if cmd != "/subagents" {
+        return None;
+    }
+    let parts = rest.split_whitespace().collect::<Vec<_>>();
+    let lines = match parts.as_slice() {
+        [] | ["list"] => match harness.subagent_snapshots() {
+            Ok(snapshots) if snapshots.is_empty() => {
+                vec!["No subagents for this session.".to_string()]
+            }
+            Ok(snapshots) => snapshots
+                .into_iter()
+                .map(|snapshot| {
+                    let group = snapshot
+                        .group_id
+                        .as_ref()
+                        .map(|id| format!(" group={id}"))
+                        .unwrap_or_default();
+                    format!(
+                        "{} {:?} {}{}",
+                        snapshot.worker_id, snapshot.status, snapshot.request.description, group
+                    )
+                })
+                .collect(),
+            Err(error) => vec![format!("could not list subagents: {error:#}")],
+        },
+        ["show", raw_id] => match raw_id.parse() {
+            Ok(id) => match harness.subagent_snapshot(&id) {
+                Ok(snapshot) => vec![
+                    serde_json::to_string_pretty(&snapshot)
+                        .unwrap_or_else(|error| format!("could not render subagent: {error}")),
+                ],
+                Err(error) => vec![format!("could not show subagent: {error:#}")],
+            },
+            Err(error) => vec![format!("invalid worker id: {error}")],
+        },
+        ["wait", raw_id] => match raw_id.parse() {
+            Ok(id) => match harness.wait_for_subagent(&id) {
+                Ok(result) => vec![
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|error| format!("could not render subagent: {error}")),
+                ],
+                Err(error) => vec![format!("could not wait for subagent: {error:#}")],
+            },
+            Err(error) => vec![format!("invalid worker id: {error}")],
+        },
+        ["cancel", raw_id] => match raw_id.parse() {
+            Ok(id) => match harness.cancel_subagent(&id) {
+                Ok(snapshot) => vec![format!(
+                    "cancellation requested for {} ({:?})",
+                    snapshot.worker_id, snapshot.status
+                )],
+                Err(error) => vec![format!("could not cancel subagent: {error:#}")],
+            },
+            Err(error) => vec![format!("invalid worker id: {error}")],
+        },
+        _ => vec![
+            "usage: /subagents [list|show <worker-id>|wait <worker-id>|cancel <worker-id>]"
+                .to_string(),
+        ],
+    };
+    Some(lines)
+}
+
+/// Shared operator controls for managed subagent worktrees.
+pub(crate) fn handle_worktrees_command<P: ChatProvider>(
+    line: &str,
+    harness: &Harness<P>,
+) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    let (cmd, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((cmd, rest)) => (cmd, rest.trim()),
+        None => (trimmed, ""),
+    };
+    if cmd != "/worktrees" {
+        return None;
+    }
+    let backend = match harness.subagent_backend() {
+        Ok(backend) => backend,
+        Err(error) => return Some(vec![format!("could not access worktrees: {error:#}")]),
+    };
+    let parts = rest.split_whitespace().collect::<Vec<_>>();
+    let lines = match parts.as_slice() {
+        [] | ["list"] => match backend.list_worktrees() {
+            Ok(records) if records.is_empty() => vec!["No managed worktrees.".to_string()],
+            Ok(records) => records
+                .into_iter()
+                .map(|record| {
+                    format!(
+                        "{} {:?} {:?} {}",
+                        record.id,
+                        record.status,
+                        record.creation_mode,
+                        record.path.display()
+                    )
+                })
+                .collect(),
+            Err(error) => vec![format!("could not list worktrees: {error:#}")],
+        },
+        ["show", raw_id] => match raw_id.parse() {
+            Ok(id) => match backend.show_worktree(&id) {
+                Ok(record) => vec![serde_json::to_string_pretty(&record)
+                    .unwrap_or_else(|error| format!("could not render worktree: {error}"))],
+                Err(error) => vec![format!("could not show worktree: {error:#}")],
+            },
+            Err(error) => vec![format!("invalid worktree id: {error}")],
+        },
+        ["rm", raw_id] | ["remove", raw_id] => remove_worktree_line(backend, raw_id, false),
+        ["rm", "--force", raw_id] | ["remove", "--force", raw_id] => {
+            remove_worktree_line(backend, raw_id, true)
+        }
+        ["gc"] => match backend.gc_worktrees() {
+            Ok(report) => vec![serde_json::to_string_pretty(&report)
+                .unwrap_or_else(|error| format!("could not render GC report: {error}"))],
+            Err(error) => vec![format!("could not inspect worktrees: {error:#}")],
+        },
+        ["adopt", raw_id] => worktree_record_line(raw_id, |id| backend.adopt_worktree(id)),
+        ["ignore", raw_id] => worktree_record_line(raw_id, |id| backend.ignore_worktree(id)),
+        ["rebuild"] => match backend.rebuild_worktree_registry() {
+            Ok(records) => vec![format!(
+                "rebuilt worktree registry with {} record(s)",
+                records.len()
+            )],
+            Err(error) => vec![format!("could not rebuild worktree registry: {error:#}")],
+        },
+        _ => vec!["usage: /worktrees [list|show <id>|rm [--force] <id>|gc|adopt <id>|ignore <id>|rebuild]".to_string()],
+    };
+    Some(lines)
+}
+
+fn remove_worktree_line(
+    backend: &crate::wayland::subagents::SubagentBackend,
+    raw_id: &str,
+    force: bool,
+) -> Vec<String> {
+    match raw_id.parse() {
+        Ok(id) => match backend.remove_worktree(&id, force) {
+            Ok(outcome) => vec![format!("{outcome:?}")],
+            Err(error) => vec![format!("could not remove worktree: {error:#}")],
+        },
+        Err(error) => vec![format!("invalid worktree id: {error}")],
+    }
+}
+
+fn worktree_record_line(
+    raw_id: &str,
+    operation: impl FnOnce(
+        &iris_subagent_runtime::WorktreeId,
+    ) -> Result<iris_subagent_runtime::worktree::WorktreeRecord>,
+) -> Vec<String> {
+    match raw_id.parse() {
+        Ok(id) => match operation(&id) {
+            Ok(record) => vec![
+                serde_json::to_string_pretty(&record)
+                    .unwrap_or_else(|error| format!("could not render worktree: {error}")),
+            ],
+            Err(error) => vec![format!("worktree operation failed: {error:#}")],
+        },
+        Err(error) => vec![format!("invalid worktree id: {error}")],
+    }
+}
+
 /// `/task` is the compact help surface for the task workflow. It is display-only
 /// and shared by text/TUI so the command copy does not drift.
 pub(crate) fn handle_task_command<P: ChatProvider>(
@@ -1585,6 +1756,18 @@ fn run_session_inner<P: ChatProvider>(
             }
             continue;
         }
+        if prompt == "/worktrees" || prompt.starts_with("/worktrees ") {
+            for line in handle_worktrees_command(prompt, harness).unwrap_or_default() {
+                ui.emit(UiEvent::Notice(line))?;
+            }
+            continue;
+        }
+        if prompt == "/subagents" || prompt.starts_with("/subagents ") {
+            for line in handle_subagents_command(prompt, harness).unwrap_or_default() {
+                ui.emit(UiEvent::Notice(line))?;
+            }
+            continue;
+        }
         if prompt == "/tasks" || prompt.starts_with("/tasks ") {
             let lines = handle_tasks_command(prompt, harness).unwrap_or_else(|| {
                 vec!["/tasks is only available in the interactive TUI".to_string()]
@@ -1743,6 +1926,37 @@ mod tests {
                 None => unsafe { env::remove_var(self.key) },
             }
         }
+    }
+
+    #[test]
+    fn subagent_and_worktree_operator_commands_have_backed_empty_states() {
+        let (mut harness, dir) = fake_harness();
+        let backend = std::sync::Arc::new(
+            crate::wayland::subagents::SubagentBackend::open(
+                dir.path.clone(),
+                &dir.path.join("worker-state"),
+                dir.path.join("managed-worktrees"),
+            )
+            .unwrap(),
+        );
+        harness.set_subagent_backend(backend);
+
+        assert_eq!(
+            handle_subagents_command("/subagents", &harness).unwrap(),
+            vec!["No subagents for this session.".to_string()]
+        );
+        assert_eq!(
+            handle_worktrees_command("/worktrees", &harness).unwrap(),
+            vec!["No managed worktrees.".to_string()]
+        );
+        assert!(
+            handle_subagents_command("/subagents unknown", &harness).unwrap()[0]
+                .starts_with("usage:")
+        );
+        assert!(
+            handle_worktrees_command("/worktrees unknown", &harness).unwrap()[0]
+                .starts_with("usage:")
+        );
     }
 
     #[test]

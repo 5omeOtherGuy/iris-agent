@@ -1852,6 +1852,20 @@ fn route_command<P: ChatProvider>(
             }
             Ok(RouteOutcome::Consumed)
         }
+        "/worktrees" => {
+            tui.screen.commit_user(prompt);
+            if let Some(lines) = crate::cli::handle_worktrees_command(prompt, harness) {
+                apply_notices(tui, lines);
+            }
+            Ok(RouteOutcome::Consumed)
+        }
+        "/subagents" => {
+            tui.screen.commit_user(prompt);
+            if let Some(lines) = crate::cli::handle_subagents_command(prompt, harness) {
+                apply_notices(tui, lines);
+            }
+            Ok(RouteOutcome::Consumed)
+        }
         "/tasks" => {
             // Open the unified task surface (ADR-0031): the active (unsettled)
             // task as a header plus this workspace's recoverable Iris tasks.

@@ -16,9 +16,9 @@
 //! - `edit` follows Claude Code's exact-string contract
 //!   (`file_path`/`old_string`/`new_string`/`replace_all`).
 //!
-//! Mutating tools require approval by default. Workspace-path enforcement is a
-//! separate opt-in via `IRIS_SECURITY_OPT_IN=1`: by default tools resolve
-//! requested paths but do not refuse workspace escapes. See [`path`].
+//! Mutating tools require approval by default. Parent-session workspace-path
+//! enforcement remains an opt-in via `IRIS_SECURITY_OPT_IN=1`; delegated workers
+//! install a per-agent strict policy regardless of that process setting. See [`path`].
 //!
 //! Module layout:
 //! - [`path`], [`text`]: shared path-resolution and text/I/O-size helpers.
@@ -60,7 +60,7 @@ pub(crate) use bash::platform_can_sandbox;
 pub(crate) use observe::ObservedFiles;
 #[cfg(test)]
 pub(crate) use registry::built_in_tools_for;
-pub(crate) use registry::{ToolsConfig, built_in_tools, built_in_tools_with};
+pub(crate) use registry::{SubagentToolsConfig, ToolsConfig, built_in_tools, built_in_tools_with};
 
 const MAX_DIFF_PREVIEW_BYTES: usize = 1024 * 1024;
 
@@ -110,6 +110,13 @@ pub(crate) struct ToolState {
     /// it is a per-run value with no process-global mutable state -- parallel
     /// tests each carry their own and never race on it.
     pub(crate) reduce_output: bool,
+    /// Per-agent mutation-confinement override. `None` preserves the parent
+    /// session's legacy environment/test behavior; delegated workers set this
+    /// to `Some(true)` before their first turn.
+    pub(crate) workspace_restrictions: Option<bool>,
+    /// Per-agent read confinement. Trusted external reads may relax this without
+    /// relaxing mutation confinement.
+    pub(crate) read_workspace_restrictions: Option<bool>,
     /// One-shot model request consumed only by Wayland's context governor at a
     /// pair-closed boundary. Shared atomically with the compaction engine so
     /// the concrete tool sets intent but never owns context mutation.
@@ -130,6 +137,8 @@ impl ToolState {
             // `with_reduce_output`, so the switch is structurally incapable of
             // leaking into a normal run -- no env var or global is consulted.
             reduce_output: true,
+            workspace_restrictions: None,
+            read_workspace_restrictions: None,
             compaction_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             goal: None,
         }
@@ -157,6 +166,15 @@ impl ToolState {
     pub(crate) fn with_reduce_output(mut self, reduce: bool) -> Self {
         self.reduce_output = reduce;
         self
+    }
+
+    pub(crate) fn set_workspace_restrictions(
+        &mut self,
+        mutations: Option<bool>,
+        reads: Option<bool>,
+    ) {
+        self.workspace_restrictions = mutations;
+        self.read_workspace_restrictions = reads;
     }
 }
 

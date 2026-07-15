@@ -450,7 +450,51 @@ fn resolve_tools_config(settings: &config::Settings) -> Result<tools::ToolsConfi
         bash_tool_mode: settings.bash_tool_mode(),
         model_compaction_tool: settings.compaction_model_tool(),
         web: resolve_web_tools_config(settings)?,
+        subagents: None,
     })
+}
+
+fn subagent_tools_config(
+    cwd: &Path,
+    session_id: &str,
+    selection: Arc<Mutex<mimir::selection::ModelSelection>>,
+    active_session_id: Arc<Mutex<String>>,
+) -> Result<(
+    tools::SubagentToolsConfig,
+    Arc<wayland::subagents::SubagentBackend>,
+)> {
+    let backend = Arc::new(wayland::subagents::SubagentBackend::open(
+        cwd.to_path_buf(),
+        &wayland::subagents::resolve_worker_state_dir(session_id)?,
+        wayland::subagents::resolve_worktree_root()?,
+    )?);
+    let provider_factory: wayland::subagents::ChildProviderFactory = Arc::new(move || {
+        let selection = selection
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let session_id = active_session_id
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        build_provider(
+            &selection,
+            "You are an isolated delegated Iris worker. Follow the supplied instruction, use only the advertised tools, and report exact results without claiming parent-workspace mutations.",
+            &session_id,
+        )
+    });
+    Ok((
+        tools::SubagentToolsConfig {
+            backend: backend.clone(),
+            provider_factory,
+            capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
+            session_id: session_id.to_string(),
+            nesting_depth: 0,
+            max_nesting_depth: 2,
+            approval: None,
+        },
+        backend,
+    ))
 }
 
 /// Build the [`tools::web::WebToolsConfig`] from settings + the auth store.
@@ -536,14 +580,6 @@ fn run_agent_inner(
     // instruction files and offer the user a choice. Must run before assemble()
     // so the newly written file is picked up by the project-doc discovery walk.
     wayland::system_prompt::onboarding::maybe_onboard();
-    // Harness-owned assembly: the fragment/slot baukasten composes the prompt
-    // from the in-binary shipped fragments plus dynamic context (project docs,
-    // date, cwd) and the live tool registry (ADR-0026). Fresh and resume call
-    // the same function.
-    let tools = tools::built_in_tools_with(&resolve_tools_config(&settings)?);
-    let prompt_assembly = wayland::system_prompt::assemble_with_notices(&cwd, &tools);
-    let system_prompt = prompt_assembly.prompt;
-    let mut startup_notices = prompt_assembly.notices;
     // One resolution point owns provider/model/reasoning precedence; capability
     // validation then rejects a configured reasoning level the model cannot do.
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
@@ -551,6 +587,42 @@ fn run_agent_inner(
     let session_id = session::new_session_id();
     let background_selection = Arc::new(Mutex::new(selection.clone()));
     let background_session_id = Arc::new(Mutex::new(session_id.clone()));
+    let subagent_backend = Arc::new(wayland::subagents::SubagentBackend::open(
+        cwd.clone(),
+        &wayland::subagents::resolve_worker_state_dir(&session_id)?,
+        wayland::subagents::resolve_worktree_root()?,
+    )?);
+    let child_selection = background_selection.clone();
+    let child_session_id = background_session_id.clone();
+    let child_provider_factory: wayland::subagents::ChildProviderFactory = Arc::new(move || {
+        let selection = child_selection
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let session_id = child_session_id
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        build_provider(
+            &selection,
+            "You are an isolated delegated Iris worker. Follow the supplied instruction, use only the advertised tools, and report exact results without claiming parent-workspace mutations.",
+            &session_id,
+        )
+    });
+    let mut tools_config = resolve_tools_config(&settings)?;
+    tools_config.subagents = Some(tools::SubagentToolsConfig {
+        backend: subagent_backend.clone(),
+        provider_factory: child_provider_factory,
+        capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
+        session_id: session_id.clone(),
+        nesting_depth: 0,
+        max_nesting_depth: 2,
+        approval: None,
+    });
+    let tools = tools::built_in_tools_with(&tools_config);
+    let prompt_assembly = wayland::system_prompt::assemble_with_notices(&cwd, &tools);
+    let system_prompt = prompt_assembly.prompt;
+    let mut startup_notices = prompt_assembly.notices;
     let provider = build_provider(&selection, &system_prompt, &session_id)?;
     let agent = Agent::new(provider, tools)
         .with_max_tool_roundtrips(settings.max_tool_roundtrips())
@@ -588,11 +660,13 @@ fn run_agent_inner(
         tools::ToolState::new(),
         session,
         budget,
-        wayland::MutationSafetyConfig {
+        wayland::HarnessRuntimeConfig::new(wayland::MutationSafetyConfig {
             enabled: settings.mutation_safety(),
             native_jj,
-        },
+        })
+        .with_worker_runtime(subagent_backend.runtime().clone()),
     );
+    harness.set_subagent_backend(subagent_backend.clone());
     harness.set_compaction_trigger(context_budget, compaction_trigger);
     // Post-change verification (issue #265): engaged only when a `verify` block
     // is present; the command runs under the unchanged approval gate.
@@ -778,14 +852,22 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
     let permission_defaults =
         startup_permission_defaults(settings.default_approval.as_deref(), skip_permissions);
     persist_cli_skip_permissions(skip_permissions);
-    let tools = tools::built_in_tools_with(&resolve_tools_config(&settings)?);
-    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
-    let usage_base = print::UsageBase::estimate(&system_prompt, &tools);
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
     let session_id = session::new_session_id();
     let background_selection = Arc::new(Mutex::new(selection.clone()));
     let background_session_id = Arc::new(Mutex::new(session_id.clone()));
+    let (subagent_config, subagent_backend) = subagent_tools_config(
+        &cwd,
+        &session_id,
+        background_selection.clone(),
+        background_session_id.clone(),
+    )?;
+    let mut tools_config = resolve_tools_config(&settings)?;
+    tools_config.subagents = Some(subagent_config);
+    let tools = tools::built_in_tools_with(&tools_config);
+    let system_prompt = wayland::system_prompt::assemble(&cwd, &tools);
+    let usage_base = print::UsageBase::estimate(&system_prompt, &tools);
     let provider = build_provider(&selection, &system_prompt, &session_id)?;
     // The persisted project policy applies headless too (a granted tool/command
     // auto-approves), but the print gate cannot mint new grants, so no sink.
@@ -814,11 +896,13 @@ fn run_print(prompt_arg: &str, approve: bool, skip_permissions: bool) -> Result<
         tools::ToolState::new(),
         session,
         budget,
-        wayland::MutationSafetyConfig {
+        wayland::HarnessRuntimeConfig::new(wayland::MutationSafetyConfig {
             enabled: settings.mutation_safety(),
             native_jj,
-        },
+        })
+        .with_worker_runtime(subagent_backend.runtime().clone()),
     );
+    harness.set_subagent_backend(subagent_backend.clone());
     harness.set_compaction_trigger(context_budget, compaction_trigger);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());
@@ -1050,17 +1134,25 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
     // a fresh session, so a resumed turn gets identical fragment/context output.
     // Onboarding must run first so a newly written ~/.iris/AGENTS.md is picked up.
     wayland::system_prompt::onboarding::maybe_onboard();
-    let tools = tools::built_in_tools_with(&resolve_tools_config(&settings)?);
-    let prompt_assembly = wayland::system_prompt::assemble_with_notices(&cwd, &tools);
-    let system_prompt = prompt_assembly.prompt;
-    let mut startup_notices = prompt_assembly.notices;
     let selection = mimir::selection::ModelSelection::resolve(&settings)?;
     mimir::model_capabilities::validate(&selection)?;
-    let (context_budget, compaction_trigger) = resolved_compaction_trigger(&settings, &selection)?;
-    let budget = Some(context_budget.hard_compaction_threshold);
     let session_id = meta.id.clone();
     let background_selection = Arc::new(Mutex::new(selection.clone()));
     let background_session_id = Arc::new(Mutex::new(session_id.clone()));
+    let (subagent_config, subagent_backend) = subagent_tools_config(
+        &cwd,
+        &session_id,
+        background_selection.clone(),
+        background_session_id.clone(),
+    )?;
+    let mut tools_config = resolve_tools_config(&settings)?;
+    tools_config.subagents = Some(subagent_config);
+    let tools = tools::built_in_tools_with(&tools_config);
+    let prompt_assembly = wayland::system_prompt::assemble_with_notices(&cwd, &tools);
+    let system_prompt = prompt_assembly.prompt;
+    let mut startup_notices = prompt_assembly.notices;
+    let (context_budget, compaction_trigger) = resolved_compaction_trigger(&settings, &selection)?;
+    let budget = Some(context_budget.hard_compaction_threshold);
     let provider = build_provider(&selection, &system_prompt, &session_id)?;
     let agent = Agent::resumed(provider, tools, stored.messages)
         .with_max_tool_roundtrips(settings.max_tool_roundtrips())
@@ -1088,11 +1180,13 @@ fn resume_agent(session_id: &str, force_plain: bool, cli_skip_permissions: bool)
         session,
         entry_ids,
         budget,
-        wayland::MutationSafetyConfig {
+        wayland::HarnessRuntimeConfig::new(wayland::MutationSafetyConfig {
             enabled: settings.mutation_safety(),
             native_jj,
-        },
+        })
+        .with_worker_runtime(subagent_backend.runtime().clone()),
     );
+    harness.set_subagent_backend(subagent_backend.clone());
     harness.set_compaction_trigger(context_budget, compaction_trigger);
     harness.set_verification(settings.verification());
     harness.set_summarizer(settings.compaction_summarizer());

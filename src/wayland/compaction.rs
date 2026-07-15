@@ -92,7 +92,7 @@ pub(super) struct CompactionOutcome {
     pub(super) origin: CompactionOrigin,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct CompactionSummary {
     pub(super) text: String,
     pub(super) origin: CompactionOrigin,
@@ -143,10 +143,9 @@ pub(super) struct BackgroundCompaction {
     pub(super) to_id: String,
     pub(super) covered_messages: usize,
     pub(super) original_tokens: u64,
-    pub(super) receiver: Receiver<BackgroundSummaryResult>,
+    pub(super) worker_id: iris_subagent_runtime::WorkerId,
     pub(super) result: Option<BackgroundSummaryResult>,
     pub(super) ready_emitted: bool,
-    pub(super) token: CancellationToken,
     pub(super) origin: CompactionOrigin,
     pub(super) trigger_tier: Option<ContextPressureTier>,
     pub(super) started_at: std::time::Instant,
@@ -186,8 +185,8 @@ pub(super) struct CompactionPlan {
 /// (ADR-0044) the input renderer's `F` lines report, plus the covered range's
 /// token estimate. `start_background` computes these from the same
 /// `CompactionPlan`/`covered` slice `apply_summary` uses later; this struct
-/// never feeds back into planner/apply-range logic, it only rides along to
-/// the worker thread for rendering.
+/// never feeds back into planner/apply-range logic, it only rides along with
+/// the scheduler job for rendering.
 #[derive(Clone)]
 pub(super) struct CompactionRangeContext {
     pub(super) from_id: String,
@@ -239,7 +238,7 @@ pub(super) struct CompactionEngine {
     pub(super) provider_compaction_factory: Option<SummarizerFactory>,
     pub(super) selection_generation: u64,
     pub(super) background: Option<BackgroundCompaction>,
-    pub(super) next_job_seq: u64,
+    pub(super) worker_runtime: Option<Arc<super::worker_runtime::WorkerRuntime>>,
     pub(super) tool_result_policy: ToolResultCompactionPolicy,
     pub(super) cache_profile: CacheProfile,
     pub(super) pending_break: Option<FoldTrigger>,
@@ -256,12 +255,31 @@ pub(super) struct ApplyContext<'a> {
 }
 
 impl CompactionEngine {
+    #[cfg(test)]
     pub(super) fn new(
         session: Option<SessionLog>,
         persisted: usize,
         entry_ids: Vec<Option<String>>,
         budget: Option<u64>,
         model_compaction_requested: Arc<AtomicBool>,
+    ) -> Self {
+        Self::new_with_runtime(
+            session,
+            persisted,
+            entry_ids,
+            budget,
+            model_compaction_requested,
+            None,
+        )
+    }
+
+    pub(super) fn new_with_runtime(
+        session: Option<SessionLog>,
+        persisted: usize,
+        entry_ids: Vec<Option<String>>,
+        budget: Option<u64>,
+        model_compaction_requested: Arc<AtomicBool>,
+        worker_runtime: Option<Arc<super::worker_runtime::WorkerRuntime>>,
     ) -> Self {
         let resume_last_activity_ms = session
             .as_ref()
@@ -273,6 +291,18 @@ impl CompactionEngine {
                 DEFAULT_SUMMARY_RESERVE,
                 crate::config::DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
             )
+        });
+        let worker_runtime = worker_runtime.or_else(|| {
+            if session.is_none() && budget.is_none() {
+                return None;
+            }
+            super::worker_runtime::session_worker_state_dir(session.as_ref().map(SessionLog::path))
+                .and_then(|path| super::worker_runtime::WorkerRuntime::open(&path))
+                .map_err(|error| {
+                    tracing::warn!(error = %format!("{error:#}"), "worker runtime unavailable");
+                    error
+                })
+                .ok()
         });
         Self {
             session,
@@ -300,7 +330,7 @@ impl CompactionEngine {
             provider_compaction_factory: None,
             selection_generation: 0,
             background: None,
-            next_job_seq: 0,
+            worker_runtime,
             tool_result_policy: crate::config::Settings::default()
                 .tool_result_compaction()
                 .expect("built-in tool-result compaction defaults are valid"),
@@ -319,9 +349,17 @@ impl CompactionEngine {
         self.session.as_ref().map(SessionLog::path)
     }
 
+    pub(super) fn cancel_worker(&self, job: &BackgroundCompaction) {
+        if let Some(runtime) = &self.worker_runtime {
+            let _ = runtime.handle().cancel(&job.worker_id);
+        }
+    }
+
     pub(super) fn cancel_background(&mut self) {
-        if let Some(job) = self.background.take() {
-            job.token.cancel();
+        if let Some(job) = self.background.take()
+            && let Some(runtime) = &self.worker_runtime
+        {
+            let _ = runtime.handle().cancel(&job.worker_id);
         }
     }
 
@@ -768,11 +806,17 @@ pub(super) fn run_provider_native_worker(
         return BackgroundSummaryResult::Cancelled;
     }
     let covered_messages = covered.len();
-    // Some adapters use reqwest's blocking client for this dedicated worker.
-    // Polling that future inside Tokio makes reqwest drop its internal runtime
-    // from an async context and panic. The worker already owns an OS thread, so
-    // a runtime-free executor is the correct boundary for this provider seam.
+    // Some adapters use reqwest's blocking client. Polling that future directly
+    // inside Tokio makes reqwest drop its internal runtime from an async context
+    // and panic. `CompactionJobExecutor` therefore runs this function in the
+    // shared scheduler's blocking pool, keeping the provider runtime-free without
+    // reintroducing a compaction-owned worker thread or result channel.
     let output = factory().and_then(|provider| {
+        if provider.compaction_capability(context_tokens(&covered))
+            != ProviderCompactionCapability::OpaqueBlocks
+        {
+            anyhow::bail!("provider-native compaction is unsupported for this selection");
+        }
         futures::executor::block_on(provider.compact_context(
             &covered,
             &config.instructions,
@@ -923,34 +967,8 @@ pub(super) fn run_subagent_summary_async<'a>(
     max_tool_roundtrips: usize,
 ) -> SummaryFuture<'a> {
     Box::pin(async move {
-        let backend = subagents::SubagentBackend::new(workspace);
-        let mut request = subagents::SubagentRequest::read_only(prompt);
-        request.budgets.max_tool_roundtrips = Some(max_tool_roundtrips);
-        request.budgets.max_output_bytes = Some(MAX_SUMMARY_CHARS);
-        let handle = backend.spawn(provider, request)?;
-        let result = tokio::select! {
-            biased;
-            _ = token.cancelled() => {
-                let _ = backend.cancel(&handle.id);
-                anyhow::bail!("subagent summary cancelled");
-            }
-            result = backend.wait(&handle.id) => result?,
-        };
-        match result.status {
-            subagents::SubagentStatus::Completed if !result.summary.trim().is_empty() => {
-                Ok((result.summary, result.usage))
-            }
-            subagents::SubagentStatus::Completed => {
-                anyhow::bail!("subagent returned empty summary")
-            }
-            subagents::SubagentStatus::Cancelled => {
-                anyhow::bail!("subagent summary cancelled")
-            }
-            subagents::SubagentStatus::Failed => anyhow::bail!(result.summary),
-            subagents::SubagentStatus::Started | subagents::SubagentStatus::Running => {
-                anyhow::bail!("subagent ended before a terminal summary state")
-            }
-        }
+        subagents::run_read_only_provider(provider, workspace, prompt, token, max_tool_roundtrips)
+            .await
     })
 }
 
@@ -971,6 +989,457 @@ fn run_subagent_summary(
             token,
             max_tool_roundtrips,
         ))
+}
+
+pub(super) struct CompactionJobExecutor {
+    factory: SummarizerFactory,
+    workspace: PathBuf,
+    covered: Vec<Message>,
+    config: CompactionWorkerConfig,
+    job: CompactionJobKind,
+}
+
+enum CompactionJobKind {
+    Portable {
+        mode: SummarizerKind,
+        range: CompactionRangeContext,
+    },
+    Native,
+}
+
+impl CompactionJobExecutor {
+    pub(super) fn portable(
+        factory: SummarizerFactory,
+        workspace: PathBuf,
+        covered: Vec<Message>,
+        config: CompactionWorkerConfig,
+        mode: SummarizerKind,
+        range: CompactionRangeContext,
+    ) -> Self {
+        Self {
+            factory,
+            workspace,
+            covered,
+            config,
+            job: CompactionJobKind::Portable { mode, range },
+        }
+    }
+
+    pub(super) fn native(
+        factory: SummarizerFactory,
+        workspace: PathBuf,
+        covered: Vec<Message>,
+        config: CompactionWorkerConfig,
+    ) -> Self {
+        Self {
+            factory,
+            workspace,
+            covered,
+            config,
+            job: CompactionJobKind::Native,
+        }
+    }
+}
+
+impl iris_subagent_runtime::WorkerExecutor for CompactionJobExecutor {
+    fn execute<'a>(
+        &'a mut self,
+        context: iris_subagent_runtime::WorkerContext,
+    ) -> iris_subagent_runtime::LocalExecutorFuture<'a> {
+        Box::pin(async move {
+            let token = context.cancellation().token();
+            let cancellation = context.cancellation().clone();
+            let future = async {
+                match &self.job {
+                    CompactionJobKind::Portable { mode, range }
+                        if *mode == SummarizerKind::Provider =>
+                    {
+                        // Provider-summary adapters may intentionally wrap a
+                        // blocking client in their future. Construct and consume
+                        // the `!Send` provider wholly on the shared scheduler's
+                        // blocking pool so no blocking-client runtime is dropped
+                        // from an async context.
+                        let factory = self.factory.clone();
+                        let workspace = self.workspace.clone();
+                        let covered = self.covered.clone();
+                        let config = self.config.clone();
+                        let range = range.clone();
+                        let child_token = token.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            run_compaction_worker(
+                                factory,
+                                workspace,
+                                covered,
+                                config,
+                                SummarizerKind::Provider,
+                                range,
+                                child_token,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(error) => BackgroundSummaryResult::Failed(format!(
+                                "provider compaction task failed: {error}"
+                            )),
+                        }
+                    }
+                    CompactionJobKind::Portable { mode, range } => {
+                        run_compaction_worker_async(
+                            self.factory.clone(),
+                            self.workspace.clone(),
+                            self.covered.clone(),
+                            self.config.clone(),
+                            *mode,
+                            range.clone(),
+                            token.clone(),
+                        )
+                        .await
+                    }
+                    CompactionJobKind::Native => {
+                        let factory = self.factory.clone();
+                        let covered = self.covered.clone();
+                        let config = self.config.clone();
+                        let child_token = token.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            run_provider_native_worker(factory, covered, config, child_token)
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(error) => BackgroundSummaryResult::Failed(format!(
+                                "provider-native compaction task failed: {error}"
+                            )),
+                        }
+                    }
+                }
+            };
+            tokio::pin!(future);
+            let result = tokio::select! {
+                result = &mut future => result,
+                _ = cancellation.cancelled() => {
+                    token.cancel();
+                    (&mut future).await
+                }
+            };
+            match result {
+                BackgroundSummaryResult::Summary(summary) => {
+                    let bytes = serde_json::to_vec(&summary).map_err(|error| {
+                        iris_subagent_runtime::ExecutorError::failed(error.to_string())
+                    })?;
+                    let mut output =
+                        iris_subagent_runtime::ExecutorOutput::text(summary.text.clone(), bytes);
+                    if let Some(usage) = &summary.worker_usage {
+                        output.usage = iris_subagent_runtime::Usage::new(
+                            usage.input_tokens,
+                            usage.output_tokens,
+                            1,
+                            0,
+                        );
+                    }
+                    Ok(output)
+                }
+                BackgroundSummaryResult::Failed(message) => {
+                    Err(iris_subagent_runtime::ExecutorError::failed(message))
+                }
+                BackgroundSummaryResult::Cancelled => Err(
+                    iris_subagent_runtime::ExecutorError::cancelled("compaction cancelled"),
+                ),
+            }
+        })
+    }
+}
+
+pub(super) fn decode_compaction_result(
+    result: &iris_subagent_runtime::WorkerResult,
+) -> BackgroundSummaryResult {
+    match result.status {
+        iris_subagent_runtime::WorkerStatus::Completed => {
+            let Some(output) = result.inline_output.as_deref() else {
+                return BackgroundSummaryResult::Failed(
+                    "compaction result was unexpectedly offloaded".to_string(),
+                );
+            };
+            match serde_json::from_str::<CompactionSummary>(output) {
+                Ok(summary) => BackgroundSummaryResult::Summary(summary),
+                Err(error) => BackgroundSummaryResult::Failed(format!(
+                    "compaction result could not be decoded: {error}"
+                )),
+            }
+        }
+        iris_subagent_runtime::WorkerStatus::Cancelled => BackgroundSummaryResult::Cancelled,
+        _ => BackgroundSummaryResult::Failed(
+            result
+                .message
+                .clone()
+                .unwrap_or_else(|| "compaction worker failed".to_string()),
+        ),
+    }
+}
+
+pub(super) fn compaction_worker_request(
+    native: bool,
+    timeout: std::time::Duration,
+) -> iris_subagent_runtime::WorkerRequest {
+    let mut request = iris_subagent_runtime::WorkerRequest::read_only(if native {
+        "provider-native context compaction"
+    } else {
+        "portable context compaction"
+    });
+    request.kind = if native {
+        iris_subagent_runtime::WorkerKind::CompactionNative
+    } else {
+        iris_subagent_runtime::WorkerKind::CompactionPortable
+    };
+    request.priority = iris_subagent_runtime::WorkerPriority::InternalUrgent;
+    request.recovery = iris_subagent_runtime::RecoveryPolicy::Discard;
+    request.budgets.wall_clock_ms = u64::try_from(timeout.as_millis()).ok();
+    request.budgets.max_inline_output_bytes = Some(128 * 1024);
+    request.budgets.max_output_bytes = Some(128 * 1024);
+    request
+}
+
+pub(super) async fn run_compaction_worker_async(
+    factory: SummarizerFactory,
+    workspace: PathBuf,
+    covered: Vec<Message>,
+    config: CompactionWorkerConfig,
+    mode: SummarizerKind,
+    range: CompactionRangeContext,
+    token: CancellationToken,
+) -> BackgroundSummaryResult {
+    if token.is_cancelled() {
+        return BackgroundSummaryResult::Cancelled;
+    }
+    let covered_messages = covered.len();
+    let result = match config.input {
+        CompactionWorkerInput::Transcript => match factory() {
+            Ok(provider)
+                if mode == SummarizerKind::Provider
+                    && provider.structured_summary_capability()
+                        == StructuredSummaryCapability::Native =>
+            {
+                run_structured_summary_async(provider.as_ref(), &covered, &range, &token)
+                    .await
+                    .map(|(text, usage)| (text, CompactionOrigin::Provider, usage))
+            }
+            Ok(provider) => run_transcript_summary_async(provider, covered, &config, &token)
+                .await
+                .map(|(text, usage)| {
+                    let origin = match mode {
+                        SummarizerKind::Subagent => CompactionOrigin::Subagent,
+                        SummarizerKind::Provider | SummarizerKind::Excerpts => {
+                            CompactionOrigin::Provider
+                        }
+                    };
+                    (text, origin, usage)
+                }),
+            Err(error) => Err(error),
+        },
+        CompactionWorkerInput::Investigator => {
+            let prompt = append_compaction_instructions(summary_worker_prompt(&covered), &config);
+            match mode {
+                SummarizerKind::Subagent => {
+                    let subagent = match factory() {
+                        Ok(provider) => {
+                            run_subagent_summary_async(
+                                provider,
+                                workspace,
+                                prompt.clone(),
+                                &token,
+                                config.max_tool_roundtrips,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match subagent {
+                        Ok((text, usage)) => Ok((text, CompactionOrigin::Subagent, usage)),
+                        Err(error) if token.is_cancelled() => Err(error),
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "investigator summary failed; trying provider summary"
+                            );
+                            match factory() {
+                                Ok(provider) => {
+                                    run_provider_prompt_summary_async(provider, prompt, &token)
+                                        .await
+                                        .map(|(text, usage)| {
+                                            (text, CompactionOrigin::Provider, usage)
+                                        })
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                    }
+                }
+                SummarizerKind::Provider | SummarizerKind::Excerpts => match factory() {
+                    Ok(provider) => run_provider_prompt_summary_async(provider, prompt, &token)
+                        .await
+                        .map(|(text, usage)| (text, CompactionOrigin::Provider, usage)),
+                    Err(error) => Err(error),
+                },
+            }
+        }
+    };
+    if token.is_cancelled() {
+        return BackgroundSummaryResult::Cancelled;
+    }
+    match result {
+        Ok((text, origin, worker_usage)) if !text.trim().is_empty() => {
+            BackgroundSummaryResult::Summary(CompactionSummary {
+                text: format!(
+                    "[compacted summary of {covered_messages} earlier message(s)]\n{}",
+                    text.trim()
+                ),
+                origin,
+                worker_usage,
+                instructions: (!config.instructions.is_empty())
+                    .then(|| config.instructions.clone()),
+                provider_blocks: Vec::new(),
+            })
+        }
+        Ok(_) => BackgroundSummaryResult::Failed("summarizer returned empty text".to_string()),
+        Err(error) => BackgroundSummaryResult::Failed(format!("{error:#}")),
+    }
+}
+
+async fn run_structured_summary_async(
+    provider: &dyn ChatProvider,
+    covered: &[Message],
+    range: &CompactionRangeContext,
+    token: &CancellationToken,
+) -> Result<SummaryResult> {
+    use crate::wayland::structured_summary::{
+        CompactInputRange, extract_forced_tool_summary, extract_native_summary,
+        render_compact_input, render_durable_summary,
+    };
+    if token.is_cancelled() {
+        anyhow::bail!("summarization cancelled");
+    }
+    let rendered = render_compact_input(&CompactInputRange {
+        from_id: &range.from_id,
+        to_id: &range.to_id,
+        covered,
+        carry_paths: &range.carry_paths,
+        original_tokens: range.original_tokens,
+    });
+    let messages = [Message::user(&rendered)];
+    let (turn, mode) = match provider
+        .run_structured_summary(&messages, StructuredSummaryMode::Native, token)
+        .await
+    {
+        Ok(turn) => (turn, StructuredSummaryMode::Native),
+        Err(StructuredSummaryError::Cancelled) => anyhow::bail!("summarization cancelled"),
+        Err(StructuredSummaryError::Unsupported) => {
+            tracing::info!(
+                "structured-output compaction summary unsupported; retrying forced virtual tool"
+            );
+            match provider
+                .run_structured_summary(&messages, StructuredSummaryMode::ForcedTool, token)
+                .await
+            {
+                Ok(turn) => (turn, StructuredSummaryMode::ForcedTool),
+                Err(StructuredSummaryError::Cancelled) => anyhow::bail!("summarization cancelled"),
+                Err(StructuredSummaryError::Unsupported) => anyhow::bail!(
+                    "forced-tool structured summary request was itself rejected as unsupported"
+                ),
+                Err(StructuredSummaryError::Other(error)) => {
+                    anyhow::bail!("forced-tool structured summary request failed: {error:#}")
+                }
+            }
+        }
+        Err(StructuredSummaryError::Other(error)) => {
+            anyhow::bail!("structured summary request failed: {error:#}")
+        }
+    };
+    let summary = match mode {
+        StructuredSummaryMode::Native => extract_native_summary(&turn),
+        StructuredSummaryMode::ForcedTool => extract_forced_tool_summary(&turn),
+    }
+    .map_err(|error| anyhow::anyhow!("structured summary extraction/validation failed: {error}"))?;
+    Ok((render_durable_summary(&summary), turn.usage))
+}
+
+async fn run_transcript_summary_async(
+    provider: Box<dyn ChatProvider>,
+    covered: Vec<Message>,
+    config: &CompactionWorkerConfig,
+    token: &CancellationToken,
+) -> Result<SummaryResult> {
+    tokio::time::timeout(config.timeout, async move {
+        let tools = Tools::new(Vec::new());
+        let mut start = 0usize;
+        loop {
+            if start >= covered.len() {
+                anyhow::bail!(
+                    "summarization context overflowed after dropping every covered message"
+                );
+            }
+            let mut request = covered[start..].to_vec();
+            request.push(Message::user(&transcript_instruction(config)));
+            let mut stream = provider.respond_stream(&request, &tools, token)?;
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => anyhow::bail!("summarization cancelled"),
+                    event = stream.next() => event.ok_or_else(|| anyhow::anyhow!(
+                        "provider stream ended before completing a summary"
+                    ))??,
+                };
+                if let ProviderEvent::Completed(turn) = event {
+                    if turn.completion_reason == Some(CompletionReason::ContextWindowExceeded) {
+                        start = start.saturating_add(1);
+                        break;
+                    }
+                    if !turn.tool_calls.is_empty() {
+                        anyhow::bail!("summarizer returned tool calls instead of summary text");
+                    }
+                    let text = turn
+                        .text
+                        .filter(|text| !text.trim().is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("provider returned no summary text"))?;
+                    return Ok((text, turn.usage));
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "compaction worker timed out after {} ms",
+            config.timeout.as_millis()
+        )
+    })?
+}
+
+async fn run_provider_prompt_summary_async(
+    provider: Box<dyn ChatProvider>,
+    prompt: String,
+    token: &CancellationToken,
+) -> Result<SummaryResult> {
+    let messages = vec![Message::user(&prompt)];
+    let tools = Tools::new(Vec::new());
+    let mut stream = provider.respond_stream(&messages, &tools, token)?;
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = token.cancelled() => anyhow::bail!("summarization cancelled"),
+            event = stream.next() => event
+                .ok_or_else(|| anyhow::anyhow!("provider stream ended before completing a summary"))??,
+        };
+        if let ProviderEvent::Completed(turn) = event {
+            if !turn.tool_calls.is_empty() {
+                anyhow::bail!("summarizer returned tool calls instead of summary text");
+            }
+            let text = turn
+                .text
+                .filter(|text| !text.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("provider returned no summary text"))?;
+            return Ok((text, turn.usage));
+        }
+    }
 }
 
 pub(super) fn summary_worker_prompt(covered: &[Message]) -> String {

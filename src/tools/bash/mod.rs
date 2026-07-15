@@ -428,7 +428,9 @@ fn bash(
     // access limited to the workspace, networking denied by default. The status
     // is surfaced below when the kernel could not fully enforce it (never a
     // silent "sandbox off").
-    let sandbox = sandbox::confine(&mut command, &sandbox::SandboxPolicy::for_workspace(root));
+    let policy = sandbox::policy_for_current_agent(root);
+    let sandbox = sandbox::confine(&mut command, &policy);
+    sandbox::require_for_current_agent(&sandbox)?;
     if let Some(notice) = sandbox.notice() {
         tracing::warn!(%notice, "bash sandbox not fully enforced");
     }

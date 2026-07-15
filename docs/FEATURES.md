@@ -266,7 +266,8 @@
   before mutating file tools. [Implemented]
 - **Secret redaction** — redact secrets from stored content and summaries.
   [Planned]
-- **Subagent tool permissions** — per-worker tool allowlists. [Planned]
+- **Subagent tool permissions** — capability ceilings and per-worker tool
+  allowlists are enforced before inference and execution. [Implemented]
 
 ## Token and context engine
 
@@ -440,31 +441,58 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   request validation, lifecycle status, budgets, allowlists, output-handle
   fields, and read-only child execution. Issue
   [#460](https://github.com/5omeOtherGuy/iris-agent/issues/460). [Implemented]
-- **Mutable subagent backend: worktree isolation** — read-write workers are gated
-  on the worktree service from the Git section (#271): linked worktree creation,
-  durable registry, progress/lifecycle state, explicit apply, and
-  `list/show/rm/gc`. The read-only backend contract is already shipped; mutable
-  subagents must not fall back to in-place parent-workspace mutation. [Planned]
-- **Advanced worktree backend slices** — snapshot fast paths, worktree
-  pooling/adoption, and remote session/codebase restore are desired follow-ups
-  after the linked-worktree apply boundary is correct. [Planned]
-- **Subagents as tools** — main agent invokes subagents through Nexus tool
-  execution under a final model-facing name that is not `task`. [Planned]
-- **Worker set** — search, advisor/reviewer, repo researcher, task worker, and
-  user-defined custom subagents. [Planned]
+- **Mutable subagent backend: worktree isolation** — mutation-capable workers
+  fail closed unless a detached managed worktree is created. The service owns a
+  durable registry, lifecycle links, explicit reviewed apply, and
+  `list/show/rm/gc` operator controls. Apply supports regular and binary files,
+  executable-mode changes, deletes, and renames normalized to delete/create.
+  Symlinks are reviewed by target, escaping targets need separate approval, and
+  gitlink/submodule changes stay unresolved; apply never stages or commits.
+  [Implemented]
+- **Advanced worktree backend slices** — local Btrfs fast path with linked
+  fallback, pristine pooling, lease-based adoption, local restore, and a trusted
+  provider-neutral remote restore port. Production cloud transport is excluded.
+  [Implemented]
+- **Subagents as tools** — `spawn_subagent`, status/cancel/output, explicit
+  best-of-N selection, and plan/apply tools run through Nexus tool execution.
+  [Implemented]
+- **Worker set** — general, explore, and review kinds ship; user-defined profiles
+  remain deferred. [Partial]
 - **Per-worker model routing** — each worker resolves its own provider/model/
   thinking level without changing the parent. [Planned]
-- **Isolated worker context by default** — worker runs a fresh conversation with
-  only its task prompt. [Planned]
+- **Isolated worker context by default** — every worker runs a fresh conversation
+  with only its delegated instruction. [Implemented]
 - **Curated context forwarding** — forward selected context-ledger entries to a
   worker by reference. [Planned]
-- **Handle-returning workers** — workers return handle plus micro-summary.
-  [Planned]
-- **Per-worker budgets** — enforced max turns and token caps. [Planned]
-- **Filtered tool access** — read-only workers enforce capability filters before
-  inference and execution; mutable/execute worker filters are planned. [Partial]
-- **Background fleet** — independent workers run in parallel with live grouped
-  status. [Planned]
+- **Handle-returning workers** — terminal results carry a bounded summary and
+  content-addressed artifact handles for oversized output. [Implemented]
+- **Per-worker budgets** — wall-clock, provider/tool-round, token, output, and
+  artifact limits are enforced by the backend or child loop. [Implemented]
+- **Filtered tool access** — every capability mode is narrowed before inference;
+  execution resolves against the same filtered tool set. [Implemented]
+- **Worker workspace confinement** — filesystem tools reject absolute paths and
+  symlink escapes outside the effective worker workspace. A parent-approved
+  `allow_outside_workspace: true` request relaxes read-only tools for one worker;
+  mutation stays confined and delegated shell execution fails closed without a
+  kernel filesystem sandbox. [Implemented]
+- **Background fleet** — durable workers start independently, run under bounded
+  global/per-group concurrency, and expose replayable lifecycle/status events.
+  [Implemented]
+
+Model tool examples:
+
+```json
+{"prompt":"Inspect the parser boundary","kind":"explore","capability":"read_only","background":true}
+```
+
+```json
+{"prompt":"Implement the reviewed parser fix","kind":"general","capability":"all","isolation":"worktree","background":true}
+```
+
+The mutable result stays outside the parent checkout. Poll with
+`subagent_status`, select a group winner with `select_subagent_candidate`, create
+an immutable review using `plan_subagent_apply`, then call `apply_subagent`; apply
+always enters the parent approval gate.
 
 ## Edits
 
@@ -516,15 +544,11 @@ task boundaries, checkpoint storage, or approval semantics — they are decided.
   Issue [#269](https://github.com/5omeOtherGuy/iris-agent/issues/269). [Planned]
 - **Pre-commit self-review** — agent reviews its own diff before committing.
   [Planned]
-- **Worktree integration** — isolated worktree plus branch per task/run; also the
-  required mutable-subagent isolation primitive. Design ADR
-  [ADR-0035](adr/0035-git-worktree-isolation-and-apply-as-settlement.md) is
-  accepted and [#267](https://github.com/5omeOtherGuy/iris-agent/issues/267) is
-  closed; implementation is tracked in
-  [#271](https://github.com/5omeOtherGuy/iris-agent/issues/271). Read-write
-  subagents must not ship without this isolation/apply boundary. Reference:
-  [`.iris-reference/grok-worktree-subsystem-spec.md`](../.iris-reference/grok-worktree-subsystem-spec.md).
-  [Planned]
+- **Worktree integration** — detached exact-base linked worktrees, durable
+  registry/ownership markers, guarded lifecycle management, and reviewed
+  file-level apply. ADR-0035 plus ADR-0063; issues
+  [#271](https://github.com/5omeOtherGuy/iris-agent/issues/271) and
+  [#459](https://github.com/5omeOtherGuy/iris-agent/issues/459). [Implemented]
 
 ## GitHub
 

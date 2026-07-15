@@ -1272,6 +1272,45 @@ pub(crate) struct ToolEnv<'a> {
     pub(crate) mutation_guard: Option<&'a dyn MutationGuard>,
 }
 
+/// Provider-neutral capability required to expose and execute a tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolCapability {
+    /// Tool can only read or inspect state.
+    Read,
+    /// Tool directly mutates filesystem state without command execution.
+    Write,
+    /// Tool executes commands. Conservatively treated as mutation-capable.
+    Execute,
+    /// Tool pauses for direct user interaction and is not delegated.
+    UserInteraction,
+    /// Tool has not declared a delegated-worker capability and is excluded.
+    Unclassified,
+}
+
+/// Effective capability grant used to build a child tool registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerCapabilityGrant {
+    ReadOnly,
+    ReadWrite,
+    Execute,
+    All,
+}
+
+impl WorkerCapabilityGrant {
+    fn allows(self, capability: ToolCapability) -> bool {
+        match (self, capability) {
+            (_, ToolCapability::Unclassified | ToolCapability::UserInteraction) => false,
+            (Self::ReadOnly, ToolCapability::Read) => true,
+            (Self::ReadWrite, ToolCapability::Read | ToolCapability::Write) => true,
+            (Self::Execute, ToolCapability::Read | ToolCapability::Execute) => true,
+            (Self::All, ToolCapability::Read | ToolCapability::Write | ToolCapability::Execute) => {
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// A tool the agent can invoke. Mirrors pi-ai's `Tool`
 /// (`name`/`description`/`parameters`) plus pi-agent's `AgentTool` (the tool
 /// runs itself via `execute`). Nexus enforces the approval policy, but each tool
@@ -1281,6 +1320,11 @@ pub(crate) trait Tool {
     fn description(&self) -> &str;
     /// JSON Schema for the arguments, used to build provider tool declarations.
     fn parameters(&self) -> Value;
+    /// Capability required for delegated-worker visibility and execution. Tools
+    /// must opt in; unclassified tools fail closed.
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Unclassified
+    }
     /// Run the tool. Async + given a child [`CancellationToken`]: a long-running
     /// tool (e.g. shell) should observe the token and stop promptly. The loop
     /// also races this future against the token, so a tool that ignores it is
@@ -1434,24 +1478,23 @@ impl Tools {
             .filter(|tool| self.caps.exposes(tool.name()))
     }
 
-    /// Build a registry that contains only read-only, ungated tools. This is
-    /// used for read-only subagents so the model-visible declarations and the
-    /// execution lookup are narrowed by the same contract: a hidden or resumed
-    /// mutating call cannot run because it is absent from [`by_name`](Self::by_name),
-    /// not merely omitted from [`iter`](Self::iter).
-    pub(crate) fn into_read_only(self) -> Self {
+    /// Build a registry narrowed by capability for both model declarations and
+    /// execution lookup. This filter runs before any allowlist.
+    pub(crate) fn into_capability(self, grant: WorkerCapabilityGrant) -> Self {
         Self {
             tools: self
                 .tools
                 .into_iter()
-                .filter(|tool| {
-                    !tool.is_mutating()
-                        && !tool.requires_approval()
-                        && !tool.requires_user_interaction()
-                })
+                .filter(|tool| grant.allows(tool.capability()))
                 .collect(),
             caps: self.caps,
         }
+    }
+
+    /// Build a read-only delegated registry.
+    #[allow(dead_code)]
+    pub(crate) fn into_read_only(self) -> Self {
+        self.into_capability(WorkerCapabilityGrant::ReadOnly)
     }
 
     /// Keep only tools named in the caller-supplied allowlist. Used after a
@@ -1594,8 +1637,17 @@ impl ChatProvider for Box<dyn ChatProvider> {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AgentConfig {
+    /// Per-agent mutation confinement override (`None` preserves host behavior).
+    pub(crate) strict_workspace: Option<bool>,
+    /// Permit read-only filesystem tools to resolve outside the workspace.
+    pub(crate) allow_outside_workspace_reads: bool,
+}
+
 pub(crate) struct Agent<P> {
     pub(crate) provider: P,
+    config: AgentConfig,
     messages: Vec<Message>,
     // Injected tool set, constructed at Tier 3 and resolved by name in the loop.
     // Core names no concrete tool; it only holds the `Tool` contract.
@@ -1780,6 +1832,7 @@ impl<P: ChatProvider> Agent<P> {
         tools.plan_surface(&provider.capabilities());
         Self {
             provider,
+            config: AgentConfig::default(),
             messages: Vec::new(),
             tools,
             session_allowed: HashSet::new(),
@@ -1792,6 +1845,11 @@ impl<P: ChatProvider> Agent<P> {
             mutated_this_turn: false,
             last_provider_usage: None,
         }
+    }
+
+    /// Mutable runtime configuration for host adapters before execution starts.
+    pub(crate) fn config_mut(&mut self) -> &mut AgentConfig {
+        &mut self.config
     }
 
     /// Install the persistent per-project permission policy and its persistence
@@ -1863,6 +1921,7 @@ impl<P: ChatProvider> Agent<P> {
         tools.plan_surface(&provider.capabilities());
         Self {
             provider,
+            config: AgentConfig::default(),
             messages,
             tools,
             session_allowed: HashSet::new(),
@@ -2000,6 +2059,13 @@ impl<P: ChatProvider> Agent<P> {
         token: &CancellationToken,
         steer: Option<&dyn SteeringSource>,
     ) -> Result<()> {
+        let read_restrictions = self
+            .config
+            .strict_workspace
+            .map(|strict| strict && !self.config.allow_outside_workspace_reads);
+        env.state
+            .borrow_mut()
+            .set_workspace_restrictions(self.config.strict_workspace, read_restrictions);
         // Reset the per-turn mutation signal so the harness's post-change
         // verification trigger (issue #265) reflects only this turn: a pure Q&A
         // turn stays `false` and runs no verification. A retry turn resets it too,

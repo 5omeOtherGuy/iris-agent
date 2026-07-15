@@ -23,7 +23,8 @@
 //! Fallback is explicit, never silent: when the kernel lacks Landlock (or it is
 //! disabled, or the platform is not Linux) the command runs unconfined and the
 //! [`SandboxStatus`] carries a notice that the bash tool surfaces in its output
-//! and logs via `tracing`.
+//! and logs via `tracing`. Delegated workers are stricter: they grant no shared
+//! temp directories and refuse to spawn when filesystem confinement is unavailable.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -69,6 +70,14 @@ impl SandboxPolicy {
             allow_tcp_bind: Vec::new(),
         }
     }
+
+    fn for_strict_workspace(root: &Path) -> Self {
+        Self {
+            writable: vec![root.to_path_buf(), PathBuf::from("/dev/null")],
+            allow_tcp_connect: Vec::new(),
+            allow_tcp_bind: Vec::new(),
+        }
+    }
 }
 
 /// What the kernel can actually enforce for a command.
@@ -86,6 +95,10 @@ pub(crate) enum SandboxStatus {
 }
 
 impl SandboxStatus {
+    pub(crate) fn filesystem_enforced(&self) -> bool {
+        matches!(self, Self::Enforced | Self::FilesystemOnly)
+    }
+
     /// A one-line notice to surface when the sandbox is not fully enforced.
     /// `None` on the fully-[`Enforced`](SandboxStatus::Enforced) happy path so
     /// normal output carries no noise.
@@ -124,6 +137,21 @@ fn decide(abi: Option<u32>) -> SandboxStatus {
 /// capability, not whether confinement is currently opted in or enforced.
 pub(crate) fn platform_can_sandbox() -> bool {
     cfg!(target_os = "linux")
+}
+
+pub(crate) fn policy_for_current_agent(root: &Path) -> SandboxPolicy {
+    if crate::tools::path::workspace_confinement_required() {
+        SandboxPolicy::for_strict_workspace(root)
+    } else {
+        SandboxPolicy::for_workspace(root)
+    }
+}
+
+pub(crate) fn require_for_current_agent(status: &SandboxStatus) -> anyhow::Result<()> {
+    if crate::tools::path::workspace_confinement_required() && !status.filesystem_enforced() {
+        anyhow::bail!("delegated shell requires kernel-enforced workspace confinement")
+    }
+    Ok(())
 }
 
 /// Detect + apply: confine `command` to `policy` using the running kernel's
@@ -359,6 +387,26 @@ mod tests {
             .unwrap();
         let status = child.wait().unwrap();
         (format!("{out}{err}"), status.success())
+    }
+
+    #[test]
+    fn delegated_policy_excludes_shared_temp_and_requires_filesystem_enforcement() {
+        let ws = workspace();
+        crate::tools::path::with_restrictions(Some(true), || {
+            let policy = policy_for_current_agent(&ws);
+            assert_eq!(
+                policy.writable,
+                vec![ws.clone(), PathBuf::from("/dev/null")]
+            );
+            assert!(
+                require_for_current_agent(&SandboxStatus::Unavailable {
+                    reason: "unsupported".to_string(),
+                })
+                .is_err()
+            );
+            require_for_current_agent(&SandboxStatus::FilesystemOnly).unwrap();
+        });
+        std::fs::remove_dir_all(ws).ok();
     }
 
     #[test]

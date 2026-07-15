@@ -9,7 +9,6 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -212,7 +211,6 @@ fn disabling_auto_compaction_cancels_the_background_job_and_clears_diagnostics()
     assert_eq!(diag.ladder.displayed_context_window, 200_000);
 
     // Install a running background job so the chip would be lit.
-    let (_sender, receiver) = mpsc::channel();
     harness.compaction.background = Some(BackgroundCompaction {
         job_id: "job".to_string(),
         session_id: None,
@@ -220,10 +218,9 @@ fn disabling_auto_compaction_cancels_the_background_job_and_clears_diagnostics()
         to_id: "2".to_string(),
         covered_messages: 2,
         original_tokens: 10,
-        receiver,
+        worker_id: iris_subagent_runtime::WorkerId::new(),
         result: None,
         ready_emitted: false,
-        token: CancellationToken::new(),
         origin: CompactionOrigin::Subagent,
         trigger_tier: Some(ContextPressureTier::Start),
         started_at: std::time::Instant::now(),
@@ -263,7 +260,6 @@ fn disabling_auto_compaction_emits_a_cancelled_lifecycle_event() {
     let (root, workspace, path) = seed_session();
     let mut harness = resume(&root.path, &workspace.path, &path, Some(200_000), false);
 
-    let (_sender, receiver) = mpsc::channel();
     harness.compaction.background = Some(BackgroundCompaction {
         job_id: "job".to_string(),
         session_id: None,
@@ -271,10 +267,9 @@ fn disabling_auto_compaction_emits_a_cancelled_lifecycle_event() {
         to_id: "2".to_string(),
         covered_messages: 2,
         original_tokens: 10,
-        receiver,
+        worker_id: iris_subagent_runtime::WorkerId::new(),
         result: None,
         ready_emitted: false,
-        token: CancellationToken::new(),
         origin: CompactionOrigin::Subagent,
         trigger_tier: Some(ContextPressureTier::Start),
         started_at: std::time::Instant::now(),
@@ -391,7 +386,6 @@ fn active_background_range_freezes_inside_folds_but_outside_folds_flush() {
     policy.semantic_dedupe.retain_per_path = 1;
     harness.set_tool_result_compaction(policy);
 
-    let (_sender, receiver) = mpsc::channel();
     harness.compaction.background = Some(BackgroundCompaction {
         job_id: "compaction_freeze".to_string(),
         session_id: Some(session_id),
@@ -399,10 +393,9 @@ fn active_background_range_freezes_inside_folds_but_outside_folds_flush() {
         to_id: ids[3].clone(),
         covered_messages: 4,
         original_tokens: 10,
-        receiver,
+        worker_id: iris_subagent_runtime::WorkerId::new(),
         result: None,
         ready_emitted: false,
-        token: CancellationToken::new(),
         origin: CompactionOrigin::Subagent,
         trigger_tier: Some(ContextPressureTier::Start),
         started_at: std::time::Instant::now(),

@@ -1,5 +1,5 @@
 [workspace]
-members = ["iris-bench"]
+members = ["iris-bench", "crates/iris-subagent-runtime"]
 resolver = "3"
 
 [package]
@@ -39,6 +39,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 globset = "0.4"
 grep = "0.4"
 ignore = "0.4"
+iris-subagent-runtime = { path = "crates/iris-subagent-runtime" }
 libc = "0.2.186"
 rand = "0.10"
 # Terminal UI primitives. Ratatui supplies stable text/style/layout primitives

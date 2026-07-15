@@ -25,12 +25,13 @@
 
 use std::cell::RefMut;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::nexus::{Tool, ToolEnv, ToolFuture, ToolOutput, Tools};
+use crate::nexus::{Tool, ToolCapability, ToolEnv, ToolFuture, ToolOutput, Tools};
 
 use super::{
     Preview, ToolState, ask_user_question, bash, edit, find, goal, grep, ls, path, read,
@@ -55,6 +56,27 @@ pub(crate) struct ToolsConfig {
     pub(crate) model_compaction_tool: bool,
     /// Resolved web-tool backends + keys. Default = both tools off.
     pub(crate) web: WebToolsConfig,
+    /// Shared backend/model factory for first-class delegated workers.
+    pub(crate) subagents: Option<SubagentToolsConfig>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SubagentToolsConfig {
+    pub(crate) backend: Arc<crate::wayland::subagents::SubagentBackend>,
+    pub(crate) provider_factory: crate::wayland::subagents::ChildProviderFactory,
+    pub(crate) capability_ceiling: iris_subagent_runtime::CapabilityMode,
+    pub(crate) session_id: String,
+    pub(crate) nesting_depth: u32,
+    pub(crate) max_nesting_depth: u32,
+    pub(crate) approval: Option<Arc<dyn iris_subagent_runtime::ApprovalPort>>,
+}
+
+impl std::fmt::Debug for SubagentToolsConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SubagentToolsConfig")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Construct the tool set for the configured bash-tool-mode setting
@@ -73,6 +95,7 @@ pub(crate) fn built_in_tools_for(bash_tool_mode: bool, model_compaction_tool: bo
         bash_tool_mode,
         model_compaction_tool,
         web: WebToolsConfig::default(),
+        subagents: None,
     })
 }
 
@@ -128,6 +151,17 @@ pub(crate) fn built_in_tools_with(config: &ToolsConfig) -> Tools {
             backend,
         )));
     }
+    if let Some(config) = &config.subagents {
+        tools.push(Box::new(SpawnSubagentTool(config.clone())));
+        tools.push(Box::new(SubagentStatusTool(config.backend.clone())));
+        tools.push(Box::new(SubagentArtifactTool(config.backend.clone())));
+        tools.push(Box::new(CancelSubagentTool(config.backend.clone())));
+        tools.push(Box::new(SelectSubagentCandidateTool(
+            config.backend.clone(),
+        )));
+        tools.push(Box::new(PlanSubagentApplyTool(config.backend.clone())));
+        tools.push(Box::new(ApplySubagentTool(config.backend.clone())));
+    }
     Tools::new(tools)
 }
 
@@ -166,6 +200,20 @@ fn reduce_output(env: &ToolEnv) -> bool {
         .unwrap_or(true)
 }
 
+fn workspace_restrictions(env: &ToolEnv<'_>) -> Option<bool> {
+    env.state
+        .try_borrow()
+        .ok()
+        .and_then(|state| state.workspace_restrictions)
+}
+
+fn read_workspace_restrictions(env: &ToolEnv<'_>) -> Option<bool> {
+    env.state
+        .try_borrow()
+        .ok()
+        .and_then(|state| state.read_workspace_restrictions)
+}
+
 /// Run a pure read-only tool body (`grep`/`find`/`ls`) on the blocking pool.
 /// The body touches no [`ToolState`], so the resolved root and owned args move
 /// into a `spawn_blocking` task: a parallel batch then runs genuinely
@@ -178,11 +226,16 @@ fn run_off_thread(
     args: Value,
     label: &'static str,
     reduce: bool,
+    restrictions: Option<bool>,
     body: fn(&Path, &Value, bool) -> Result<ToolOutput>,
 ) -> ToolFuture<'static> {
     Box::pin(async move {
         let root = root?;
-        match tokio::task::spawn_blocking(move || body(&root, &args, reduce)).await {
+        match tokio::task::spawn_blocking(move || {
+            path::with_restrictions(restrictions, || body(&root, &args, reduce))
+        })
+        .await
+        {
             Ok(result) => result,
             Err(_join_err) => Err(anyhow!("{} tool task failed: {}", label, _join_err)),
         }
@@ -199,6 +252,587 @@ fn render(workspace: &Path, preview: impl FnOnce(&Path) -> Preview) -> Option<St
     render_preview(preview(&root))
 }
 
+struct SpawnSubagentTool(SubagentToolsConfig);
+
+impl Tool for SpawnSubagentTool {
+    fn name(&self) -> &str {
+        "spawn_subagent"
+    }
+
+    fn description(&self) -> &str {
+        "Spawn an independently scheduled subagent. Mutation-capable workers always run in a managed isolated worktree."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": { "type": "string", "description": "Complete delegated instruction." },
+                "description": { "type": "string", "description": "Short worker label." },
+                "kind": { "type": "string", "enum": ["general", "explore", "review"] },
+                "capability": { "type": "string", "enum": ["read_only", "read_write", "execute", "all"] },
+                "isolation": { "type": "string", "enum": ["none", "worktree"] },
+                "tools": { "type": "array", "items": { "type": "string" } },
+                "cwd": { "type": "string", "description": "Optional directory inside the parent workspace; incompatible with worktree isolation." },
+                "allow_outside_workspace": { "type": "boolean", "description": "Explicitly allow read-only filesystem tools to follow paths outside the effective workspace. Mutation remains confined. Defaults to false." },
+                "background": { "type": "boolean", "description": "Return immediately when true (default); otherwise wait for the durable result." },
+                "resume_from": { "type": "string", "description": "Optional prior worker ID used as the explicit recovery source." },
+                "max_provider_rounds": { "type": "integer", "minimum": 1 },
+                "max_tool_rounds": { "type": "integer", "minimum": 1 },
+                "max_tokens": { "type": "integer", "minimum": 1 },
+                "count": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Independent candidates for explicit best-of-N selection." }
+            },
+            "required": ["prompt"],
+            "additionalProperties": false
+        })
+    }
+
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Execute
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let prompt = args
+                .get("prompt")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow!("spawn_subagent requires a non-empty prompt"))?;
+            let kind = args
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("general");
+            let requested = match args
+                .get("capability")
+                .and_then(Value::as_str)
+                .unwrap_or("read_only")
+            {
+                "read_only" => iris_subagent_runtime::CapabilityMode::ReadOnly,
+                "read_write" => iris_subagent_runtime::CapabilityMode::ReadWrite,
+                "execute" => iris_subagent_runtime::CapabilityMode::Execute,
+                "all" => iris_subagent_runtime::CapabilityMode::All,
+                other => return Err(anyhow!("unsupported subagent capability: {other}")),
+            };
+            let kind_ceiling = match kind {
+                "general" => self.0.capability_ceiling,
+                "explore" | "review" => iris_subagent_runtime::CapabilityMode::ReadOnly,
+                other => return Err(anyhow!("unknown subagent kind: {other}")),
+            };
+            let mut request = iris_subagent_runtime::WorkerRequest::read_only(prompt);
+            request.description = args
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or(kind)
+                .to_string();
+            request.kind = match kind {
+                "explore" => iris_subagent_runtime::WorkerKind::Explore,
+                "review" => iris_subagent_runtime::WorkerKind::Review,
+                _ => iris_subagent_runtime::WorkerKind::General,
+            };
+            request.policy.capability = requested;
+            request.policy.parent_capability = kind_ceiling;
+            request.policy.isolation = match args.get("isolation").and_then(Value::as_str) {
+                Some("none") => iris_subagent_runtime::IsolationMode::None,
+                Some("worktree") => iris_subagent_runtime::IsolationMode::Worktree,
+                Some(other) => return Err(anyhow!("unsupported subagent isolation: {other}")),
+                None if requested.is_mutation_capable() => {
+                    iris_subagent_runtime::IsolationMode::Worktree
+                }
+                None => iris_subagent_runtime::IsolationMode::None,
+            };
+            request.policy.cwd = args.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+            request.policy.tool_allowlist = args
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            request.policy.allow_outside_workspace = args
+                .get("allow_outside_workspace")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            request.policy.nesting_depth = self.0.nesting_depth.saturating_add(1);
+            request.policy.max_nesting_depth = self.0.max_nesting_depth;
+            request.session_id = Some(self.0.session_id.clone());
+            request.resume_from = args
+                .get("resume_from")
+                .and_then(Value::as_str)
+                .map(str::parse)
+                .transpose()?;
+            request.budgets.max_provider_rounds =
+                args.get("max_provider_rounds").and_then(Value::as_u64);
+            request.budgets.max_tool_rounds = args.get("max_tool_rounds").and_then(Value::as_u64);
+            request.budgets.max_tokens = args.get("max_tokens").and_then(Value::as_u64);
+            let count = args.get("count").and_then(Value::as_u64).unwrap_or(1);
+            if !(1..=8).contains(&count) {
+                return Err(anyhow!("subagent count must be between 1 and 8"));
+            }
+            let background = args
+                .get("background")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if count == 1 {
+                let id = self.0.backend.spawn(
+                    self.0.provider_factory.clone(),
+                    request,
+                    self.0.approval.clone(),
+                )?;
+                if background {
+                    Ok(ToolOutput::text(
+                        serde_json::json!({ "worker_id": id, "status": "queued" }).to_string(),
+                    ))
+                } else {
+                    let wait = self.0.backend.runtime().handle().wait(&id);
+                    tokio::pin!(wait);
+                    let result = tokio::select! {
+                        result = &mut wait => result?,
+                        _ = cancel.cancelled() => {
+                            self.0.backend.cancel(&id)?;
+                            return Err(anyhow!("foreground subagent cancelled"));
+                        }
+                    };
+                    Ok(ToolOutput::text(serde_json::to_string(&result)?))
+                }
+            } else {
+                let group_id = self.0.backend.spawn_group(
+                    self.0.provider_factory.clone(),
+                    vec![request; count as usize],
+                    self.0.approval.clone(),
+                )?;
+                if background {
+                    let group = self.0.backend.poll_group(&group_id)?;
+                    Ok(ToolOutput::text(
+                        serde_json::json!({
+                            "group_id": group_id,
+                            "worker_ids": group.workers,
+                            "status": "queued"
+                        })
+                        .to_string(),
+                    ))
+                } else {
+                    let wait = self.0.backend.runtime().handle().wait_group(&group_id);
+                    tokio::pin!(wait);
+                    let result = tokio::select! {
+                        result = &mut wait => result?,
+                        _ = cancel.cancelled() => {
+                            self.0.backend.cancel_group(&group_id)?;
+                            return Err(anyhow!("foreground subagent group cancelled"));
+                        }
+                    };
+                    Ok(ToolOutput::text(serde_json::to_string(&result)?))
+                }
+            }
+        })
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    fn supports_allow_always(&self) -> bool {
+        false
+    }
+
+    fn diff_preview(&self, _workspace: &Path, args: &Value) -> Option<String> {
+        Some(format!(
+            "Spawn {} subagent candidate(s) with capability={} and isolation={}",
+            args.get("count").and_then(Value::as_u64).unwrap_or(1),
+            args.get("capability")
+                .and_then(Value::as_str)
+                .unwrap_or("read_only"),
+            args.get("isolation")
+                .and_then(Value::as_str)
+                .unwrap_or("automatic")
+        ))
+    }
+}
+
+struct SubagentStatusTool(Arc<crate::wayland::subagents::SubagentBackend>);
+
+impl Tool for SubagentStatusTool {
+    fn name(&self) -> &str {
+        "subagent_status"
+    }
+    fn description(&self) -> &str {
+        "Poll a delegated worker without consuming its result."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "worker_id": { "type": "string" },
+                "group_id": { "type": "string" }
+            },
+            "additionalProperties": false
+        })
+    }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Read
+    }
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let value = if let Some(id) = parse_optional_worker_id(args)? {
+                serde_json::to_value(self.0.poll(&id)?)?
+            } else if let Some(id) = parse_optional_group_id(args)? {
+                serde_json::to_value(self.0.poll_group(&id)?)?
+            } else {
+                return Err(anyhow!("subagent_status requires worker_id or group_id"));
+            };
+            Ok(ToolOutput::text(serde_json::to_string(&value)?))
+        })
+    }
+}
+
+struct SubagentArtifactTool(Arc<crate::wayland::subagents::SubagentBackend>);
+
+impl Tool for SubagentArtifactTool {
+    fn name(&self) -> &str {
+        "read_subagent_output"
+    }
+
+    fn description(&self) -> &str {
+        "Read a UTF-8 page from an oversized subagent output artifact."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "artifact_id": { "type": "string" },
+                "offset": { "type": "integer", "minimum": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 50000 }
+            },
+            "required": ["artifact_id"],
+            "additionalProperties": false
+        })
+    }
+
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Read
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let id: iris_subagent_runtime::ArtifactId = args
+                .get("artifact_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("artifact_id is required"))?
+                .parse()?;
+            let bytes = self.0.read_artifact(&id)?;
+            let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+            let offset = usize::try_from(offset).map_err(|_| anyhow!("offset is too large"))?;
+            if offset > bytes.len() {
+                return Err(anyhow!("offset exceeds artifact length"));
+            }
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(16_000);
+            if !(1..=50_000).contains(&limit) {
+                return Err(anyhow!("limit must be between 1 and 50000"));
+            }
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| anyhow!("subagent output artifact is not UTF-8"))?;
+            if !text.is_char_boundary(offset) {
+                return Err(anyhow!("offset must be a UTF-8 character boundary"));
+            }
+            let mut end = offset.saturating_add(limit as usize).min(bytes.len());
+            while end > offset && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let content = &text[offset..end];
+            Ok(ToolOutput::text(
+                serde_json::json!({
+                    "artifact_id": id,
+                    "offset": offset,
+                    "next_offset": (end < bytes.len()).then_some(end),
+                    "total_bytes": bytes.len(),
+                    "content": content
+                })
+                .to_string(),
+            ))
+        })
+    }
+}
+
+struct CancelSubagentTool(Arc<crate::wayland::subagents::SubagentBackend>);
+
+impl Tool for CancelSubagentTool {
+    fn name(&self) -> &str {
+        "cancel_subagent"
+    }
+    fn description(&self) -> &str {
+        "Cancel a delegated worker cooperatively, with bounded hard abort."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "worker_id": { "type": "string" },
+                "group_id": { "type": "string" }
+            },
+            "additionalProperties": false
+        })
+    }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Read
+    }
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let value = if let Some(id) = parse_optional_worker_id(args)? {
+                serde_json::to_value(self.0.cancel(&id)?)?
+            } else if let Some(id) = parse_optional_group_id(args)? {
+                serde_json::to_value(self.0.cancel_group(&id)?)?
+            } else {
+                return Err(anyhow!("cancel_subagent requires worker_id or group_id"));
+            };
+            Ok(ToolOutput::text(serde_json::to_string(&value)?))
+        })
+    }
+}
+
+struct PlanSubagentApplyTool(Arc<crate::wayland::subagents::SubagentBackend>);
+
+impl Tool for PlanSubagentApplyTool {
+    fn name(&self) -> &str {
+        "plan_subagent_apply"
+    }
+    fn description(&self) -> &str {
+        "Build an immutable reviewed apply plan for a completed mutable worker. This does not mutate the parent workspace."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "worker_id": { "type": "string" } },
+            "required": ["worker_id"],
+            "additionalProperties": false
+        })
+    }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Read
+    }
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let worker_id =
+                parse_optional_worker_id(args)?.ok_or_else(|| anyhow!("worker_id is required"))?;
+            let plan = self.0.plan_apply(&worker_id)?;
+            Ok(ToolOutput::text(serde_json::to_string(&plan)?))
+        })
+    }
+}
+
+struct ApplySubagentTool(Arc<crate::wayland::subagents::SubagentBackend>);
+
+impl Tool for ApplySubagentTool {
+    fn name(&self) -> &str {
+        "apply_subagent"
+    }
+    fn description(&self) -> &str {
+        "Apply an immutable reviewed worker plan to the parent filesystem. Dirty/base-drifted and escaping-symlink paths require explicit per-path approvals."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "plan_id": { "type": "string" },
+                "approved_overwrites": { "type": "array", "items": { "type": "string" } },
+                "approved_escaping_symlinks": { "type": "array", "items": { "type": "string" } },
+                "skipped_paths": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["plan_id"],
+            "additionalProperties": false
+        })
+    }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Write
+    }
+    fn requires_approval(&self) -> bool {
+        true
+    }
+    fn supports_allow_always(&self) -> bool {
+        false
+    }
+    fn is_mutating(&self) -> bool {
+        true
+    }
+    fn mutates_paths(&self, args: &Value) -> Vec<PathBuf> {
+        self.load(args)
+            .map(|plan| {
+                plan.operations
+                    .into_iter()
+                    .map(|operation| operation.path)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn diff_preview(&self, _workspace: &Path, args: &Value) -> Option<String> {
+        let plan = self.load(args).ok()?;
+        let mut output = format!("Apply plan {} ({})\n", plan.id, plan.digest);
+        for operation in plan.operations {
+            output.push_str(&format!(
+                "{:?} {}",
+                operation.change,
+                operation.path.display()
+            ));
+            if operation.dirty_parent {
+                output.push_str(" [dirty parent]");
+            }
+            if operation.base_drift {
+                output.push_str(" [base drift]");
+            }
+            if operation.escaping_symlink {
+                output.push_str(" [escaping symlink]");
+            }
+            output.push('\n');
+        }
+        Some(output)
+    }
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let plan = self.load(args)?;
+            let mut options = iris_subagent_runtime::worktree::ApplyOptions::new();
+            options.approved_overwrites = path_set(args, "approved_overwrites");
+            options.approved_escaping_symlinks = path_set(args, "approved_escaping_symlinks");
+            options.skipped_paths = path_set(args, "skipped_paths");
+            let result = self.0.apply(&plan, &options)?;
+            Ok(ToolOutput::text(serde_json::to_string(&result)?))
+        })
+    }
+}
+
+impl ApplySubagentTool {
+    fn load(&self, args: &Value) -> Result<iris_subagent_runtime::worktree::ApplyPlan> {
+        let id: iris_subagent_runtime::ApplyPlanId = args
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("plan_id is required"))?
+            .parse()?;
+        self.0.load_apply_plan(&id)
+    }
+}
+
+fn path_set(args: &Value, key: &str) -> std::collections::BTreeSet<PathBuf> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(PathBuf::from)
+        .collect()
+}
+
+struct SelectSubagentCandidateTool(Arc<crate::wayland::subagents::SubagentBackend>);
+
+impl Tool for SelectSubagentCandidateTool {
+    fn name(&self) -> &str {
+        "select_subagent_candidate"
+    }
+    fn description(&self) -> &str {
+        "Explicitly select one successful member of a completed best-of-N group. Selection does not apply files."
+    }
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "group_id": { "type": "string" },
+                "worker_id": { "type": "string" }
+            },
+            "required": ["group_id", "worker_id"],
+            "additionalProperties": false
+        })
+    }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Read
+    }
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let group_id =
+                parse_optional_group_id(args)?.ok_or_else(|| anyhow!("group_id is required"))?;
+            let worker_id =
+                parse_optional_worker_id(args)?.ok_or_else(|| anyhow!("worker_id is required"))?;
+            let group = self.0.poll_group(&group_id)?;
+            if !group.workers.contains(&worker_id) {
+                return Err(anyhow!("selected worker is not a member of the group"));
+            }
+            if group
+                .snapshots
+                .iter()
+                .any(|snapshot| !snapshot.status.is_terminal())
+            {
+                return Err(anyhow!(
+                    "all group candidates must be terminal before selection"
+                ));
+            }
+            let selected = group
+                .snapshots
+                .into_iter()
+                .find(|snapshot| snapshot.worker_id == worker_id)
+                .and_then(|snapshot| snapshot.result)
+                .ok_or_else(|| anyhow!("selected candidate has no terminal result"))?;
+            if selected.status != iris_subagent_runtime::WorkerStatus::Completed {
+                return Err(anyhow!("selected candidate did not complete successfully"));
+            }
+            if let Some(worktree) = &selected.worktree {
+                self.0.select_worktree_candidate(&worktree.id)?;
+            }
+            Ok(ToolOutput::text(serde_json::to_string(&selected)?))
+        })
+    }
+}
+
+fn parse_optional_worker_id(args: &Value) -> Result<Option<iris_subagent_runtime::WorkerId>> {
+    args.get("worker_id")
+        .and_then(Value::as_str)
+        .map(str::parse)
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn parse_optional_group_id(args: &Value) -> Result<Option<iris_subagent_runtime::GroupId>> {
+    args.get("group_id")
+        .and_then(Value::as_str)
+        .map(str::parse)
+        .transpose()
+        .map_err(Into::into)
+}
+
 struct AskUserQuestionTool;
 impl Tool for AskUserQuestionTool {
     fn name(&self) -> &str {
@@ -211,6 +845,10 @@ impl Tool for AskUserQuestionTool {
 
     fn parameters(&self) -> Value {
         ask_user_question::parameters()
+    }
+
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::UserInteraction
     }
 
     fn execute<'a>(
@@ -321,6 +959,9 @@ impl Tool for ReadTool {
     fn parameters(&self) -> Value {
         read::parameters()
     }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Read
+    }
     fn execute<'a>(
         &'a self,
         args: &'a Value,
@@ -331,7 +972,9 @@ impl Tool for ReadTool {
             let root = root(env)?;
             let mut state = state_mut(env)?;
             let state = &mut *state;
-            read::execute(&root, args, &mut state.observed, &state.skill_read_roots)
+            path::with_restrictions(state.read_workspace_restrictions, || {
+                read::execute(&root, args, &mut state.observed, &state.skill_read_roots)
+            })
         })
     }
     // `read` mutates `state.observed` (read-before-write tracking) behind the
@@ -365,6 +1008,9 @@ impl Tool for BashTool {
     fn parameters(&self) -> Value {
         bash::parameters()
     }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Execute
+    }
     fn execute<'a>(
         &'a self,
         args: &'a Value,
@@ -383,6 +1029,7 @@ impl Tool for BashTool {
             // bash output. Copied out before the blocking task so no borrow of
             // the `!Send` env crosses the thread boundary.
             let reduce = reduce_output(env);
+            let strict = workspace_restrictions(env);
 
             // Bridge the live-output sink across the thread boundary: the
             // blocking body forwards each chunk over an unbounded channel and the
@@ -399,14 +1046,16 @@ impl Tool for BashTool {
                 let mut guard = bash_state.lock().map_err(|_| {
                     anyhow!("bash state poisoned by a previous panic; restart the session")
                 })?;
-                bash::execute(
-                    &root,
-                    &args,
-                    &mut guard,
-                    &cancel_for_task,
-                    Some(&sink),
-                    reduce,
-                )
+                path::with_restrictions(strict, || {
+                    bash::execute(
+                        &root,
+                        &args,
+                        &mut guard,
+                        &cancel_for_task,
+                        Some(&sink),
+                        reduce,
+                    )
+                })
             });
 
             // Keep polling the executor while the command runs: forward each
@@ -474,6 +1123,9 @@ impl Tool for EditTool {
     fn parameters(&self) -> Value {
         edit::parameters()
     }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Write
+    }
     fn execute<'a>(
         &'a self,
         args: &'a Value,
@@ -483,7 +1135,9 @@ impl Tool for EditTool {
         Box::pin(async move {
             let root = root(env)?;
             let mut state = state_mut(env)?;
-            edit::execute(&root, args, &mut state.observed)
+            path::with_restrictions(state.workspace_restrictions, || {
+                edit::execute(&root, args, &mut state.observed)
+            })
         })
     }
     fn requires_approval(&self) -> bool {
@@ -528,6 +1182,9 @@ impl Tool for WriteTool {
     fn parameters(&self) -> Value {
         write::parameters()
     }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Write
+    }
     fn execute<'a>(
         &'a self,
         args: &'a Value,
@@ -537,7 +1194,9 @@ impl Tool for WriteTool {
         Box::pin(async move {
             let root = root(env)?;
             let mut state = state_mut(env)?;
-            write::execute(&root, args, &mut state.observed)
+            path::with_restrictions(state.workspace_restrictions, || {
+                write::execute(&root, args, &mut state.observed)
+            })
         })
     }
     fn requires_approval(&self) -> bool {
@@ -578,6 +1237,9 @@ impl Tool for GrepTool {
     fn parameters(&self) -> Value {
         grep::parameters()
     }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Read
+    }
     fn execute<'a>(
         &'a self,
         args: &'a Value,
@@ -589,6 +1251,7 @@ impl Tool for GrepTool {
             args.clone(),
             "grep",
             reduce_output(env),
+            read_workspace_restrictions(env),
             grep::execute,
         )
     }
@@ -608,6 +1271,9 @@ impl Tool for FindTool {
     fn parameters(&self) -> Value {
         find::parameters()
     }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Read
+    }
     fn execute<'a>(
         &'a self,
         args: &'a Value,
@@ -619,6 +1285,7 @@ impl Tool for FindTool {
             args.clone(),
             "find",
             reduce_output(env),
+            read_workspace_restrictions(env),
             find::execute,
         )
     }
@@ -637,6 +1304,9 @@ impl Tool for ReadOutputTool {
     }
     fn parameters(&self) -> Value {
         read_output::parameters()
+    }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Read
     }
     fn execute<'a>(
         &'a self,
@@ -669,6 +1339,9 @@ impl Tool for RecallTool {
     fn parameters(&self) -> Value {
         recall::parameters()
     }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Read
+    }
     fn execute<'a>(
         &'a self,
         args: &'a Value,
@@ -694,6 +1367,9 @@ impl Tool for RequestCompactionTool {
     }
     fn parameters(&self) -> Value {
         request_compaction::parameters()
+    }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Read
     }
     fn execute<'a>(
         &'a self,
@@ -722,6 +1398,9 @@ impl Tool for LsTool {
     fn parameters(&self) -> Value {
         ls::parameters()
     }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Read
+    }
     fn execute<'a>(
         &'a self,
         args: &'a Value,
@@ -733,6 +1412,7 @@ impl Tool for LsTool {
             args.clone(),
             "ls",
             reduce_output(env),
+            read_workspace_restrictions(env),
             ls::execute,
         )
     }
@@ -828,11 +1508,54 @@ fn destructive_command_basename(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nexus::{ChatProvider, Message, ProviderEvent, ProviderStream};
     use crate::tools::test_support::{root_of, temp_dir};
     use serde_json::json;
+    use std::rc::Rc;
+
+    struct PendingProvider(Rc<()>);
+
+    impl ChatProvider for PendingProvider {
+        fn respond_stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _tools: &'a crate::nexus::Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<ProviderStream<'a>> {
+            let _ = &self.0;
+            Ok(Box::pin(futures::stream::pending::<Result<ProviderEvent>>()))
+        }
+    }
 
     fn bash_args(command: &str) -> Value {
         json!({ "command": command })
+    }
+
+    #[test]
+    fn delegated_capability_modes_filter_visibility_and_execution_lookup() {
+        use crate::nexus::WorkerCapabilityGrant;
+
+        let read_only = built_in_tools().into_capability(WorkerCapabilityGrant::ReadOnly);
+        assert!(read_only.by_name("read").is_some());
+        assert!(read_only.by_name("edit").is_none());
+        assert!(read_only.by_name("bash").is_none());
+        assert!(read_only.by_name("AskUserQuestion").is_none());
+
+        let read_write = built_in_tools().into_capability(WorkerCapabilityGrant::ReadWrite);
+        assert!(read_write.by_name("edit").is_some());
+        assert!(read_write.by_name("write").is_some());
+        assert!(read_write.by_name("bash").is_none());
+
+        let execute = built_in_tools().into_capability(WorkerCapabilityGrant::Execute);
+        assert!(execute.by_name("bash").is_some());
+        assert!(execute.by_name("edit").is_none());
+        assert!(execute.by_name("write").is_none());
+
+        let all = built_in_tools().into_capability(WorkerCapabilityGrant::All);
+        assert!(all.by_name("edit").is_some());
+        assert!(all.by_name("write").is_some());
+        assert!(all.by_name("bash").is_some());
+        assert!(all.by_name("AskUserQuestion").is_none());
     }
 
     #[test]
@@ -920,6 +1643,64 @@ mod tests {
             output_sink: sink,
             mutation_guard: None,
         }
+    }
+
+    #[test]
+    fn cancelling_foreground_spawn_cancels_the_independent_worker() {
+        let dir = temp_dir();
+        let workspace = root_of(&dir);
+        let backend = Arc::new(
+            crate::wayland::subagents::SubagentBackend::open(
+                workspace.clone(),
+                &workspace.join("worker-state"),
+                workspace.join("worktrees"),
+            )
+            .unwrap(),
+        );
+        let provider_factory: crate::wayland::subagents::ChildProviderFactory =
+            Arc::new(|| Ok(Box::new(PendingProvider(Rc::new(()))) as Box<dyn ChatProvider>));
+        let tool = SpawnSubagentTool(SubagentToolsConfig {
+            backend: backend.clone(),
+            provider_factory,
+            capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
+            session_id: "foreground-cancel".to_string(),
+            nesting_depth: 0,
+            max_nesting_depth: 2,
+            approval: None,
+        });
+        let state = std::cell::RefCell::new(ToolState::new());
+        let env = bash_env(&workspace, &state, None);
+        let cancel = CancellationToken::new();
+        let cancel_from_thread = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cancel_from_thread.cancel();
+        });
+
+        let error = current_thread_runtime()
+            .block_on(tool.execute(
+                &json!({ "prompt": "wait", "background": false }),
+                &env,
+                cancel,
+            ))
+            .unwrap_err();
+        canceller.join().unwrap();
+        assert!(error.to_string().contains("foreground subagent cancelled"));
+        let snapshot = backend
+            .runtime()
+            .handle()
+            .list(&iris_subagent_runtime::WorkerFilter::default())
+            .pop()
+            .unwrap();
+        let result = backend
+            .runtime()
+            .handle()
+            .wait_blocking(&snapshot.worker_id)
+            .unwrap();
+        assert_eq!(
+            result.status,
+            iris_subagent_runtime::WorkerStatus::Cancelled
+        );
     }
 
     #[test]
@@ -1166,6 +1947,10 @@ mod tests {
 
     #[test]
     fn all_tool_schemas_stay_in_provider_safe_subset() {
+        // Keep this scratch root alive until after every registry drops its
+        // scheduler-backed subagent tools.
+        let subagent_dir = temp_dir();
+        let subagent_workspace = root_of(&subagent_dir);
         // Every registry configuration the CLI can build, plus the
         // test-only-injectable `read_output` tool: PR #593 added a top-level
         // `oneOf` to exactly one tool (`recall`) and it was invisible to every
@@ -1203,11 +1988,124 @@ mod tests {
                 read_web_page: Some(web::ReadBackend::Native),
                 ..WebToolsConfig::default()
             },
+            subagents: None,
         };
         registries.push((
             "built_in_tools_with(web enabled)",
             built_in_tools_with(&web_config),
         ));
+
+        let backend = Arc::new(
+            crate::wayland::subagents::SubagentBackend::open(
+                subagent_workspace.clone(),
+                &subagent_workspace.join("worker-state"),
+                subagent_workspace.join("worktrees"),
+            )
+            .unwrap(),
+        );
+        let provider_factory: crate::wayland::subagents::ChildProviderFactory =
+            Arc::new(|| Err(anyhow!("schema test must not execute a provider")));
+        let subagent_config = ToolsConfig {
+            subagents: Some(SubagentToolsConfig {
+                backend,
+                provider_factory,
+                capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
+                session_id: "schema-test".to_string(),
+                nesting_depth: 0,
+                max_nesting_depth: 2,
+                approval: None,
+            }),
+            ..ToolsConfig::default()
+        };
+        let subagent_tools = built_in_tools_with(&subagent_config);
+        let names = subagent_tools
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>();
+        for expected in [
+            "spawn_subagent",
+            "subagent_status",
+            "read_subagent_output",
+            "cancel_subagent",
+            "select_subagent_candidate",
+            "plan_subagent_apply",
+            "apply_subagent",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}");
+        }
+        assert!(
+            names
+                .iter()
+                .filter(|name| name.contains("subagent"))
+                .all(|name| !name.contains("task"))
+        );
+        let spawn_schema = subagent_tools
+            .by_name("spawn_subagent")
+            .unwrap()
+            .parameters();
+        let properties = spawn_schema["properties"].as_object().unwrap();
+        for required_field in [
+            "prompt",
+            "description",
+            "kind",
+            "capability",
+            "isolation",
+            "cwd",
+            "background",
+            "resume_from",
+        ] {
+            assert!(
+                properties.contains_key(required_field),
+                "missing {required_field}"
+            );
+        }
+        let state = std::cell::RefCell::new(ToolState::new());
+        let env = bash_env(&subagent_workspace, &state, None);
+        let spawn = subagent_tools.by_name("spawn_subagent").unwrap();
+        for invalid in [
+            json!({
+                "prompt": "invalid",
+                "kind": "review",
+                "capability": "read_write"
+            }),
+            json!({
+                "prompt": "invalid",
+                "capability": "read_only",
+                "isolation": "worktree",
+                "cwd": "."
+            }),
+            json!({
+                "prompt": "invalid",
+                "capability": "read_write",
+                "isolation": "none"
+            }),
+        ] {
+            let error = current_thread_runtime()
+                .block_on(spawn.execute(&invalid, &env, CancellationToken::new()))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("worker")
+                    || error.to_string().contains("worktree")
+                    || error.to_string().contains("capability"),
+                "unexpected validation error: {error:#}"
+            );
+        }
+        let failed = current_thread_runtime()
+            .block_on(spawn.execute(
+                &json!({
+                    "prompt": "must fail before inference",
+                    "capability": "read_write",
+                    "background": false
+                }),
+                &env,
+                CancellationToken::new(),
+            ))
+            .unwrap();
+        let failed: iris_subagent_runtime::WorkerResult =
+            serde_json::from_str(&failed.content).unwrap();
+        assert_eq!(failed.status, iris_subagent_runtime::WorkerStatus::Failed);
+        assert!(!subagent_workspace.join("result.txt").exists());
+        registries.push(("built_in_tools_with(subagents)", subagent_tools));
 
         let mut checked_any = false;
         for (config_name, tools) in &registries {

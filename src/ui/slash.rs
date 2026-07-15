@@ -77,6 +77,16 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Submit,
     },
     SlashCommand {
+        name: "/worktrees",
+        description: "List, inspect, recover, or remove managed subagent worktrees",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
+        name: "/subagents",
+        description: "List, inspect, wait for, or cancel delegated workers",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/tasks",
         description: "Review the active task or resume interrupted tasks",
         action: SlashAction::Submit,
