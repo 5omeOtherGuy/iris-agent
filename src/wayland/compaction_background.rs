@@ -10,6 +10,11 @@ enum WorkerSpawn {
     Portable(SummarizerFactory),
 }
 
+enum NativeWaitError {
+    Timeout,
+    Failed(String),
+}
+
 /// Outcome of the provider-native rung of the hard-tier fallback ladder
 /// (subagent -> provider-native -> deterministic excerpts).
 enum NativeFallbackOutcome {
@@ -100,24 +105,7 @@ impl CompactionEngine {
             original_tokens,
         };
         let native_factory = if self.provider_native {
-            self.provider_compaction_factory
-                .as_ref()
-                .and_then(|factory| match factory() {
-                    Ok(provider)
-                        if provider.compaction_capability(original_tokens)
-                            == ProviderCompactionCapability::OpaqueBlocks =>
-                    {
-                        Some(factory.clone())
-                    }
-                    Ok(_) => None,
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %format!("{error:#}"),
-                            "provider-native compaction probe failed; using the portable worker"
-                        );
-                        None
-                    }
-                })
+            self.provider_compaction_factory.clone()
         } else {
             None
         };
@@ -148,41 +136,37 @@ impl CompactionEngine {
                 SummarizerKind::Excerpts => CompactionOrigin::Excerpts,
             },
         };
-        let job_id = format!("compaction_{:08x}", self.next_job_seq);
-        self.next_job_seq = self.next_job_seq.saturating_add(1);
-        let token = CancellationToken::new();
-        let worker_token = token.clone();
+        let runtime = self
+            .worker_runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("worker runtime is unavailable"))?
+            .clone();
         let worker = self.worker.clone();
-        let (tx, receiver) = mpsc::channel();
-        match spawn {
-            WorkerSpawn::Native(factory) => {
-                thread::Builder::new()
-                    .name(format!("iris-{job_id}"))
-                    .spawn(move || {
-                        let result =
-                            run_provider_native_worker(factory, covered, worker, worker_token);
-                        let _ = tx.send(result);
-                    })?;
-            }
-            WorkerSpawn::Portable(factory) => {
-                let workspace_for_worker = workspace.to_path_buf();
-                let mode = self.summarizer;
-                thread::Builder::new()
-                    .name(format!("iris-{job_id}"))
-                    .spawn(move || {
-                        let result = run_compaction_worker(
-                            factory,
-                            workspace_for_worker,
-                            covered,
-                            worker,
-                            mode,
-                            range_context,
-                            worker_token,
-                        );
-                        let _ = tx.send(result);
-                    })?;
-            }
-        }
+        let (native, executor) = match spawn {
+            WorkerSpawn::Native(factory) => (
+                true,
+                CompactionJobExecutor::native(factory, workspace.to_path_buf(), covered, worker),
+            ),
+            WorkerSpawn::Portable(factory) => (
+                false,
+                CompactionJobExecutor::portable(
+                    factory,
+                    workspace.to_path_buf(),
+                    covered,
+                    worker,
+                    self.summarizer,
+                    range_context,
+                ),
+            ),
+        };
+        let request = compaction_worker_request(native, self.worker.timeout);
+        let worker_id = runtime.spawn(
+            request,
+            Box::new(move || {
+                Ok(Box::new(executor) as Box<dyn iris_subagent_runtime::WorkerExecutor>)
+            }),
+        )?;
+        let job_id = worker_id.to_string();
         let job = BackgroundCompaction {
             job_id,
             session_id: self.session_id().map(str::to_string),
@@ -190,10 +174,9 @@ impl CompactionEngine {
             to_id: plan.to_id,
             covered_messages,
             original_tokens,
-            receiver,
+            worker_id,
             result: None,
             ready_emitted: false,
-            token,
             origin,
             trigger_tier,
             started_at: std::time::Instant::now(),
@@ -220,30 +203,28 @@ impl CompactionEngine {
             return Ok(());
         };
         if job.result.is_none() {
-            match job.receiver.try_recv() {
-                Ok(result) => {
-                    if let BackgroundSummaryResult::Summary(summary) = &result {
-                        self.emit_lifecycle(
-                            obs,
-                            &job,
-                            CompactionLifecycleState::Ready,
-                            summary.worker_usage.clone(),
-                            Some(
-                                "background compaction summary ready; waiting for hard pressure"
-                                    .to_string(),
-                            ),
-                        )?;
-                        job.ready_emitted = true;
-                    }
-                    job.result = Some(result);
+            let snapshot = self
+                .worker_runtime
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("worker runtime is unavailable"))?
+                .handle()
+                .poll(&job.worker_id)?;
+            if let Some(worker_result) = snapshot.result {
+                let result = decode_compaction_result(&worker_result);
+                if let BackgroundSummaryResult::Summary(summary) = &result {
+                    self.emit_lifecycle(
+                        obs,
+                        &job,
+                        CompactionLifecycleState::Ready,
+                        summary.worker_usage.clone(),
+                        Some(
+                            "background compaction summary ready; waiting for hard pressure"
+                                .to_string(),
+                        ),
+                    )?;
+                    job.ready_emitted = true;
                 }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    job.result = Some(BackgroundSummaryResult::Failed(
-                        "background compaction worker stopped before returning a summary"
-                            .to_string(),
-                    ));
-                }
+                job.result = Some(result);
             }
         }
         self.background = Some(job);
@@ -275,8 +256,13 @@ impl CompactionEngine {
         let Some(mut job) = self.background.take() else {
             return Ok(None);
         };
+        let runtime = self
+            .worker_runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("worker runtime is unavailable"))?
+            .clone();
         if token.is_cancelled() {
-            job.token.cancel();
+            let _ = runtime.handle().cancel(&job.worker_id);
             self.emit_lifecycle(
                 cx.observer,
                 &job,
@@ -289,66 +275,46 @@ impl CompactionEngine {
         if let Some(result) = job.result.take() {
             return self.finish_background_at_boundary(job, result, messages, cx, Some(token));
         }
-        let job_id = job.job_id.clone();
-        let covered_messages = job.covered_messages;
-        let original_tokens = job.original_tokens;
-        let origin = job.origin;
-        let trigger_tier = job.trigger_tier;
-        let worker_token = job.token.clone();
-        let hard_wait = self.hard_wait;
-        let waiter = tokio::task::spawn_blocking(move || {
-            let result = job.receiver.recv_timeout(hard_wait);
-            (job, result)
-        });
-        let joined = tokio::select! {
+        let worker_id = job.worker_id.clone();
+        let hard_wait = self.hard_wait.max(std::time::Duration::from_millis(250));
+        let wait = tokio::time::timeout(hard_wait, runtime.handle().wait(&worker_id));
+        tokio::pin!(wait);
+        let result = tokio::select! {
             biased;
             _ = token.cancelled() => {
-                worker_token.cancel();
-                emit_context_event(
+                let _ = runtime.handle().cancel(&worker_id);
+                self.emit_lifecycle(
                     cx.observer,
-                    AgentEvent::CompactionLifecycle {
-                        job_id,
-                        state: CompactionLifecycleState::Cancelled,
-                        covered_messages,
-                        original_tokens_estimate: original_tokens,
-                        origin,
-                        worker_usage: None,
-                        trigger_tier,
-                        message: Some("background compaction cancelled with the turn".to_string()),
-                    },
-                    "compaction lifecycle",
-                );
+                    &job,
+                    CompactionLifecycleState::Cancelled,
+                    None,
+                    Some("background compaction cancelled with the turn".to_string()),
+                )?;
                 return Ok(None);
             }
-            joined = waiter => joined,
-        };
-        let (job, result) = match joined {
-            Ok(joined) => joined,
-            Err(error) => {
-                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-                emit_context_event(
-                    cx.observer,
-                    AgentEvent::CompactionLifecycle {
-                        job_id,
-                        state: CompactionLifecycleState::Failed,
-                        covered_messages,
-                        original_tokens_estimate: original_tokens,
-                        origin,
-                        worker_usage: None,
-                        trigger_tier,
-                        message: Some(format!("background hard-wait task failed: {error}")),
-                    },
-                    "compaction lifecycle",
-                );
-                return Ok(None);
-            }
+            result = &mut wait => result,
         };
         match result {
-            Ok(result) => {
-                self.finish_background_at_boundary(job, result, messages, cx, Some(token))
+            Ok(Ok(worker_result)) => self.finish_background_at_boundary(
+                job,
+                decode_compaction_result(&worker_result),
+                messages,
+                cx,
+                Some(token),
+            ),
+            Ok(Err(error)) => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                self.emit_lifecycle(
+                    cx.observer,
+                    &job,
+                    CompactionLifecycleState::Failed,
+                    None,
+                    Some(format!("background compaction wait failed: {error}")),
+                )?;
+                self.apply_job_fallback(&job, messages, cx, Some(token))
             }
-            Err(RecvTimeoutError::Timeout) => {
-                job.token.cancel();
+            Err(_) => {
+                let _ = runtime.handle().cancel(&worker_id);
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 self.emit_lifecycle(
                     cx.observer,
@@ -357,22 +323,8 @@ impl CompactionEngine {
                     None,
                     Some(format!(
                         "background compaction summary exceeded the {} ms hard wait; escalating fallback",
-                        self.hard_wait.as_millis()
+                        hard_wait.as_millis()
                     )),
-                )?;
-                self.apply_job_fallback(&job, messages, cx, Some(token))
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-                self.emit_lifecycle(
-                    cx.observer,
-                    &job,
-                    CompactionLifecycleState::Failed,
-                    None,
-                    Some(
-                        "background compaction worker stopped before returning a summary"
-                            .to_string(),
-                    ),
                 )?;
                 self.apply_job_fallback(&job, messages, cx, Some(token))
             }
@@ -456,14 +408,20 @@ impl CompactionEngine {
             }
             BackgroundSummaryResult::Failed(message) => {
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                let lifecycle_message = if job.origin == CompactionOrigin::ProviderNative
+                    && message.contains("unsupported")
+                {
+                    "provider-native compaction unavailable; using deterministic excerpts"
+                        .to_string()
+                } else {
+                    format!("background compaction failed; using deterministic fallback: {message}")
+                };
                 self.emit_lifecycle(
                     cx.observer,
                     &job,
                     CompactionLifecycleState::Failed,
                     None,
-                    Some(format!(
-                        "background compaction failed; using deterministic fallback: {message}"
-                    )),
+                    Some(lifecycle_message),
                 )?;
                 self.apply_job_fallback(&job, messages, cx, native)
             }
@@ -539,13 +497,12 @@ impl CompactionEngine {
         }
     }
 
-    /// Provider-native rung of the hard-tier fallback ladder. Runs one bounded,
-    /// cancellable provider-native compaction off the loop (the adapter may use
-    /// a blocking client, so it runs on its own OS thread) and applies it
-    /// through the same parent-owned path a subagent summary uses. A success
-    /// resets the model-backed circuit breaker exactly like a subagent apply.
-    /// Provider names never cross this boundary: eligibility is decided only by
-    /// the `compaction_capability` seam.
+    /// Provider-native rung of the hard-tier fallback ladder. Submits one bounded,
+    /// cancellable provider-native compaction to the shared worker scheduler and
+    /// applies it through the same parent-owned path a portable summary uses. A
+    /// success resets the model-backed circuit breaker exactly like a portable
+    /// apply. Provider names never cross this boundary: eligibility is decided
+    /// only by the `compaction_capability` seam.
     fn try_provider_native_fallback(
         &mut self,
         job: &BackgroundCompaction,
@@ -559,32 +516,6 @@ impl CompactionEngine {
             return Ok(NativeFallbackOutcome::Unavailable);
         };
         let factory = factory.clone();
-        let supported = match factory() {
-            Ok(provider) => {
-                provider.compaction_capability(job.original_tokens)
-                    == ProviderCompactionCapability::OpaqueBlocks
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "provider-native fallback probe failed; using deterministic excerpts"
-                );
-                false
-            }
-        };
-        if !supported {
-            self.emit_lifecycle(
-                cx.observer,
-                job,
-                CompactionLifecycleState::Discarded,
-                None,
-                Some(
-                    "provider-native compaction unavailable; using deterministic excerpts"
-                        .to_string(),
-                ),
-            )?;
-            return Ok(NativeFallbackOutcome::Unavailable);
-        }
         if self.model_compaction_cap_reached(CompactionOrigin::ProviderNative) {
             self.emit_lifecycle(
                 cx.observer,
@@ -612,23 +543,24 @@ impl CompactionEngine {
             )),
         )?;
         let covered = messages[plan.start..plan.end].to_vec();
-        let worker = self.worker.clone();
-        let worker_token = CancellationToken::new();
-        let child_token = worker_token.clone();
-        let (tx, receiver) = mpsc::channel();
-        thread::Builder::new()
-            .name(format!("iris-{}-native-fallback", job.job_id))
-            .spawn(move || {
-                let result = run_provider_native_worker(factory, covered, worker, child_token);
-                let _ = tx.send(result);
-            })?;
-        // Bounded, cancellable wait: reuse the hard-wait budget as the boundary
-        // bound and poll the turn token in short slices so a cancelled turn
-        // stops the blocking provider request instead of running to completion.
-        let deadline = std::time::Instant::now() + self.hard_wait;
+        let runtime = self
+            .worker_runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("worker runtime is unavailable"))?
+            .clone();
+        let executor =
+            CompactionJobExecutor::native(factory, PathBuf::new(), covered, self.worker.clone());
+        let worker_id = runtime.spawn(
+            compaction_worker_request(true, self.worker.timeout),
+            Box::new(move || {
+                Ok(Box::new(executor) as Box<dyn iris_subagent_runtime::WorkerExecutor>)
+            }),
+        )?;
+        let native_wait = self.hard_wait.max(std::time::Duration::from_millis(250));
+        let deadline = std::time::Instant::now() + native_wait;
         let result = loop {
             if token.is_cancelled() {
-                worker_token.cancel();
+                let _ = runtime.handle().cancel(&worker_id);
                 self.emit_lifecycle(
                     cx.observer,
                     job,
@@ -640,13 +572,16 @@ impl CompactionEngine {
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                worker_token.cancel();
-                break Err(RecvTimeoutError::Timeout);
+                let _ = runtime.handle().cancel(&worker_id);
+                break Err(NativeWaitError::Timeout);
             }
-            match receiver.recv_timeout(remaining.min(std::time::Duration::from_millis(25))) {
-                Ok(result) => break Ok(result),
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => break Err(RecvTimeoutError::Disconnected),
+            match runtime.handle().wait_blocking_timeout(
+                &worker_id,
+                Some(remaining.min(std::time::Duration::from_millis(25))),
+            ) {
+                Ok(result) => break Ok(decode_compaction_result(&result)),
+                Err(iris_subagent_runtime::RuntimeError::WaitTimeout) => continue,
+                Err(error) => break Err(NativeWaitError::Failed(error.to_string())),
             }
         };
         match result {
@@ -693,7 +628,7 @@ impl CompactionEngine {
                 )?;
                 Ok(NativeFallbackOutcome::Unavailable)
             }
-            Err(RecvTimeoutError::Timeout) => {
+            Err(NativeWaitError::Timeout) => {
                 self.emit_lifecycle(
                     cx.observer,
                     job,
@@ -706,15 +641,14 @@ impl CompactionEngine {
                 )?;
                 Ok(NativeFallbackOutcome::Unavailable)
             }
-            Err(RecvTimeoutError::Disconnected) => {
+            Err(NativeWaitError::Failed(message)) => {
                 self.emit_lifecycle(
                     cx.observer,
                     job,
                     CompactionLifecycleState::Failed,
                     None,
                     Some(
-                        "provider-native fallback worker stopped before returning a summary; using deterministic excerpts"
-                            .to_string(),
+                        format!("provider-native fallback failed before returning a summary; using deterministic excerpts: {message}"),
                     ),
                 )?;
                 Ok(NativeFallbackOutcome::Unavailable)

@@ -98,11 +98,17 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 | Tool execution state (observed files, bash sessions) | `tools/observe.rs`, `tools/bash/session.rs` (`ToolState`) |
 | Host capabilities, if a plugin system is ever added (`host_read`, `host_ls`, later `host_*_plan`) | _exploratory (issue #18)_ |
 | Oversized tool-output handle storage | `handles.rs`, `wayland/mod.rs` |
-| Context compaction engine, transcript/investigator workers, mid-turn governor, reactive overflow recovery, inspectable background lifecycle, hybrid measurement, and trigger ladder | `wayland/compaction.rs`, `wayland/compaction_governor.rs`, `wayland/compaction_background.rs`, `wayland/trigger.rs`, `wayland/mod.rs`, `session.rs` |
+| Context compaction policy, range planning, stale-result revalidation, safe-boundary apply, mid-turn governor, hybrid measurement, and trigger ladder | `wayland/compaction.rs`, `wayland/compaction_governor.rs`, `wayland/compaction_background.rs`, `wayland/trigger.rs`, `wayland/mod.rs`, `session.rs` |
+| Iris adapters for the shared worker scheduler: `!Send` executor registration, child Nexus loops, compaction executors, and worktree linkage | `wayland/worker_runtime.rs`, `wayland/subagents.rs`, `wayland/compaction_background.rs` |
 | System-prompt / project-instruction assembly (fragments + generated tool blocks + project docs + runtime context) | `wayland/system_prompt/` |
 | Skills: bounded repo/user/system/admin discovery, Codex metadata/config compatibility, metadata budgeting, contextual injection, confined resource reads, refresh-at-turn-boundary | `wayland/skills/`, `wayland/mod.rs`, `tools/read.rs` |
 
-Depends on Tier 1 only. The `Harness` is the analogue of pi's `AgentHarness`
+Depends on Tier 1 and the host-neutral `iris-subagent-runtime` support crate. That
+crate is not a fourth Iris product tier: it owns reusable bounded scheduling,
+durability, artifacts, groups, and worktree infrastructure and imports no Iris,
+Nexus, Mimir, settings, provider, or terminal code. Wayland supplies executors
+that run Nexus child loops or compaction calls; compaction retains policy and
+safe-boundary application. The `Harness` is the analogue of pi's `AgentHarness`
 (`agent-harness.ts`): it owns `env`/`session`, passes `env` into the run, and
 appends transcript messages itself.
 
@@ -122,7 +128,8 @@ translate wire formats into the Tier 1 `ChatProvider` contract.
 | Terminal I/O behind the `Ui` trait | `ui/`, `tool_display.rs` |
 | Render backends: screen-mode policy (ADR-0029) selects the alt-screen pager (full-frame ratatui `Terminal`) or the inline terminal surface (ADR-0006); both render the same `Screen` state | `ui/screen_mode.rs`, `ui/tui/pager.rs`, `ui/terminal_surface.rs` |
 | Approval prompt UX + `ApprovalGate`/`AgentObserver` adapter (`UiBridge`); decision parsing | `ui/` (`UiBridge`, `request_approval`), `approval.rs` (`parse_decision`) |
-| Tool implementations: `read` `write` `edit` `bash` `grep` `find` `ls` | `tools/*` (impls) |
+| Tool implementations: workspace tools plus model-facing subagent spawn/status/cancel/selection/apply adapters | `tools/*`, `tools/registry.rs` |
+| Subagent/worktree operator commands and apply authorization UX | `cli.rs`, `ui/tui_loop.rs`, `ui/slash.rs` |
 | Plugin runtime + registration, if a plugin system is ever added: executor (WASM/Extism or subprocess), manifest parsing, registry wiring | _exploratory (issue #18)_ |
 | Trusted approval-preview diff rendering | `tools/mod.rs` (`diff_preview`) → Tier 3 |
 | Provider adapters (translate OpenAI Codex Responses, Anthropic Messages, and Antigravity/Gemini wire formats → contracts), packaged as **Mimir** (the AI/provider package; see [`NAMING.md`](NAMING.md)); provider-native prompt-cache/context-management request knobs stay inside these adapters | `mimir/providers/*` |

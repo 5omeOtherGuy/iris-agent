@@ -179,6 +179,14 @@ Implemented today:
   calls, compactions, and output handles, plus typed observability events for
   provider-turn lifecycle, tool lifecycle, compaction metadata, and
   output-handle metadata.
+- Delegated-worker backend ([#459](https://github.com/5omeOtherGuy/iris-agent/issues/459),
+  [ADR-0063](adr/0063-extract-subagent-runtime-and-centralize-worker-scheduling.md)):
+  the public `iris-subagent-runtime` crate owns bounded durable scheduling,
+  cancellation, groups, artifacts, recovery, and managed worktrees. Iris runs
+  `!Send` child agents and compaction jobs on that scheduler. Mutation-capable
+  workers use detached worktrees and reviewed apply; linked/Btrfs creation,
+  pooling/adoption, restore seams, best-of-N, and `/subagents`/`/worktrees`
+  operator controls ship in the same backend.
 - TUI implementation foundations: reusable `Component`/`Container` composition,
   explicit overlay focus routing, a shared Unicode/ANSI text engine, a built-in
   tool renderer registry, terminal-depth palette degradation, frame-owned pager
@@ -194,8 +202,7 @@ Implemented today:
 Not implemented yet:
 
 - Persistent approval policies, transcript-tree branching/rollback, modes,
-  subagents, context ledger/planner, handle dereference UI (browser),
-  provider-side compact replay, token-efficiency benchmark proof, git
+  context ledger/planner, handle dereference UI (browser), provider-side compact replay, token-efficiency benchmark proof, git
   automation, and GitHub integration. [The model-facing handle dereference
   tool shipped ([#205](https://github.com/5omeOtherGuy/iris-agent/issues/205)).]
 
@@ -1055,15 +1062,24 @@ selection must be centralized in Nexus rather than duplicated in Iris CLI.
 **Goal:** add the pi-mmr-inspired workflow only after the base agent and context
 engine are stable.
 
-Potential scope:
+**Status:** delegated-worker slice shipped 2026-07-14 under
+[#459](https://github.com/5omeOtherGuy/iris-agent/issues/459). Mode profiles
+and per-worker provider routing remain deferred.
 
-- Simple mode profiles.
-- Mode-specific prompt/tool/model settings.
-- Subagents as tools.
-- Per-worker model routing.
-- Per-worker tool allowlists.
-- Worker token/turn budgets.
-- Handle-returning worker outputs.
+Shipped scope:
+
+- Read-only and worktree-isolated mutation-capable subagents as model tools.
+- Per-worker tool allowlists, capability ceilings, token/turn budgets, durable
+  background lifecycle, groups, cancellation, recovery, and artifact-backed
+  outputs.
+- Shared scheduler for delegated workers and compaction; provider/agent state may
+  remain `!Send`.
+- Explicit best-of-N selection and reviewed apply. No model-authorized apply.
+
+Remaining scope:
+
+- Simple mode profiles and mode-specific prompt/tool/model settings.
+- Per-worker model/provider routing.
 
 Acceptance signal: Iris can delegate search/review/research work without bloating
 the main conversation and can report the token/latency cost of that delegation.
@@ -1138,18 +1154,16 @@ Active slice (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261)
   further changes; stop at the cap); honest pass/fail-after-N/skipped events;
   verification never settles the task, so a failed loop stays rollbackable
   (ADR-0028).
-- Worktree isolation slice — design ADR accepted
-  ([#267](https://github.com/5omeOtherGuy/iris-agent/issues/267), closed;
-  [ADR-0035](adr/0035-git-worktree-isolation-and-apply-as-settlement.md)). The
-  implementation (#271) is the first mutable-subagent backend slice. Settled
-  framing: worktree isolation is Tier 0 of the ADR-0028 guarantee model; apply is
-  a guarded parent-workspace mutation through the #262 choke point and is task
-  settlement only when the opt-in durable workflow exists; the final diff engine
-  (#264) doubles as the apply review artifact. Reference:
-  [`.iris-reference/grok-worktree-subsystem-spec.md`](../.iris-reference/grok-worktree-subsystem-spec.md)
-  (Grok Build subsystem reference, not an Iris decision). Reserves the future
-  subagent `isolation` schema seam; read-write subagents must not ship before
-  this isolation/apply backend exists.
+- Worktree isolation slice — shipped
+  ([#267](https://github.com/5omeOtherGuy/iris-agent/issues/267),
+  [#271](https://github.com/5omeOtherGuy/iris-agent/issues/271),
+  [ADR-0035](adr/0035-git-worktree-isolation-and-apply-as-settlement.md),
+  [ADR-0063](adr/0063-extract-subagent-runtime-and-centralize-worker-scheduling.md)).
+  Managed detached linked worktrees use a durable registry, independent ownership
+  markers, guarded removal/GC, and explicit review-first file apply through the
+  parent mutation choke point. The #459 follow-up ships Btrfs fallback, pooling,
+  adoption, restore, and best-of-N behind the same contract. Overlay mounts,
+  privileged snapshot delegates, and production cloud restore remain excluded.
 
 Later slices (not in #261):
 
@@ -1203,12 +1217,6 @@ Later slices (not in #261):
 - Optional auto-commit behind explicit approval
   ([#270](https://github.com/5omeOtherGuy/iris-agent/issues/270); needs its own
   ADR per the still-binding gate).
-- Worktree support implementation
-  ([#271](https://github.com/5omeOtherGuy/iris-agent/issues/271); first backend
-  slice for mutable subagents, based on accepted ADR-0035).
-- Advanced subagent worktree backend slices — snapshot fast paths,
-  pooling/adoption, and remote restore are desired follow-ups after #271 proves
-  linked worktree creation, registry, explicit apply, and guarded removal.
 
 Acceptance signal: Iris can safely complete a local coding task, show the diff,
 and either roll it back or prepare it for commit without touching unrelated user
@@ -1221,7 +1229,7 @@ settlement).
 Gate before Git automation: dirty-tree behavior, rollback semantics, and approval
 requirements must be specified before auto-commit, worktree, GitHub, or CI features
 are implemented. [Satisfied for the #261 slice by ADR-0028 (2026-07-03); still
-binding for auto-commit, worktree, GitHub, and CI slices.]
+binding for auto-commit, GitHub, CI, and future worktree-strategy deviations.]
 
 ## Milestone 6 — Alt-Screen Pager TUI
 

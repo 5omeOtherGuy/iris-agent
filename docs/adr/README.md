@@ -93,6 +93,7 @@ implementation.
 | [0060](0060-harness-actor-keeps-tui-input-always-live.md) | Keep TUI input live by owning turns in a harness actor | proposed | 2026-07-12 |
 | [0061](0061-typed-structured-output-compaction-summaries.md) | Typed structured-output compaction summaries | accepted | 2026-07-13 |
 | [0062](0062-keep-codex-prompt-caches-session-scoped.md) | Keep Codex prompt caches session-scoped | accepted | 2026-07-14 |
+| [0063](0063-extract-subagent-runtime-and-centralize-worker-scheduling.md) | Extract the subagent runtime and centralize worker scheduling | accepted; supersedes 0035 in part | 2026-07-14 |
 
 Two historical number collisions exist: ADR-0051 and ADR-0058 each name two
 records. The `-A`/`-B` labels above are index disambiguators only; filenames and

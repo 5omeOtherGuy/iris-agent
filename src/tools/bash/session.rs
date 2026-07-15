@@ -187,7 +187,9 @@ impl Session {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         crate::process_group::in_own_group(&mut command);
-        let status = sandbox::confine(&mut command, &sandbox::SandboxPolicy::for_workspace(root));
+        let policy = sandbox::policy_for_current_agent(root);
+        let status = sandbox::confine(&mut command, &policy);
+        sandbox::require_for_current_agent(&status)?;
         if let Some(notice) = status.notice() {
             tracing::warn!(%notice, "bash session sandbox not fully enforced");
         }

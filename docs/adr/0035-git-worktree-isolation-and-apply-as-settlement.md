@@ -4,7 +4,12 @@
 **Status**: accepted — amended by
 [ADR-0052](0052-task-workflow-v2-opt-in-guard-and-integrated-settlement.md)
 (the future subagent feature must not be named `task`; task records are
-per-worktree while checkpoint refs live in the shared common ref store)
+per-worktree while checkpoint refs live in the shared common ref store), and
+superseded in part by
+[ADR-0063](0063-extract-subagent-runtime-and-centralize-worker-scheduling.md)
+(the reusable crate owns generic scheduling/worktree infrastructure; managed
+control and git-admin markers replace the child-tree marker; Btrfs, pooling,
+restore, and best-of-N slices are activated)
 **Deciders**: operator + agent design review (epic [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261), issue [#267](https://github.com/5omeOtherGuy/iris-agent/issues/267))
 
 ## Context

@@ -35,7 +35,7 @@ impl CompactionEngine {
         };
 
         if let Some(job) = self.background.take() {
-            job.token.cancel();
+            self.cancel_worker(&job);
             self.emit_lifecycle(
                 apply_cx.observer,
                 &job,

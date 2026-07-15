@@ -1,16 +1,46 @@
 //! Workspace path resolution.
 //!
-//! Safety restrictions are development opt-in via `IRIS_SECURITY_OPT_IN=1`.
-//! By default, tools resolve paths but do not confine them to the workspace.
+//! Parent-session safety restrictions are development opt-in via
+//! `IRIS_SECURITY_OPT_IN=1`. Delegated agents install a thread-local per-agent
+//! override so their mutation paths stay confined independent of process settings.
 
+use std::cell::Cell;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+thread_local! {
+    static RESTRICTIONS_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
 pub(crate) fn restrictions_enabled() -> bool {
-    // Keep legacy safety tests meaningful while the shipped/dev binary defaults
-    // to unrestricted unless explicitly opted in.
-    cfg!(test) || restrictions_enabled_value(std::env::var("IRIS_SECURITY_OPT_IN").ok().as_deref())
+    RESTRICTIONS_OVERRIDE.get().unwrap_or_else(|| {
+        cfg!(test)
+            || restrictions_enabled_value(std::env::var("IRIS_SECURITY_OPT_IN").ok().as_deref())
+    })
+}
+
+pub(crate) fn workspace_confinement_required() -> bool {
+    RESTRICTIONS_OVERRIDE.get() == Some(true)
+}
+
+/// Runs one synchronous tool body with an optional workspace-confinement policy.
+/// The override is thread-local and nestable, so independent scheduler/blocking
+/// threads cannot change each other's policy. `None` preserves the parent
+/// process's legacy environment/test behavior.
+pub(crate) fn with_restrictions<T>(restrictions: Option<bool>, operation: impl FnOnce() -> T) -> T {
+    let Some(restrictions) = restrictions else {
+        return operation();
+    };
+    let previous = RESTRICTIONS_OVERRIDE.replace(Some(restrictions));
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RESTRICTIONS_OVERRIDE.set(self.0);
+        }
+    }
+    let _reset = Reset(previous);
+    operation()
 }
 
 fn restrictions_enabled_value(value: Option<&str>) -> bool {
@@ -176,7 +206,9 @@ pub(crate) fn workspace_relative(root: &Path, requested: &str) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{root_of, temp_dir};
-    use super::{restrictions_enabled_value, workspace_relative};
+    use super::{
+        restrictions_enabled, restrictions_enabled_value, with_restrictions, workspace_relative,
+    };
 
     #[test]
     fn workspace_relative_keeps_inside_paths_and_drops_escapes() {
@@ -222,6 +254,21 @@ mod tests {
         // rejected before normalization, not cosmetically collapsed.
         assert_eq!(workspace_relative(root, "src/../src/a.rs"), None);
         assert_eq!(workspace_relative(root, "./src/../src/a.rs"), None);
+    }
+
+    #[test]
+    fn per_agent_restrictions_are_nested_and_thread_local() {
+        assert!(
+            restrictions_enabled(),
+            "test default should remain confined"
+        );
+        with_restrictions(Some(false), || {
+            assert!(!restrictions_enabled());
+            with_restrictions(Some(true), || assert!(restrictions_enabled()));
+            assert!(!restrictions_enabled());
+            assert!(std::thread::spawn(restrictions_enabled).join().unwrap());
+        });
+        assert!(restrictions_enabled());
     }
 
     #[test]

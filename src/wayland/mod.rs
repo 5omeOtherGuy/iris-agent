@@ -18,6 +18,7 @@ pub(crate) mod subagents;
 pub(crate) mod system_prompt;
 mod trigger;
 pub(crate) mod trust;
+pub(crate) mod worker_runtime;
 
 #[cfg(test)]
 mod skills_tests;
@@ -30,8 +31,6 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
-use std::thread;
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -61,6 +60,7 @@ use crate::session::{
 };
 use crate::tools::ToolState;
 use crate::tools::recall;
+#[cfg(test)]
 use compaction::run_compaction_worker;
 use compaction::*;
 pub(crate) use compaction::{
@@ -306,6 +306,28 @@ pub(crate) struct MutationSafetyConfig {
     pub(crate) native_jj: bool,
 }
 
+pub(crate) struct HarnessRuntimeConfig {
+    mutation_safety: MutationSafetyConfig,
+    worker_runtime: Option<Arc<worker_runtime::WorkerRuntime>>,
+}
+
+impl HarnessRuntimeConfig {
+    pub(crate) fn new(mutation_safety: MutationSafetyConfig) -> Self {
+        Self {
+            mutation_safety,
+            worker_runtime: None,
+        }
+    }
+
+    pub(crate) fn with_worker_runtime(
+        mut self,
+        worker_runtime: Arc<worker_runtime::WorkerRuntime>,
+    ) -> Self {
+        self.worker_runtime = Some(worker_runtime);
+        self
+    }
+}
+
 /// Wraps a bare [`Agent`] with the execution env it runs against and the
 /// optional transcript log it persists to.
 pub(crate) struct Harness<P> {
@@ -318,6 +340,7 @@ pub(crate) struct Harness<P> {
     // and fold/cache scheduling. Kept behind one owner so the harness remains a
     // coordinator rather than a second compaction implementation.
     compaction: CompactionEngine,
+    subagent_backend: Option<Arc<subagents::SubagentBackend>>,
     // Codex-compatible skill discovery and progressive-disclosure state.
     // The catalog refreshes at every turn boundary; the nested option
     // distinguishes "not injected yet" from "injected with no skills".
@@ -359,6 +382,7 @@ impl<P: ChatProvider> Harness<P> {
     /// Wrap a bare agent with its execution surface and optional transcript log.
     /// `budget` is the context token budget that triggers auto-compaction, or
     /// `None` to disable it.
+    #[cfg(test)]
     pub(crate) fn new(
         agent: Agent<P>,
         workspace: PathBuf,
@@ -373,10 +397,10 @@ impl<P: ChatProvider> Harness<P> {
             session,
             (0, Vec::new()),
             budget,
-            MutationSafetyConfig {
+            HarnessRuntimeConfig::new(MutationSafetyConfig {
                 enabled: true,
                 native_jj: true,
-            },
+            }),
         )
     }
 
@@ -388,7 +412,7 @@ impl<P: ChatProvider> Harness<P> {
         state: ToolState,
         session: Option<SessionLog>,
         budget: Option<u64>,
-        safety: MutationSafetyConfig,
+        config: HarnessRuntimeConfig,
     ) -> Self {
         Self::build(
             agent,
@@ -397,7 +421,7 @@ impl<P: ChatProvider> Harness<P> {
             session,
             (0, Vec::new()),
             budget,
-            safety,
+            config,
         )
     }
 
@@ -433,10 +457,10 @@ impl<P: ChatProvider> Harness<P> {
             session,
             (persisted, entry_ids),
             budget,
-            MutationSafetyConfig {
+            HarnessRuntimeConfig::new(MutationSafetyConfig {
                 enabled: true,
                 native_jj: true,
-            },
+            }),
         )
     }
 
@@ -447,7 +471,7 @@ impl<P: ChatProvider> Harness<P> {
         session: Option<SessionLog>,
         entry_ids: Vec<Option<String>>,
         budget: Option<u64>,
-        safety: MutationSafetyConfig,
+        config: HarnessRuntimeConfig,
     ) -> Self {
         let persisted = entry_ids.len();
         Self::build(
@@ -457,7 +481,7 @@ impl<P: ChatProvider> Harness<P> {
             session,
             (persisted, entry_ids),
             budget,
-            safety,
+            config,
         )
     }
 
@@ -468,8 +492,12 @@ impl<P: ChatProvider> Harness<P> {
         session: Option<SessionLog>,
         prefix: (usize, Vec<Option<String>>),
         budget: Option<u64>,
-        safety: MutationSafetyConfig,
+        config: HarnessRuntimeConfig,
     ) -> Self {
+        let HarnessRuntimeConfig {
+            mutation_safety: safety,
+            worker_runtime,
+        } = config;
         let (persisted, entry_ids) = prefix;
         // Derive the handle store from the session file so oversized outputs are
         // stored beside the transcript that references them.
@@ -498,13 +526,15 @@ impl<P: ChatProvider> Harness<P> {
             agent,
             workspace,
             state: RefCell::new(state),
-            compaction: CompactionEngine::new(
+            compaction: CompactionEngine::new_with_runtime(
                 session,
                 persisted,
                 entry_ids,
                 budget,
                 model_compaction_requested,
+                worker_runtime,
             ),
+            subagent_backend: None,
             skills,
             last_skills_instructions,
             reported_skill_warnings: HashSet::new(),
@@ -553,6 +583,68 @@ impl<P: ChatProvider> Harness<P> {
         self.compaction.reactive_enabled = config.reactive;
     }
 
+    pub(crate) fn set_worker_runtime(&mut self, runtime: Arc<worker_runtime::WorkerRuntime>) {
+        self.compaction.worker_runtime = Some(runtime);
+    }
+
+    pub(crate) fn set_subagent_backend(&mut self, backend: Arc<subagents::SubagentBackend>) {
+        self.set_worker_runtime(backend.runtime().clone());
+        self.subagent_backend = Some(backend);
+    }
+
+    pub(crate) fn subagent_snapshots(&self) -> Result<Vec<iris_subagent_runtime::WorkerSnapshot>> {
+        let runtime = self
+            .compaction
+            .worker_runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("subagent runtime is unavailable"))?;
+        Ok(runtime
+            .handle()
+            .list(&iris_subagent_runtime::WorkerFilter::default()))
+    }
+
+    pub(crate) fn subagent_snapshot(
+        &self,
+        id: &iris_subagent_runtime::WorkerId,
+    ) -> Result<iris_subagent_runtime::WorkerSnapshot> {
+        let runtime = self
+            .compaction
+            .worker_runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("subagent runtime is unavailable"))?;
+        Ok(runtime.handle().poll(id)?)
+    }
+
+    pub(crate) fn wait_for_subagent(
+        &self,
+        id: &iris_subagent_runtime::WorkerId,
+    ) -> Result<iris_subagent_runtime::WorkerResult> {
+        let runtime = self
+            .compaction
+            .worker_runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("subagent runtime is unavailable"))?;
+        Ok(runtime.handle().wait_blocking(id)?)
+    }
+
+    pub(crate) fn cancel_subagent(
+        &self,
+        id: &iris_subagent_runtime::WorkerId,
+    ) -> Result<iris_subagent_runtime::WorkerSnapshot> {
+        let runtime = self
+            .compaction
+            .worker_runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("subagent runtime is unavailable"))?;
+        Ok(runtime.handle().cancel(id)?)
+    }
+
+    pub(crate) fn subagent_backend(&self) -> Result<&Arc<subagents::SubagentBackend>> {
+        self.subagent_backend
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("subagent backend is unavailable"))
+    }
+
     /// Install the provider builder used by background compaction workers
     /// (issue #472). The factory must create a fresh provider because the parent
     /// agent's provider may be streaming a turn while the worker summarizes a
@@ -593,7 +685,7 @@ impl<P: ChatProvider> Harness<P> {
         // harness-owned (the UI has no observer at the out-of-turn settings
         // write) so the event carries the same job metadata every other
         // lifecycle emission does.
-        job.token.cancel();
+        self.compaction.cancel_worker(&job);
         self.emit_compaction_lifecycle(
             obs,
             &job,
@@ -1116,6 +1208,10 @@ impl<P: ChatProvider> Harness<P> {
     /// (`/copy`, `/session`, `/debug`). Same view the persistence cursor walks.
     pub(crate) fn messages(&self) -> &[Message] {
         self.agent.messages()
+    }
+
+    pub(crate) fn worker_mutation_paths(&self) -> Vec<PathBuf> {
+        self.git_safety.mutation_paths()
     }
 
     /// Estimated tokens of the current provider-visible context, using the same
@@ -1967,7 +2063,7 @@ impl<P: ChatProvider> Harness<P> {
             return Ok(());
         }
         if !allow_background_start && let Some(job) = self.compaction.background.take() {
-            job.token.cancel();
+            self.compaction.cancel_worker(&job);
             self.emit_compaction_lifecycle(
                 obs,
                 &job,
@@ -2130,10 +2226,25 @@ impl<P: ChatProvider> Harness<P> {
         if let Some(result) = job.result.take() {
             return self.finish_background_compaction(job, result, obs);
         }
-        match job.receiver.recv_timeout(self.compaction.hard_wait) {
-            Ok(result) => self.finish_background_compaction(job, result, obs),
-            Err(RecvTimeoutError::Timeout) => {
-                job.token.cancel();
+        let runtime = self
+            .compaction
+            .worker_runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("worker runtime is unavailable"))?
+            .clone();
+        let hard_wait = self
+            .compaction
+            .hard_wait
+            .max(std::time::Duration::from_millis(250));
+        match runtime
+            .handle()
+            .wait_blocking_timeout(&job.worker_id, Some(hard_wait))
+        {
+            Ok(result) => {
+                self.finish_background_compaction(job, decode_compaction_result(&result), obs)
+            }
+            Err(iris_subagent_runtime::RuntimeError::WaitTimeout) => {
+                self.compaction.cancel_worker(&job);
                 self.record_compaction_failure();
                 self.emit_compaction_lifecycle(
                     obs,
@@ -2146,16 +2257,13 @@ impl<P: ChatProvider> Harness<P> {
                 )?;
                 self.apply_deterministic_fallback_for_job(&job, obs)
             }
-            Err(RecvTimeoutError::Disconnected) => {
+            Err(error) => {
                 self.record_compaction_failure();
                 self.emit_compaction_lifecycle(
                     obs,
                     &job,
                     CompactionLifecycleState::Failed,
-                    Some(
-                        "background compaction worker stopped before returning a summary"
-                            .to_string(),
-                    ),
+                    Some(format!("background compaction wait failed: {error}")),
                 )?;
                 self.apply_deterministic_fallback_for_job(&job, obs)
             }
@@ -2340,27 +2448,18 @@ impl<P: ChatProvider> Harness<P> {
         let Some(job) = self.compaction.background.as_ref() else {
             return Ok(());
         };
-        match job.receiver.try_recv() {
-            Ok(result) => {
-                let job = self.compaction.background.take().expect("checked above");
-                self.finish_background_compaction(job, result, obs)
-            }
-            Err(TryRecvError::Empty) => Ok(()),
-            Err(TryRecvError::Disconnected) => {
-                let job = self.compaction.background.take().expect("checked above");
-                self.record_compaction_failure();
-                self.emit_compaction_lifecycle(
-                    obs,
-                    &job,
-                    CompactionLifecycleState::Failed,
-                    Some(
-                        "background compaction worker stopped before returning a summary"
-                            .to_string(),
-                    ),
-                )?;
-                self.apply_deterministic_fallback_for_job(&job, obs)
-            }
-        }
+        let snapshot = self
+            .compaction
+            .worker_runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("worker runtime is unavailable"))?
+            .handle()
+            .poll(&job.worker_id)?;
+        let Some(result) = snapshot.result else {
+            return Ok(());
+        };
+        let job = self.compaction.background.take().expect("checked above");
+        self.finish_background_compaction(job, decode_compaction_result(&result), obs)
     }
 
     fn finish_background_compaction(

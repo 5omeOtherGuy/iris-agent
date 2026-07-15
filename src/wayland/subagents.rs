@@ -1,390 +1,515 @@
-//! Wayland-owned subagent backend contract and read-only MVP (#460).
-#![allow(dead_code)]
-//!
-//! The backend owns child orchestration and execution-environment state. Nexus
-//! remains the provider/tool loop: a child is a fresh bare [`Agent`] wrapped with
-//! a read-only tool registry and an independent [`ToolState`].
+//! Wayland adapter between the host-neutral worker runtime and Nexus child agents.
 
-use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result};
+use iris_subagent_runtime::worktree::{
+    WorktreeCancellation, WorktreeConfig, WorktreeCreateRequest, WorktreeService,
+};
+use iris_subagent_runtime::{
+    ApprovalDecision as RuntimeApprovalDecision, ApprovalPort, ExecutorError, ExecutorOutput,
+    IsolationMode, LocalExecutorFuture, Usage, WorkerContext, WorkerExecutor, WorkerRequest,
+    WorkerWorktree,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider,
-    Message, ReviewContext, Role, ToolCall,
+    Message, ProviderUsage, ReviewContext, Role, ToolCall, WorkerCapabilityGrant,
 };
 use crate::tools::{ToolState, built_in_tools};
-use crate::wayland::Harness;
+use crate::wayland::worker_runtime::WorkerRuntime;
+use crate::wayland::{Harness, HarnessRuntimeConfig, MutationSafetyConfig};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub(crate) struct SubagentId(String);
+/// Factory that constructs a fresh `!Send` provider on the scheduler thread.
+pub(crate) type ChildProviderFactory =
+    Arc<dyn Fn() -> Result<Box<dyn ChatProvider>> + Send + Sync + 'static>;
 
-impl SubagentId {
-    fn new(seq: u64) -> Self {
-        Self(format!("subagent_{seq:08x}"))
-    }
+type ChildAgentConfigurator = fn(&WorkerRequest, &mut Agent<Box<dyn ChatProvider>>);
 
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
+fn configure_child_agent(request: &WorkerRequest, agent: &mut Agent<Box<dyn ChatProvider>>) {
+    let config = agent.config_mut();
+    config.strict_workspace = Some(true);
+    config.allow_outside_workspace_reads = request.policy.allow_outside_workspace;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SubagentCapabilityMode {
-    ReadOnly,
-    ReadWrite,
-    Execute,
-    All,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SubagentIsolation {
-    None,
-    Worktree,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SubagentBudgets {
-    pub(crate) max_tool_roundtrips: Option<usize>,
-    pub(crate) max_output_bytes: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SubagentRequest {
-    pub(crate) prompt: String,
-    pub(crate) capability_mode: SubagentCapabilityMode,
-    pub(crate) isolation: Option<SubagentIsolation>,
-    pub(crate) cwd: Option<PathBuf>,
-    pub(crate) tool_allowlist: Option<Vec<String>>,
-    pub(crate) budgets: SubagentBudgets,
-}
-
-impl SubagentRequest {
-    pub(crate) fn read_only(prompt: impl Into<String>) -> Self {
-        Self {
-            prompt: prompt.into(),
-            capability_mode: SubagentCapabilityMode::ReadOnly,
-            isolation: Some(SubagentIsolation::None),
-            cwd: None,
-            tool_allowlist: None,
-            budgets: SubagentBudgets::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SubagentStatus {
-    Started,
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-impl SubagentStatus {
-    fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SubagentHandle {
-    pub(crate) id: SubagentId,
-    pub(crate) status: SubagentStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SubagentOutputHandle {
-    pub(crate) id: String,
-    pub(crate) bytes: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SubagentLifecycleEvent {
-    pub(crate) worker_id: SubagentId,
-    pub(crate) status: SubagentStatus,
-    pub(crate) message: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SubagentResult {
-    pub(crate) worker_id: SubagentId,
-    pub(crate) status: SubagentStatus,
-    pub(crate) summary: String,
-    pub(crate) output_handles: Vec<SubagentOutputHandle>,
-    pub(crate) events: Vec<SubagentLifecycleEvent>,
-    /// Aggregate usage across the worker's provider round trips when reported.
-    pub(crate) usage: Option<crate::nexus::ProviderUsage>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SubagentSnapshot {
-    pub(crate) handle: SubagentHandle,
-    pub(crate) result: Option<SubagentResult>,
-    pub(crate) events: Vec<SubagentLifecycleEvent>,
-}
-
-pub(crate) struct SubagentBackend<P> {
+/// Iris-owned child-agent adapter sharing the single backend scheduler.
+pub(crate) struct SubagentBackend {
+    runtime: Arc<WorkerRuntime>,
     workspace: PathBuf,
-    next_seq: Cell<u64>,
-    workers: RefCell<BTreeMap<SubagentId, Worker<P>>>,
+    worktrees: Arc<WorktreeService>,
+    configure_agent: ChildAgentConfigurator,
 }
 
-struct Worker<P> {
-    request: SubagentRequest,
-    workspace: PathBuf,
-    provider: Option<P>,
-    token: CancellationToken,
-    status: SubagentStatus,
-    result: Option<SubagentResult>,
-    events: Vec<SubagentLifecycleEvent>,
-}
-
-impl<P: ChatProvider> SubagentBackend<P> {
-    pub(crate) fn new(workspace: PathBuf) -> Self {
-        Self {
+impl SubagentBackend {
+    pub(crate) fn open(
+        workspace: PathBuf,
+        state_dir: &Path,
+        worktree_root: PathBuf,
+    ) -> Result<Self> {
+        Ok(Self {
+            runtime: WorkerRuntime::open(state_dir)?,
             workspace,
-            next_seq: Cell::new(0),
-            workers: RefCell::new(BTreeMap::new()),
-        }
+            worktrees: Arc::new(WorktreeService::open(WorktreeConfig::new(worktree_root))?),
+            configure_agent: configure_child_agent,
+        })
     }
 
-    pub(crate) fn spawn(&self, provider: P, request: SubagentRequest) -> Result<SubagentHandle> {
-        validate_request(&request)?;
-        let workspace = match &request.cwd {
-            Some(cwd) => validate_cwd(&self.workspace, cwd)?,
-            None => self.workspace.clone(),
-        };
-        let id = SubagentId::new(self.next_seq.get());
-        self.next_seq.set(self.next_seq.get() + 1);
-        let mut worker = Worker {
+    pub(crate) fn spawn(
+        &self,
+        factory: ChildProviderFactory,
+        request: WorkerRequest,
+        approval: Option<Arc<dyn ApprovalPort>>,
+    ) -> Result<iris_subagent_runtime::WorkerId> {
+        let workspace = self.workspace.clone();
+        let worktrees = self.worktrees.clone();
+        let worker_runtime = self.runtime.clone();
+        let configure_agent = self.configure_agent;
+        let preauthorized_isolated = request.policy.isolation == IsolationMode::Worktree;
+        self.runtime.spawn(
             request,
-            workspace,
-            provider: Some(provider),
-            token: CancellationToken::new(),
-            status: SubagentStatus::Started,
-            result: None,
-            events: Vec::new(),
+            Box::new(move || {
+                Ok(Box::new(NexusWorker {
+                    provider_factory: factory,
+                    parent_workspace: workspace,
+                    worktrees,
+                    worker_runtime,
+                    configure_agent,
+                    approval,
+                    preauthorized_isolated,
+                }) as Box<dyn WorkerExecutor>)
+            }),
+        )
+    }
+
+    pub(crate) fn spawn_group(
+        &self,
+        factory: ChildProviderFactory,
+        requests: Vec<WorkerRequest>,
+        approval: Option<Arc<dyn ApprovalPort>>,
+    ) -> Result<iris_subagent_runtime::GroupId> {
+        let configure_agent = self.configure_agent;
+        let jobs = requests
+            .into_iter()
+            .map(|request| {
+                let provider_factory = factory.clone();
+                let workspace = self.workspace.clone();
+                let worktrees = self.worktrees.clone();
+                let worker_runtime = self.runtime.clone();
+                let approval = approval.clone();
+                let preauthorized_isolated = request.policy.isolation == IsolationMode::Worktree;
+                (
+                    request,
+                    Box::new(move || {
+                        Ok(Box::new(NexusWorker {
+                            provider_factory,
+                            parent_workspace: workspace,
+                            worktrees,
+                            worker_runtime,
+                            configure_agent,
+                            approval,
+                            preauthorized_isolated,
+                        }) as Box<dyn WorkerExecutor>)
+                    })
+                        as Box<
+                            dyn FnOnce() -> std::result::Result<
+                                    Box<dyn WorkerExecutor>,
+                                    iris_subagent_runtime::RuntimeError,
+                                > + Send,
+                        >,
+                )
+            })
+            .collect();
+        self.runtime.spawn_group(jobs)
+    }
+
+    pub(crate) fn runtime(&self) -> &Arc<WorkerRuntime> {
+        &self.runtime
+    }
+
+    pub(crate) fn poll(
+        &self,
+        id: &iris_subagent_runtime::WorkerId,
+    ) -> Result<iris_subagent_runtime::WorkerSnapshot> {
+        Ok(self.runtime.handle().poll(id)?)
+    }
+
+    pub(crate) fn read_artifact(&self, id: &iris_subagent_runtime::ArtifactId) -> Result<Vec<u8>> {
+        Ok(self.runtime.handle().read_artifact(id)?)
+    }
+
+    pub(crate) fn select_worktree_candidate(
+        &self,
+        id: &iris_subagent_runtime::WorktreeId,
+    ) -> Result<iris_subagent_runtime::worktree::WorktreeRecord> {
+        Ok(self.worktrees.select_group_candidate(id)?)
+    }
+
+    pub(crate) fn list_worktrees(
+        &self,
+    ) -> Result<Vec<iris_subagent_runtime::worktree::WorktreeRecord>> {
+        Ok(self
+            .worktrees
+            .list(&iris_subagent_runtime::worktree::WorktreeFilter::default())?)
+    }
+
+    pub(crate) fn show_worktree(
+        &self,
+        id: &iris_subagent_runtime::WorktreeId,
+    ) -> Result<iris_subagent_runtime::worktree::WorktreeRecord> {
+        Ok(self.worktrees.show(id)?)
+    }
+
+    pub(crate) fn remove_worktree(
+        &self,
+        id: &iris_subagent_runtime::WorktreeId,
+        force: bool,
+    ) -> Result<iris_subagent_runtime::worktree::RemoveOutcome> {
+        let options = if force {
+            iris_subagent_runtime::worktree::RemoveOptions::force()
+        } else {
+            iris_subagent_runtime::worktree::RemoveOptions::default()
         };
-        worker.push_event(&id, SubagentStatus::Started, None);
-        worker.status = SubagentStatus::Running;
-        worker.push_event(&id, SubagentStatus::Running, None);
-        let handle = SubagentHandle {
-            id: id.clone(),
-            status: worker.status,
-        };
-        self.workers.borrow_mut().insert(id, worker);
-        Ok(handle)
+        Ok(self
+            .worktrees
+            .remove(id, options, &WorktreeCancellation::default())?)
     }
 
-    pub(crate) fn poll(&self, id: &SubagentId) -> Result<SubagentSnapshot> {
-        let workers = self.workers.borrow();
-        let worker = workers
-            .get(id)
-            .with_context(|| format!("unknown subagent: {}", id.as_str()))?;
-        Ok(worker.snapshot(id))
+    pub(crate) fn gc_worktrees(&self) -> Result<iris_subagent_runtime::worktree::GcReport> {
+        Ok(self.worktrees.gc(
+            iris_subagent_runtime::worktree::RemoveOptions::default(),
+            &WorktreeCancellation::default(),
+        )?)
     }
 
-    pub(crate) fn cancel(&self, id: &SubagentId) -> Result<SubagentSnapshot> {
-        let mut workers = self.workers.borrow_mut();
-        let worker = workers
-            .get_mut(id)
-            .with_context(|| format!("unknown subagent: {}", id.as_str()))?;
-        worker.token.cancel();
-        if !worker.status.is_terminal() {
-            worker.status = SubagentStatus::Cancelled;
-            worker.push_event(id, SubagentStatus::Cancelled, Some("cancelled".to_string()));
-            worker.result = Some(worker.terminal_result(id, "cancelled"));
+    pub(crate) fn adopt_worktree(
+        &self,
+        id: &iris_subagent_runtime::WorktreeId,
+    ) -> Result<iris_subagent_runtime::worktree::WorktreeRecord> {
+        Ok(self.worktrees.adopt(id, &WorktreeCancellation::default())?)
+    }
+
+    pub(crate) fn ignore_worktree(
+        &self,
+        id: &iris_subagent_runtime::WorktreeId,
+    ) -> Result<iris_subagent_runtime::worktree::WorktreeRecord> {
+        Ok(self.worktrees.ignore(id)?)
+    }
+
+    pub(crate) fn rebuild_worktree_registry(
+        &self,
+    ) -> Result<Vec<iris_subagent_runtime::worktree::WorktreeRecord>> {
+        Ok(self.worktrees.rebuild(&WorktreeCancellation::default())?)
+    }
+
+    pub(crate) fn plan_apply(
+        &self,
+        worker_id: &iris_subagent_runtime::WorkerId,
+    ) -> Result<iris_subagent_runtime::worktree::ApplyPlan> {
+        let snapshot = self.poll(worker_id)?;
+        let result = snapshot
+            .result
+            .ok_or_else(|| anyhow::anyhow!("worker has no terminal result"))?;
+        if result.status != iris_subagent_runtime::WorkerStatus::Completed {
+            anyhow::bail!("only a completed worker can produce an apply plan");
         }
-        Ok(worker.snapshot(id))
-    }
-
-    pub(crate) async fn wait(&self, id: &SubagentId) -> Result<SubagentResult> {
-        let (provider, request, workspace, token) = {
-            let mut workers = self.workers.borrow_mut();
-            let worker = workers
-                .get_mut(id)
-                .with_context(|| format!("unknown subagent: {}", id.as_str()))?;
-            if let Some(result) = &worker.result {
-                return Ok(result.clone());
-            }
-            if worker.token.is_cancelled() || worker.status == SubagentStatus::Cancelled {
-                worker.status = SubagentStatus::Cancelled;
-                worker.push_event(id, SubagentStatus::Cancelled, Some("cancelled".to_string()));
-                let result = worker.terminal_result(id, "cancelled");
-                worker.result = Some(result.clone());
-                return Ok(result);
-            }
-            (
-                worker
-                    .provider
-                    .take()
-                    .context("subagent provider already consumed")?,
-                worker.request.clone(),
-                worker.workspace.clone(),
-                worker.token.clone(),
-            )
-        };
-
-        let tools = read_only_tools(request.tool_allowlist.as_deref());
-        let agent = Agent::new(provider, tools)
-            .with_max_tool_roundtrips(request.budgets.max_tool_roundtrips);
-        let mut harness = Harness::new(agent, workspace, ToolState::new(), None, None);
-        let observer = ChildObserver::default();
-        let gate = DenyGate;
-        let run = harness
-            .submit_turn(&request.prompt, &observer, &gate, &token)
-            .await;
-
-        let mut workers = self.workers.borrow_mut();
-        let worker = workers
-            .get_mut(id)
-            .with_context(|| format!("unknown subagent: {}", id.as_str()))?;
-        if token.is_cancelled() || worker.status == SubagentStatus::Cancelled {
-            worker.status = SubagentStatus::Cancelled;
-            worker.push_event(id, SubagentStatus::Cancelled, Some("cancelled".to_string()));
-            let result = worker.terminal_result(id, "cancelled");
-            worker.result = Some(result.clone());
-            return Ok(result);
-        }
-        match run {
-            Ok(_) => {
-                worker.status = SubagentStatus::Completed;
-                let summary = limit_summary(
-                    final_assistant_text(harness.messages()),
-                    request.budgets.max_output_bytes,
-                );
-                worker.push_event(id, SubagentStatus::Completed, None);
-                let result = SubagentResult {
-                    worker_id: id.clone(),
-                    status: SubagentStatus::Completed,
-                    summary,
-                    output_handles: Vec::new(),
-                    events: worker.events.clone(),
-                    usage: observer.usage.borrow().clone(),
-                };
-                worker.result = Some(result.clone());
-                Ok(result)
-            }
-            Err(error) => {
-                let message = limit_summary(format!("{error:#}"), request.budgets.max_output_bytes);
-                worker.status = SubagentStatus::Failed;
-                worker.push_event(id, SubagentStatus::Failed, Some(message.clone()));
-                let result = SubagentResult {
-                    worker_id: id.clone(),
-                    status: SubagentStatus::Failed,
-                    summary: message,
-                    output_handles: Vec::new(),
-                    events: worker.events.clone(),
-                    usage: observer.usage.borrow().clone(),
-                };
-                worker.result = Some(result.clone());
-                Ok(result)
-            }
-        }
-    }
-}
-
-impl<P> Worker<P> {
-    fn push_event(&mut self, id: &SubagentId, status: SubagentStatus, message: Option<String>) {
-        self.events.push(SubagentLifecycleEvent {
-            worker_id: id.clone(),
-            status,
-            message,
-        });
-    }
-
-    fn terminal_result(&self, id: &SubagentId, summary: &str) -> SubagentResult {
-        SubagentResult {
-            worker_id: id.clone(),
-            status: self.status,
-            summary: summary.to_string(),
-            output_handles: Vec::new(),
-            events: self.events.clone(),
-            usage: None,
-        }
-    }
-
-    fn snapshot(&self, id: &SubagentId) -> SubagentSnapshot {
-        SubagentSnapshot {
-            handle: SubagentHandle {
-                id: id.clone(),
-                status: self.status,
-            },
-            result: self.result.clone(),
-            events: self.events.clone(),
-        }
-    }
-}
-
-fn validate_request(request: &SubagentRequest) -> Result<()> {
-    if request.prompt.trim().is_empty() {
-        bail!("subagent prompt must not be empty");
-    }
-    if request.cwd.is_some() && matches!(request.isolation, Some(SubagentIsolation::Worktree)) {
-        bail!("subagent request cannot specify both cwd and worktree isolation");
-    }
-    match request.capability_mode {
-        SubagentCapabilityMode::ReadOnly => {}
-        SubagentCapabilityMode::ReadWrite => {
-            bail!("unsupported subagent capability_mode: read_write")
-        }
-        SubagentCapabilityMode::Execute => bail!("unsupported subagent capability_mode: execute"),
-        SubagentCapabilityMode::All => bail!("unsupported subagent capability_mode: all"),
-    }
-    match request.isolation.unwrap_or(SubagentIsolation::None) {
-        SubagentIsolation::None => Ok(()),
-        SubagentIsolation::Worktree => bail!("unsupported subagent isolation: worktree"),
-    }
-}
-
-fn validate_cwd(workspace: &Path, cwd: &Path) -> Result<PathBuf> {
-    let root = workspace
-        .canonicalize()
-        .with_context(|| format!("subagent workspace does not exist: {}", workspace.display()))?;
-    let path = cwd
-        .canonicalize()
-        .with_context(|| format!("subagent cwd does not exist: {}", cwd.display()))?;
-    if !path.is_dir() {
-        bail!("subagent cwd is not a directory: {}", path.display());
-    }
-    if path != root && !path.starts_with(&root) {
-        bail!(
-            "subagent cwd must stay inside the parent workspace: {}",
-            cwd.display()
+        let worktree = result
+            .worktree
+            .ok_or_else(|| anyhow::anyhow!("worker has no isolated worktree"))?;
+        let manifest = iris_subagent_runtime::worktree::MutationManifest::new(
+            result
+                .changed_paths
+                .into_iter()
+                .map(iris_subagent_runtime::worktree::MutationEntry::path)
+                .collect(),
         );
+        Ok(self
+            .worktrees
+            .plan_apply(&worktree.id, &manifest, &WorktreeCancellation::default())?)
     }
-    Ok(path)
+
+    pub(crate) fn load_apply_plan(
+        &self,
+        id: &iris_subagent_runtime::ApplyPlanId,
+    ) -> Result<iris_subagent_runtime::worktree::ApplyPlan> {
+        Ok(self.worktrees.load_apply_plan(id)?)
+    }
+
+    pub(crate) fn apply(
+        &self,
+        plan: &iris_subagent_runtime::worktree::ApplyPlan,
+        options: &iris_subagent_runtime::worktree::ApplyOptions,
+    ) -> Result<iris_subagent_runtime::worktree::ApplyResult> {
+        Ok(self
+            .worktrees
+            .apply(plan, options, &WorktreeCancellation::default())?)
+    }
+
+    pub(crate) fn poll_group(
+        &self,
+        id: &iris_subagent_runtime::GroupId,
+    ) -> Result<iris_subagent_runtime::GroupSnapshot> {
+        Ok(self.runtime.handle().poll_group(id)?)
+    }
+
+    pub(crate) fn cancel_group(
+        &self,
+        id: &iris_subagent_runtime::GroupId,
+    ) -> Result<iris_subagent_runtime::GroupSnapshot> {
+        Ok(self.runtime.handle().cancel_group(id)?)
+    }
+
+    pub(crate) fn cancel(
+        &self,
+        id: &iris_subagent_runtime::WorkerId,
+    ) -> Result<iris_subagent_runtime::WorkerSnapshot> {
+        Ok(self.runtime.handle().cancel(id)?)
+    }
 }
 
-fn read_only_tools(allowlist: Option<&[String]>) -> crate::nexus::Tools {
-    let tools = built_in_tools().into_read_only();
-    match allowlist {
-        Some(names) => tools.into_allowlist(names),
-        None => tools,
+struct NexusWorker {
+    provider_factory: ChildProviderFactory,
+    parent_workspace: PathBuf,
+    worktrees: Arc<WorktreeService>,
+    worker_runtime: Arc<WorkerRuntime>,
+    configure_agent: ChildAgentConfigurator,
+    approval: Option<Arc<dyn ApprovalPort>>,
+    preauthorized_isolated: bool,
+}
+
+impl WorkerExecutor for NexusWorker {
+    fn execute<'a>(&'a mut self, context: WorkerContext) -> LocalExecutorFuture<'a> {
+        Box::pin(async move {
+            let request = context.request().clone();
+            let (workspace, worktree) = self
+                .resolve_workspace(&request, &context)
+                .await
+                .map_err(executor_error)?;
+            if context.cancellation().is_cancelled() {
+                return Err(ExecutorError::cancelled(
+                    "worker cancelled during initialization",
+                ));
+            }
+            let provider = (self.provider_factory)().map_err(executor_error)?;
+            let grant = capability_grant(request.policy.capability);
+            let mut tools = built_in_tools().into_capability(grant);
+            if !request.policy.tool_allowlist.is_empty() {
+                tools = tools.into_allowlist(&request.policy.tool_allowlist);
+            }
+            let max_rounds = request
+                .budgets
+                .max_tool_rounds
+                .and_then(|value| usize::try_from(value).ok());
+            let mut agent = Agent::new(provider, tools).with_max_tool_roundtrips(max_rounds);
+            (self.configure_agent)(&request, &mut agent);
+            let mut harness = Harness::new_configured(
+                agent,
+                workspace,
+                ToolState::new(),
+                None,
+                None,
+                HarnessRuntimeConfig::new(MutationSafetyConfig {
+                    enabled: true,
+                    native_jj: false,
+                })
+                .with_worker_runtime(self.worker_runtime.clone()),
+            );
+            let observer = ChildObserver {
+                context: context.clone(),
+                usage: RefCell::new(Usage::default()),
+            };
+            let gate = ChildApprovalGate {
+                context: context.clone(),
+                approval: self.approval.clone(),
+                preauthorized_isolated: self.preauthorized_isolated,
+            };
+            let token = context.cancellation().token();
+            let cancellation = context.cancellation().clone();
+            let result = {
+                let run = harness.submit_turn(&request.prompt, &observer, &gate, &token);
+                tokio::pin!(run);
+                tokio::select! {
+                    result = &mut run => result,
+                    _ = cancellation.cancelled() => {
+                        token.cancel();
+                        (&mut run).await
+                    }
+                }
+            };
+            if context.cancellation().is_cancelled() {
+                return Err(ExecutorError::cancelled("worker cancelled"));
+            }
+            result.map_err(executor_error)?;
+            let summary = final_assistant_text(harness.messages());
+            let changed_paths = harness.worker_mutation_paths();
+            let usage = observer.usage.borrow().clone();
+            let mut output = ExecutorOutput::text(summary.clone(), summary.into_bytes());
+            output.usage = usage;
+            output.changed_paths = changed_paths;
+            output.worktree = worktree;
+            Ok(output)
+        })
     }
 }
 
-fn limit_summary(mut summary: String, max_bytes: Option<usize>) -> String {
-    let Some(max_bytes) = max_bytes else {
-        return summary;
-    };
-    if summary.len() <= max_bytes {
-        return summary;
+impl NexusWorker {
+    async fn resolve_workspace(
+        &self,
+        request: &WorkerRequest,
+        context: &WorkerContext,
+    ) -> Result<(PathBuf, Option<WorkerWorktree>)> {
+        match request.policy.isolation {
+            IsolationMode::None => {
+                let root = self.parent_workspace.canonicalize().with_context(|| {
+                    format!(
+                        "parent workspace does not exist: {}",
+                        self.parent_workspace.display()
+                    )
+                })?;
+                let workspace = match &request.policy.cwd {
+                    Some(cwd) => cwd
+                        .canonicalize()
+                        .with_context(|| format!("worker cwd does not exist: {}", cwd.display()))?,
+                    None => root.clone(),
+                };
+                if !workspace.is_dir() || (workspace != root && !workspace.starts_with(&root)) {
+                    anyhow::bail!("worker cwd must stay inside the validated parent workspace");
+                }
+                Ok((workspace, None))
+            }
+            IsolationMode::Worktree => {
+                let service = self.worktrees.clone();
+                let source = self.parent_workspace.clone();
+                let session_id = request.session_id.clone();
+                let worker_id = context.worker_id().clone();
+                let group_id = context.group_id().cloned();
+                let parent_worker_id = request.parent_worker_id.clone();
+                let cancel = WorktreeCancellation::default();
+                let cancel_for_task = cancel.clone();
+                let task = tokio::task::spawn_blocking(move || {
+                    let mut create = WorktreeCreateRequest::worker(source);
+                    create.session_id = session_id;
+                    create.worker_id = Some(worker_id);
+                    create.group_id = group_id;
+                    create.parent_worker_id = parent_worker_id;
+                    service.create(create, &cancel_for_task)
+                });
+                tokio::pin!(task);
+                let record = tokio::select! {
+                    result = &mut task => result
+                        .map_err(|error| anyhow::anyhow!("worktree creation task failed: {error}"))??,
+                    _ = context.cancellation().cancelled() => {
+                        cancel.cancel();
+                        let _ = (&mut task).await;
+                        anyhow::bail!("worker cancelled during worktree creation")
+                    }
+                };
+                let metadata = WorkerWorktree::new(
+                    record.id,
+                    record.path.clone(),
+                    record.base_commit,
+                    record.creation_mode.as_str(),
+                );
+                Ok((record.path, Some(metadata)))
+            }
+            _ => anyhow::bail!("unsupported worker isolation mode"),
+        }
     }
-    let mut cut = max_bytes;
-    while cut > 0 && !summary.is_char_boundary(cut) {
-        cut -= 1;
+}
+
+struct ChildObserver {
+    context: WorkerContext,
+    usage: RefCell<Usage>,
+}
+
+impl AgentObserver for ChildObserver {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        match event {
+            AgentEvent::ProviderTurnStarted { .. } => {
+                self.context.progress("provider round started");
+            }
+            AgentEvent::ProviderTurnCompleted {
+                usage: provider_usage,
+                ..
+            } => {
+                let mut usage = self.usage.borrow_mut();
+                usage.provider_rounds = usage.provider_rounds.saturating_add(1);
+                if let Some(provider_usage) = provider_usage {
+                    merge_usage(&mut usage, &provider_usage);
+                }
+                self.context.usage(usage.clone());
+            }
+            AgentEvent::ToolStarted(call) => {
+                let mut usage = self.usage.borrow_mut();
+                usage.tool_rounds = usage.tool_rounds.saturating_add(1);
+                self.context.progress(format!("running {}", call.name));
+                self.context.usage(usage.clone());
+            }
+            _ => {}
+        }
+        Ok(())
     }
-    summary.truncate(cut);
-    summary
+}
+
+struct ChildApprovalGate {
+    context: WorkerContext,
+    approval: Option<Arc<dyn ApprovalPort>>,
+    preauthorized_isolated: bool,
+}
+
+impl ApprovalGate for ChildApprovalGate {
+    fn review<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        _allow_always: bool,
+        _allow_project: bool,
+        _ctx: ReviewContext,
+    ) -> ApprovalFuture<'a> {
+        Box::pin(async move {
+            let Some(port) = &self.approval else {
+                return Ok(if self.preauthorized_isolated {
+                    ApprovalDecision::Allow
+                } else {
+                    ApprovalDecision::Deny
+                });
+            };
+            self.context.waiting_for_approval(
+                call.id.clone(),
+                format!("{} requires approval", call.name),
+                None,
+            );
+            let decision = port
+                .review(iris_subagent_runtime::ApprovalRequest::new(
+                    call.id.clone(),
+                    format!("{} requires approval", call.name),
+                    None,
+                ))
+                .await?;
+            self.context.progress("approval resolved");
+            Ok(match decision {
+                RuntimeApprovalDecision::Approve => ApprovalDecision::Allow,
+                RuntimeApprovalDecision::Deny => ApprovalDecision::Deny,
+                _ => ApprovalDecision::Deny,
+            })
+        })
+    }
+}
+
+fn capability_grant(mode: iris_subagent_runtime::CapabilityMode) -> WorkerCapabilityGrant {
+    match mode {
+        iris_subagent_runtime::CapabilityMode::ReadOnly => WorkerCapabilityGrant::ReadOnly,
+        iris_subagent_runtime::CapabilityMode::ReadWrite => WorkerCapabilityGrant::ReadWrite,
+        iris_subagent_runtime::CapabilityMode::Execute => WorkerCapabilityGrant::Execute,
+        iris_subagent_runtime::CapabilityMode::All => WorkerCapabilityGrant::All,
+        _ => WorkerCapabilityGrant::ReadOnly,
+    }
+}
+
+fn merge_usage(total: &mut Usage, usage: &ProviderUsage) {
+    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
 }
 
 fn final_assistant_text(messages: &[Message]) -> String {
@@ -396,12 +521,71 @@ fn final_assistant_text(messages: &[Message]) -> String {
         .unwrap_or_default()
 }
 
-#[derive(Default)]
-struct ChildObserver {
-    usage: RefCell<Option<crate::nexus::ProviderUsage>>,
+fn executor_error(error: impl std::fmt::Display) -> ExecutorError {
+    ExecutorError::failed(error.to_string())
 }
 
-impl AgentObserver for ChildObserver {
+pub(crate) fn resolve_worker_state_dir(session_id: &str) -> Result<PathBuf> {
+    if let Some(root) = std::env::var_os("IRIS_SESSION_DIR")
+        && !root.is_empty()
+    {
+        return Ok(PathBuf::from(root).join("workers").join(session_id));
+    }
+    let home = std::env::var_os("HOME").context("HOME is unset; cannot resolve worker state")?;
+    Ok(PathBuf::from(home).join(".iris/workers").join(session_id))
+}
+
+pub(crate) fn resolve_worktree_root() -> Result<PathBuf> {
+    if let Some(root) = std::env::var_os("IRIS_WORKTREE_DIR")
+        && !root.is_empty()
+    {
+        return Ok(PathBuf::from(root));
+    }
+    let home = std::env::var_os("HOME").context("HOME is unset; cannot resolve worktree root")?;
+    Ok(PathBuf::from(home).join(".iris/worktrees"))
+}
+
+pub(crate) async fn run_read_only_provider(
+    provider: Box<dyn ChatProvider>,
+    workspace: PathBuf,
+    prompt: String,
+    token: &CancellationToken,
+    max_tool_roundtrips: usize,
+) -> Result<(String, Option<ProviderUsage>)> {
+    let agent = Agent::new(
+        provider,
+        built_in_tools().into_capability(WorkerCapabilityGrant::ReadOnly),
+    )
+    .with_max_tool_roundtrips(Some(max_tool_roundtrips));
+    let mut harness = Harness::new_configured(
+        agent,
+        workspace,
+        ToolState::new(),
+        None,
+        None,
+        HarnessRuntimeConfig::new(MutationSafetyConfig {
+            enabled: true,
+            native_jj: false,
+        }),
+    );
+    let observer = SummaryObserver::default();
+    let gate = DenyGate;
+    harness
+        .submit_turn(&prompt, &observer, &gate, token)
+        .await?;
+    let summary = final_assistant_text(harness.messages());
+    if summary.trim().is_empty() {
+        anyhow::bail!("subagent returned empty summary");
+    }
+    Ok((summary, observer.usage.into_inner()))
+}
+
+#[derive(Default)]
+struct SummaryObserver {
+    usage: RefCell<Option<ProviderUsage>>,
+}
+
+impl AgentObserver for SummaryObserver {
     fn on_event(&self, event: AgentEvent) -> Result<()> {
         if let AgentEvent::ProviderTurnCompleted {
             usage: Some(usage), ..
@@ -414,36 +598,6 @@ impl AgentObserver for ChildObserver {
             }
         }
         Ok(())
-    }
-}
-
-fn merge_provider_usage(
-    total: &mut crate::nexus::ProviderUsage,
-    usage: &crate::nexus::ProviderUsage,
-) {
-    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
-    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
-    total.cache_read_input_tokens = total
-        .cache_read_input_tokens
-        .saturating_add(usage.cache_read_input_tokens);
-    total.cache_write_input_tokens = total
-        .cache_write_input_tokens
-        .saturating_add(usage.cache_write_input_tokens);
-    total.reasoning_output_tokens = total
-        .reasoning_output_tokens
-        .saturating_add(usage.reasoning_output_tokens);
-    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
-    match (&mut total.cache_creation, &usage.cache_creation) {
-        (Some(total), Some(usage)) => {
-            total.ephemeral_5m_input_tokens = total
-                .ephemeral_5m_input_tokens
-                .saturating_add(usage.ephemeral_5m_input_tokens);
-            total.ephemeral_1h_input_tokens = total
-                .ephemeral_1h_input_tokens
-                .saturating_add(usage.ephemeral_1h_input_tokens);
-        }
-        (slot @ None, Some(usage)) => *slot = Some(usage.clone()),
-        _ => {}
     }
 }
 
@@ -461,357 +615,726 @@ impl ApprovalGate for DenyGate {
     }
 }
 
+fn merge_provider_usage(total: &mut ProviderUsage, usage: &ProviderUsage) {
+    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+    total.cache_read_input_tokens = total
+        .cache_read_input_tokens
+        .saturating_add(usage.cache_read_input_tokens);
+    total.cache_write_input_tokens = total
+        .cache_write_input_tokens
+        .saturating_add(usage.cache_write_input_tokens);
+    total.reasoning_output_tokens = total
+        .reasoning_output_tokens
+        .saturating_add(usage.reasoning_output_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::fs;
-    use std::future::Future;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::process::Command;
     use std::rc::Rc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
-    use anyhow::anyhow;
-    use serde_json::{Value, json};
+    use crate::nexus::{AssistantTurn, CompletionReason, ProviderEvent, ProviderStream};
+    use serde_json::json;
 
-    use crate::nexus::{AssistantTurn, ProviderEvent, ProviderStream, Tool, ToolEnv, ToolFuture};
+    struct TextProvider(Rc<()>);
 
-    fn block_on<F: Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(future)
-    }
-
-    fn turn_stream(turn: AssistantTurn) -> ProviderStream<'static> {
-        Box::pin(futures::stream::once(async move {
-            Ok(ProviderEvent::Completed(turn))
-        }))
-    }
-
-    #[derive(Clone)]
-    struct RecordingProvider {
-        turns: Rc<RefCell<Vec<AssistantTurn>>>,
-        visible_tools: Rc<RefCell<Vec<Vec<String>>>>,
-    }
-
-    impl RecordingProvider {
-        fn new(turns: Vec<AssistantTurn>) -> Self {
-            Self {
-                turns: Rc::new(RefCell::new(turns.into_iter().rev().collect())),
-                visible_tools: Rc::new(RefCell::new(Vec::new())),
-            }
-        }
-    }
-
-    impl ChatProvider for RecordingProvider {
+    impl ChatProvider for TextProvider {
         fn respond_stream<'a>(
             &'a self,
             _messages: &'a [Message],
             tools: &'a crate::nexus::Tools,
             _cancel: &'a CancellationToken,
         ) -> Result<ProviderStream<'a>> {
-            self.visible_tools.borrow_mut().push(
-                tools
-                    .iter()
-                    .map(|tool| tool.name().to_string())
-                    .collect::<Vec<_>>(),
-            );
-            let turn = self
-                .turns
-                .borrow_mut()
-                .pop()
-                .ok_or_else(|| anyhow!("unexpected provider call"))?;
-            Ok(turn_stream(turn))
+            assert!(tools.by_name("read").is_some());
+            assert!(tools.by_name("edit").is_none());
+            assert!(tools.by_name("write").is_none());
+            assert!(tools.by_name("bash").is_none());
+            let _ = &self.0;
+            Ok(Box::pin(futures::stream::once(async {
+                Ok(ProviderEvent::Completed(AssistantTurn::text(
+                    "finished independently",
+                )))
+            })))
         }
     }
 
-    struct PendingProvider;
+    struct ReadPathProvider {
+        path: String,
+        expect_secret: bool,
+        round: Cell<u8>,
+        _not_send: Rc<()>,
+    }
 
-    impl ChatProvider for PendingProvider {
+    impl ReadPathProvider {
+        fn new(path: impl Into<String>, expect_secret: bool) -> Self {
+            Self {
+                path: path.into(),
+                expect_secret,
+                round: Cell::new(0),
+                _not_send: Rc::new(()),
+            }
+        }
+    }
+
+    impl ChatProvider for ReadPathProvider {
+        fn respond_stream<'a>(
+            &'a self,
+            messages: &'a [Message],
+            _tools: &'a crate::nexus::Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<ProviderStream<'a>> {
+            let round = self.round.replace(self.round.get().saturating_add(1));
+            let turn = if round == 0 {
+                AssistantTurn {
+                    text: None,
+                    reasoning: Vec::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "read-path".to_string(),
+                        thought_signature: None,
+                        name: "read".to_string(),
+                        arguments: json!({ "path": self.path }),
+                    }],
+                    response_id: None,
+                    usage: None,
+                    completion_reason: Some(CompletionReason::ToolUse),
+                }
+            } else {
+                let result = messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == Role::Tool)
+                    .expect("read tool result");
+                if self.expect_secret {
+                    assert!(
+                        result.content.contains("outside-secret"),
+                        "{}",
+                        result.content
+                    );
+                } else {
+                    assert!(
+                        result.content.contains("path escapes workspace"),
+                        "{}",
+                        result.content
+                    );
+                    assert!(
+                        !result.content.contains("outside-secret"),
+                        "{}",
+                        result.content
+                    );
+                }
+                AssistantTurn::text(if self.expect_secret {
+                    "outside read allowed"
+                } else {
+                    "outside read blocked"
+                })
+            };
+            Ok(Box::pin(futures::stream::once(async move {
+                Ok(ProviderEvent::Completed(turn))
+            })))
+        }
+    }
+
+    struct WritePathProvider {
+        path: String,
+        round: Cell<u8>,
+        _not_send: Rc<()>,
+    }
+
+    impl WritePathProvider {
+        fn new(path: impl Into<String>) -> Self {
+            Self {
+                path: path.into(),
+                round: Cell::new(0),
+                _not_send: Rc::new(()),
+            }
+        }
+    }
+
+    impl ChatProvider for WritePathProvider {
+        fn respond_stream<'a>(
+            &'a self,
+            messages: &'a [Message],
+            _tools: &'a crate::nexus::Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<ProviderStream<'a>> {
+            let round = self.round.replace(self.round.get().saturating_add(1));
+            let turn = if round == 0 {
+                AssistantTurn {
+                    text: None,
+                    reasoning: Vec::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "write-path".to_string(),
+                        thought_signature: None,
+                        name: "write".to_string(),
+                        arguments: json!({ "path": self.path, "content": "forged\n" }),
+                    }],
+                    response_id: None,
+                    usage: None,
+                    completion_reason: Some(CompletionReason::ToolUse),
+                }
+            } else {
+                let result = messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == Role::Tool)
+                    .expect("write tool result");
+                assert!(
+                    result.content.contains("path escapes workspace"),
+                    "{}",
+                    result.content
+                );
+                AssistantTurn::text("outside write blocked")
+            };
+            Ok(Box::pin(futures::stream::once(async move {
+                Ok(ProviderEvent::Completed(turn))
+            })))
+        }
+    }
+
+    struct BashWriteProvider {
+        command: String,
+        round: Cell<u8>,
+        _not_send: Rc<()>,
+    }
+
+    impl BashWriteProvider {
+        fn new(command: String) -> Self {
+            Self {
+                command,
+                round: Cell::new(0),
+                _not_send: Rc::new(()),
+            }
+        }
+    }
+
+    impl ChatProvider for BashWriteProvider {
         fn respond_stream<'a>(
             &'a self,
             _messages: &'a [Message],
             _tools: &'a crate::nexus::Tools,
             _cancel: &'a CancellationToken,
         ) -> Result<ProviderStream<'a>> {
+            let round = self.round.replace(self.round.get().saturating_add(1));
+            let turn = if round == 0 {
+                AssistantTurn {
+                    text: None,
+                    reasoning: Vec::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "bash-parent-write".to_string(),
+                        thought_signature: None,
+                        name: "bash".to_string(),
+                        arguments: json!({ "command": self.command }),
+                    }],
+                    response_id: None,
+                    usage: None,
+                    completion_reason: Some(CompletionReason::ToolUse),
+                }
+            } else {
+                AssistantTurn::text("outside shell write attempted")
+            };
+            Ok(Box::pin(futures::stream::once(async move {
+                Ok(ProviderEvent::Completed(turn))
+            })))
+        }
+    }
+
+    struct HangingProvider(Rc<()>);
+
+    impl ChatProvider for HangingProvider {
+        fn respond_stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            _tools: &'a crate::nexus::Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<ProviderStream<'a>> {
+            let _ = &self.0;
             Ok(Box::pin(futures::stream::pending()))
         }
     }
 
-    fn single_call_turn(name: &str, arguments: Value) -> AssistantTurn {
-        AssistantTurn {
-            text: None,
-            reasoning: Vec::new(),
-            tool_calls: vec![ToolCall {
-                id: "call_1".to_string(),
-                name: name.to_string(),
-                arguments,
-                thought_signature: None,
-            }],
-            response_id: None,
-            usage: None,
-            completion_reason: None,
+    struct ScriptProvider {
+        turns: RefCell<VecDeque<AssistantTurn>>,
+        _not_send: Rc<()>,
+    }
+
+    impl ScriptProvider {
+        fn write(path: impl Into<String>, content: impl Into<String>, summary: String) -> Self {
+            Self {
+                turns: RefCell::new(VecDeque::from([
+                    AssistantTurn {
+                        text: None,
+                        reasoning: Vec::new(),
+                        tool_calls: vec![ToolCall {
+                            id: "write-child".to_string(),
+                            thought_signature: None,
+                            name: "write".to_string(),
+                            arguments: json!({
+                                "path": path.into(),
+                                "content": content.into(),
+                            }),
+                        }],
+                        response_id: None,
+                        usage: None,
+                        completion_reason: Some(CompletionReason::ToolUse),
+                    },
+                    AssistantTurn::text(&summary),
+                ])),
+                _not_send: Rc::new(()),
+            }
         }
     }
 
-    struct TestDir {
-        path: PathBuf,
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    fn test_dir() -> Result<TestDir> {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("iris-subagent-test-{nanos}-{seq}"));
-        fs::create_dir(&path)?;
-        Ok(TestDir { path })
-    }
-
-    #[test]
-    fn request_contract_serializes_stable_tokens() -> Result<()> {
-        let request = SubagentRequest {
-            prompt: "inspect".to_string(),
-            capability_mode: SubagentCapabilityMode::ReadOnly,
-            isolation: Some(SubagentIsolation::None),
-            cwd: None,
-            tool_allowlist: Some(vec!["read".to_string()]),
-            budgets: SubagentBudgets {
-                max_tool_roundtrips: Some(2),
-                max_output_bytes: Some(1024),
-            },
-        };
-
-        let encoded = serde_json::to_value(&request)?;
-
-        assert_eq!(encoded["capability_mode"], "read_only");
-        assert_eq!(encoded["isolation"], "none");
-        assert_eq!(encoded["budgets"]["max_tool_roundtrips"], 2);
-        let decoded: SubagentRequest = serde_json::from_value(encoded)?;
-        assert_eq!(decoded, request);
-        Ok(())
-    }
-
-    #[test]
-    fn validation_rejects_unsupported_capabilities_and_worktree_isolation() -> Result<()> {
-        let workspace = test_dir()?;
-        let provider = RecordingProvider::new(vec![AssistantTurn::text("unused")]);
-        let backend = SubagentBackend::new(workspace.path.clone());
-
-        let mut read_write = SubagentRequest::read_only("go");
-        read_write.capability_mode = SubagentCapabilityMode::ReadWrite;
-        let err = backend.spawn(provider.clone(), read_write).unwrap_err();
-        assert!(err.to_string().contains("read_write"));
-
-        let mut worktree = SubagentRequest::read_only("go");
-        worktree.isolation = Some(SubagentIsolation::Worktree);
-        let err = backend.spawn(provider.clone(), worktree).unwrap_err();
-        assert!(err.to_string().contains("worktree"));
-
-        let mut both = SubagentRequest::read_only("go");
-        both.cwd = Some(workspace.path.clone());
-        both.isolation = Some(SubagentIsolation::Worktree);
-        let err = backend.spawn(provider, both).unwrap_err();
-        assert!(err.to_string().contains("both cwd and worktree isolation"));
-        Ok(())
-    }
-
-    #[test]
-    fn request_cwd_must_stay_inside_parent_workspace() -> Result<()> {
-        let workspace = test_dir()?;
-        let outside = test_dir()?;
-        let backend = SubagentBackend::new(workspace.path.clone());
-        let provider = RecordingProvider::new(vec![AssistantTurn::text("unused")]);
-        let mut request = SubagentRequest::read_only("inspect");
-        request.cwd = Some(outside.path.clone());
-
-        let err = backend.spawn(provider, request).unwrap_err();
-
-        assert!(err.to_string().contains("inside the parent workspace"));
-        Ok(())
-    }
-
-    #[test]
-    fn max_output_budget_limits_returned_summary() -> Result<()> {
-        let workspace = test_dir()?;
-        let provider = RecordingProvider::new(vec![AssistantTurn::text("abcdef")]);
-        let backend = SubagentBackend::new(workspace.path.clone());
-        let mut request = SubagentRequest::read_only("summarize");
-        request.budgets.max_output_bytes = Some(3);
-        let handle = backend.spawn(provider, request)?;
-
-        let result = block_on(backend.wait(&handle.id))?;
-
-        assert_eq!(result.summary, "abc");
-        Ok(())
-    }
-
-    #[test]
-    fn read_only_worker_returns_structured_result() -> Result<()> {
-        let workspace = test_dir()?;
-        fs::write(workspace.path.join("note.txt"), "hello")?;
-        let provider = RecordingProvider::new(vec![
-            single_call_turn("read", json!({ "path": "note.txt" })),
-            AssistantTurn::text("saw hello"),
-        ]);
-        let visible = provider.visible_tools.clone();
-        let backend = SubagentBackend::new(workspace.path.clone());
-        let handle = backend.spawn(provider, SubagentRequest::read_only("read note"))?;
-
-        let result = block_on(backend.wait(&handle.id))?;
-
-        assert_eq!(result.status, SubagentStatus::Completed);
-        assert_eq!(result.summary, "saw hello");
-        assert_eq!(result.events[0].status, SubagentStatus::Started);
-        assert_eq!(result.events[1].status, SubagentStatus::Running);
-        assert_eq!(
-            result.events.last().unwrap().status,
-            SubagentStatus::Completed
-        );
-        let first_visible = &visible.borrow()[0];
-        assert!(first_visible.contains(&"read".to_string()));
-        assert!(!first_visible.contains(&"write".to_string()));
-        assert!(!first_visible.contains(&"edit".to_string()));
-        assert!(!first_visible.contains(&"bash".to_string()));
-        Ok(())
-    }
-
-    #[test]
-    fn mutating_tool_call_is_rejected_before_execution_even_if_hidden() -> Result<()> {
-        let workspace = test_dir()?;
-        let provider = RecordingProvider::new(vec![
-            single_call_turn("write", json!({ "path": "out.txt", "content": "nope" })),
-            AssistantTurn::text("done"),
-        ]);
-        let backend = SubagentBackend::new(workspace.path.clone());
-        let handle = backend.spawn(provider, SubagentRequest::read_only("try write"))?;
-
-        let result = block_on(backend.wait(&handle.id))?;
-
-        assert_eq!(result.status, SubagentStatus::Completed);
-        assert!(!workspace.path.join("out.txt").exists());
-        Ok(())
-    }
-
-    struct ClassifiedTool {
-        name: &'static str,
-        mutating: bool,
-        approval: bool,
-    }
-
-    impl Tool for ClassifiedTool {
-        fn name(&self) -> &str {
-            self.name
-        }
-
-        fn description(&self) -> &str {
-            "test tool"
-        }
-
-        fn parameters(&self) -> Value {
-            json!({ "type": "object" })
-        }
-
-        fn execute<'a>(
+    impl ChatProvider for ScriptProvider {
+        fn respond_stream<'a>(
             &'a self,
-            _args: &'a Value,
-            _env: &'a ToolEnv<'_>,
-            _cancel: CancellationToken,
-        ) -> ToolFuture<'a> {
-            Box::pin(async { Ok(crate::nexus::ToolOutput::text("ok")) })
-        }
-
-        fn requires_approval(&self) -> bool {
-            self.approval
-        }
-
-        fn is_mutating(&self) -> bool {
-            self.mutating
+            _messages: &'a [Message],
+            tools: &'a crate::nexus::Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<ProviderStream<'a>> {
+            assert!(tools.by_name("write").is_some());
+            let turn = self
+                .turns
+                .borrow_mut()
+                .pop_front()
+                .expect("provider script exhausted");
+            Ok(Box::pin(futures::stream::once(async move {
+                Ok(ProviderEvent::Completed(turn))
+            })))
         }
     }
 
-    #[test]
-    fn read_only_filter_uses_tool_classification_not_names() {
-        let tools = crate::nexus::Tools::new(vec![
-            Box::new(ClassifiedTool {
-                name: "innocent_name",
-                mutating: true,
-                approval: false,
-            }),
-            Box::new(ClassifiedTool {
-                name: "custom_read",
-                mutating: false,
-                approval: false,
-            }),
-            Box::new(ClassifiedTool {
-                name: "custom_prompted",
-                mutating: false,
-                approval: true,
-            }),
-        ])
-        .into_read_only();
-
-        assert!(tools.by_name("innocent_name").is_none());
-        assert!(tools.by_name("custom_prompted").is_none());
-        assert!(tools.by_name("custom_read").is_some());
-    }
-
-    #[test]
-    fn allowlist_cannot_readd_mutating_tools() {
-        let tools = read_only_tools(Some(&["write".to_string(), "read".to_string()]));
-        let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
-
-        assert_eq!(names, vec!["read"]);
-        assert!(tools.by_name("write").is_none());
-    }
-
-    #[test]
-    fn cancellation_reaches_terminal_cancelled_state_before_wait() -> Result<()> {
-        let workspace = test_dir()?;
-        let provider = RecordingProvider::new(vec![AssistantTurn::text("unused")]);
-        let backend = SubagentBackend::new(workspace.path.clone());
-        let handle = backend.spawn(provider, SubagentRequest::read_only("wait"))?;
-
-        let snapshot = backend.cancel(&handle.id)?;
-        let result = block_on(backend.wait(&handle.id))?;
-
-        assert_eq!(snapshot.handle.status, SubagentStatus::Cancelled);
-        assert_eq!(result.status, SubagentStatus::Cancelled);
-        assert_eq!(
-            backend.poll(&handle.id)?.handle.status,
-            SubagentStatus::Cancelled
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
         );
-        Ok(())
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn repo(root: &Path) -> PathBuf {
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        git(&workspace, &["init", "-q"]);
+        git(
+            &workspace,
+            &["config", "user.email", "worker@example.invalid"],
+        );
+        git(&workspace, &["config", "user.name", "Worker Test"]);
+        std::fs::write(workspace.join("candidate.txt"), "parent\n").unwrap();
+        git(&workspace, &["add", "candidate.txt"]);
+        git(&workspace, &["commit", "-qm", "base"]);
+        workspace
+    }
+
+    fn mutable_request(prompt: &str) -> WorkerRequest {
+        let mut request = WorkerRequest::read_only(prompt);
+        request.policy.capability = iris_subagent_runtime::CapabilityMode::ReadWrite;
+        request.policy.isolation = IsolationMode::Worktree;
+        request.session_id = Some("test-session".to_string());
+        request
+    }
+
+    fn read_path_factory(path: String, expect_secret: bool) -> ChildProviderFactory {
+        Arc::new(move || {
+            Ok(Box::new(ReadPathProvider::new(path.clone(), expect_secret))
+                as Box<dyn ChatProvider>)
+        })
+    }
+
+    fn write_path_factory(path: String) -> ChildProviderFactory {
+        Arc::new(
+            move || Ok(Box::new(WritePathProvider::new(path.clone())) as Box<dyn ChatProvider>),
+        )
+    }
+
+    fn bash_write_factory(command: String) -> ChildProviderFactory {
+        Arc::new(move || {
+            Ok(Box::new(BashWriteProvider::new(command.clone())) as Box<dyn ChatProvider>)
+        })
+    }
+
+    fn wait_worker(
+        backend: &SubagentBackend,
+        id: &iris_subagent_runtime::WorkerId,
+    ) -> iris_subagent_runtime::WorkerResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(backend.runtime().handle().wait(id))
+            .unwrap()
+    }
+
+    fn wait_group(
+        backend: &SubagentBackend,
+        id: &iris_subagent_runtime::GroupId,
+    ) -> iris_subagent_runtime::GroupResult {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(backend.runtime().handle().wait_group(id))
+            .unwrap()
     }
 
     #[test]
-    fn cancellation_reaches_terminal_cancelled_state_while_waiting() -> Result<()> {
-        let workspace = test_dir()?;
-        let backend = SubagentBackend::new(workspace.path.clone());
-        let handle = backend.spawn(PendingProvider, SubagentRequest::read_only("wait"))?;
+    fn nexus_worker_runs_independently_on_backend_scheduler() {
+        let root = std::env::temp_dir().join(format!(
+            "iris-wayland-worker-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let backend =
+            SubagentBackend::open(workspace, &root.join("state"), root.join("worktrees")).unwrap();
+        let factory: ChildProviderFactory = Arc::new(|| Ok(Box::new(TextProvider(Rc::new(())))));
+        let id = backend
+            .spawn(factory, WorkerRequest::read_only("run"), None)
+            .unwrap();
 
-        let result = block_on(async {
-            let wait = backend.wait(&handle.id);
-            let cancel = async {
-                tokio::task::yield_now().await;
-                backend.cancel(&handle.id)
-            };
-            let (wait_result, cancel_result) = tokio::join!(wait, cancel);
-            cancel_result?;
-            wait_result
-        })?;
+        std::thread::sleep(Duration::from_millis(100));
+        let snapshot = backend.runtime.handle().poll(&id).unwrap();
 
-        assert_eq!(result.status, SubagentStatus::Cancelled);
         assert_eq!(
-            backend.poll(&handle.id)?.handle.status,
-            SubagentStatus::Cancelled
+            snapshot.status,
+            iris_subagent_runtime::WorkerStatus::Completed
         );
-        Ok(())
+        assert_eq!(snapshot.result.unwrap().summary, "finished independently");
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_workspace_confinement_is_default_and_outside_access_is_explicit() {
+        let root = std::env::temp_dir().join(format!(
+            "iris-wayland-worker-paths-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = repo(&root);
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "outside-secret\n").unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("escape")).unwrap();
+        let backend = SubagentBackend::open(
+            workspace.clone(),
+            &root.join("state"),
+            root.join("worktrees"),
+        )
+        .unwrap();
+
+        for path in [
+            secret.to_string_lossy().into_owned(),
+            "escape/secret.txt".to_string(),
+        ] {
+            let id = backend
+                .spawn(
+                    read_path_factory(path, false),
+                    WorkerRequest::read_only("try outside read"),
+                    None,
+                )
+                .unwrap();
+            let result = wait_worker(&backend, &id);
+            assert_eq!(
+                result.status,
+                iris_subagent_runtime::WorkerStatus::Completed
+            );
+            assert_eq!(result.summary, "outside read blocked");
+        }
+
+        let mut unrestricted = WorkerRequest::read_only("explicit outside read");
+        unrestricted.policy.allow_outside_workspace = true;
+        let id = backend
+            .spawn(
+                read_path_factory("escape/secret.txt".to_string(), true),
+                unrestricted,
+                None,
+            )
+            .unwrap();
+        let result = wait_worker(&backend, &id);
+        assert_eq!(
+            result.status,
+            iris_subagent_runtime::WorkerStatus::Completed
+        );
+        assert_eq!(result.summary, "outside read allowed");
+
+        let mut mutable = mutable_request("attempt outside write");
+        mutable.policy.allow_outside_workspace = true;
+        let id = backend
+            .spawn(
+                write_path_factory(secret.to_string_lossy().into_owned()),
+                mutable,
+                None,
+            )
+            .unwrap();
+        let result = wait_worker(&backend, &id);
+        assert_eq!(
+            result.status,
+            iris_subagent_runtime::WorkerStatus::Completed
+        );
+        assert_eq!(result.summary, "outside write blocked");
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            "outside-secret\n"
+        );
+
+        let mut shell_worker = mutable_request("attempt parent write through shell");
+        shell_worker.policy.capability = iris_subagent_runtime::CapabilityMode::All;
+        let command = format!(
+            "printf forged > {}",
+            workspace.join("candidate.txt").display()
+        );
+        let id = backend
+            .spawn(bash_write_factory(command), shell_worker, None)
+            .unwrap();
+        let result = wait_worker(&backend, &id);
+        assert_eq!(
+            result.status,
+            iris_subagent_runtime::WorkerStatus::Completed
+        );
+        assert_eq!(result.summary, "outside shell write attempted");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("candidate.txt")).unwrap(),
+            "parent\n"
+        );
+
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mutable_worker_cancellation_is_terminal_and_leaves_parent_unchanged() {
+        let root = std::env::temp_dir().join(format!(
+            "iris-wayland-cancel-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = repo(&root);
+        let backend = SubagentBackend::open(
+            workspace.clone(),
+            &root.join("state"),
+            root.join("worktrees"),
+        )
+        .unwrap();
+        let factory: ChildProviderFactory = Arc::new(|| Ok(Box::new(HangingProvider(Rc::new(())))));
+        let id = backend
+            .spawn(factory, mutable_request("wait"), None)
+            .unwrap();
+        for _ in 0..100 {
+            let status = backend.poll(&id).unwrap().status;
+            if matches!(
+                status,
+                iris_subagent_runtime::WorkerStatus::Running
+                    | iris_subagent_runtime::WorkerStatus::Initializing
+            ) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        backend.cancel(&id).unwrap();
+        let first = wait_worker(&backend, &id);
+        let second = wait_worker(&backend, &id);
+        assert_eq!(first.status, iris_subagent_runtime::WorkerStatus::Cancelled);
+        assert_eq!(second, first);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("candidate.txt")).unwrap(),
+            "parent\n"
+        );
+
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mutable_worker_edits_only_its_worktree_until_reviewed_apply() {
+        let root = std::env::temp_dir().join(format!(
+            "iris-wayland-mutable-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = repo(&root);
+        let backend = SubagentBackend::open(
+            workspace.clone(),
+            &root.join("state"),
+            root.join("worktrees"),
+        )
+        .unwrap();
+        let factory: ChildProviderFactory = Arc::new(|| {
+            Ok(Box::new(ScriptProvider::write(
+                "result.txt",
+                "child\n",
+                "created result".to_string(),
+            )))
+        });
+        let id = backend
+            .spawn(factory, mutable_request("create result"), None)
+            .unwrap();
+        let result = wait_worker(&backend, &id);
+
+        assert_eq!(
+            result.status,
+            iris_subagent_runtime::WorkerStatus::Completed
+        );
+        assert_eq!(result.summary, "created result");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("candidate.txt")).unwrap(),
+            "parent\n"
+        );
+        assert!(!workspace.join("result.txt").exists());
+        let worktree = result.worktree.as_ref().expect("worktree metadata");
+        assert_eq!(
+            std::fs::read_to_string(worktree.path.join("result.txt")).unwrap(),
+            "child\n"
+        );
+        assert_eq!(result.changed_paths, vec![PathBuf::from("result.txt")]);
+        let record: iris_subagent_runtime::worktree::WorktreeRecord = serde_json::from_slice(
+            &std::fs::read(
+                root.join("worktrees")
+                    .join("control")
+                    .join(format!("{}.json", worktree.id)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record.worker_id.as_ref(), Some(&id));
+        assert_eq!(record.session_id.as_deref(), Some("test-session"));
+
+        let plan = backend.plan_apply(&id).unwrap();
+        assert_eq!(plan.operations.len(), 1);
+        let applied = backend
+            .apply(&plan, &iris_subagent_runtime::worktree::ApplyOptions::new())
+            .unwrap();
+        assert_eq!(
+            applied.disposition,
+            iris_subagent_runtime::worktree::ApplyDisposition::Complete
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("result.txt")).unwrap(),
+            "child\n"
+        );
+
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn best_of_n_keeps_candidates_isolated_and_applies_only_selected_worker() {
+        let root = std::env::temp_dir().join(format!(
+            "iris-wayland-group-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = repo(&root);
+        let backend = SubagentBackend::open(
+            workspace.clone(),
+            &root.join("state"),
+            root.join("worktrees"),
+        )
+        .unwrap();
+        let sequence = Arc::new(AtomicUsize::new(0));
+        let factory: ChildProviderFactory = Arc::new(move || {
+            let index = sequence.fetch_add(1, Ordering::SeqCst);
+            if index == 2 {
+                anyhow::bail!("intentional candidate failure");
+            }
+            let content = format!("candidate-{index}\n");
+            Ok(Box::new(ScriptProvider::write(
+                "result.txt",
+                content.clone(),
+                format!("produced {content}"),
+            )) as Box<dyn ChatProvider>)
+        });
+        let group_id = backend
+            .spawn_group(factory, vec![mutable_request("candidate"); 3], None)
+            .unwrap();
+        let group = wait_group(&backend, &group_id);
+
+        assert_eq!(group.results.len(), 3);
+        let successful = group
+            .results
+            .iter()
+            .filter(|result| result.status == iris_subagent_runtime::WorkerStatus::Completed)
+            .collect::<Vec<_>>();
+        assert_eq!(successful.len(), 2);
+        assert_eq!(
+            group
+                .results
+                .iter()
+                .filter(|result| result.status == iris_subagent_runtime::WorkerStatus::Failed)
+                .count(),
+            1
+        );
+        let paths = successful
+            .iter()
+            .map(|result| result.worktree.as_ref().unwrap().path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(paths.len(), 2);
+        assert!(!workspace.join("result.txt").exists());
+
+        let selected = successful[1];
+        let selected_content =
+            std::fs::read_to_string(selected.worktree.as_ref().unwrap().path.join("result.txt"))
+                .unwrap();
+        let selected_record: iris_subagent_runtime::worktree::WorktreeRecord =
+            serde_json::from_slice(
+                &std::fs::read(
+                    root.join("worktrees")
+                        .join("control")
+                        .join(format!("{}.json", selected.worktree.as_ref().unwrap().id)),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            selected_record.worker_id.as_ref(),
+            Some(&selected.worker_id)
+        );
+        assert_eq!(selected_record.group_id.as_ref(), Some(&group_id));
+        let selected_record = backend
+            .select_worktree_candidate(&selected.worktree.as_ref().unwrap().id)
+            .unwrap();
+        assert!(selected_record.selected);
+        assert!(backend.plan_apply(&successful[0].worker_id).is_err());
+        let plan = backend.plan_apply(&selected.worker_id).unwrap();
+        backend
+            .apply(&plan, &iris_subagent_runtime::worktree::ApplyOptions::new())
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("result.txt")).unwrap(),
+            selected_content
+        );
+        let non_winner = successful[0];
+        assert!(non_winner.worktree.as_ref().unwrap().path.exists());
+        backend
+            .remove_worktree(&selected.worktree.as_ref().unwrap().id, true)
+            .unwrap();
+        assert!(
+            backend
+                .select_worktree_candidate(&non_winner.worktree.as_ref().unwrap().id)
+                .is_err()
+        );
+
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

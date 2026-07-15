@@ -111,7 +111,9 @@ impl Jobs {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         crate::process_group::in_own_group(&mut cmd);
-        let status = sandbox::confine(&mut cmd, &sandbox::SandboxPolicy::for_workspace(root));
+        let policy = sandbox::policy_for_current_agent(root);
+        let status = sandbox::confine(&mut cmd, &policy);
+        sandbox::require_for_current_agent(&status)?;
         if let Some(notice) = status.notice() {
             tracing::warn!(%notice, "bash job sandbox not fully enforced");
         }

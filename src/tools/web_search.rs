@@ -11,7 +11,7 @@
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::nexus::{Tool, ToolEnv, ToolFuture};
+use crate::nexus::{Tool, ToolCapability, ToolEnv, ToolFuture};
 
 use super::web::{SearchBackend, WebToolsConfig};
 
@@ -84,6 +84,9 @@ impl Tool for WebSearchTool {
     }
     fn parameters(&self) -> Value {
         parameters()
+    }
+    fn capability(&self) -> ToolCapability {
+        ToolCapability::Read
     }
     fn execute<'a>(
         &'a self,

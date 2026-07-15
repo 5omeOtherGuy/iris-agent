@@ -618,6 +618,29 @@ impl GitSafety {
             .unwrap_or(0)
     }
 
+    pub(crate) fn mutation_paths(&self) -> Vec<PathBuf> {
+        self.sync_barrier();
+        self.state
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .map(|task| {
+                task.ledger
+                    .entries
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .path
+                            .strip_prefix(&self.workspace)
+                            .ok()
+                            .map(Path::to_path_buf)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn has_ledger_entries(&self) -> bool {
         self.state
             .lock()
