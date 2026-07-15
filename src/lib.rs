@@ -35,6 +35,8 @@ mod ui;
 mod wayland;
 
 #[cfg(test)]
+mod goal_tests;
+#[cfg(test)]
 mod structured_summary_probe;
 
 pub mod harness;
