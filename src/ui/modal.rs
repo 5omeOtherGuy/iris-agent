@@ -132,6 +132,10 @@ pub(crate) enum ModalAction {
         name: String,
         path: String,
     },
+    /// Confirm replacing an unfinished saved goal.
+    ReplaceGoal(String),
+    /// Save an edited objective while preserving the current goal id and usage.
+    EditGoal(String),
     ResolveUserQuestion(crate::nexus::InteractionOutcome),
 }
 
@@ -155,6 +159,8 @@ pub(crate) enum ModalOutcome {
 #[derive(Debug, Clone)]
 pub(crate) enum Modal {
     JjSetup(JjSetupPrompt),
+    GoalReplace(GoalReplacePrompt),
+    GoalEdit(GoalEditDialog),
     SwitchContext(SwitchContextPrompt),
     // Boxed (like Tasks) so the panel's snapshot does not dominate the enum.
     Settings(Box<crate::ui::settings_menu::SettingsPanel>),
@@ -172,6 +178,8 @@ impl Modal {
     pub(crate) fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
         match self {
             Modal::JjSetup(prompt) => prompt.handle_key(key),
+            Modal::GoalReplace(prompt) => prompt.handle_key(key),
+            Modal::GoalEdit(dialog) => dialog.handle_key(key),
             Modal::SwitchContext(prompt) => prompt.handle_key(key),
             Modal::Settings(panel) => panel.handle_key(key),
             Modal::Session(picker) => picker.handle_key(key),
@@ -190,7 +198,11 @@ impl Modal {
 
     pub(crate) fn paste_text(&mut self, text: &str) -> ModalOutcome {
         match self {
-            Modal::JjSetup(_) => ModalOutcome::Ignore,
+            Modal::JjSetup(_) | Modal::GoalReplace(_) => ModalOutcome::Ignore,
+            Modal::GoalEdit(dialog) => {
+                dialog.push_str(text);
+                ModalOutcome::Redraw
+            }
             Modal::LoginDialog(dialog) if dialog.accepts_manual_input() => {
                 dialog.push_str(text);
                 ModalOutcome::Redraw
@@ -242,6 +254,8 @@ impl Modal {
     pub(crate) fn render(&self, width: u16) -> Vec<Line<'static>> {
         match self {
             Modal::JjSetup(prompt) => prompt.render(width),
+            Modal::GoalReplace(prompt) => prompt.render(width),
+            Modal::GoalEdit(dialog) => dialog.render(width),
             Modal::SwitchContext(prompt) => prompt.render(width),
             Modal::Settings(panel) => panel.render(width),
             Modal::Session(picker) => picker.render(width),
@@ -387,6 +401,109 @@ pub(crate) fn selector_rows(selector: &Selector, empty: &str) -> Vec<(Line<'stat
         ));
     }
     out
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GoalReplacePrompt {
+    objective: String,
+    selector: Selector,
+}
+
+impl GoalReplacePrompt {
+    pub(crate) fn new(objective: String) -> Self {
+        Self {
+            objective,
+            selector: Selector::new(
+                vec![
+                    SelectorItem::new("cancel", "Keep the current goal"),
+                    SelectorItem::new("replace", "Replace the current goal")
+                        .detail("resets goal usage and elapsed-time accounting"),
+                ],
+                false,
+                true,
+                2,
+            ),
+        }
+    }
+
+    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match key {
+            ModalKey::Up => {
+                self.selector.up();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Down => {
+                self.selector.down();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Enter => match self.selector.selected_id() {
+                Some("replace") => {
+                    ModalOutcome::Emit(ModalAction::ReplaceGoal(self.objective.clone()))
+                }
+                Some("cancel") => ModalOutcome::Close,
+                _ => ModalOutcome::Ignore,
+            },
+            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        let preview: String = self.objective.chars().take(120).collect();
+        let mut rows = vec![(
+            Line::from(Span::styled(format!("New objective: {preview}"), dim())),
+            false,
+        )];
+        rows.extend(selector_rows(&self.selector, "No choices"));
+        crate::ui::tui::overlay_menu(
+            Some("Replace unfinished goal?"),
+            rows,
+            Some("↑↓ move · ↵ choose · esc cancel"),
+            usize::from(width),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GoalEditDialog {
+    objective: String,
+}
+
+impl GoalEditDialog {
+    pub(crate) fn new(objective: String) -> Self {
+        Self { objective }
+    }
+
+    fn push_str(&mut self, text: &str) {
+        self.objective.push_str(text);
+    }
+
+    fn handle_key(&mut self, key: ModalKey) -> ModalOutcome {
+        match key {
+            ModalKey::Char(character) => {
+                self.objective.push(character);
+                ModalOutcome::Redraw
+            }
+            ModalKey::Backspace => {
+                self.objective.pop();
+                ModalOutcome::Redraw
+            }
+            ModalKey::Enter if !self.objective.trim().is_empty() => {
+                ModalOutcome::Emit(ModalAction::EditGoal(self.objective.clone()))
+            }
+            ModalKey::Esc | ModalKey::CtrlC => ModalOutcome::Close,
+            _ => ModalOutcome::Ignore,
+        }
+    }
+
+    fn render(&self, width: u16) -> Vec<Line<'static>> {
+        crate::ui::tui::overlay_menu(
+            Some("Edit goal objective"),
+            vec![(Line::from(self.objective.clone()), true)],
+            Some("type to edit · ↵ save · esc cancel"),
+            usize::from(width),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1184,6 +1301,28 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("beta"));
         assert!(!text.contains("alpha"));
+    }
+
+    #[test]
+    fn goal_replacement_defaults_to_cancel_and_requires_explicit_selection() {
+        let mut prompt = GoalReplacePrompt::new("new objective".to_string());
+        assert_eq!(prompt.handle_key(ModalKey::Enter), ModalOutcome::Close);
+        prompt.handle_key(ModalKey::Down);
+        assert_eq!(
+            prompt.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::ReplaceGoal("new objective".to_string()))
+        );
+    }
+
+    #[test]
+    fn goal_edit_dialog_emits_the_edited_objective() {
+        let mut dialog = GoalEditDialog::new("old".to_string());
+        dialog.handle_key(ModalKey::Backspace);
+        dialog.handle_key(ModalKey::Char('w'));
+        assert_eq!(
+            dialog.handle_key(ModalKey::Enter),
+            ModalOutcome::Emit(ModalAction::EditGoal("olw".to_string()))
+        );
     }
 
     #[test]

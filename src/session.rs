@@ -198,7 +198,10 @@ impl SessionLog {
             "goal": goal,
         });
         write_line(&mut self.file, &entry).with_context(|| {
-            format!("failed to append goal state to session {}", self.path.display())
+            format!(
+                "failed to append goal state to session {}",
+                self.path.display()
+            )
         })?;
         self.resumed_goal = goal.cloned();
         self.last_id = Some(id.clone());
@@ -750,14 +753,12 @@ impl SessionStore {
             context_tokens,
         } = read_messages(&meta.path)?;
         let dangerous_skip_permissions = read_dangerous_skip_permissions(&meta.path)?;
-        let goal = read_goal(&meta.path)?;
         Ok(StoredSession {
             meta: meta.clone(),
             messages,
             entry_ids,
             context_tokens,
             dangerous_skip_permissions,
-            goal,
         })
     }
 
@@ -1054,9 +1055,6 @@ pub(crate) struct StoredSession {
     /// `Some(false)` is an explicit clear after a prior dangerous marker. This is
     /// chrome/runtime state, not provider-visible context.
     pub(crate) dangerous_skip_permissions: Option<bool>,
-    /// Latest persisted long-running goal snapshot. Session metadata only; it is
-    /// never inserted into provider context by the session reader.
-    pub(crate) goal: Option<Goal>,
 }
 
 /// Serialize one message into its session entry value, with a stable id and a
@@ -1421,6 +1419,7 @@ fn read_dangerous_skip_permissions(path: &Path) -> Result<Option<bool>> {
 
 /// Read the latest valid goal snapshot. A `null` snapshot clears earlier state;
 /// malformed/truncated rows are skipped without erasing the last valid value.
+#[cfg(test)]
 pub(crate) fn read_goal(path: &Path) -> Result<Option<Goal>> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut goal = None;

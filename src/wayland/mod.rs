@@ -42,6 +42,9 @@ use tracing::Instrument;
 use crate::config::{
     CompactionCacheTiming, CompactionTriggerConfig, ToolResultCompactionPolicy, VerificationConfig,
 };
+use crate::goal::{
+    BUDGET_LIMIT_PROMPT, Goal, GoalRuntime, GoalStatus, now_seconds, render_continuation,
+};
 use crate::handles::HandleStore;
 use crate::nexus::ToolOutputStore;
 use crate::nexus::{
@@ -90,10 +93,17 @@ struct TurnContextController<'a> {
     git_safety: &'a git_safety::GitSafety,
     task_workflow_enabled: bool,
     token: &'a CancellationToken,
+    goal: &'a GoalRuntime,
 }
 
 impl AgentObserver for TurnContextController<'_> {
     fn on_event(&self, event: AgentEvent) -> Result<()> {
+        if let AgentEvent::ProviderTurnCompleted {
+            usage: Some(usage), ..
+        } = &event
+        {
+            self.goal.account_usage(usage, now_seconds());
+        }
         if let AgentEvent::ProviderTransportFallback(fallback) = &event
             && let Some(engine) = self.compaction.borrow_mut().as_deref_mut()
         {
@@ -314,6 +324,9 @@ pub(crate) struct Harness<P> {
     // Shared so the loop can hand a `&ToolEnv` to several concurrency-safe tools
     // at once; tool bodies borrow it only for their synchronous duration.
     state: RefCell<ToolState>,
+    // Provider-neutral goal lifecycle and accounting. Wayland owns this state;
+    // model tools receive only the narrow controller stored in ToolState.
+    goal: Rc<GoalRuntime>,
     // Durable context-rewrite state: session cursor/id map, budget, worker slot,
     // and fold/cache scheduling. Kept behind one owner so the harness remains a
     // coordinator rather than a second compaction implementation.
@@ -484,6 +497,19 @@ impl<P: ChatProvider> Harness<P> {
         let skills = skills::SkillCatalog::load(&workspace, budget);
         let mut state = state;
         state.skill_read_roots = skills.resource_roots();
+        let persistent = session.is_some();
+        let goal = Rc::new(GoalRuntime::new(
+            session.as_ref().and_then(|log| log.resumed_goal().cloned()),
+            persistent,
+        ));
+        goal.set_output_store(
+            output_store
+                .as_ref()
+                .map(|store| Rc::new(store.clone()) as Rc<dyn ToolOutputStore>),
+        );
+        if persistent {
+            state.set_goal_controller(goal.clone());
+        }
         let model_compaction_requested = state.compaction_requested.clone();
         let last_skills_instructions = last_skills_instructions(agent.messages());
         // Stamp the current session id onto the guard up front (ADR-0031), so a
@@ -498,6 +524,7 @@ impl<P: ChatProvider> Harness<P> {
             agent,
             workspace,
             state: RefCell::new(state),
+            goal,
             compaction: CompactionEngine::new(
                 session,
                 persisted,
@@ -516,6 +543,66 @@ impl<P: ChatProvider> Harness<P> {
             task_workflow_enabled: true,
             verify: None,
         }
+    }
+
+    pub(crate) fn goal(&self) -> Option<Goal> {
+        self.goal.get()
+    }
+
+    pub(crate) fn goal_runtime(&self) -> Rc<GoalRuntime> {
+        self.goal.clone()
+    }
+
+    pub(crate) fn replace_goal(
+        &mut self,
+        objective: &str,
+        token_budget: Option<u64>,
+    ) -> Result<Goal> {
+        let goal = self
+            .goal
+            .replace_external(objective, token_budget, now_seconds())?;
+        self.persist_goal()?;
+        Ok(goal)
+    }
+
+    pub(crate) fn edit_goal(&mut self, objective: &str) -> Result<Goal> {
+        let goal = self.goal.edit_external(objective, now_seconds())?;
+        self.persist_goal()?;
+        Ok(goal)
+    }
+
+    pub(crate) fn pause_goal(&mut self) -> Result<Goal> {
+        let goal = self
+            .goal
+            .set_status_external(GoalStatus::Paused, now_seconds())?;
+        self.persist_goal()?;
+        Ok(goal)
+    }
+
+    pub(crate) fn resume_goal(&mut self) -> Result<Goal> {
+        let goal = self
+            .goal
+            .set_status_external(GoalStatus::Active, now_seconds())?;
+        self.persist_goal()?;
+        Ok(goal)
+    }
+
+    pub(crate) fn clear_goal(&mut self) -> Result<bool> {
+        let changed = self.goal.clear_external()?;
+        self.persist_goal()?;
+        Ok(changed)
+    }
+
+    pub(crate) fn persist_goal(&mut self) -> Result<()> {
+        let Some(snapshot) = self.goal.pending_snapshot() else {
+            return Ok(());
+        };
+        let log = self.compaction.session.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("goals require a saved session; session persistence is unavailable")
+        })?;
+        log.append_goal(snapshot.as_ref())?;
+        self.goal.mark_persisted();
+        Ok(())
     }
 
     /// Install (or clear) the post-change verification config (issue #265). The
@@ -817,6 +904,19 @@ impl<P: ChatProvider> Harness<P> {
         self.output_store = session
             .as_ref()
             .map(|log| HandleStore::for_session(log.path()));
+        self.goal.set_output_store(
+            self.output_store
+                .as_ref()
+                .map(|store| Rc::new(store.clone()) as Rc<dyn ToolOutputStore>),
+        );
+        let persistent = session.is_some();
+        self.goal.replace_from_session(
+            session.as_ref().and_then(|log| log.resumed_goal().cloned()),
+            persistent,
+        );
+        if persistent {
+            self.state.get_mut().set_goal_controller(self.goal.clone());
+        }
         // A swapped-in resumed log carries its prior activity for the A4
         // cold-resume fold trigger (issue #400); `/new` swaps in a fresh log
         // (or none), which has none.
@@ -1225,11 +1325,54 @@ impl<P: ChatProvider> Harness<P> {
         }
     }
 
+    /// Run a user turn and keep issuing internal continuation turns while the
+    /// saved goal remains active. A reached budget gets one final wrap-up turn.
+    pub(crate) async fn submit_turn(
+        &mut self,
+        prompt: &str,
+        obs: &dyn AgentObserver,
+        gate: &dyn ApprovalGate,
+        token: &CancellationToken,
+    ) -> Result<TurnOutcome> {
+        let mut next_prompt = prompt.to_string();
+        loop {
+            self.goal.begin_turn();
+            let result = self
+                .submit_single_turn(&next_prompt, obs, gate, token)
+                .await;
+            self.goal.finish_turn(now_seconds());
+            if let Err(error) = &result
+                && self.goal.is_active()
+                && is_usage_limit_error(error)
+            {
+                self.goal
+                    .set_status_external(GoalStatus::UsageLimited, now_seconds())?;
+            }
+            self.persist_goal()?;
+            let outcome = result?;
+            if token.is_cancelled() {
+                return Ok(outcome);
+            }
+            if self.goal.take_budget_steering() {
+                next_prompt = BUDGET_LIMIT_PROMPT.to_string();
+                continue;
+            }
+            let Some(goal) = self
+                .goal
+                .get()
+                .filter(|goal| goal.status == GoalStatus::Active)
+            else {
+                return Ok(outcome);
+            };
+            next_prompt = render_continuation(&goal);
+        }
+    }
+
     /// Run one turn against the owned execution env, then persist any new
     /// transcript messages. The env is injected into the bare loop (mirroring
     /// `AgentHarness` passing `env` into the run); persistence lives here, not
     /// in the loop.
-    pub(crate) async fn submit_turn(
+    async fn submit_single_turn(
         &mut self,
         prompt: &str,
         obs: &dyn AgentObserver,
@@ -1340,6 +1483,7 @@ impl<P: ChatProvider> Harness<P> {
                 git_safety: &self.git_safety,
                 task_workflow_enabled,
                 token,
+                goal: &self.goal,
             };
             self.agent
                 .submit_turn_with_context_and_governor(
@@ -1536,6 +1680,7 @@ impl<P: ChatProvider> Harness<P> {
                             git_safety: &self.git_safety,
                             task_workflow_enabled,
                             token,
+                            goal: &self.goal,
                         };
                         self.agent
                             .submit_turn_with_governor(
@@ -3032,6 +3177,17 @@ fn summarize(messages: &[Message]) -> String {
         out.push_str(&truncate_chars(message.content.trim(), MAX_EXCERPT_CHARS));
     }
     truncate_chars(&out, MAX_SUMMARY_CHARS)
+}
+
+fn is_usage_limit_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("rate_limit")
+            || message.contains("rate limited")
+            || message.contains("rate limit")
+            || message.contains("quota exceeded")
+            || message.contains("status 429")
+    })
 }
 
 /// Truncate to at most `max` characters (char-boundary safe), appending an

@@ -1,18 +1,22 @@
 use std::cell::RefCell;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use anyhow::Result;
 use futures::stream;
 use tokio_util::sync::CancellationToken;
 
 use crate::goal::{
-    Goal, GoalCommand, GoalRuntime, GoalStatus, parse_goal_command, render_continuation,
+    Goal, GoalCommand, GoalRuntime, GoalStatus, materialize_oversized_objective,
+    parse_goal_command, render_continuation,
 };
+use crate::handles::HandleStore;
 use crate::nexus::{
-    Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, AssistantTurn,
-    ChatProvider, InteractionFuture, InteractionOutcome, ProviderEvent, ProviderStream,
-    ProviderUsage, ReviewContext, ToolCall, ToolEnv,
+    Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate,
+    AssistantTurn, ChatProvider, InteractionFuture, InteractionOutcome, ProviderEvent,
+    ProviderStream, ProviderUsage, ReviewContext, ToolCall, ToolEnv, ToolOutputStore,
 };
 use crate::session::{SessionLog, read_goal};
 use crate::tools::{ToolState, built_in_tools};
@@ -57,7 +61,10 @@ fn command_parser_matches_controls_case_insensitively_and_keeps_other_text_liter
         parse_goal_command("/goal --tokens 98.5K ship it"),
         Some(GoalCommand::Set("--tokens 98.5K ship it".to_string()))
     );
-    assert_eq!(parse_goal_command("/Goal nope"), None);
+    assert_eq!(
+        parse_goal_command("/Goal nope"),
+        Some(GoalCommand::Set("nope".to_string()))
+    );
     assert_eq!(parse_goal_command("/goaal nope"), None);
 }
 
@@ -69,6 +76,31 @@ fn objective_validation_is_unicode_scalar_based_and_rejects_empty_or_oversized()
     let goal = Goal::new_at(&unicode, Some(1), 1).expect("4,000 scalars accepted");
     assert_eq!(goal.objective, unicode);
     assert!(Goal::new_at("ok", Some(0), 1).is_err());
+    assert!(Goal::new_with_budgets("ok", None, Some(0), 1).is_err());
+}
+
+#[test]
+fn oversized_objective_is_materialized_in_session_storage() {
+    let root = temp_dir("objective");
+    let store = HandleStore::with_dir(root.join("outputs"));
+    let objective = "x".repeat(4_001);
+    let reference = materialize_oversized_objective(&objective, Some(&store)).unwrap();
+    let handle = reference
+        .split('`')
+        .nth(1)
+        .expect("reference contains handle");
+    assert_eq!(
+        store.get(handle).unwrap().as_deref(),
+        Some(objective.as_str())
+    );
+    assert!(reference.contains("read_output"));
+
+    let runtime = GoalRuntime::new(None, true);
+    runtime.set_output_store(Some(Rc::new(store.clone())));
+    let goal = runtime.replace_external(&objective, None, 1).unwrap();
+    assert!(goal.objective.contains("read_output"));
+    assert!(goal.objective.chars().count() <= 4_000);
+    fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -89,10 +121,7 @@ fn model_create_rejects_unfinished_goal_but_replaces_complete_goal() {
 
 #[test]
 fn accounting_excludes_cached_input_and_limits_at_equal_budget() {
-    let runtime = GoalRuntime::new(
-        Some(Goal::new_at("ship", Some(10), 1).expect("goal")),
-        true,
-    );
+    let runtime = GoalRuntime::new(Some(Goal::new_at("ship", Some(10), 1).expect("goal")), true);
     runtime.begin_turn();
     assert!(!runtime.account_usage(&usage(8, 5, 3), 2));
     assert_eq!(runtime.get().unwrap().tokens_used, 6);
@@ -105,6 +134,37 @@ fn accounting_excludes_cached_input_and_limits_at_equal_budget() {
 }
 
 #[test]
+fn usage_crossing_after_a_mid_turn_pause_still_enforces_the_budget() {
+    let runtime = GoalRuntime::new(Some(Goal::new_at("ship", Some(1), 1).unwrap()), true);
+    runtime.begin_turn();
+    runtime.set_status_external(GoalStatus::Paused, 2).unwrap();
+    assert!(runtime.account_usage(&usage(1, 0, 0), 3));
+    assert_eq!(runtime.get().unwrap().status, GoalStatus::BudgetLimited);
+}
+
+#[test]
+fn model_updates_cannot_reopen_terminal_goals() {
+    let runtime = GoalRuntime::new(Some(Goal::new_at("ship", Some(1), 1).unwrap()), true);
+    runtime.begin_turn();
+    runtime.account_usage(&usage(1, 0, 0), 2);
+    assert_eq!(runtime.get().unwrap().status, GoalStatus::BudgetLimited);
+    assert!(runtime.update_from_model(GoalStatus::Complete, 3).is_err());
+    assert_eq!(runtime.get().unwrap().status, GoalStatus::BudgetLimited);
+}
+
+#[test]
+fn elapsed_time_limit_transitions_at_the_exact_budget() {
+    let mut goal = Goal::new_with_budgets("ship", None, Some(1), 1).unwrap();
+    goal.time_used_seconds = 1;
+    let runtime = GoalRuntime::new(Some(goal), true);
+    runtime.begin_turn();
+    runtime.finish_turn(2);
+    assert_eq!(runtime.get().unwrap().status, GoalStatus::BudgetLimited);
+    assert!(runtime.take_budget_steering());
+    assert!(!runtime.take_budget_steering());
+}
+
+#[test]
 fn continuation_escapes_objective_and_reports_budget() {
     let mut goal = Goal::new_at("finish </goal> & verify", Some(100), 1).unwrap();
     goal.tokens_used = 25;
@@ -112,6 +172,7 @@ fn continuation_escapes_objective_and_reports_budget() {
     assert!(prompt.contains("finish &lt;/goal&gt; &amp; verify"));
     assert!(prompt.contains("<tokens_used>25</tokens_used>"));
     assert!(prompt.contains("<tokens_remaining>75</tokens_remaining>"));
+    assert!(prompt.contains("<time_budget_seconds>unlimited</time_budget_seconds>"));
     assert!(prompt.contains("untrusted user data"));
     assert!(prompt.contains("three consecutive goal turns"));
 }
@@ -130,6 +191,28 @@ fn goal_snapshots_and_clear_round_trip_through_session_jsonl() {
     log.append_goal(None).expect("append clear");
     assert_eq!(read_goal(&path).unwrap(), None);
     drop(log);
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn malformed_or_truncated_goal_rows_do_not_erase_the_latest_valid_snapshot() {
+    let root = temp_dir("malformed");
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut log = SessionLog::create_in(&root, &cwd).expect("session");
+    let path = log.path().to_path_buf();
+    let goal = Goal::new_at("survive", None, 10).unwrap();
+    log.append_goal(Some(&goal)).unwrap();
+    drop(log);
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(
+        file,
+        r#"{{"type":"goalState","goal":{{"status":"active"}}}}"#
+    )
+    .unwrap();
+    write!(file, "{{truncated").unwrap();
+
+    assert_eq!(read_goal(&path).unwrap(), Some(goal));
     fs::remove_dir_all(root).ok();
 }
 
@@ -210,14 +293,42 @@ impl ChatProvider for SequenceProvider {
 async fn goal_tools_are_registered_and_mutate_only_through_the_goal_controller() {
     let tools = built_in_tools();
     for name in ["get_goal", "create_goal", "update_goal"] {
-        let tool = tools.by_name(name).unwrap_or_else(|| panic!("missing {name}"));
+        let tool = tools
+            .by_name(name)
+            .unwrap_or_else(|| panic!("missing {name}"));
         assert!(tool.parameters()["type"] == "object");
         assert!(!tool.description().is_empty());
     }
 
     let root = temp_dir("tools");
+    let unavailable_state = RefCell::new(ToolState::new());
+    let unavailable_env = ToolEnv {
+        workspace: &root,
+        state: &unavailable_state,
+        output_store: None,
+        session_span: None,
+        output_sink: None,
+        mutation_guard: None,
+    };
+    let unavailable = tools
+        .by_name("get_goal")
+        .unwrap()
+        .execute(
+            &serde_json::json!({}),
+            &unavailable_env,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        unavailable
+            .to_string()
+            .contains("persistence is unavailable")
+    );
+
     let state = RefCell::new(ToolState::new());
-    let runtime = GoalRuntime::new(None, true);
+    let runtime = Rc::new(GoalRuntime::new(None, true));
+    state.borrow_mut().set_goal_controller(runtime.clone());
     let env = ToolEnv {
         workspace: &root,
         state: &state,
@@ -225,14 +336,17 @@ async fn goal_tools_are_registered_and_mutate_only_through_the_goal_controller()
         session_span: None,
         output_sink: None,
         mutation_guard: None,
-        goal: Some(&runtime),
     };
     let cancel = CancellationToken::new();
     let created = tools
         .by_name("create_goal")
         .unwrap()
         .execute(
-            &serde_json::json!({"objective":"ship the feature","token_budget":100}),
+            &serde_json::json!({
+                "objective":"ship the feature",
+                "token_budget":100,
+                "time_budget_seconds":60
+            }),
             &env,
             cancel.child_token(),
         )
@@ -241,6 +355,7 @@ async fn goal_tools_are_registered_and_mutate_only_through_the_goal_controller()
     let created: serde_json::Value = serde_json::from_str(&created.content).unwrap();
     assert_eq!(created["objective"], "ship the feature");
     assert_eq!(created["status"], "active");
+    assert_eq!(created["timeBudgetSeconds"], 60);
 
     let error = tools
         .by_name("update_goal")
@@ -265,6 +380,51 @@ async fn goal_tools_are_registered_and_mutate_only_through_the_goal_controller()
         .await
         .expect("complete goal");
     assert_eq!(runtime.get().unwrap().status, GoalStatus::Complete);
+    fs::remove_dir_all(root).ok();
+}
+
+struct RateLimitedProvider;
+
+impl ChatProvider for RateLimitedProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        _messages: &'a [crate::nexus::Message],
+        _tools: &'a crate::nexus::Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        Ok(Box::pin(stream::iter(vec![Err(anyhow::anyhow!(
+            "rate_limit: retry later"
+        ))])))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_usage_limit_pauses_automatic_continuation_durably() {
+    let root = temp_dir("usage-limit");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let session = SessionLog::create_in(&root, &workspace).expect("session");
+    let session_path = session.path().to_path_buf();
+    let agent = Agent::new(RateLimitedProvider, built_in_tools());
+    let mut harness = Harness::new(agent, workspace, ToolState::new(), Some(session), None);
+    harness.replace_goal("finish", None).unwrap();
+
+    assert!(
+        harness
+            .submit_turn(
+                "begin",
+                &TestObserver,
+                &AllowGate,
+                &CancellationToken::new(),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(harness.goal().unwrap().status, GoalStatus::UsageLimited);
+    assert_eq!(
+        read_goal(&session_path).unwrap().unwrap().status,
+        GoalStatus::UsageLimited
+    );
     fs::remove_dir_all(root).ok();
 }
 
@@ -317,6 +477,9 @@ async fn harness_automatically_continues_an_active_goal_until_model_completion()
     let second = &harness.agent.provider.requests.borrow()[1];
     let continuation = &second.last().expect("continuation prompt").content;
     assert!(continuation.contains("&lt;all&gt; &amp; verify"));
-    assert_eq!(read_goal(&session_path).unwrap().unwrap().status, GoalStatus::Complete);
+    assert_eq!(
+        read_goal(&session_path).unwrap().unwrap().status,
+        GoalStatus::Complete
+    );
     fs::remove_dir_all(root).ok();
 }
