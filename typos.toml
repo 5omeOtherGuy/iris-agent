@@ -35,3 +35,5 @@ Hel = "Hel"
 caf = "caf"
 # Rust TUI crate name.
 ratatui = "ratatui"
+# Stable worker ID prefix.
+wrk = "wrk"
