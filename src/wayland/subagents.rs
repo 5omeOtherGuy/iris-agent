@@ -643,6 +643,42 @@ mod tests {
     use crate::nexus::{AssistantTurn, CompletionReason, ProviderEvent, ProviderStream};
     use serde_json::json;
 
+    #[test]
+    fn effective_route_serialization_round_trips_and_sets_a_stable_id() {
+        let route = ChildRoute::new(
+            "anthropic",
+            "claude-opus-4-6",
+            "https://api.anthropic.com",
+            Some("high"),
+        );
+        let mut request = WorkerRequest::read_only("route");
+
+        attach_route(&mut request, &route).unwrap();
+
+        assert!(
+            request
+                .route_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with(IRIS_ROUTE_ID_PREFIX))
+        );
+        assert_eq!(route_from_request(&request).unwrap(), Some(route));
+        assert_eq!(request.profile_id, None);
+    }
+
+    #[test]
+    fn malformed_claimed_iris_route_fails_closed_while_legacy_requests_inherit() {
+        let legacy = WorkerRequest::read_only("legacy");
+        assert_eq!(route_from_request(&legacy).unwrap(), None);
+
+        let mut malformed = WorkerRequest::read_only("malformed");
+        malformed.route_id = Some(format!("{IRIS_ROUTE_ID_PREFIX}bad"));
+        malformed.host.kind = IRIS_ROUTE_PAYLOAD_KIND.to_string();
+        malformed.host.value = json!({ "provider": "anthropic" });
+
+        let error = route_from_request(&malformed).unwrap_err().to_string();
+        assert!(error.contains("malformed Iris worker route"), "{error}");
+    }
+
     struct TextProvider(Rc<()>);
 
     impl ChatProvider for TextProvider {

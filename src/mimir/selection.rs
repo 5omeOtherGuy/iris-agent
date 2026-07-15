@@ -1451,6 +1451,114 @@ mod tests {
     }
 
     #[test]
+    fn selection_overrides_inherit_and_apply_components_independently() {
+        let mut parent = selection_for(
+            ProviderId::Anthropic,
+            "claude-sonnet-4-6",
+            PromptCacheRetention::Short,
+        );
+        parent.base_url = "https://api.anthropic.com".to_string();
+        parent.reasoning = Some(ReasoningEffort::High);
+
+        assert_eq!(
+            apply_selection_overrides(&parent, None, None).unwrap(),
+            parent
+        );
+
+        let model_only = apply_selection_overrides(&parent, Some("claude-opus-4-6"), None).unwrap();
+        assert_eq!(model_only.provider, ProviderId::Anthropic);
+        assert_eq!(model_only.model, "claude-opus-4-6");
+        assert_eq!(model_only.base_url, parent.base_url);
+        assert_eq!(model_only.reasoning, Some(ReasoningEffort::High));
+
+        let effort_only = apply_selection_overrides(&parent, None, Some("low")).unwrap();
+        assert_eq!(effort_only.provider, parent.provider);
+        assert_eq!(effort_only.model, parent.model);
+        assert_eq!(effort_only.reasoning, Some(ReasoningEffort::Low));
+
+        let both = apply_selection_overrides(
+            &parent,
+            Some("antigravity/gemini-3.5-flash"),
+            Some("medium"),
+        )
+        .unwrap();
+        assert_eq!(both.provider, ProviderId::Antigravity);
+        assert_eq!(both.model, "gemini-3.5-flash");
+        assert_eq!(both.base_url, "https://daily-cloudcode-pa.googleapis.com");
+        assert_eq!(both.reasoning, Some(ReasoningEffort::Medium));
+    }
+
+    #[test]
+    fn model_override_carries_and_clamps_existing_effort() {
+        let mut parent = selection_for(
+            ProviderId::OpenAiCodex,
+            "gpt-5.6-sol",
+            PromptCacheRetention::Short,
+        );
+        parent.base_url = "https://chatgpt.com/backend-api".to_string();
+        parent.reasoning = Some(ReasoningEffort::Max);
+
+        let routed = apply_selection_overrides(&parent, Some("gpt-5.5"), None).unwrap();
+
+        assert_eq!(routed.reasoning, Some(ReasoningEffort::XHigh));
+    }
+
+    #[test]
+    fn explicit_effort_is_strictly_validated_after_model_resolution() {
+        let parent = selection_for(
+            ProviderId::OpenAiCodex,
+            "gpt-5.6-sol",
+            PromptCacheRetention::Short,
+        );
+
+        let error = apply_selection_overrides(&parent, Some("openai/gpt-4.1"), Some("high"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("not supported by openai/gpt-4.1"), "{error}");
+    }
+
+    #[test]
+    fn selection_overrides_reject_empty_model_and_unknown_provider() {
+        let parent = selection_for(
+            ProviderId::OpenAiCodex,
+            "gpt-5.6-sol",
+            PromptCacheRetention::Short,
+        );
+
+        let empty = apply_selection_overrides(&parent, Some("  "), None)
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("model"), "{empty}");
+
+        let unknown = apply_selection_overrides(&parent, Some("unknown/model"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("unsupported provider"), "{unknown}");
+    }
+
+    #[test]
+    fn sequential_overrides_compose_profile_defaults_before_spawn_overrides() {
+        let mut parent = selection_for(
+            ProviderId::Anthropic,
+            "claude-sonnet-4-6",
+            PromptCacheRetention::Short,
+        );
+        parent.base_url = "https://api.anthropic.com".to_string();
+        parent.reasoning = Some(ReasoningEffort::High);
+
+        let profile =
+            apply_selection_overrides(&parent, Some("claude-haiku-4-5"), Some("low")).unwrap();
+        let spawn_model =
+            apply_selection_overrides(&profile, Some("claude-opus-4-6"), None).unwrap();
+        assert_eq!(spawn_model.model, "claude-opus-4-6");
+        assert_eq!(spawn_model.reasoning, Some(ReasoningEffort::Low));
+
+        let spawn_effort = apply_selection_overrides(&spawn_model, None, Some("xhigh")).unwrap();
+        assert_eq!(spawn_effort.reasoning, Some(ReasoningEffort::XHigh));
+    }
+
+    #[test]
     fn dedicated_compaction_worker_resolves_a_qualified_global_model() {
         let settings = settings(Some("openai-codex"), Some("gpt-5.4-mini"), None, None);
         let worker =

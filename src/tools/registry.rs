@@ -1761,6 +1761,67 @@ mod tests {
     }
 
     #[test]
+    fn invalid_routing_overrides_are_rejected_before_worker_acceptance() {
+        let dir = temp_dir();
+        let workspace = root_of(&dir);
+        let backend = Arc::new(
+            crate::wayland::subagents::SubagentBackend::open(
+                workspace.clone(),
+                &workspace.join("worker-state"),
+                workspace.join("worktrees"),
+            )
+            .unwrap(),
+        );
+        let selection = Arc::new(std::sync::Mutex::new(
+            crate::mimir::selection::ModelSelection::resolve(&crate::config::Settings::default())
+                .unwrap(),
+        ));
+        let provider_factory: crate::wayland::subagents::ChildProviderFactory =
+            Arc::new(|_| Err(anyhow!("invalid route must not construct a provider")));
+        let tool = SpawnSubagentTool(SubagentToolsConfig {
+            backend: backend.clone(),
+            provider_factory,
+            selection,
+            capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
+            session_id: "invalid-route".to_string(),
+            nesting_depth: 0,
+            max_nesting_depth: 2,
+            approval: None,
+        });
+        let state = std::cell::RefCell::new(ToolState::new());
+        let env = bash_env(&workspace, &state, None);
+
+        for invalid in [
+            json!({ "prompt": "invalid", "model": "" }),
+            json!({ "prompt": "invalid", "model": "unknown/model" }),
+            json!({ "prompt": "invalid", "effort": "ultra" }),
+            json!({
+                "prompt": "invalid",
+                "model": "openai/gpt-4.1",
+                "effort": "high"
+            }),
+        ] {
+            let error = current_thread_runtime()
+                .block_on(tool.execute(&invalid, &env, CancellationToken::new()))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("model")
+                    || error.to_string().contains("provider")
+                    || error.to_string().contains("reasoning"),
+                "unexpected routing error: {error:#}"
+            );
+            assert!(
+                backend
+                    .runtime()
+                    .handle()
+                    .list(&iris_subagent_runtime::WorkerFilter::default())
+                    .is_empty(),
+                "invalid routing must fail before durable worker acceptance"
+            );
+        }
+    }
+
+    #[test]
     fn cancelling_foreground_spawn_cancels_the_independent_worker() {
         let dir = temp_dir();
         let workspace = root_of(&dir);
@@ -2199,6 +2260,8 @@ mod tests {
             "prompt",
             "description",
             "kind",
+            "model",
+            "effort",
             "capability",
             "isolation",
             "tools",
@@ -2231,6 +2294,14 @@ mod tests {
             (
                 "kind",
                 "Worker category. explore and review force read_only; categories do not inject a persona, so state any desired role in prompt.",
+            ),
+            (
+                "model",
+                "Optional child model. Use <model> to keep the current provider or <provider>/<model> to switch provider. Omit to inherit the spawn-time effective selection.",
+            ),
+            (
+                "effort",
+                "Optional reasoning effort: off, minimal, low, medium, high, xhigh, or max. Omit to inherit and clamp the effective effort for the selected model.",
             ),
             (
                 "capability",
