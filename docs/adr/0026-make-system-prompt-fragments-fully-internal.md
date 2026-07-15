@@ -1,7 +1,7 @@
 # ADR-0026: Make system-prompt fragments fully internal
 
 **Date**: 2026-07-02
-**Status**: proposed (supersedes the file-loading decision of ADR-0012; amends ADR-0013 and ADR-0015)
+**Status**: proposed (supersedes the file-loading decision of ADR-0012; amends ADR-0013 and ADR-0015; amended by ADR-0064)
 **Deciders**: Iris maintainers, Pi agent session
 
 ## Context
@@ -23,7 +23,7 @@ The shipped fragments in `src/wayland/system_prompt/defaults.rs` become the sing
 - `ensure_default_fragments` (startup disk materialization) is removed. Previously materialized `~/.iris/fragments/*.md` are left orphaned; they are no longer read.
 - Removing repo fragment loading eliminates the system-prompt-injection surface, so the #234 trust gate's original purpose ends. The per-cwd trust store is repurposed as a project permission policy in ADR-0027; the fragment-trust decision, the fragment-gating first-run prompt, and issue #255 are obsolete.
 
-The bounded, symlink-refusing reader stays for `AGENTS.md`/`CLAUDE.md`, which are still folded in.
+The bounded, symlink-refusing reader stays for `AGENTS.md`/`CLAUDE.md`, which are still folded in. ADR-0064 extends that project-instruction channel with explicit override and additive local candidates without restoring user-defined system-prompt fragments.
 
 ## Alternatives Considered
 
