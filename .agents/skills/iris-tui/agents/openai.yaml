@@ -1,0 +1,4 @@
+interface:
+  display_name: "Iris TUI"
+  short_description: "Current Iris terminal UI workflow"
+  default_prompt: "Use $iris-tui to make this terminal UI change against the current design and renderer architecture."
