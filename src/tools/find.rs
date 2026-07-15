@@ -17,7 +17,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
-use globset::GlobBuilder;
+use globset::{GlobBuilder, GlobMatcher};
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -71,24 +71,7 @@ fn find(root: &Path, input: &FindInput, group: bool) -> Result<String> {
     let search_path = resolve_existing(root, search)?;
     let limit = input.limit.unwrap_or(DEFAULT_FIND_LIMIT).max(1);
 
-    // A pattern without a path separator matches the file name at any depth
-    // (fd / Glob-tool convention); one with a separator matches the relative
-    // path under the search directory.
-    let normalized = if input.pattern.contains('/') {
-        input.pattern.clone()
-    } else {
-        format!("**/{}", input.pattern)
-    };
-    // Smart-case like `fd`: case-insensitive unless the pattern has an uppercase
-    // character. `literal_separator(true)` keeps `*` from crossing `/` (only
-    // `**` does), matching standard glob and the documented examples.
-    let smart_case = !input.pattern.chars().any(|c| c.is_uppercase());
-    let matcher = GlobBuilder::new(&normalized)
-        .case_insensitive(smart_case)
-        .literal_separator(true)
-        .build()
-        .with_context(|| format!("invalid glob pattern: {}", input.pattern))?
-        .compile_matcher();
+    let matcher = compile_glob(&input.pattern)?;
 
     let mut entries: Vec<(String, Option<SystemTime>)> = Vec::new();
     let walker = WalkBuilder::new(&search_path)
@@ -144,6 +127,24 @@ fn find(root: &Path, input: &FindInput, group: bool) -> Result<String> {
         DEFAULT_MAX_BYTES,
         group,
     ))
+}
+
+/// Compile the path glob convention shared by file-navigation tools.
+/// Patterns without a separator match a name at any depth; matching is
+/// case-insensitive unless the pattern contains an uppercase character.
+pub(super) fn compile_glob(pattern: &str) -> Result<GlobMatcher> {
+    let normalized = if pattern.contains('/') {
+        pattern.to_string()
+    } else {
+        format!("**/{pattern}")
+    };
+    let smart_case = !pattern.chars().any(|c| c.is_uppercase());
+    Ok(GlobBuilder::new(&normalized)
+        .case_insensitive(smart_case)
+        .literal_separator(true)
+        .build()
+        .with_context(|| format!("invalid glob pattern: {pattern}"))?
+        .compile_matcher())
 }
 
 /// Render the sorted match list, compacting only when matches would otherwise

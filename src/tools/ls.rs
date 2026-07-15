@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use globset::GlobMatcher;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -27,7 +28,7 @@ const SUMMARY_TOP_EXT: usize = 5;
 /// bound (`>=N ... scan capped`).
 const SCAN_BUDGET: usize = 10_000;
 
-pub(super) const DESCRIPTION: &str = "List directory contents: directories first, then files (case-insensitive), with '/' suffix for directories. Includes dotfiles. Set recursive=true (or depth>1) for an indented tree up to `depth` levels. Set long=true to prefix each entry with a type marker (d/f/l) and human-readable size. Output is truncated to 500 entries or 50KB (whichever is hit first); a truncated listing ends with a summary line carrying the exact total, the dirs/files split, and the dominant omitted extensions so what was cut is visible without a blind re-list.";
+pub(super) const DESCRIPTION: &str = "List directory contents: directories first, then files (case-insensitive), with '/' suffix for directories. Includes dotfiles. Set ignore to a glob or array of globs to filter relative paths. Set recursive=true (or depth>1) for an indented tree up to `depth` levels. Set long=true to prefix each entry with a type marker (d/f/l) and human-readable size. Output is truncated to 500 entries or 50KB (whichever is hit first); a truncated listing ends with a summary line carrying the exact total, the dirs/files split, and the dominant omitted extensions so what was cut is visible without a blind re-list.";
 
 pub(super) fn parameters() -> Value {
     json!({
@@ -37,7 +38,14 @@ pub(super) fn parameters() -> Value {
             "limit": { "type": "integer", "description": "Maximum number of entries to return (default: 500)" },
             "recursive": { "type": "boolean", "description": "List subdirectories as an indented tree (default: false)" },
             "depth": { "type": "integer", "description": "Levels to descend: 1 = immediate children (default), 2 = children and grandchildren, etc. recursive=true implies at least 2." },
-            "long": { "type": "boolean", "description": "Prefix each entry with a type marker (d/f/l) and human-readable size (default false)" }
+            "long": { "type": "boolean", "description": "Prefix each entry with a type marker (d/f/l) and human-readable size (default false)" },
+            "ignore": {
+                "description": "Glob pattern or array of patterns for relative paths to exclude",
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "array", "items": { "type": "string" } }
+                ]
+            }
         }
     })
 }
@@ -65,6 +73,24 @@ struct LsInput {
     depth: Option<usize>,
     #[serde(default)]
     long: bool,
+    #[serde(default)]
+    ignore: Option<IgnoreInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum IgnoreInput {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl IgnoreInput {
+    fn patterns(&self) -> &[String] {
+        match self {
+            Self::One(pattern) => std::slice::from_ref(pattern),
+            Self::Many(patterns) => patterns,
+        }
+    }
 }
 
 fn ls(root: &Path, input: &LsInput) -> Result<super::ToolOutput> {
@@ -77,6 +103,12 @@ fn ls(root: &Path, input: &LsInput) -> Result<super::ToolOutput> {
         bail!("not a directory: {dir}");
     }
     let limit = input.limit.unwrap_or(DEFAULT_LS_LIMIT).max(1);
+    let ignore = input
+        .ignore
+        .iter()
+        .flat_map(|input| input.patterns().iter())
+        .map(|pattern| super::find::compile_glob(pattern))
+        .collect::<Result<Vec<_>>>()?;
 
     // Explicit depth wins; bare `recursive` means a 2-level tree; default is flat.
     let max_depth = match (input.recursive, input.depth) {
@@ -91,7 +123,12 @@ fn ls(root: &Path, input: &LsInput) -> Result<super::ToolOutput> {
     // request cannot traverse an unbounded tree. When the budget is hit the
     // total becomes a lower bound and the summary says so.
     let mut entries: Vec<Entry> = Vec::new();
-    collect_entries(&dir_path, dir, 0, max_depth, SCAN_BUDGET, &mut entries)?;
+    let walk = WalkOptions {
+        max_depth,
+        budget: SCAN_BUDGET,
+        ignore: &ignore,
+    };
+    collect_entries(&dir_path, Path::new(""), dir, 0, &walk, &mut entries)?;
 
     if entries.is_empty() {
         return Ok(super::ToolOutput::text("(empty directory)").with("entries", json!(0)));
@@ -129,6 +166,12 @@ struct Rendered {
     truncated: bool,
 }
 
+struct WalkOptions<'a> {
+    max_depth: usize,
+    budget: usize,
+    ignore: &'a [GlobMatcher],
+}
+
 /// Human-readable byte size, e.g. `537 B`, `1.5 KB`, `3.4 MB`.
 fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -153,13 +196,13 @@ fn human_size(bytes: u64) -> String {
 /// does not abort the whole listing.
 fn collect_entries(
     dir_path: &Path,
+    relative_dir: &Path,
     dir_label: &str,
     depth: usize,
-    max_depth: usize,
-    budget: usize,
+    options: &WalkOptions<'_>,
     out: &mut Vec<Entry>,
 ) -> Result<()> {
-    if out.len() >= budget {
+    if out.len() >= options.budget {
         return Ok(());
     }
     let read = match fs::read_dir(dir_path) {
@@ -177,6 +220,15 @@ fn collect_entries(
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
+        let name = entry.file_name();
+        let relative_path = relative_dir.join(&name);
+        if options
+            .ignore
+            .iter()
+            .any(|matcher| matcher.is_match(&relative_path))
+        {
+            continue;
+        }
         let is_symlink = file_type.is_symlink();
         let is_dir = file_type.is_dir()
             || (is_symlink && entry.metadata().map(|m| m.is_dir()).unwrap_or(false));
@@ -188,7 +240,7 @@ fn collect_entries(
         };
         level.push(Entry {
             depth,
-            name: entry.file_name().to_string_lossy().to_string(),
+            name: name.to_string_lossy().to_string(),
             is_dir,
             is_symlink,
             size,
@@ -201,12 +253,12 @@ fn collect_entries(
     for entry in level {
         // Stop the whole walk once the scan budget is reached; the caller marks
         // the total as a lower bound.
-        if out.len() >= budget {
+        if out.len() >= options.budget {
             return Ok(());
         }
         // Descend into real subdirectories only: never follow a symlink, so the
         // walk cannot cycle or leave the resolved root.
-        let child = if entry.is_dir && !entry.is_symlink && depth + 1 < max_depth {
+        let child = if entry.is_dir && !entry.is_symlink && depth + 1 < options.max_depth {
             Some(dir_path.join(&entry.name))
         } else {
             None
@@ -214,7 +266,15 @@ fn collect_entries(
         let child_label = entry.name.clone();
         out.push(entry);
         if let Some(child) = child {
-            collect_entries(&child, &child_label, depth + 1, max_depth, budget, out)?;
+            let child_relative = relative_dir.join(&child_label);
+            collect_entries(
+                &child,
+                &child_relative,
+                &child_label,
+                depth + 1,
+                options,
+                out,
+            )?;
         }
     }
     Ok(())
@@ -363,6 +423,7 @@ mod tests {
                 recursive,
                 depth,
                 long: false,
+                ignore: None,
             },
         )
         .unwrap()
@@ -392,6 +453,7 @@ mod tests {
                 recursive: false,
                 depth: None,
                 long: true,
+                ignore: None,
             },
         )
         .unwrap()
@@ -415,6 +477,7 @@ mod tests {
                 recursive: false,
                 depth: None,
                 long: false,
+                ignore: None,
             },
         )
         .unwrap();
@@ -468,6 +531,56 @@ mod tests {
     }
 
     #[test]
+    fn ls_ignore_string_filters_matching_entries() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::write(dir.path.join("app.log"), "x").unwrap();
+        fs::write(dir.path.join("app.rs"), "x").unwrap();
+
+        let output = execute(&root, &json!({ "ignore": "*.log" }), false).unwrap();
+
+        assert_eq!(output.content, "app.rs");
+        assert_eq!(output.metadata.get("entries"), Some(&json!(1)));
+    }
+
+    #[test]
+    fn ls_ignore_array_filters_multiple_patterns_and_prunes_directories() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+        fs::create_dir_all(dir.path.join("target/debug")).unwrap();
+        fs::create_dir_all(dir.path.join("src/generated")).unwrap();
+        fs::write(dir.path.join("target/debug/build.log"), "x").unwrap();
+        fs::write(dir.path.join("src/generated/schema.rs"), "x").unwrap();
+        fs::write(dir.path.join("src/lib.rs"), "x").unwrap();
+
+        let output = execute(
+            &root,
+            &json!({
+                "recursive": true,
+                "depth": 3,
+                "ignore": ["target", "**/generated"]
+            }),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(output.content, "src/\n  lib.rs");
+        assert_eq!(output.metadata.get("entries"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn ls_rejects_invalid_ignore_glob() {
+        let dir = temp_dir();
+        let root = root_of(&dir);
+
+        let error = execute(&root, &json!({ "ignore": "[" }), false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid glob pattern"), "{error}");
+    }
+
+    #[test]
     fn ls_depth_bounds_descent() {
         let dir = temp_dir();
         let root = root_of(&dir);
@@ -506,6 +619,7 @@ mod tests {
                 recursive: false,
                 depth: None,
                 long: false,
+                ignore: None,
             },
         )
         .unwrap_err()
@@ -522,6 +636,7 @@ mod tests {
                 recursive,
                 depth,
                 long: false,
+                ignore: None,
             },
         )
         .unwrap()
@@ -564,6 +679,7 @@ mod tests {
                 recursive: false,
                 depth: None,
                 long: false,
+                ignore: None,
             },
         )
         .unwrap();
@@ -626,7 +742,12 @@ mod tests {
         }
         // Full depth-2 tree = 3 dirs + 9 files = 12 entries; budget 4 stops at 4.
         let mut entries = Vec::new();
-        collect_entries(&dir.path, ".", 0, 2, 4, &mut entries).unwrap();
+        let walk = WalkOptions {
+            max_depth: 2,
+            budget: 4,
+            ignore: &[],
+        };
+        collect_entries(&dir.path, Path::new(""), ".", 0, &walk, &mut entries).unwrap();
         assert_eq!(entries.len(), 4, "collection is bounded by the scan budget");
 
         let out = render_listing(
