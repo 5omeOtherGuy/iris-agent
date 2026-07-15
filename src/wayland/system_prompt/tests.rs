@@ -363,7 +363,8 @@ fn subagent_fragment_renders_only_with_the_live_spawn_tool() {
     assert!(with_subagents.contains("<subagent_delegation>"));
     for rule in [
         "Delegate only when it has a clear payoff",
-        "one self-contained outcome",
+        "Delegate one outcome per worker",
+        "Use foreground execution when the result blocks further work",
         "Treat worker output as evidence, not completion",
         "Never claim the parent workspace changed until apply succeeds",
     ] {
@@ -383,7 +384,7 @@ fn no_other_tools_guardrail_mentions_subagents_only_when_they_are_absent() {
 
     let with_subagents = available_tools_body(&named_tools(&["spawn_subagent"]));
     assert!(!with_subagents.contains("multi_tool wrappers, subagents"));
-    assert!(with_subagents.contains("multi_tool wrappers or hidden parallel tool APIs"));
+    assert!(with_subagents.contains("multi_tool wrappers, or hidden parallel tool APIs"));
 }
 
 #[test]

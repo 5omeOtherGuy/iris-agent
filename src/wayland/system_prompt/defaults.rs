@@ -80,6 +80,11 @@ pub(super) const DEFAULTS: &[Default] = &[
         body: COMPACTION_RECALL,
     },
     Default {
+        name: "subagent_delegation",
+        slot: Some(12),
+        body: SUBAGENT_DELEGATION,
+    },
+    Default {
         name: "tool_use",
         slot: None,
         body: TOOL_USE,
@@ -160,6 +165,12 @@ const FILE_LINKS: &str = r#"Link every file you mention when the interface suppo
 const COMPACTION_RECALL: &str = r#"When the context grows large, an earlier stretch of this conversation is compacted: the original turns are replaced by a short summary that begins with "[compacted summary ...]" or "[auto-compacted summary ...]", sometimes followed by a "[files touched or read in the compacted range]" list and a "[recall] ... recall(handle="...")" reference. The originals are not lost -- they are stored durably and retrievable on demand.
 
 Use the recall tool when the summary dropped a specific detail you now need (an exact path, symbol, value, or decision). Address the originals either by the `handle` from the recall reference, or -- without a handle -- by a `from`/`to` entry-id span read directly from this session. A local "[folded]" tool-result stub gives an exact `recall(tool_call_id="...")` instruction. A provider-native cleared tool result can be recovered the same way from its preserved tool-call id. Search first with a `pattern` to locate where a compacted detail lives -- it returns matching turns with their entry ids -- then do a windowed read (offset/limit, or a from/to entry-id span) targeting the hit. Do not page the whole range back in: that re-inflates the context compaction just reduced. Recall retrieves on demand; it does not un-compact, and it never rewrites live context."#;
+
+const SUBAGENT_DELEGATION: &str = r#"Delegate only when it has a clear payoff: the user asks for a subagent, a bounded independent task can run concurrently, or context-heavy independent investigation would crowd the parent context. Handle focused searches, a few file reads, and small visible edits directly.
+
+Delegate one outcome per worker. Grant the narrowest capability and tool set that can complete it. Use foreground execution when the result blocks further work. For different independent tasks, spawn separate background workers and continue useful parent work; do not poll while useful work remains. For best-of-N attempts at the same task, use one `spawn_subagent` call with `count`, wait for every member to become terminal, inspect every result, then call `select_subagent_candidate`.
+
+Treat worker output as evidence, not completion. Review and synthesize it, call `cancel_subagent` for obsolete work, and verify the combined result yourself. You own the final answer. Mutable work remains isolated: call `plan_subagent_apply`, review the plan, then call the separately approval-gated `apply_subagent`. Never claim the parent workspace changed until apply succeeds."#;
 
 const TOOL_USE: &str = r#"Use context first; reach for a tool when it would change your answer — never guess what a tool can tell you. Run independent read-only calls in parallel; never parallelize edits to the same file. Don't re-read content you already have.
 

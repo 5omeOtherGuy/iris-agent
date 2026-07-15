@@ -79,6 +79,10 @@ const GEN_TOOL_GUIDELINES: &str = "available_tool_guidelines";
 /// registered -- so a build without the tool never advertises an absent
 /// affordance.
 const FRAGMENT_COMPACTION_RECALL: &str = "compaction_recall";
+/// Tool-gated orchestration guidance. Keep it out of builds that do not expose
+/// first-class delegated workers.
+const FRAGMENT_SUBAGENT_DELEGATION: &str = "subagent_delegation";
+const TOOL_SPAWN_SUBAGENT: &str = "spawn_subagent";
 
 /// Project-doc filenames discovered per directory, in priority order (first
 /// existing wins for that directory). Mirrors pi's candidate list.
@@ -182,13 +186,15 @@ fn build_prompt(
     let identity = take_anchor(&mut fragments, ANCHOR_IDENTITY);
     let tool_use = take_anchor(&mut fragments, ANCHOR_TOOL_USE);
     fragments.retain(|f| f.name != GEN_AVAILABLE_TOOLS && f.name != GEN_TOOL_GUIDELINES);
-    // Tool-gated fragments render only when their tool is in the live registry
-    // (ADR-0046): drop the recall guidance when recall is not registered.
+    // Tool-gated fragments render only when their affordance is live.
     if tools
         .by_name(crate::tools::recall::RECALL_TOOL_NAME)
         .is_none()
     {
         fragments.retain(|f| f.name != FRAGMENT_COMPACTION_RECALL);
+    }
+    if tools.by_name(TOOL_SPAWN_SUBAGENT).is_none() {
+        fragments.retain(|f| f.name != FRAGMENT_SUBAGENT_DELEGATION);
     }
     let middles = order_middles(fragments);
 
@@ -265,10 +271,17 @@ fn available_tools_body(tools: &Tools) -> String {
     for tool in tools.iter() {
         body.push_str(&format!("\n- {}: {}", tool.name(), tool.description()));
     }
-    body.push_str(
-        "\n\nNo other tools are available. Do not assume Codex CLI/native agent tools, \
+    if tools.by_name(TOOL_SPAWN_SUBAGENT).is_some() {
+        body.push_str(
+            "\n\nNo other tools are available. Do not assume Codex CLI/native agent tools, \
+multi_tool wrappers, or hidden parallel tool APIs exist.",
+        );
+    } else {
+        body.push_str(
+            "\n\nNo other tools are available. Do not assume Codex CLI/native agent tools, \
 multi_tool wrappers, subagents, or hidden parallel tool APIs exist.",
-    );
+        );
+    }
     body
 }
 
