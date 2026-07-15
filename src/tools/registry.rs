@@ -270,7 +270,7 @@ impl Tool for SpawnSubagentTool {
                 "prompt": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Self-contained instruction for a fresh worker that does not receive the parent conversation. Include the goal, relevant context, scope, constraints, verification, and expected return format."
+                    "description": "Self-contained instruction for a fresh worker that does not receive the parent conversation. Include the goal, a verifiable definition of done, relevant context, scope, constraints, required verification, and expected return format."
                 },
                 "description": {
                     "type": "string",
@@ -2222,7 +2222,7 @@ mod tests {
         for (field, description) in [
             (
                 "prompt",
-                "Self-contained instruction for a fresh worker that does not receive the parent conversation. Include the goal, relevant context, scope, constraints, verification, and expected return format.",
+                "Self-contained instruction for a fresh worker that does not receive the parent conversation. Include the goal, a verifiable definition of done, relevant context, scope, constraints, required verification, and expected return format.",
             ),
             (
                 "description",
