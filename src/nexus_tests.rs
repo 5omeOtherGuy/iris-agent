@@ -6724,7 +6724,7 @@ impl ChatProvider for SurfaceProbe {
     }
 }
 
-const FULL_SURFACE: [&str; 10] = [
+const FULL_SURFACE: [&str; 13] = [
     "read",
     "bash",
     "edit",
@@ -6733,6 +6733,9 @@ const FULL_SURFACE: [&str; 10] = [
     "find",
     "ls",
     "AskUserQuestion",
+    "get_goal",
+    "create_goal",
+    "update_goal",
     "read_output",
     "recall",
 ];
@@ -6763,6 +6766,9 @@ fn native_edit_capability_hides_only_edit_but_keeps_it_executable() {
             "find",
             "ls",
             "AskUserQuestion",
+            "get_goal",
+            "create_goal",
+            "update_goal",
             "read_output",
             "recall"
         ]
@@ -6869,6 +6875,9 @@ fn native_edit_provider_is_advertised_a_surface_without_edit() -> Result<()> {
             "find",
             "ls",
             "AskUserQuestion",
+            "get_goal",
+            "create_goal",
+            "update_goal",
             "read_output",
             "recall"
         ]

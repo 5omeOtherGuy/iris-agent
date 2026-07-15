@@ -10,6 +10,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 
 use crate::config;
+use crate::goal::{GoalCommand, display_lines, parse_goal_command};
 use crate::mimir::model_capabilities;
 use crate::mimir::selection::{self, ModelSelection, ProviderId, ReasoningEffort};
 use crate::nexus::{
@@ -1419,11 +1420,12 @@ pub(crate) fn run_interactive<P: ChatProvider>(
     // a list before this point whenever the plain renderer is requested or stdio
     // is not a terminal; if TUI creation fails after requesting a startup modal,
     // the branch above errors instead of silently starting a fresh session.
+    let resume_goal = startup.resumed_session.is_some();
     let mut ui = crate::ui::text::TextUi::stdio();
     for notice in startup.notices {
         ui.emit(crate::ui::UiEvent::Notice(notice))?;
     }
-    run_session(harness, &mut ui, switch)
+    run_session_with_goal_resume(harness, &mut ui, switch, resume_goal)
 }
 
 /// Whether the interactive entry point will fall back to the plain, ANSI-free
@@ -1505,17 +1507,115 @@ pub(crate) fn run_print_turn<P: ChatProvider>(
 /// background watcher thread trips when the user presses Ctrl-C. The blocking
 /// stdin reads and rendering stay synchronous; only the turn itself runs on the
 /// runtime so provider streams and tools are raced against cancellation.
+#[cfg(test)]
 pub(crate) fn run_session<P: ChatProvider>(
     harness: &mut Harness<P>,
     ui: &mut dyn Ui,
     switch: &mut Option<ModelSwitch<'_, P>>,
 ) -> Result<()> {
+    run_session_with_goal_resume(harness, ui, switch, false)
+}
+
+fn run_session_with_goal_resume<P: ChatProvider>(
+    harness: &mut Harness<P>,
+    ui: &mut dyn Ui,
+    switch: &mut Option<ModelSwitch<'_, P>>,
+    resume_goal: bool,
+) -> Result<()> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    let result = run_session_inner(harness, ui, &runtime, switch);
+    let result = run_session_inner(harness, ui, &runtime, switch, resume_goal);
     // Bound shutdown so an orphaned blocking provider request (the loop dropped
     // its stream on cancel) cannot hang process exit, including early error exits.
     runtime.shutdown_timeout(Duration::from_secs(1));
     result
+}
+
+fn handle_text_goal_command<P: ChatProvider>(
+    command: GoalCommand,
+    harness: &mut Harness<P>,
+) -> (Vec<String>, Option<String>) {
+    let mut start = None;
+    let lines = match command {
+        GoalCommand::Show => display_lines(harness.goal().as_ref()),
+        GoalCommand::Set(objective) => {
+            if harness
+                .goal()
+                .as_ref()
+                .is_some_and(|goal| goal.status.is_unfinished())
+            {
+                vec![
+                    "an unfinished goal already exists; use the interactive TUI to confirm replacement, or clear it first"
+                        .to_string(),
+                ]
+            } else {
+                match harness.replace_goal(&objective, None) {
+                    Ok(goal) => {
+                        start = Some(crate::goal::render_continuation(&goal));
+                        display_lines(Some(&goal))
+                    }
+                    Err(error) => vec![format!("could not set goal: {error:#}")],
+                }
+            }
+        }
+        GoalCommand::Replace(objective) => match harness.replace_goal(&objective, None) {
+            Ok(goal) => {
+                start = Some(crate::goal::render_continuation(&goal));
+                display_lines(Some(&goal))
+            }
+            Err(error) => vec![format!("could not replace goal: {error:#}")],
+        },
+        GoalCommand::Clear => match harness.clear_goal() {
+            Ok(true) => vec!["goal cleared".to_string()],
+            Ok(false) => vec!["no goal is set".to_string()],
+            Err(error) => vec![format!("could not clear goal: {error:#}")],
+        },
+        GoalCommand::Edit => vec![
+            "goal editing requires the interactive TUI; clear and recreate it in text mode"
+                .to_string(),
+        ],
+        GoalCommand::EditValue(objective) => match harness.edit_goal(&objective) {
+            Ok(goal) => display_lines(Some(&goal)),
+            Err(error) => vec![format!("could not edit goal: {error:#}")],
+        },
+        GoalCommand::Pause => match harness.pause_goal() {
+            Ok(goal) => display_lines(Some(&goal)),
+            Err(error) => vec![format!("could not pause goal: {error:#}")],
+        },
+        GoalCommand::Resume => match harness.resume_goal() {
+            Ok(goal) => {
+                start = Some(crate::goal::render_continuation(&goal));
+                display_lines(Some(&goal))
+            }
+            Err(error) => vec![format!("could not resume goal: {error:#}")],
+        },
+    };
+    (lines, start)
+}
+
+fn run_text_turn<P: ChatProvider>(
+    harness: &mut Harness<P>,
+    ui: &mut dyn Ui,
+    runtime: &Runtime,
+    prompt: &str,
+) -> Result<()> {
+    crate::signals::reset();
+    let token = CancellationToken::new();
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = std::thread::spawn({
+        let token = token.clone();
+        let done = Arc::clone(&done);
+        move || watch_for_interrupt(&token, &done)
+    });
+    let result = {
+        let bridge = UiBridge::new(ui);
+        runtime.block_on(harness.submit_turn(prompt, &bridge, &bridge, &token))
+    };
+    done.store(true, Ordering::Relaxed);
+    let _ = watcher.join();
+    if let Err(error) = result {
+        ui.emit(UiEvent::from_turn_error(&error))?;
+    }
+    Ok(())
 }
 
 fn run_session_inner<P: ChatProvider>(
@@ -1523,8 +1623,21 @@ fn run_session_inner<P: ChatProvider>(
     ui: &mut dyn Ui,
     runtime: &Runtime,
     switch: &mut Option<ModelSwitch<'_, P>>,
+    resume_goal: bool,
 ) -> Result<()> {
     ui.emit(UiEvent::SessionStarted)?;
+    if resume_goal
+        && let Some(goal) = harness
+            .goal()
+            .filter(|goal| goal.status == crate::goal::GoalStatus::Active)
+    {
+        run_text_turn(
+            harness,
+            ui,
+            runtime,
+            &crate::goal::render_continuation(&goal),
+        )?;
+    }
 
     while let Some(prompt) = ui.next_prompt()? {
         let prompt = prompt.trim();
@@ -1540,6 +1653,16 @@ fn run_session_inner<P: ChatProvider>(
             Some((cmd, rest)) => (cmd, rest.trim()),
             None => (prompt, ""),
         };
+        if let Some(command) = parse_goal_command(prompt) {
+            let (lines, start) = handle_text_goal_command(command, harness);
+            for line in lines {
+                ui.emit(UiEvent::Notice(line))?;
+            }
+            if let Some(goal_prompt) = start {
+                run_text_turn(harness, ui, runtime, &goal_prompt)?;
+            }
+            continue;
+        }
         if cmd == "/copy" {
             for line in copy_command_lines(harness, rest) {
                 ui.emit(UiEvent::Notice(line))?;
@@ -1669,32 +1792,7 @@ fn run_session_inner<P: ChatProvider>(
             continue;
         }
 
-        // Clear any stale interrupt BEFORE arming the watcher, so a Ctrl-C left
-        // over from the idle prompt cannot cancel this fresh turn immediately.
-        crate::signals::reset();
-        let token = CancellationToken::new();
-        let done = Arc::new(AtomicBool::new(false));
-        let watcher = std::thread::spawn({
-            let token = token.clone();
-            let done = Arc::clone(&done);
-            move || watch_for_interrupt(&token, &done)
-        });
-
-        // One bridge per turn backs both Nexus seams (observer + approval gate)
-        // from two shared borrows; it drops here so `ui` is free for the
-        // session-driver events below.
-        let result = {
-            let bridge = UiBridge::new(ui);
-            runtime.block_on(harness.submit_turn(prompt, &bridge, &bridge, &token))
-        };
-        // Stop and join the watcher so it cannot leak past the turn or trip the
-        // next one.
-        done.store(true, Ordering::Relaxed);
-        let _ = watcher.join();
-
-        if let Err(error) = result {
-            ui.emit(UiEvent::from_turn_error(&error))?;
-        }
+        run_text_turn(harness, ui, runtime, prompt)?;
     }
 
     ui.shutdown()?;
@@ -1726,7 +1824,10 @@ mod tests {
     use std::{cell::RefCell, env};
 
     use crate::mimir::test_support::ConfigPathGuard;
-    use crate::nexus::{Agent, AssistantTurn, Message, ProviderEvent, ProviderStream, Tools};
+    use crate::nexus::{
+        Agent, AssistantTurn, Message, ProviderEvent, ProviderStream, ToolCall, Tools,
+    };
+    use crate::session::SessionLog;
     use crate::ui::text::TextUi;
     use crate::wayland::Harness;
 
@@ -2500,6 +2601,46 @@ mod tests {
             !lines.iter().any(|l| l.contains("/compact")),
             "a small carried context needs no advisory: {lines:?}"
         );
+    }
+
+    #[test]
+    fn text_resume_automatically_continues_an_active_goal() -> Result<()> {
+        let dir = crate::tools::test_support::temp_dir();
+        let session = SessionLog::create_in(&dir.path, &dir.path)?;
+        let completion = AssistantTurn {
+            tool_calls: vec![ToolCall {
+                id: "goal-complete".to_string(),
+                name: "update_goal".to_string(),
+                arguments: serde_json::json!({"status": "complete"}),
+                thought_signature: None,
+            }],
+            ..AssistantTurn::default()
+        };
+        let provider = FakeProvider::new(vec![
+            Ok(completion),
+            Ok(AssistantTurn::text("resumed goal done")),
+        ]);
+        let agent = Agent::new(provider, crate::tools::built_in_tools());
+        let mut harness = Harness::new(
+            agent,
+            dir.path.clone(),
+            crate::tools::ToolState::new(),
+            Some(session),
+            None,
+        );
+        harness.replace_goal("finish after resume", None)?;
+        let mut ui = TextUi::new("/quit\n".as_bytes(), Vec::new(), Vec::new());
+        let mut switch = None;
+
+        run_session_with_goal_resume(&mut harness, &mut ui, &mut switch, true)?;
+
+        assert_eq!(
+            harness.goal().unwrap().status,
+            crate::goal::GoalStatus::Complete
+        );
+        let (_, output, _) = ui.into_parts();
+        assert!(String::from_utf8(output)?.contains("resumed goal done"));
+        Ok(())
     }
 
     #[test]

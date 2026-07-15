@@ -2,11 +2,13 @@
 //! task-attribution markers, and the flat fuzzy filter (`/` or `@`-entry).
 //!
 //! Data: `git ls-files --cached --others --exclude-standard` when the root is
-//! a repo (respects .gitignore), plain readdir otherwise. `↵` on a file
+//! a repo (respects .gitignore), plain readdir otherwise. Non-repo filtering
+//! lazily inventories nested files with the same in-process `ignore` walker
+//! used by the search tools. `↵` on a file
 //! inserts `@<relative-path> ` into the composer; `↵` on a dir toggles it.
 //! No box-drawing tree guides — indent + `▾`/`▸` carry the structure.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -58,6 +60,9 @@ pub(crate) struct TreeMenu {
     cwd: PathBuf,
     /// Repo file list relative to `root` (`None` = non-repo readdir mode).
     files: Option<Vec<String>>,
+    /// Non-repo search inventory, populated once on first filter render so
+    /// opening the ordinary tree does not recursively walk the workspace.
+    filter_files: OnceCell<Vec<String>>,
     /// Directory listing cache (key = dir rel path, `""` = root). Behind a
     /// `RefCell` so the read-only render path can fill it in place — the tree
     /// is never cloned per frame to obtain `&mut` for the cache.
@@ -75,6 +80,7 @@ impl TreeMenu {
             root: cwd.clone(),
             cwd,
             files: None,
+            filter_files: OnceCell::new(),
             children: RefCell::new(BTreeMap::new()),
             expanded: BTreeSet::new(),
             selected: 0,
@@ -99,6 +105,7 @@ impl TreeMenu {
     /// (Re)load the file list for the current root.
     fn reload(&mut self) {
         self.children.get_mut().clear();
+        self.filter_files.take();
         self.expanded.clear();
         self.selected = 0;
         self.files = git::is_git_worktree(&self.root)
@@ -274,15 +281,31 @@ impl TreeMenu {
     }
 
     fn filter_matches(&self, input: &str) -> Vec<String> {
-        match &self.files {
-            Some(files) => files
-                .iter()
-                .filter(|file| fuzzy_match(input, file))
-                .take(VISIBLE_ROW_CAP)
-                .cloned()
-                .collect(),
-            None => Vec::new(),
-        }
+        let files = self.files.as_ref().unwrap_or_else(|| {
+            self.filter_files.get_or_init(|| {
+                ignore::WalkBuilder::new(&self.root)
+                    .require_git(false)
+                    .follow_links(false)
+                    .build()
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+                    .filter_map(|entry| {
+                        entry
+                            .path()
+                            .strip_prefix(&self.root)
+                            .ok()
+                            .map(|relative| relative.display().to_string())
+                    })
+                    .take(FILE_CAP)
+                    .collect()
+            })
+        });
+        files
+            .iter()
+            .filter(|file| fuzzy_match(input, file))
+            .take(VISIBLE_ROW_CAP)
+            .cloned()
+            .collect()
     }
 
     /// The `@`-reference text for a rel path: cwd-relative when possible.
@@ -770,6 +793,7 @@ mod tests {
             root: PathBuf::from("/repo"),
             cwd: PathBuf::from("/repo"),
             files: Some(files.iter().map(|f| f.to_string()).collect()),
+            filter_files: OnceCell::new(),
             children: RefCell::new(BTreeMap::new()),
             expanded: BTreeSet::new(),
             selected: 0,
@@ -852,6 +876,34 @@ mod tests {
     }
 
     #[test]
+    fn at_filter_finds_nested_files_outside_a_git_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "iris-tree-filter-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src/ui")).unwrap();
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(root.join("src/ui/screen.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("ignored/screen.rs"), "ignored\n").unwrap();
+
+        let mut tree = TreeMenu::new(root.clone(), true);
+        for character in "screen".chars() {
+            tree.handle_key(MenuKey::Char(character), false);
+        }
+
+        let text = lines_text(&tree.render_lines(60, 16, false, None, &[]));
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(text.contains("screen.rs"), "{text}");
+        assert!(text.contains("src/ui/"), "{text}");
+        assert!(!text.contains("ignored/"), "{text}");
+    }
+
+    #[test]
     fn attribution_markers_render_from_the_status_partition() {
         let mut t = tree(FILES);
         // Expand src/ and src/ui/ so the marked files are visible.
@@ -883,6 +935,7 @@ mod tests {
                 "repo/Cargo.toml".to_string(),
                 "other/README.md".to_string(),
             ]),
+            filter_files: OnceCell::new(),
             children: RefCell::new(BTreeMap::new()),
             expanded: BTreeSet::new(),
             selected: 0,
@@ -928,6 +981,7 @@ mod tests {
                 "repo/src/c.rs".to_string(),
                 "other/README.md".to_string(),
             ]),
+            filter_files: OnceCell::new(),
             children: RefCell::new(BTreeMap::new()),
             expanded: BTreeSet::new(),
             selected: 0,

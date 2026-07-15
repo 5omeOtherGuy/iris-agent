@@ -31,6 +31,7 @@ mod bash;
 pub(crate) mod bench_support;
 mod edit;
 mod find;
+mod goal;
 mod grep;
 mod ls;
 mod observe;
@@ -120,6 +121,9 @@ pub(crate) struct ToolState {
     /// pair-closed boundary. Shared atomically with the compaction engine so
     /// the concrete tool sets intent but never owns context mutation.
     pub(crate) compaction_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Saved-session goal lifecycle injected by Wayland. Goal tools fail clearly
+    /// when this is absent instead of creating ephemeral state.
+    goal: Option<std::rc::Rc<dyn crate::nexus::GoalController>>,
 }
 
 impl ToolState {
@@ -136,7 +140,19 @@ impl ToolState {
             workspace_restrictions: None,
             read_workspace_restrictions: None,
             compaction_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            goal: None,
         }
+    }
+
+    pub(crate) fn set_goal_controller(
+        &mut self,
+        goal: std::rc::Rc<dyn crate::nexus::GoalController>,
+    ) {
+        self.goal = Some(goal);
+    }
+
+    pub(crate) fn goal_controller(&self) -> Option<&dyn crate::nexus::GoalController> {
+        self.goal.as_deref()
     }
 
     /// Benchmark-only arm switch (issue #210): build a state with output
@@ -341,6 +357,9 @@ mod tests {
                 "find",
                 "ls",
                 "AskUserQuestion",
+                "get_goal",
+                "create_goal",
+                "update_goal",
                 "read_output",
                 "recall"
             ]
@@ -377,7 +396,16 @@ mod tests {
         let names: Vec<&str> = on.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
-            vec!["bash", "edit", "AskUserQuestion", "read_output", "recall"]
+            vec![
+                "bash",
+                "edit",
+                "AskUserQuestion",
+                "get_goal",
+                "create_goal",
+                "update_goal",
+                "read_output",
+                "recall"
+            ]
         );
         for gone in ["read", "write", "grep", "find", "ls"] {
             assert!(on.by_name(gone).is_none(), "{gone} should be deactivated");

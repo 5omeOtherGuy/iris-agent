@@ -886,6 +886,19 @@ pub(crate) trait SessionSpanReader {
     fn recall_tool_call(&self, tool_call_id: &str) -> Result<Vec<(Option<String>, Message)>>;
 }
 
+/// Session-scoped goal control exposed to model-facing goal tools. Wayland owns
+/// persistence and lifecycle policy; Nexus only carries this injected contract.
+pub(crate) trait GoalController {
+    fn get_goal(&self) -> Result<Value>;
+    fn create_goal(
+        &self,
+        objective: &str,
+        token_budget: Option<u64>,
+        time_budget_seconds: Option<u64>,
+    ) -> Result<Value>;
+    fn update_goal(&self, status: &str) -> Result<Value>;
+}
+
 /// Display-only live-output sink for a running tool (issue #90 sub-item 1). A
 /// long-running tool (today only `bash`) forwards each output chunk here as it
 /// is produced; Nexus wraps it per-call and re-emits an

@@ -40,6 +40,7 @@ const HANDLE_ID_BYTES: usize = 16;
 /// Local, session-scoped store for oversized tool outputs. Holds only the target
 /// directory; the directory is created lazily on first write so a session that
 /// never offloads leaves nothing behind.
+#[derive(Clone)]
 pub(crate) struct HandleStore {
     dir: PathBuf,
 }

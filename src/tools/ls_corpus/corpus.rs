@@ -144,6 +144,7 @@ fn iris_listing(entries: &[ParsedEntry]) -> (TestDir, String) {
             recursive: false,
             depth: None,
             long: false,
+            ignore: None,
         },
     )
     .unwrap()
@@ -191,6 +192,7 @@ fn corpus_overhead_under_10ms_per_call() {
             recursive: false,
             depth: None,
             long: false,
+            ignore: None,
         };
         // Warm the OS page cache before timing.
         let _ = ls(&root, &input).unwrap();

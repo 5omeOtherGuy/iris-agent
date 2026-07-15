@@ -47,6 +47,11 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         action: SlashAction::Exit,
     },
     SlashCommand {
+        name: "/goal",
+        description: "Show or manage a persistent long-running session goal",
+        action: SlashAction::Submit,
+    },
+    SlashCommand {
         name: "/model",
         description: "Model & reasoning (opens settings › engine, or /model <id>)",
         action: SlashAction::Submit,
@@ -332,6 +337,16 @@ mod tests {
         assert_eq!(se[2].name, "/settings");
         assert!(matches("/zzz").is_empty());
         assert!(matches("hello").is_empty());
+    }
+
+    #[test]
+    fn goal_command_is_registered_and_submits() {
+        let command = COMMANDS
+            .iter()
+            .find(|command| command.name == "/goal")
+            .expect("/goal must be registered");
+        assert_eq!(command.action, SlashAction::Submit);
+        assert_eq!(matches("/go")[0].name, "/goal");
     }
 
     #[test]

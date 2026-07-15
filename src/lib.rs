@@ -18,6 +18,7 @@ mod config;
 mod display_path;
 mod errors;
 mod git;
+mod goal;
 mod handles;
 mod metrics;
 mod mimir;
@@ -34,6 +35,8 @@ mod tools;
 mod ui;
 mod wayland;
 
+#[cfg(test)]
+mod goal_tests;
 #[cfg(test)]
 mod structured_summary_probe;
 
