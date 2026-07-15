@@ -307,6 +307,31 @@ impl ChatProvider for SequenceProvider {
     }
 }
 
+#[test]
+fn create_goal_tool_requires_explicit_goal_and_budget_requests() {
+    let tools = built_in_tools();
+    let tool = tools.by_name("create_goal").expect("create_goal tool");
+
+    assert!(
+        tool.description()
+            .contains("only when explicitly requested by the user or system/developer instructions")
+    );
+    assert!(
+        tool.description()
+            .contains("do not infer goals from ordinary tasks")
+    );
+
+    let parameters = tool.parameters();
+    for name in ["token_budget", "time_budget_seconds"] {
+        assert!(
+            parameters["properties"][name]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Omit unless explicitly requested")),
+            "{name} must require an explicit request"
+        );
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn goal_tools_are_registered_and_mutate_only_through_the_goal_controller() {
     let tools = built_in_tools();
