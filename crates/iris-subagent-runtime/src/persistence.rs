@@ -26,6 +26,8 @@ pub(crate) enum JournalRecord {
     Terminal {
         schema_version: u32,
         result: WorkerResult,
+        #[serde(default)]
+        events: Vec<WorkerEvent>,
     },
     Group {
         schema_version: u32,
@@ -88,6 +90,19 @@ impl Journal {
 
     pub fn append(&self, record: &JournalRecord) -> Result<(), RuntimeError> {
         self.append_many(std::slice::from_ref(record))
+    }
+
+    /// Persists the result and terminal events in one recoverable record.
+    pub fn finish(
+        &self,
+        result: &WorkerResult,
+        events: &[WorkerEvent],
+    ) -> Result<(), RuntimeError> {
+        self.append(&JournalRecord::Terminal {
+            schema_version: SCHEMA_VERSION,
+            result: result.clone(),
+            events: events.to_vec(),
+        })
     }
 
     fn append_many(&self, records: &[JournalRecord]) -> Result<(), RuntimeError> {
@@ -177,9 +192,11 @@ impl Journal {
                 JournalRecord::Terminal {
                     schema_version,
                     result,
+                    events,
                 } => {
                     check_schema(&self.path, schema_version)?;
                     if let Some(worker) = state.workers.get_mut(&result.worker_id) {
+                        worker.events.extend(events);
                         worker.result = Some(result);
                     }
                 }
@@ -226,6 +243,82 @@ mod tests {
     use super::*;
     use crate::{WorkerEventKind, WorkerStatus};
     use rand::random;
+
+    #[test]
+    fn terminal_result_and_completion_events_recover_atomically() {
+        let root = std::env::temp_dir().join(format!("iris-journal-{:032x}", random::<u128>()));
+        let journal = Journal::open(&root).unwrap();
+        let id = WorkerId::new();
+        let request = WorkerRequest::read_only("run");
+        let queued = WorkerEvent {
+            schema_version: SCHEMA_VERSION,
+            worker_id: id.clone(),
+            sequence: 1,
+            timestamp_ms: 1,
+            kind: WorkerEventKind::Status(WorkerStatus::Queued),
+        };
+        journal.accept(&id, None, &request, &queued).unwrap();
+        let result = WorkerResult {
+            schema_version: SCHEMA_VERSION,
+            worker_id: id.clone(),
+            status: WorkerStatus::Completed,
+            summary: "done".to_string(),
+            inline_output: Some("output".to_string()),
+            artifacts: Vec::new(),
+            usage: crate::Usage::default(),
+            changed_paths: Vec::new(),
+            worktree: None,
+            apply_plan_id: None,
+            host: Default::default(),
+            message: None,
+        };
+        let terminal_events = [
+            WorkerEvent {
+                schema_version: SCHEMA_VERSION,
+                worker_id: id.clone(),
+                sequence: 2,
+                timestamp_ms: 2,
+                kind: WorkerEventKind::Status(WorkerStatus::Completed),
+            },
+            WorkerEvent {
+                schema_version: SCHEMA_VERSION,
+                worker_id: id.clone(),
+                sequence: 3,
+                timestamp_ms: 3,
+                kind: WorkerEventKind::Completed,
+            },
+        ];
+        journal.finish(&result, &terminal_events).unwrap();
+
+        let bytes = fs::read(journal.path()).unwrap();
+        let records = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<JournalRecord>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        let JournalRecord::Terminal { events, .. } = &records[2] else {
+            panic!("third record must atomically contain terminal state");
+        };
+        assert_eq!(events, &terminal_events);
+
+        let terminal_end = bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .nth(2)
+            .map(|(index, _)| index + 1)
+            .unwrap();
+        fs::write(journal.path(), &bytes[..terminal_end]).unwrap();
+        let recovered = journal.recover().unwrap();
+        let worker = &recovered.workers[&id];
+        assert_eq!(worker.result.as_ref(), Some(&result));
+        let expected_events = std::iter::once(queued)
+            .chain(terminal_events)
+            .collect::<Vec<_>>();
+        assert_eq!(worker.events, expected_events);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn partial_last_line_is_ignored() {

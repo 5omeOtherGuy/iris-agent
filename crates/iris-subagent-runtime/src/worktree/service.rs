@@ -235,12 +235,14 @@ impl WorktreeService {
                 path.display()
             )));
         }
-        let mode = if matches!(
+        let prefer_btrfs = matches!(
             request.strategy,
             StrategyPreference::Auto | StrategyPreference::BtrfsPreferred
-        ) && self.btrfs_eligible(&source_input, &source_repo, cancellation)
+        );
+        let mode = if prefer_btrfs
+            && self.btrfs_eligible(&source_input, &source_repo, &base_commit, cancellation)
         {
-            match self.create_btrfs(&source_repo, &path, cancellation) {
+            match self.create_btrfs(&source_repo, &path, &base_commit, cancellation) {
                 Ok(()) => CreationMode::BtrfsSnapshot,
                 Err(_) => {
                     self.cleanup_partial_btrfs(&path, cancellation);
@@ -635,9 +637,16 @@ impl WorktreeService {
         &self,
         source: &Path,
         source_repo: &Path,
+        base_commit: &str,
         cancellation: &WorktreeCancellation,
     ) -> bool {
         if source != source_repo || !source_repo.join(".git").is_dir() {
+            return false;
+        }
+        let source_head_matches = self
+            .git_text(source_repo, ["rev-parse", "HEAD^{commit}"], cancellation)
+            .is_ok_and(|head| head == base_commit);
+        if !source_head_matches {
             return false;
         }
         let clean = self
@@ -668,6 +677,7 @@ impl WorktreeService {
         &self,
         source: &Path,
         path: &Path,
+        base_commit: &str,
         cancellation: &WorktreeCancellation,
     ) -> Result<(), RuntimeError> {
         self.run_success(
@@ -685,6 +695,16 @@ impl WorktreeService {
             },
             cancellation,
         )?;
+        let snapshot_head = self.git_text(path, ["rev-parse", "HEAD^{commit}"], cancellation)?;
+        let snapshot_clean = self
+            .git_output(path, ["status", "--porcelain", "-z"], cancellation)?
+            .stdout
+            .is_empty();
+        if snapshot_head != base_commit || !snapshot_clean {
+            return Err(RuntimeError::Conflict(
+                "Btrfs snapshot does not match the resolved base commit".to_string(),
+            ));
+        }
         Ok(())
     }
 

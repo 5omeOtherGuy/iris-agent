@@ -183,14 +183,30 @@ impl Shared {
         if result.usage == Usage::default() {
             result.usage = state.usage.clone();
         }
-        self.append_event_locked(id, &mut state, WorkerEventKind::Status(result.status))?;
-        self.append_event_locked(id, &mut state, WorkerEventKind::Completed)?;
-        self.journal.append(&JournalRecord::Terminal {
-            schema_version: SCHEMA_VERSION,
-            result: result.clone(),
-        })?;
+        let sequence = state.events.last().map_or(1, |event| event.sequence + 1);
+        let terminal_events = [
+            WorkerEvent {
+                schema_version: SCHEMA_VERSION,
+                worker_id: id.clone(),
+                sequence,
+                timestamp_ms: now_ms(),
+                kind: WorkerEventKind::Status(result.status),
+            },
+            WorkerEvent {
+                schema_version: SCHEMA_VERSION,
+                worker_id: id.clone(),
+                sequence: sequence + 1,
+                timestamp_ms: now_ms(),
+                kind: WorkerEventKind::Completed,
+            },
+        ];
+        self.journal.finish(&result, &terminal_events)?;
         state.status = result.status;
         state.result = Some(result.clone());
+        for event in terminal_events {
+            state.events.push(event.clone());
+            let _ = self.events.send(event);
+        }
         drop(state);
         cell.changed.notify_all();
         cell.notify.notify_waiters();
@@ -1004,14 +1020,9 @@ fn recover_workers(
                 timestamp_ms: now_ms(),
                 kind: WorkerEventKind::Status(status),
             };
-            shared.journal.append(&JournalRecord::Event {
-                schema_version: SCHEMA_VERSION,
-                event: event.clone(),
-            })?;
-            shared.journal.append(&JournalRecord::Terminal {
-                schema_version: SCHEMA_VERSION,
-                result: result.clone(),
-            })?;
+            shared
+                .journal
+                .finish(&result, std::slice::from_ref(&event))?;
             events.push(event);
             (status, Some(result))
         };

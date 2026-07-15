@@ -360,6 +360,7 @@ fn only_pristine_candidates_return_to_pool() {
 #[derive(Default)]
 struct FakeBtrfs {
     system: SystemProcessRunner,
+    advance_source_before_snapshot: bool,
 }
 
 impl ProcessRunner for FakeBtrfs {
@@ -378,6 +379,12 @@ impl ProcessRunner for FakeBtrfs {
             [subvolume, snapshot, source, destination]
                 if subvolume == "subvolume" && snapshot == "snapshot" =>
             {
+                if self.advance_source_before_snapshot {
+                    let source = Path::new(source);
+                    fs::write(source.join("tracked.txt"), "raced\n").unwrap();
+                    git(source, &["add", "tracked.txt"]);
+                    git(source, &["commit", "-qm", "raced"]);
+                }
                 copy_tree(Path::new(source), Path::new(destination));
                 Ok(ProcessOutput::success(Vec::new()))
             }
@@ -401,6 +408,83 @@ fn copy_tree(source: &Path, destination: &Path) {
             fs::copy(entry.path(), target).unwrap();
         }
     }
+}
+
+#[test]
+fn btrfs_preferred_non_head_base_falls_back_to_exact_linked_worktree() {
+    let temp = TestDir::new("btrfs-base");
+    let repo = repo(&temp.0);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    fs::write(repo.join("tracked.txt"), "head\n").unwrap();
+    git(&repo, &["add", "tracked.txt"]);
+    git(&repo, &["commit", "-qm", "head"]);
+    let managed = temp.0.join("managed");
+    let service = WorktreeService::with_ports(
+        WorktreeConfig::new(&managed),
+        Arc::new(FakeBtrfs::default()),
+        Arc::new(Dead),
+    )
+    .unwrap();
+    let mut request = WorktreeCreateRequest::worker(&repo);
+    request.base = Some(base.clone());
+    request.strategy = StrategyPreference::BtrfsPreferred;
+
+    let record = service
+        .create(request, &WorktreeCancellation::default())
+        .unwrap();
+
+    assert_eq!(record.creation_mode, CreationMode::Linked);
+    assert_eq!(record.base_commit, base);
+    assert_eq!(git(&record.path, &["rev-parse", "HEAD"]), base);
+    assert_eq!(
+        fs::read_to_string(record.path.join("tracked.txt")).unwrap(),
+        "base\n"
+    );
+    service
+        .remove(
+            &record.id,
+            RemoveOptions::force(),
+            &WorktreeCancellation::default(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn btrfs_snapshot_race_falls_back_to_the_resolved_base() {
+    let temp = TestDir::new("btrfs-race");
+    let repo = repo(&temp.0);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    let managed = temp.0.join("managed");
+    let service = WorktreeService::with_ports(
+        WorktreeConfig::new(&managed),
+        Arc::new(FakeBtrfs {
+            advance_source_before_snapshot: true,
+            ..FakeBtrfs::default()
+        }),
+        Arc::new(Dead),
+    )
+    .unwrap();
+    let mut request = WorktreeCreateRequest::worker(&repo);
+    request.strategy = StrategyPreference::BtrfsPreferred;
+
+    let record = service
+        .create(request, &WorktreeCancellation::default())
+        .unwrap();
+
+    assert_eq!(record.creation_mode, CreationMode::Linked);
+    assert_eq!(record.base_commit, base);
+    assert_eq!(git(&record.path, &["rev-parse", "HEAD"]), base);
+    assert_eq!(
+        fs::read_to_string(record.path.join("tracked.txt")).unwrap(),
+        "base\n"
+    );
+    service
+        .remove(
+            &record.id,
+            RemoveOptions::force(),
+            &WorktreeCancellation::default(),
+        )
+        .unwrap();
 }
 
 #[test]
