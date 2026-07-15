@@ -33,8 +33,8 @@ use tokio_util::sync::CancellationToken;
 use crate::nexus::{Tool, ToolEnv, ToolFuture, ToolOutput, Tools};
 
 use super::{
-    Preview, ToolState, ask_user_question, bash, edit, find, grep, ls, path, read, read_output,
-    read_web_page, recall, render_preview, request_compaction, web, web_search, write,
+    Preview, ToolState, ask_user_question, bash, edit, find, goal, grep, ls, path, read,
+    read_output, read_web_page, recall, render_preview, request_compaction, web, web_search, write,
 };
 use web::WebToolsConfig;
 
@@ -87,6 +87,9 @@ pub(crate) fn built_in_tools_with(config: &ToolsConfig) -> Tools {
             Box::new(BashTool),
             Box::new(EditTool),
             Box::new(AskUserQuestionTool),
+            Box::new(GetGoalTool),
+            Box::new(CreateGoalTool),
+            Box::new(UpdateGoalTool),
             Box::new(ReadOutputTool),
             Box::new(RecallTool),
         ]
@@ -100,6 +103,9 @@ pub(crate) fn built_in_tools_with(config: &ToolsConfig) -> Tools {
             Box::new(FindTool),
             Box::new(LsTool),
             Box::new(AskUserQuestionTool),
+            Box::new(GetGoalTool),
+            Box::new(CreateGoalTool),
+            Box::new(UpdateGoalTool),
             Box::new(ReadOutputTool),
             Box::new(RecallTool),
         ]
@@ -229,6 +235,78 @@ impl Tool for AskUserQuestionTool {
 
     fn requires_user_interaction(&self) -> bool {
         true
+    }
+}
+
+struct GetGoalTool;
+impl Tool for GetGoalTool {
+    fn name(&self) -> &str {
+        "get_goal"
+    }
+    fn description(&self) -> &str {
+        goal::GET_DESCRIPTION
+    }
+    fn parameters(&self) -> Value {
+        goal::empty_parameters()
+    }
+    fn execute<'a>(
+        &'a self,
+        _args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let state = env.state.borrow();
+            goal::get(state.goal_controller())
+        })
+    }
+}
+
+struct CreateGoalTool;
+impl Tool for CreateGoalTool {
+    fn name(&self) -> &str {
+        "create_goal"
+    }
+    fn description(&self) -> &str {
+        goal::CREATE_DESCRIPTION
+    }
+    fn parameters(&self) -> Value {
+        goal::create_parameters()
+    }
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let state = env.state.borrow();
+            goal::create(args, state.goal_controller(), env.output_store)
+        })
+    }
+}
+
+struct UpdateGoalTool;
+impl Tool for UpdateGoalTool {
+    fn name(&self) -> &str {
+        "update_goal"
+    }
+    fn description(&self) -> &str {
+        goal::UPDATE_DESCRIPTION
+    }
+    fn parameters(&self) -> Value {
+        goal::update_parameters()
+    }
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let state = env.state.borrow();
+            goal::update(args, state.goal_controller())
+        })
     }
 }
 

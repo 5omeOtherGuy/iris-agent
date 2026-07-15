@@ -10,6 +10,7 @@ use ratatui::widgets::Widget;
 use ratatui_textarea::{TextArea, WrapMode};
 
 use crate::git::status::{GitStatus, JjStatus, VcsStatus};
+use crate::goal::Goal;
 #[cfg(test)]
 use crate::mimir::model_catalog;
 use crate::nexus::{
@@ -1027,6 +1028,8 @@ pub(crate) struct Screen {
     /// it from the live model selection; `None` falls back to the composer hint
     /// (e.g. before a provider is selected).
     footer: Option<Footer>,
+    /// Current durable goal shown as compact status chrome, never transcript context.
+    goal: Option<Goal>,
     /// Composer-adjacent model-switch analytics. A switch first shows predicted
     /// context/cache impact; the next provider turn replaces it with realized
     /// usage/cache/fold/compaction numbers without appending transcript notices.
@@ -1196,6 +1199,7 @@ impl Screen {
             awaiting_approval: false,
             review_offer: ReviewOffer::default(),
             footer: None,
+            goal: None,
             switch_status: None,
             compaction_running: false,
             modal: None,
@@ -1549,6 +1553,14 @@ impl Screen {
     /// will convert it from predicted cache/context impact to realized usage.
     pub(crate) fn set_switch_status(&mut self, status: SwitchStatus) {
         self.switch_status = Some(status);
+    }
+
+    pub(crate) fn set_goal(&mut self, goal: Option<Goal>) {
+        self.goal = goal;
+    }
+
+    pub(crate) fn goal(&self) -> Option<&Goal> {
+        self.goal.as_ref()
     }
 
     /// Reconcile the background-compaction status chip with the live harness,
@@ -2687,6 +2699,28 @@ pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Lin
         ]
     };
     let compaction_seg = || vec![Span::styled("compacting…".to_string(), dim_style())];
+    let goal_seg = screen.goal.as_ref().map(|goal| {
+        let usage = goal.token_budget.map_or_else(
+            || compact_count(goal.tokens_used),
+            |budget| {
+                format!(
+                    "{}/{}",
+                    compact_count(goal.tokens_used),
+                    compact_count(budget)
+                )
+            },
+        );
+        vec![
+            Span::styled(
+                format!("{} ", crate::ui::symbols::ACTIVE),
+                if review { dim_style() } else { prompt_style() },
+            ),
+            Span::styled(
+                format!("GOAL {} {usage}", goal.status.as_str().to_ascii_uppercase()),
+                dim_style(),
+            ),
+        ]
+    });
 
     // Candidates from fullest to minimum. The drop order is monotonic and
     // matches the spec: drop the mouse hint, then the policy segment, then
@@ -2716,6 +2750,15 @@ pub(super) fn composer_statusline(screen: &Screen, box_width: u16) -> Option<Lin
             policy_seg(),
             mouse_seg(),
         ]);
+    }
+    if let Some(goal) = goal_seg {
+        candidates.push(vec![
+            mode_seg(),
+            model_with_effort(),
+            goal.clone(),
+            policy_seg(),
+        ]);
+        candidates.push(vec![mode_seg(), model_with_effort(), goal]);
     }
     candidates.extend([
         vec![mode_seg(), model_with_effort(), policy_seg()],
@@ -3842,6 +3885,19 @@ mod tests {
                 "internal rule is dim"
             );
         }
+    }
+
+    #[test]
+    fn composer_statusline_shows_current_goal_status_and_budget_usage() {
+        let mut screen = footer_screen("~/repo");
+        let mut goal = crate::goal::Goal::new_at("ship", Some(100), 1).unwrap();
+        goal.tokens_used = 25;
+        screen.set_goal(Some(goal));
+
+        let status = composer_statusline(&screen, 120)
+            .map(|line| line_text(&line))
+            .expect("statusline");
+        assert!(status.contains("GOAL ACTIVE 25/100"), "{status:?}");
     }
 
     #[test]

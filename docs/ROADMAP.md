@@ -98,6 +98,14 @@ Implemented today:
   inspection, approvals, and cancellation live during provider streaming, tool
   execution, approval review, and compaction; runtime-affecting settings queue
   to the next safe boundary. The text/non-TTY path never steers.
+- Persistent long-running session goals: `/goal` and the `/goooooal` alias set,
+  inspect, edit, pause, resume, and clear one durable objective per saved session;
+  replacement requires confirmation. `get_goal`, `create_goal`, and `update_goal`
+  expose the restricted model surface. Wayland owns chained JSONL snapshots,
+  fresh-input-plus-output token accounting, active-time budgets, usage-limit
+  suspension, oversized-objective attachments, and automatic continuation; the
+  TUI keeps goal controls live during turns and shows status and usage in the
+  footer.
 - Typed boundary errors with process exit codes (`src/errors.rs`) and `RUST_LOG`
   tracing to stderr (`src/telemetry.rs`).
 - Workspace-scoped built-in tools: `read`, `write`, `edit`, `bash`, `grep`,

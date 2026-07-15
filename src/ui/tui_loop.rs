@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::{LoadedSource, ModelSwitch, SessionLoader, SessionSource, StartupUi};
 use crate::git::status::{GitStatusCache, VcsStatus};
+use crate::goal::{GoalCommand, display_lines, parse_goal_command};
 use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::selection::ModelSelection;
 use crate::nexus::{AgentObserver, ApprovalDecision, ChatProvider, PermissionMode, ToolCall};
@@ -214,6 +215,8 @@ enum RouteOutcome {
     /// Run an on-demand compaction at the boundary (driven like a turn, so the
     /// provider-backed summarizer stays cancellable and the spinner runs).
     Compact(String),
+    /// Start pursuing a goal immediately with an internal steering prompt.
+    Goal(String),
 }
 
 enum DeferredReplay {
@@ -297,6 +300,7 @@ async fn session_loop<P: ChatProvider>(
         start_page,
         resumed_session,
     } = startup;
+    let mut continue_resumed_goal = resumed_session.is_some();
     let (input_tx, mut input_rx) = unbounded_channel::<Event>();
     let current_turn: ActiveTokenSlot = Arc::new(Mutex::new(None));
 
@@ -380,8 +384,10 @@ async fn session_loop<P: ChatProvider>(
                 &mut git_generation,
             )
             .await?;
-            if let Some(source) = requested {
-                perform_swap(&source, swap, harness, tui, switch)?;
+            if let Some(source) = requested
+                && perform_swap(&source, swap, harness, tui, switch)?
+            {
+                continue_resumed_goal = true;
             }
             if tui.screen.focus() != FocusTarget::Modal
                 && let Some(modal) = followup_modal.take()
@@ -389,6 +395,45 @@ async fn session_loop<P: ChatProvider>(
                 tui.screen.open_modal(modal);
             }
             refresh_footer(harness, tui, switch);
+            tui.draw()?;
+            continue;
+        }
+        if std::mem::take(&mut continue_resumed_goal)
+            && let Some(goal) = harness
+                .goal()
+                .filter(|goal| goal.status == crate::goal::GoalStatus::Active)
+        {
+            tui.screen.start_turn();
+            tui.draw()?;
+            let (_turn_ok, deferred) = run_harness_op(
+                harness,
+                switch,
+                tui,
+                &mut input_rx,
+                &mut tick,
+                &current_turn,
+                Operation::Turn(crate::goal::render_continuation(&goal)),
+                steering.clone(),
+                &git_cache,
+                &mut git_generation,
+            )
+            .await?;
+            let _ = replay_deferred(
+                deferred,
+                harness,
+                tui,
+                &mut input_rx,
+                &mut tick,
+                switch,
+                &login_backend,
+                &current_turn,
+                &steering,
+                &git_cache,
+                &mut git_generation,
+                Some(swap),
+            )
+            .await?;
+            git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
             tui.draw()?;
             continue;
         }
@@ -523,7 +568,9 @@ async fn session_loop<P: ChatProvider>(
                 // safe inter-turn boundary and never start a turn.
                 match route_command(&prompt, harness, tui, switch, &git_cache)? {
                     RouteOutcome::Swap(source) => {
-                        perform_swap(&source, swap, harness, tui, switch)?;
+                        if perform_swap(&source, swap, harness, tui, switch)? {
+                            continue_resumed_goal = true;
+                        }
                     }
                     // Consumed: a modal may now be open; the top-of-loop modal
                     // phase runs it on the next iteration.
@@ -559,6 +606,40 @@ async fn session_loop<P: ChatProvider>(
                             Some(swap),
                         )
                         .await?;
+                        tui.draw()?;
+                    }
+                    RouteOutcome::Goal(goal_prompt) => {
+                        tui.screen.start_turn();
+                        tui.draw()?;
+                        let (_turn_ok, deferred) = run_harness_op(
+                            harness,
+                            switch,
+                            tui,
+                            &mut input_rx,
+                            &mut tick,
+                            &current_turn,
+                            Operation::Turn(goal_prompt),
+                            steering.clone(),
+                            &git_cache,
+                            &mut git_generation,
+                        )
+                        .await?;
+                        let _ = replay_deferred(
+                            deferred,
+                            harness,
+                            tui,
+                            &mut input_rx,
+                            &mut tick,
+                            switch,
+                            &login_backend,
+                            &current_turn,
+                            &steering,
+                            &git_cache,
+                            &mut git_generation,
+                            Some(swap),
+                        )
+                        .await?;
+                        git_cache.request_refresh(std::env::current_dir().unwrap_or_default());
                         tui.draw()?;
                     }
                     RouteOutcome::Fall => {
@@ -622,14 +703,14 @@ fn perform_swap<P: ChatProvider>(
     harness: &mut Harness<P>,
     tui: &mut TuiUi,
     switch: &mut Option<ModelSwitch<'_, P>>,
-) -> Result<()> {
+) -> Result<bool> {
     // The loader updates the shared session-id cell and opens/creates the target
     // log before returning; the provider rebuild below then reads the new id.
     let mut loaded: LoadedSource = match swap(source) {
         Ok(loaded) => loaded,
         Err(error) => {
             apply_notices(tui, vec![format!("could not switch session: {error:#}")]);
-            return Ok(());
+            return Ok(false);
         }
     };
     if let Some(sw) = switch.as_ref() {
@@ -637,7 +718,7 @@ fn perform_swap<P: ChatProvider>(
             Ok(provider) => harness.replace_provider(provider),
             Err(error) => {
                 apply_notices(tui, vec![format!("could not switch session: {error:#}")]);
-                return Ok(());
+                return Ok(false);
             }
         }
     }
@@ -679,7 +760,7 @@ fn perform_swap<P: ChatProvider>(
         SessionSource::Fresh => harness.recover_checkpoints(),
     };
     apply_recovery(recovery, tui);
-    Ok(())
+    Ok(true)
 }
 
 /// Apply a [`RecoveryOutcome`] at a safe boundary (#288, ADR-0031): nothing for
@@ -804,6 +885,7 @@ fn refresh_footer<P: ChatProvider>(
     tui: &mut TuiUi,
     switch: &Option<ModelSwitch<'_, P>>,
 ) {
+    tui.screen.set_goal(harness.goal());
     let Some(sw) = switch.as_ref() else {
         return;
     };
@@ -1581,6 +1663,73 @@ fn apply_focus_command(screen: &mut Screen, text: &str) -> Option<String> {
     })
 }
 
+fn route_idle_goal_command<P: ChatProvider>(
+    command: GoalCommand,
+    harness: &mut Harness<P>,
+    tui: &mut TuiUi,
+) -> Option<String> {
+    let mut start = None;
+    let lines = match command {
+        GoalCommand::Show => display_lines(harness.goal().as_ref()),
+        GoalCommand::Set(objective) => {
+            if harness
+                .goal()
+                .as_ref()
+                .is_some_and(|goal| goal.status.is_unfinished())
+            {
+                tui.screen.open_modal(Modal::GoalReplace(
+                    crate::ui::modal::GoalReplacePrompt::new(objective),
+                ));
+                Vec::new()
+            } else {
+                match harness.replace_goal(&objective, None) {
+                    Ok(goal) => {
+                        start = Some(crate::goal::render_continuation(&goal));
+                        display_lines(Some(&goal))
+                    }
+                    Err(error) => vec![format!("could not set goal: {error:#}")],
+                }
+            }
+        }
+        GoalCommand::Replace(objective) => match harness.replace_goal(&objective, None) {
+            Ok(goal) => display_lines(Some(&goal)),
+            Err(error) => vec![format!("could not replace goal: {error:#}")],
+        },
+        GoalCommand::Clear => match harness.clear_goal() {
+            Ok(true) => vec!["goal cleared".to_string()],
+            Ok(false) => vec!["no goal is set".to_string()],
+            Err(error) => vec![format!("could not clear goal: {error:#}")],
+        },
+        GoalCommand::Edit => match harness.goal() {
+            Some(goal) => {
+                tui.screen
+                    .open_modal(Modal::GoalEdit(crate::ui::modal::GoalEditDialog::new(
+                        goal.objective,
+                    )));
+                Vec::new()
+            }
+            None => vec!["no goal is set".to_string()],
+        },
+        GoalCommand::EditValue(objective) => match harness.edit_goal(&objective) {
+            Ok(goal) => display_lines(Some(&goal)),
+            Err(error) => vec![format!("could not edit goal: {error:#}")],
+        },
+        GoalCommand::Pause => match harness.pause_goal() {
+            Ok(goal) => display_lines(Some(&goal)),
+            Err(error) => vec![format!("could not pause goal: {error:#}")],
+        },
+        GoalCommand::Resume => match harness.resume_goal() {
+            Ok(goal) => {
+                start = Some(crate::goal::render_continuation(&goal));
+                display_lines(Some(&goal))
+            }
+            Err(error) => vec![format!("could not resume goal: {error:#}")],
+        },
+    };
+    apply_notices(tui, lines);
+    start
+}
+
 fn route_command<P: ChatProvider>(
     prompt: &str,
     harness: &mut Harness<P>,
@@ -1593,6 +1742,13 @@ fn route_command<P: ChatProvider>(
         Some((cmd, rest)) => (cmd, rest.trim()),
         None => (trimmed, ""),
     };
+    if let Some(command) = parse_goal_command(trimmed) {
+        tui.screen.commit_user(prompt);
+        return Ok(match route_idle_goal_command(command, harness, tui) {
+            Some(prompt) => RouteOutcome::Goal(prompt),
+            None => RouteOutcome::Consumed,
+        });
+    }
     match cmd {
         "/model" => {
             let Some(sw) = switch.as_mut() else {
@@ -2209,6 +2365,16 @@ fn handle_active_modal_event(
             screen.sync_palette();
             true
         }
+        ModalOutcome::Emit(ModalAction::ReplaceGoal(objective)) => {
+            let _ = commands.send(HarnessCommand::Goal(GoalCommand::Replace(objective)));
+            screen.close_modal();
+            true
+        }
+        ModalOutcome::Emit(ModalAction::EditGoal(objective)) => {
+            let _ = commands.send(HarnessCommand::Goal(GoalCommand::EditValue(objective)));
+            screen.close_modal();
+            true
+        }
         ModalOutcome::Emit(action) => {
             if let ModalAction::SaveSetting { field, value } = &action {
                 apply_live_tui_setting(screen, *field, value.as_deref());
@@ -2236,6 +2402,32 @@ fn handle_active_submission(
     let (command, rest) = trimmed
         .split_once(char::is_whitespace)
         .map_or((trimmed, ""), |(command, rest)| (command, rest.trim()));
+    if let Some(goal_command) = parse_goal_command(trimmed) {
+        match goal_command {
+            GoalCommand::Set(objective)
+                if screen
+                    .goal()
+                    .is_some_and(|goal| goal.status.is_unfinished()) =>
+            {
+                screen.open_modal(Modal::GoalReplace(
+                    crate::ui::modal::GoalReplacePrompt::new(objective),
+                ));
+            }
+            GoalCommand::Edit => {
+                if let Some(goal) = screen.goal() {
+                    screen.open_modal(Modal::GoalEdit(crate::ui::modal::GoalEditDialog::new(
+                        goal.objective.clone(),
+                    )));
+                } else {
+                    let _ = commands.send(HarnessCommand::Goal(GoalCommand::Show));
+                }
+            }
+            command => {
+                let _ = commands.send(HarnessCommand::Goal(command));
+            }
+        }
+        return true;
+    }
     match command {
         "/settings" => open_active_settings(screen, settings, None),
         "/model" | "/reasoning" if rest.is_empty() => {
@@ -2534,6 +2726,13 @@ fn replay_deferred_command<P: ChatProvider>(
             );
             Ok(None)
         }
+        RouteOutcome::Goal(_) => {
+            apply_notices(
+                tui,
+                vec!["goal set; submit any prompt to begin automatic continuation".to_string()],
+            );
+            Ok(None)
+        }
         RouteOutcome::Fall => {
             apply_notices(
                 tui,
@@ -2594,8 +2793,7 @@ async fn replay_deferred<P: ChatProvider>(
                 ],
             );
         } else if let Some(swap) = swap {
-            perform_swap(&source, swap, harness, tui, switch)?;
-            switched = true;
+            switched = perform_swap(&source, swap, harness, tui, switch)?;
         } else {
             requested = Some(source);
         }
@@ -2878,10 +3076,12 @@ fn apply_actor_state(
         permission_mode,
         compaction_state: _compaction_state,
         task_state: _task_state,
+        goal,
         settings: actor_settings,
         context_budget,
     } = state;
     *settings = actor_settings;
+    tui.screen.set_goal(goal);
     if let Some(selection) = selection {
         let effort = selection.reasoning.map(|effort| {
             crate::mimir::model_capabilities::display_level(
@@ -3215,6 +3415,96 @@ async fn dispatch_action<P: ChatProvider>(
                 ActionResult::Replace(modal, lines) => {
                     apply_model_switch_lines(tui, harness, Some(&before), Some(&after), lines);
                     tui.screen.open_modal(*modal);
+                }
+            }
+        }
+        ModalAction::ReplaceGoal(objective) => {
+            tui.screen.close_modal();
+            match harness.replace_goal(&objective, None) {
+                Ok(goal) => {
+                    apply_notices(tui, display_lines(Some(&goal)));
+                    tui.screen.start_turn();
+                    tui.draw()?;
+                    let (_turn_ok, deferred) = run_harness_op(
+                        harness,
+                        switch,
+                        tui,
+                        input_rx,
+                        tick,
+                        current_turn,
+                        Operation::Turn(crate::goal::render_continuation(&goal)),
+                        steering.clone(),
+                        git_cache,
+                        git_generation,
+                    )
+                    .await?;
+                    let requested = replay_deferred(
+                        deferred,
+                        harness,
+                        tui,
+                        input_rx,
+                        tick,
+                        switch,
+                        login_backend,
+                        current_turn,
+                        steering,
+                        git_cache,
+                        git_generation,
+                        None,
+                    )
+                    .await?;
+                    if requested.is_some() {
+                        return Ok(requested);
+                    }
+                }
+                Err(error) => {
+                    apply_notices(tui, vec![format!("could not replace goal: {error:#}")]);
+                }
+            }
+        }
+        ModalAction::EditGoal(objective) => {
+            tui.screen.close_modal();
+            match harness.edit_goal(&objective) {
+                Ok(goal) => {
+                    apply_notices(tui, display_lines(Some(&goal)));
+                    if goal.status == crate::goal::GoalStatus::Active {
+                        tui.screen.start_turn();
+                        tui.draw()?;
+                        let (_turn_ok, deferred) = run_harness_op(
+                            harness,
+                            switch,
+                            tui,
+                            input_rx,
+                            tick,
+                            current_turn,
+                            Operation::Turn(crate::goal::render_continuation(&goal)),
+                            steering.clone(),
+                            git_cache,
+                            git_generation,
+                        )
+                        .await?;
+                        let requested = replay_deferred(
+                            deferred,
+                            harness,
+                            tui,
+                            input_rx,
+                            tick,
+                            switch,
+                            login_backend,
+                            current_turn,
+                            steering,
+                            git_cache,
+                            git_generation,
+                            None,
+                        )
+                        .await?;
+                        if requested.is_some() {
+                            return Ok(requested);
+                        }
+                    }
+                }
+                Err(error) => {
+                    apply_notices(tui, vec![format!("could not edit goal: {error:#}")]);
                 }
             }
         }
@@ -4350,6 +4640,38 @@ mod tests {
             }
         }
         changed
+    }
+
+    #[test]
+    fn active_goal_replacement_requires_modal_confirmation() {
+        let mut screen = Screen::new();
+        screen.set_goal(Some(crate::goal::Goal::new_at("old", None, 1).unwrap()));
+        let (commands, mut command_rx) = unbounded_channel();
+
+        assert!(handle_active_submission(
+            &mut screen,
+            "/goooooal new".to_string(),
+            SteeringMode::Steering,
+            None,
+            &commands,
+        ));
+        assert!(matches!(screen.modal, Some(Modal::GoalReplace(_))));
+        assert!(command_rx.try_recv().is_err());
+
+        handle_active_modal_event(
+            &mut screen,
+            &Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            &commands,
+        );
+        handle_active_modal_event(
+            &mut screen,
+            &Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &commands,
+        );
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(HarnessCommand::Goal(GoalCommand::Replace(objective))) if objective == "new"
+        ));
     }
 
     #[test]

@@ -52,6 +52,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::goal::Goal;
 use crate::nexus::{Message, ModelOrigin, ProviderTransportFallback, Role};
 
 /// Durable detail for one range-compaction entry. This is an inspection view,
@@ -104,6 +105,9 @@ pub(crate) struct SessionLog {
     /// prior process's last activity for the cold-resume fold trigger (#400).
     /// `None` for a freshly created log or a transcript without timestamps.
     resumed_last_activity_ms: Option<u64>,
+    /// Latest persisted goal snapshot observed when this log was resumed. Goal
+    /// state is session metadata and never enters provider-visible context.
+    resumed_goal: Option<Goal>,
     /// Unix ms of the most recent entry appended by THIS process, for the
     /// mid-session inferred-cold fold trigger (#400 Class B). `None` until
     /// the first append after create/resume.
@@ -163,6 +167,7 @@ impl SessionLog {
             next_seq: 0,
             compactions: 0,
             resumed_last_activity_ms: None,
+            resumed_goal: None,
             appended_activity_ms: None,
         })
     }
@@ -176,6 +181,29 @@ impl SessionLog {
         let entry = message_entry(&id, self.last_id.as_deref(), message);
         write_line(&mut self.file, &entry)
             .with_context(|| format!("failed to append to session {}", self.path.display()))?;
+        self.last_id = Some(id.clone());
+        Ok(id)
+    }
+
+    /// Append the complete current goal snapshot, or `null` when the goal was
+    /// cleared. Goal rows are chained session metadata and are skipped by the
+    /// provider-context rebuild; the latest valid row wins on resume.
+    pub(crate) fn append_goal(&mut self, goal: Option<&Goal>) -> Result<String> {
+        let id = self.next_id();
+        let entry = json!({
+            "type": "goalState",
+            "id": id,
+            "parentId": self.last_id.as_deref(),
+            "timestamp": now_ms(),
+            "goal": goal,
+        });
+        write_line(&mut self.file, &entry).with_context(|| {
+            format!(
+                "failed to append goal state to session {}",
+                self.path.display()
+            )
+        })?;
+        self.resumed_goal = goal.cloned();
         self.last_id = Some(id.clone());
         Ok(id)
     }
@@ -591,6 +619,7 @@ impl SessionLog {
             next_seq: state.next_seq,
             compactions: state.compactions,
             resumed_last_activity_ms: state.last_activity_ms,
+            resumed_goal: state.goal,
             appended_activity_ms: None,
         })
     }
@@ -601,6 +630,10 @@ impl SessionLog {
     /// whose entries carry no timestamps.
     pub(crate) fn resumed_last_activity_ms(&self) -> Option<u64> {
         self.resumed_last_activity_ms
+    }
+
+    pub(crate) fn resumed_goal(&self) -> Option<&Goal> {
+        self.resumed_goal.as_ref()
     }
 
     /// Session id (header `id`), used to open this session back later.
@@ -1214,6 +1247,8 @@ struct ResumeState {
     /// generation ordinal (ADR-0047) from entry order -- correct even for
     /// sessions written before the persisted `generation` field existed.
     compactions: u32,
+    /// Last valid `goalState` snapshot in the transcript.
+    goal: Option<Goal>,
 }
 
 /// Scan an existing transcript so [`SessionLog::resume`] can continue it.
@@ -1241,6 +1276,7 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
     let mut last_id = None;
     let mut count: u32 = 0;
     let mut compactions: u32 = 0;
+    let mut goal: Option<Goal> = None;
     let mut max_seq: Option<u32> = None;
     let mut last_activity_ms: Option<u64> = None;
     for line in lines {
@@ -1258,6 +1294,15 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         // still flow through them or `parentId` breaks -- and `append_fold`
         // consumes a seq, so ignoring `fold` here would let the next append
         // reuse the fold's id (issue #378).)
+        if value.get("type").and_then(Value::as_str) == Some("goalState")
+            && let Some(snapshot) = value.get("goal")
+        {
+            if snapshot.is_null() {
+                goal = None;
+            } else if let Ok(parsed) = serde_json::from_value::<Goal>(snapshot.clone()) {
+                goal = Some(parsed);
+            }
+        }
         match value.get("type").and_then(Value::as_str) {
             Some("message")
             | Some("compaction")
@@ -1265,7 +1310,8 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
             | Some("modelSelection")
             | Some("taskLifecycle")
             | Some("providerTransportFallback")
-            | Some("dangerousMode") => {}
+            | Some("dangerousMode")
+            | Some("goalState") => {}
             _ => continue,
         }
         if value.get("type").and_then(Value::as_str) == Some("compaction") {
@@ -1294,6 +1340,7 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         needs_newline,
         compactions,
         last_activity_ms,
+        goal,
     })
 }
 
@@ -1368,6 +1415,32 @@ fn read_dangerous_skip_permissions(path: &Path) -> Result<Option<bool>> {
         }
     }
     Ok(enabled)
+}
+
+/// Read the latest valid goal snapshot. A `null` snapshot clears earlier state;
+/// malformed/truncated rows are skipped without erasing the last valid value.
+#[cfg(test)]
+pub(crate) fn read_goal(path: &Path) -> Result<Option<Goal>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut goal = None;
+    for line in jsonl_lines(&bytes).skip(1) {
+        let Ok(text) = line else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("goalState") {
+            continue;
+        }
+        let Some(snapshot) = value.get("goal") else {
+            continue;
+        };
+        if snapshot.is_null() {
+            goal = None;
+        } else if let Ok(parsed) = serde_json::from_value::<Goal>(snapshot.clone()) {
+            goal = Some(parsed);
+        }
+    }
+    Ok(goal)
 }
 
 /// Read the ORIGINAL turns of a durable entry-id span from a session transcript

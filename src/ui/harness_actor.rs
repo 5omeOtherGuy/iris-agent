@@ -14,6 +14,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::ModelSwitch;
+use crate::goal::{Goal, GoalCommand, GoalRuntime, GoalStatus, display_lines, now_seconds};
 use crate::mimir::selection::ModelSelection;
 use crate::nexus::{
     AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ChatProvider,
@@ -77,6 +78,7 @@ pub(crate) struct ActorState {
     pub(crate) permission_mode: PermissionMode,
     pub(crate) compaction_state: Option<CompactionLifecycleState>,
     pub(crate) task_state: TaskState,
+    pub(crate) goal: Option<Goal>,
     pub(crate) settings: Option<Snapshot>,
     pub(crate) context_budget: Option<u64>,
 }
@@ -110,6 +112,7 @@ pub(crate) enum HarnessCommand {
         text: String,
         mode: SteeringMode,
     },
+    Goal(GoalCommand),
     RefreshUiState,
     Shutdown,
     /// A non-steering slash command accepted while active. The TUI replays it
@@ -291,6 +294,46 @@ impl ApprovalGate for ActorBridge {
     }
 }
 
+fn apply_active_goal_command(goal: &GoalRuntime, command: GoalCommand) -> Vec<String> {
+    let result = match command {
+        GoalCommand::Show => return display_lines(goal.get().as_ref()),
+        GoalCommand::Pause => goal.set_status_external(GoalStatus::Paused, now_seconds()),
+        GoalCommand::Resume => goal.set_status_external(GoalStatus::Active, now_seconds()),
+        GoalCommand::Clear => {
+            return match goal.clear_external() {
+                Ok(true) => vec!["goal cleared".to_string()],
+                Ok(false) => vec!["no goal is set".to_string()],
+                Err(error) => vec![format!("could not clear goal: {error:#}")],
+            };
+        }
+        GoalCommand::Set(objective) => {
+            return goal
+                .create_external(&objective, None, now_seconds())
+                .map(|goal| display_lines(Some(&goal)))
+                .unwrap_or_else(|error| vec![format!("could not set goal: {error:#}")]);
+        }
+        GoalCommand::Replace(objective) => {
+            return goal
+                .replace_external(&objective, None, now_seconds())
+                .map(|goal| display_lines(Some(&goal)))
+                .unwrap_or_else(|error| vec![format!("could not replace goal: {error:#}")]);
+        }
+        GoalCommand::Edit => {
+            return vec!["use `/goal edit` to open the goal editor".to_string()];
+        }
+        GoalCommand::EditValue(objective) => {
+            return goal
+                .edit_external(&objective, now_seconds())
+                .map(|goal| display_lines(Some(&goal)))
+                .unwrap_or_else(|error| vec![format!("could not edit goal: {error:#}")]);
+        }
+    };
+    match result {
+        Ok(updated) => display_lines(Some(&updated)),
+        Err(error) => vec![format!("could not update goal: {error:#}")],
+    }
+}
+
 fn stop_active_operation(
     pending_approval: &mut Option<oneshot::Sender<ApprovalDecision>>,
     pending_interaction: &mut Option<oneshot::Sender<InteractionOutcome>>,
@@ -404,6 +447,7 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
             ActiveKind::Compaction => HarnessEvent::CompactionStarted,
         });
         let mut active_state = self.state(Some(active_kind));
+        let goal = self.harness.goal_runtime();
         let workspace = self.harness.workspace().to_path_buf();
         let _ = self
             .events
@@ -487,6 +531,13 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                                     &token,
                                 );
                             }
+                            HarnessCommand::Goal(command) => {
+                                for line in apply_active_goal_command(&goal, command) {
+                                    let _ = self.events.send(HarnessEvent::UiEvent(UiEvent::Notice(line)));
+                                }
+                                active_state.goal = goal.get();
+                                let _ = self.events.send(HarnessEvent::ActorState(Box::new(active_state.clone())));
+                            }
                             HarnessCommand::QueueSteering { text, mode } => {
                                 if !text.trim().is_empty() && active_kind == ActiveKind::Turn {
                                     match mode {
@@ -556,6 +607,7 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                 }
             }
         };
+        let result = result.and(self.harness.persist_goal());
 
         if let Some(reply) = pending_approval.take() {
             let _ = reply.send(ApprovalDecision::Deny);
@@ -659,6 +711,7 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                 workflow_enabled: self.harness.task_workflow_enabled(),
                 active_id: self.harness.current_task_id(),
             },
+            goal: self.harness.goal(),
             settings,
             context_budget: self.harness.context_budget(),
         }
@@ -704,6 +757,8 @@ fn settings_row(action: &ModalAction) -> Option<RowId> {
         | ModalAction::ShowTaskDiff
         | ModalAction::ListTaskRollback
         | ModalAction::InsertSkillMention { .. }
+        | ModalAction::ReplaceGoal(_)
+        | ModalAction::EditGoal(_)
         | ModalAction::ResolveUserQuestion(_) => None,
     }
 }
@@ -750,6 +805,28 @@ fn immediate_during_active(field: Field) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_goal_replacement_still_requires_a_confirmed_command() {
+        let runtime = GoalRuntime::new(Some(Goal::new_at("old", None, 1).unwrap()), true);
+        let lines = apply_active_goal_command(&runtime, GoalCommand::Set("new".to_string()));
+        assert!(lines[0].contains("unfinished goal already exists"));
+        assert_eq!(runtime.get().unwrap().objective, "old");
+
+        apply_active_goal_command(&runtime, GoalCommand::Replace("new".to_string()));
+        assert_eq!(runtime.get().unwrap().objective, "new");
+    }
+
+    #[test]
+    fn active_goal_controls_apply_without_becoming_model_steering() {
+        let runtime = GoalRuntime::new(Some(Goal::new_at("ship", None, 1).unwrap()), true);
+        let lines = apply_active_goal_command(&runtime, GoalCommand::Pause);
+        assert!(lines[0].contains("paused"));
+        assert_eq!(runtime.get().unwrap().status, GoalStatus::Paused);
+        let lines = apply_active_goal_command(&runtime, GoalCommand::Resume);
+        assert!(lines[0].contains("active"));
+        assert_eq!(runtime.get().unwrap().status, GoalStatus::Active);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn eof_shutdown_denies_parked_approval_and_cancels_the_operation() {
