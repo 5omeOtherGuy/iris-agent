@@ -324,6 +324,22 @@ mod tests {
         cleanup(&home);
     }
 
+    #[test]
+    fn active_shared_hub_suppresses_redundant_iris_onboarding() {
+        let home = test_dir();
+        let hub_dir = home.join(".agents");
+        fs::create_dir_all(&hub_dir).unwrap();
+        fs::write(hub_dir.join("AGENTS.md"), "shared rules").unwrap();
+        let pi_dir = home.join(".pi/agent");
+        fs::create_dir_all(&pi_dir).unwrap();
+        fs::write(pi_dir.join("AGENTS.md"), "duplicate candidate").unwrap();
+
+        assert!(!onboarding_needed(&home));
+        assert!(!home.join(".iris/AGENTS.md").exists());
+
+        cleanup(&home);
+    }
+
     #[cfg(unix)]
     #[test]
     fn discover_rejects_symlinked_peer_doc() {
