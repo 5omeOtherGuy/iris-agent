@@ -1,11 +1,22 @@
+use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
+
+use anyhow::Result;
+use futures::stream;
+use tokio_util::sync::CancellationToken;
 
 use crate::goal::{
     Goal, GoalCommand, GoalRuntime, GoalStatus, parse_goal_command, render_continuation,
 };
-use crate::nexus::ProviderUsage;
+use crate::nexus::{
+    Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, AssistantTurn,
+    ChatProvider, InteractionFuture, InteractionOutcome, ProviderEvent, ProviderStream,
+    ProviderUsage, ReviewContext, ToolCall, ToolEnv,
+};
 use crate::session::{SessionLog, read_goal};
+use crate::tools::{ToolState, built_in_tools};
+use crate::wayland::Harness;
 
 fn temp_dir(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -136,5 +147,176 @@ fn resumed_log_restores_latest_goal_snapshot() {
     let resumed = SessionLog::resume(&path).expect("resume log");
     assert_eq!(resumed.resumed_goal(), Some(&goal));
     drop(resumed);
+    fs::remove_dir_all(root).ok();
+}
+
+#[derive(Default)]
+struct TestObserver;
+
+impl AgentObserver for TestObserver {
+    fn on_event(&self, _event: AgentEvent) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct AllowGate;
+
+impl ApprovalGate for AllowGate {
+    fn review<'a>(
+        &'a self,
+        _call: &'a ToolCall,
+        _allow_always: bool,
+        _allow_project: bool,
+        _ctx: ReviewContext,
+    ) -> ApprovalFuture<'a> {
+        Box::pin(async { Ok(ApprovalDecision::Allow) })
+    }
+
+    fn interact<'a>(&'a self, _call: &'a ToolCall) -> InteractionFuture<'a> {
+        Box::pin(async { Ok(InteractionOutcome::Rejected { feedback: None }) })
+    }
+}
+
+struct SequenceProvider {
+    turns: RefCell<Vec<AssistantTurn>>,
+    requests: RefCell<Vec<Vec<crate::nexus::Message>>>,
+}
+
+impl SequenceProvider {
+    fn new(turns: Vec<AssistantTurn>) -> Self {
+        Self {
+            turns: RefCell::new(turns.into_iter().rev().collect()),
+            requests: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl ChatProvider for SequenceProvider {
+    fn respond_stream<'a>(
+        &'a self,
+        messages: &'a [crate::nexus::Message],
+        _tools: &'a crate::nexus::Tools,
+        _cancel: &'a CancellationToken,
+    ) -> Result<ProviderStream<'a>> {
+        self.requests.borrow_mut().push(messages.to_vec());
+        let turn = self.turns.borrow_mut().pop().expect("scripted turn");
+        Ok(Box::pin(stream::iter(vec![Ok(ProviderEvent::Completed(
+            turn,
+        ))])))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn goal_tools_are_registered_and_mutate_only_through_the_goal_controller() {
+    let tools = built_in_tools();
+    for name in ["get_goal", "create_goal", "update_goal"] {
+        let tool = tools.by_name(name).unwrap_or_else(|| panic!("missing {name}"));
+        assert!(tool.parameters()["type"] == "object");
+        assert!(!tool.description().is_empty());
+    }
+
+    let root = temp_dir("tools");
+    let state = RefCell::new(ToolState::new());
+    let runtime = GoalRuntime::new(None, true);
+    let env = ToolEnv {
+        workspace: &root,
+        state: &state,
+        output_store: None,
+        session_span: None,
+        output_sink: None,
+        mutation_guard: None,
+        goal: Some(&runtime),
+    };
+    let cancel = CancellationToken::new();
+    let created = tools
+        .by_name("create_goal")
+        .unwrap()
+        .execute(
+            &serde_json::json!({"objective":"ship the feature","token_budget":100}),
+            &env,
+            cancel.child_token(),
+        )
+        .await
+        .expect("create goal");
+    let created: serde_json::Value = serde_json::from_str(&created.content).unwrap();
+    assert_eq!(created["objective"], "ship the feature");
+    assert_eq!(created["status"], "active");
+
+    let error = tools
+        .by_name("update_goal")
+        .unwrap()
+        .execute(
+            &serde_json::json!({"status":"paused"}),
+            &env,
+            cancel.child_token(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("complete or blocked"));
+
+    tools
+        .by_name("update_goal")
+        .unwrap()
+        .execute(
+            &serde_json::json!({"status":"complete"}),
+            &env,
+            cancel.child_token(),
+        )
+        .await
+        .expect("complete goal");
+    assert_eq!(runtime.get().unwrap().status, GoalStatus::Complete);
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harness_automatically_continues_an_active_goal_until_model_completion() {
+    let root = temp_dir("continuation");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let session = SessionLog::create_in(&root, &workspace).expect("session");
+    let session_path = session.path().to_path_buf();
+    let update = ToolCall {
+        id: "goal-complete".to_string(),
+        name: "update_goal".to_string(),
+        arguments: serde_json::json!({"status":"complete"}),
+        thought_signature: None,
+    };
+    let provider = SequenceProvider::new(vec![
+        AssistantTurn::text("made progress"),
+        AssistantTurn {
+            tool_calls: vec![update],
+            ..AssistantTurn::default()
+        },
+        AssistantTurn::text("goal complete"),
+    ]);
+    let agent = Agent::new(provider, built_in_tools());
+    let mut harness = Harness::new(
+        agent,
+        workspace.clone(),
+        ToolState::new(),
+        Some(session),
+        None,
+    );
+    harness
+        .replace_goal("finish <all> & verify", Some(1_000))
+        .expect("set goal");
+
+    harness
+        .submit_turn(
+            "begin",
+            &TestObserver,
+            &AllowGate,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("goal run");
+
+    let goal = harness.goal().expect("goal remains for inspection");
+    assert_eq!(goal.status, GoalStatus::Complete);
+    assert_eq!(harness.agent.provider.requests.borrow().len(), 3);
+    let second = &harness.agent.provider.requests.borrow()[1];
+    let continuation = &second.last().expect("continuation prompt").content;
+    assert!(continuation.contains("&lt;all&gt; &amp; verify"));
+    assert_eq!(read_goal(&session_path).unwrap().unwrap().status, GoalStatus::Complete);
     fs::remove_dir_all(root).ok();
 }
