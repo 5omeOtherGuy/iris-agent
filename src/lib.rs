@@ -18,6 +18,7 @@ mod config;
 mod display_path;
 mod errors;
 mod git;
+mod goal;
 mod handles;
 mod metrics;
 mod mimir;
