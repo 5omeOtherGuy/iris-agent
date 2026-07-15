@@ -308,7 +308,7 @@ fn apply_active_goal_command(goal: &GoalRuntime, command: GoalCommand) -> Vec<St
         }
         GoalCommand::Set(objective) => {
             return goal
-                .create_from_model_with_budgets(&objective, None, None, now_seconds())
+                .create_external(&objective, None, now_seconds())
                 .map(|goal| display_lines(Some(&goal)))
                 .unwrap_or_else(|error| vec![format!("could not set goal: {error:#}")]);
         }

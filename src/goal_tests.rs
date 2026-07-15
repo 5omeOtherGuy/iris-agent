@@ -120,6 +120,24 @@ fn model_create_rejects_unfinished_goal_but_replaces_complete_goal() {
 }
 
 #[test]
+fn mid_turn_user_replacement_does_not_charge_in_flight_usage_to_the_new_goal() {
+    let runtime = GoalRuntime::new(Some(Goal::new_at("old", None, 1).unwrap()), true);
+    runtime.begin_turn();
+    runtime.replace_external("new", Some(10), 2).unwrap();
+    assert!(!runtime.account_usage(&usage(8, 0, 1), 3));
+    assert_eq!(runtime.get().unwrap().tokens_used, 0);
+}
+
+#[test]
+fn model_creation_associates_usage_after_its_tool_call_boundary() {
+    let runtime = GoalRuntime::new(None, true);
+    runtime.begin_turn();
+    runtime.create_from_model("new", Some(10), 2).unwrap();
+    assert!(!runtime.account_usage(&usage(2, 0, 1), 3));
+    assert_eq!(runtime.get().unwrap().tokens_used, 3);
+}
+
+#[test]
 fn accounting_excludes_cached_input_and_limits_at_equal_budget() {
     let runtime = GoalRuntime::new(Some(Goal::new_at("ship", Some(10), 1).expect("goal")), true);
     runtime.begin_turn();

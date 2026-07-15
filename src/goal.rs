@@ -291,10 +291,33 @@ impl GoalRuntime {
         state.elapsed_remainder = Duration::ZERO;
         state.budget_steering_pending = false;
         if state.turn_open {
-            state.associated_goal_id = Some(goal.goal_id.clone());
+            // User replacement can arrive while a provider round is in flight.
+            // Do not charge that round's indivisible usage to the new goal; the
+            // next goal turn associates it normally. Model creation restores the
+            // association below at its tool-call boundary.
+            state.associated_goal_id = None;
             state.active_since = Some(Instant::now());
         }
         Ok(goal)
+    }
+
+    pub(crate) fn create_external(
+        &self,
+        objective: &str,
+        token_budget: Option<u64>,
+        now: u64,
+    ) -> Result<Goal> {
+        self.ensure_persistent()?;
+        if self
+            .state
+            .borrow()
+            .goal
+            .as_ref()
+            .is_some_and(|goal| goal.status.is_unfinished())
+        {
+            bail!("an unfinished goal already exists; update it or ask the user to replace it");
+        }
+        self.replace_external(objective, token_budget, now)
     }
 
     #[cfg(test)]
@@ -324,7 +347,13 @@ impl GoalRuntime {
         {
             bail!("an unfinished goal already exists; update it or ask the user to replace it");
         }
-        self.replace_external_with_budgets(objective, token_budget, time_budget_seconds, now)
+        let goal =
+            self.replace_external_with_budgets(objective, token_budget, time_budget_seconds, now)?;
+        let mut state = self.state.borrow_mut();
+        if state.turn_open {
+            state.associated_goal_id = Some(goal.goal_id.clone());
+        }
+        Ok(goal)
     }
 
     pub(crate) fn edit_external(&self, objective: &str, now: u64) -> Result<Goal> {
