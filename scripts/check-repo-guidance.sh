@@ -8,8 +8,9 @@ fail() { printf 'check-repo-guidance: %s\n' "$*" >&2; exit 1; }
 
 [ -d "$ROOT" ] || fail "repository root is not a directory: $ROOT"
 for path in AGENTS.md CLAUDE.md .worktreeinclude; do
-  [ -f "$ROOT/$path" ] && [ ! -L "$ROOT/$path" ] \
-    || fail "$path must be a regular file"
+  if [ ! -f "$ROOT/$path" ] || [ -L "$ROOT/$path" ]; then
+    fail "$path must be a regular file"
+  fi
 done
 
 lines=$(wc -l <"$ROOT/AGENTS.md" | tr -d ' ')
@@ -34,24 +35,28 @@ cmp -s "$expected_include" "$ROOT/.worktreeinclude" \
 
 canonical="$ROOT/.agents/skills"
 projections="$ROOT/.claude/skills"
-[ -d "$canonical" ] && [ ! -L "$canonical" ] \
-  || fail ".agents/skills must be a regular directory"
-[ -d "$projections" ] && [ ! -L "$projections" ] \
-  || fail ".claude/skills must be a regular directory"
+if [ ! -d "$canonical" ] || [ -L "$canonical" ]; then
+  fail ".agents/skills must be a regular directory"
+fi
+if [ ! -d "$projections" ] || [ -L "$projections" ]; then
+  fail ".claude/skills must be a regular directory"
+fi
 
 skill_count=0
 for skill_dir in "$canonical"/*; do
   if [ ! -e "$skill_dir" ] && [ ! -L "$skill_dir" ]; then
     continue
   fi
-  [ -d "$skill_dir" ] && [ ! -L "$skill_dir" ] \
-    || fail "canonical skill must be a regular directory: ${skill_dir#"$ROOT/"}"
+  if [ ! -d "$skill_dir" ] || [ -L "$skill_dir" ]; then
+    fail "canonical skill must be a regular directory: ${skill_dir#"$ROOT/"}"
+  fi
   name=${skill_dir##*/}
   [[ "$name" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] \
     || fail "invalid skill directory name: $name"
   skill="$skill_dir/SKILL.md"
-  [ -f "$skill" ] && [ ! -L "$skill" ] \
-    || fail "missing regular .agents/skills/$name/SKILL.md"
+  if [ ! -f "$skill" ] || [ -L "$skill" ]; then
+    fail "missing regular .agents/skills/$name/SKILL.md"
+  fi
   first=$(sed -n '1p' "$skill")
   [ "$first" = '---' ] || fail "$name SKILL.md lacks YAML frontmatter"
   metadata_name=$(awk '
@@ -84,8 +89,9 @@ for projection in "$projections"/*; do
   fi
   name=${projection##*/}
   [ -L "$projection" ] || fail "Claude skill projection must be a symlink: $name"
-  [ -d "$canonical/$name" ] && [ ! -L "$canonical/$name" ] \
-    || fail "Claude projection has no canonical skill: $name"
+  if [ ! -d "$canonical/$name" ] || [ -L "$canonical/$name" ]; then
+    fail "Claude projection has no canonical skill: $name"
+  fi
 done
 
 if [ -d "$ROOT/.pi/skills" ] \

@@ -32,8 +32,9 @@ PRIMARY_TOP=$(cd "$(dirname "$COMMON_DIR")" && pwd)
 
 WT_PARENT=$(dirname "$WT_PATH")
 WT_NAME=$(basename "$WT_PATH")
-[ "$WT_NAME" != "." ] && [ "$WT_NAME" != ".." ] \
-  || die "invalid worktree path: $WT_PATH"
+if [ "$WT_NAME" = "." ] || [ "$WT_NAME" = ".." ]; then
+  die "invalid worktree path: $WT_PATH"
+fi
 [ -d "$WT_PARENT" ] || die "worktree parent does not exist: $WT_PARENT"
 WT_PARENT=$(cd "$WT_PARENT" && pwd)
 WT_ABS="$WT_PARENT/$WT_NAME"
@@ -47,8 +48,9 @@ fi
 bash "$SCRIPT_DIR/worktree-preflight.sh"
 
 INCLUDE_FILE="$PRIMARY_TOP/.worktreeinclude"
-[ -f "$INCLUDE_FILE" ] && [ ! -L "$INCLUDE_FILE" ] \
-  || die "missing regular .worktreeinclude in primary checkout"
+if [ ! -f "$INCLUDE_FILE" ] || [ -L "$INCLUDE_FILE" ]; then
+  die "missing regular .worktreeinclude in primary checkout"
+fi
 
 COPY_PATHS=()
 while IFS= read -r entry || [ -n "$entry" ]; do

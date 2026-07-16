@@ -12,7 +12,7 @@ fail() {
 }
 
 setup_repo() {
-  local name=$1 fixture="$TMP/$1"
+  local fixture="$TMP/$1"
   git init --quiet --bare --initial-branch=main "$fixture/origin.git"
   git clone --quiet "$fixture/origin.git" "$fixture/primary"
   git -C "$fixture/primary" config user.email test@example.invalid
@@ -50,7 +50,9 @@ expect_refusal() {
   if (cd "$primary" && bash "$WRAPPER" "$target" "$branch" >/dev/null 2>&1); then
     fail "expected refusal for $branch"
   fi
-  [ ! -e "$target" ] && [ ! -L "$target" ] || fail "refusal left target $target"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    fail "refusal left target $target"
+  fi
   if git -C "$primary" show-ref --verify --quiet "refs/heads/$branch"; then
     fail "refusal left branch $branch"
   fi
@@ -79,8 +81,9 @@ for path in AGENTS.md CLAUDE.md .worktreeinclude .agents/skills/example/SKILL.md
   [ -f "$plain/$path" ] || fail "tracked file missing from ordinary Git worktree: $path"
 done
 for path in AGENTS.override.md AGENTS.local.md CLAUDE.local.md .pi/APPEND_SYSTEM.md; do
-  [ ! -e "$plain/$path" ] && [ ! -L "$plain/$path" ] \
-    || fail "ordinary Git worktree unexpectedly copied ignored file: $path"
+  if [ -e "$plain/$path" ] || [ -L "$plain/$path" ]; then
+    fail "ordinary Git worktree unexpectedly copied ignored file: $path"
+  fi
 done
 
 primary=$(setup_repo symlink)
