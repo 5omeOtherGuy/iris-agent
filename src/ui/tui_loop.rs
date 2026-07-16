@@ -36,6 +36,9 @@ use crate::mimir::auth::storage::AuthStore;
 use crate::mimir::selection::ModelSelection;
 use crate::nexus::{AgentObserver, ApprovalDecision, ChatProvider, PermissionMode, ToolCall};
 use crate::ui::UiEvent;
+use crate::ui::delegation_dashboard::{
+    DelegationDashboard, DelegationRequest, DelegationResponse, DelegationScope, execute_request,
+};
 use crate::ui::harness_actor::{
     self, ActiveTokenSlot, ActorState, HarnessActor, HarnessCommand, HarnessEvent, Operation,
     SettingsOrigin, SettingsResultEvent, SteeringMode,
@@ -1854,14 +1857,24 @@ fn route_command<P: ChatProvider>(
         }
         "/worktrees" => {
             tui.screen.commit_user(prompt);
-            if let Some(lines) = crate::cli::handle_worktrees_command(prompt, harness) {
+            if rest.is_empty() {
+                tui.screen
+                    .open_modal(Modal::Delegation(Box::new(DelegationDashboard::new(
+                        DelegationScope::Worktrees,
+                    ))));
+            } else if let Some(lines) = crate::cli::handle_worktrees_command(prompt, harness) {
                 apply_notices(tui, lines);
             }
             Ok(RouteOutcome::Consumed)
         }
         "/subagents" => {
             tui.screen.commit_user(prompt);
-            if let Some(lines) = crate::cli::handle_subagents_command(prompt, harness) {
+            if rest.is_empty() {
+                tui.screen
+                    .open_modal(Modal::Delegation(Box::new(DelegationDashboard::new(
+                        DelegationScope::Workers,
+                    ))));
+            } else if let Some(lines) = crate::cli::handle_subagents_command(prompt, harness) {
                 apply_notices(tui, lines);
             }
             Ok(RouteOutcome::Consumed)
@@ -2389,6 +2402,10 @@ fn handle_active_modal_event(
             screen.close_modal();
             true
         }
+        ModalOutcome::Emit(ModalAction::Delegation(request)) => {
+            let _ = commands.send(HarnessCommand::Delegation(request));
+            true
+        }
         ModalOutcome::Emit(action) => {
             if let ModalAction::SaveSetting { field, value } = &action {
                 apply_live_tui_setting(screen, *field, value.as_deref());
@@ -2443,6 +2460,20 @@ fn handle_active_submission(
         return true;
     }
     match command {
+        "/subagents" | "/worktrees" if rest.is_empty() => {
+            screen.commit_user(&text);
+            let scope = if command == "/subagents" {
+                DelegationScope::Workers
+            } else {
+                DelegationScope::Worktrees
+            };
+            let mut dashboard = DelegationDashboard::new(scope);
+            if let Some(request) = dashboard.request_initial() {
+                let _ = commands.send(HarnessCommand::Delegation(request));
+            }
+            screen.open_modal(Modal::Delegation(Box::new(dashboard)));
+            true
+        }
         "/settings" => open_active_settings(screen, settings, None),
         "/model" | "/reasoning" if rest.is_empty() => {
             open_active_settings(screen, settings, Some(settings_menu::HatchTarget::Model))
@@ -2560,7 +2591,10 @@ fn handle_active_event(
         // cancel the operation.
         if key.code == KeyCode::Esc
             && screen.focus() == FocusTarget::Modal
-            && !matches!(screen.modal.as_ref(), Some(Modal::AskUserQuestion(_)))
+            && !matches!(
+                screen.modal.as_ref(),
+                Some(Modal::AskUserQuestion(_) | Modal::Delegation(_))
+            )
         {
             screen.close_modal();
             return true;
@@ -2941,6 +2975,11 @@ async fn run_harness_op<P: ChatProvider>(
                 sync_esc_cancel_enabled(current_turn, &pending, &tui.screen);
             }
             _ = tick.tick() => {
+                if let Some(Modal::Delegation(dashboard)) = tui.screen.modal.as_mut()
+                    && let Some(request) = dashboard.request_refresh(Instant::now().into())
+                {
+                    let _ = channels.commands.send(HarnessCommand::Delegation(request));
+                }
                 if tui.screen.tick() {
                     request_render(&mut sched, tui)?;
                 }
@@ -3069,6 +3108,11 @@ fn apply_actor_event(
         HarnessEvent::SettingsActionQueued { action } => {
             deferred.push(DeferredReplay::Action(action));
         }
+        HarnessEvent::Delegation(response) => {
+            if let Some(Modal::Delegation(dashboard)) = tui.screen.modal.as_mut() {
+                dashboard.apply_response(response);
+            }
+        }
         HarnessEvent::CommandQueued(command) => {
             tui.screen.apply(UiEvent::Notice(format!(
                 "queued `{command}` until the active operation finishes"
@@ -3156,6 +3200,16 @@ fn apply_settings_result(
     }
 }
 
+fn spawn_idle_delegation(
+    backend: Option<Arc<crate::wayland::subagents::SubagentBackend>>,
+    request: DelegationRequest,
+    responses: UnboundedSender<DelegationResponse>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let _ = responses.send(execute_request(backend, request));
+    });
+}
+
 /// Drive an open picker/dialog to completion: route keys to the modal, apply the
 /// outcomes (model/effort switches, scoped edits, login/logout) at this safe
 /// inter-turn boundary, and return when the modal closes (or input ends).
@@ -3182,6 +3236,13 @@ async fn run_modal_phase<P: ChatProvider>(
     // intact, BEFORE the next draw so the dock never collapses for a frame
     // (§2.5, the invariant that killed the jank in fa93453).
     let mut settings_stash: Option<crate::ui::settings_menu::PanelView> = None;
+    let (delegation_tx, mut delegation_rx) = unbounded_channel::<DelegationResponse>();
+    let delegation_backend = harness.subagent_backend().ok().cloned();
+    if let Some(Modal::Delegation(dashboard)) = tui.screen.modal.as_mut()
+        && let Some(request) = dashboard.request_initial_if_needed()
+    {
+        spawn_idle_delegation(delegation_backend.clone(), request, delegation_tx.clone());
+    }
     while tui.screen.focus() == FocusTarget::Modal {
         tokio::select! {
             maybe = input_rx.recv() => {
@@ -3226,20 +3287,30 @@ async fn run_modal_phase<P: ChatProvider>(
                 {
                     settings_stash = Some(view.clone());
                 }
-                let requested = apply_modal_outcome(
-                    outcome,
-                    harness,
-                    tui,
-                    input_rx,
-                    tick,
-                    switch,
-                    login_backend,
-                    current_turn,
-                    steering,
-                    git_cache,
-                    git_generation,
-                )
-                .await?;
+                let requested = match outcome {
+                    ModalOutcome::Emit(ModalAction::Delegation(request)) => {
+                        spawn_idle_delegation(
+                            delegation_backend.clone(),
+                            request,
+                            delegation_tx.clone(),
+                        );
+                        None
+                    }
+                    outcome => apply_modal_outcome(
+                        outcome,
+                        harness,
+                        tui,
+                        input_rx,
+                        tick,
+                        switch,
+                        login_backend,
+                        current_turn,
+                        steering,
+                        git_cache,
+                        git_generation,
+                    )
+                    .await?,
+                };
                 if requested.is_some() {
                     return Ok(requested);
                 }
@@ -3263,7 +3334,23 @@ async fn run_modal_phase<P: ChatProvider>(
                 refresh_footer(harness, tui, switch);
                 tui.draw()?;
             }
+            Some(response) = delegation_rx.recv() => {
+                if let Some(Modal::Delegation(dashboard)) = tui.screen.modal.as_mut()
+                    && dashboard.apply_response(response)
+                {
+                    tui.draw()?;
+                }
+            }
             _ = tick.tick() => {
+                if let Some(Modal::Delegation(dashboard)) = tui.screen.modal.as_mut()
+                    && let Some(request) = dashboard.request_refresh(Instant::now().into())
+                {
+                    spawn_idle_delegation(
+                        delegation_backend.clone(),
+                        request,
+                        delegation_tx.clone(),
+                    );
+                }
                 // Keep the tick grid live while a modal is open: the settings
                 // panel's detent flash settles here, and the start page's
                 // IrisMark keeps sweeping behind a docked picker.
@@ -3657,6 +3744,10 @@ async fn dispatch_action<P: ChatProvider>(
                 }
                 _ => tui.screen.close_modal(),
             }
+        }
+        ModalAction::Delegation(_) => {
+            // Delegation requests are dispatched by the modal phase so their
+            // blocking backend work never enters the settings action path.
         }
         ModalAction::InsertSkillMention { name, path } => {
             tui.screen.close_modal();
@@ -4584,6 +4675,7 @@ impl AgentObserver for SettingsEventSink {
 mod tests {
     use super::*;
     use crate::nexus::SteeringSource;
+    use crate::ui::delegation_dashboard::DelegationRequestKind;
     use crate::ui::tui::Screen;
     use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
 
@@ -4686,6 +4778,67 @@ mod tests {
             command_rx.try_recv(),
             Ok(HarnessCommand::Goal(GoalCommand::Replace(objective))) if objective == "new"
         ));
+    }
+
+    #[test]
+    fn active_delegation_commands_open_dashboards_without_queuing_model_input() {
+        for (command, title) in [
+            ("/subagents", "DELEGATION · WORKERS"),
+            ("/worktrees", "DELEGATION · WORKTREES"),
+        ] {
+            let mut screen = Screen::new();
+            let (commands, mut command_rx) = unbounded_channel();
+
+            assert!(handle_active_submission(
+                &mut screen,
+                command.to_string(),
+                SteeringMode::Steering,
+                None,
+                &commands,
+            ));
+            let Some(Modal::Delegation(dashboard)) = screen.modal.as_ref() else {
+                panic!("{command} did not open a delegation dashboard");
+            };
+            let rendered = dashboard
+                .render(100)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(rendered.contains(title), "{rendered}");
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(HarnessCommand::Delegation(DelegationRequest {
+                    kind: DelegationRequestKind::Snapshot {
+                        include_worktrees: actual
+                    },
+                    ..
+                })) if actual
+            ));
+            assert!(command_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn typed_delegation_commands_keep_the_existing_command_path() {
+        for command in ["/subagents list", "/worktrees show wt_123"] {
+            let mut screen = Screen::new();
+            let (commands, mut command_rx) = unbounded_channel();
+
+            assert!(handle_active_submission(
+                &mut screen,
+                command.to_string(),
+                SteeringMode::Steering,
+                None,
+                &commands,
+            ));
+            assert!(screen.modal.is_none());
+            assert!(matches!(
+                command_rx.try_recv(),
+                Ok(HarnessCommand::QueueCommand { text }) if text == command
+            ));
+            assert!(command_rx.try_recv().is_err());
+        }
     }
 
     #[test]

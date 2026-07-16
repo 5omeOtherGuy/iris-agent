@@ -1078,8 +1078,9 @@ engine are stable.
 
 **Status:** delegated-worker slice shipped 2026-07-14 under
 [#459](https://github.com/5omeOtherGuy/iris-agent/issues/459). Direct per-spawn
-model/provider and reasoning-effort routing shipped 2026-07-15. Named worker
-profiles are the immediate follow-up.
+model/provider and reasoning-effort routing and the live operator surface
+([#640](https://github.com/5omeOtherGuy/iris-agent/issues/640)) shipped 2026-07-15.
+Named worker profiles are the immediate follow-up.
 
 Shipped scope:
 
@@ -1093,6 +1094,9 @@ Shipped scope:
 - Direct `spawn_subagent` model/provider and effort overrides. Omitted components
   inherit the spawn-time parent selection; accepted workers persist one effective
   route and do not follow later parent switches.
+- One live `DELEGATION` dashboard for worker/group/artifact/worktree inspection,
+  recovery actions, candidate selection, and exact-plan apply authorization. Bare
+  `/subagents` and `/worktrees` open it; typed forms remain text fast paths.
 
 Remaining scope:
 

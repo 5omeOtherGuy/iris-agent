@@ -464,6 +464,11 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 - **Subagents as tools** — `spawn_subagent`, status/cancel/output, explicit
   best-of-N selection, and plan/apply tools run through Nexus tool execution.
   [Implemented]
+- **Delegation dashboard** — bare `/subagents` and `/worktrees` open one live,
+  keyboard-driven TUI surface over workers, groups, artifacts, managed worktrees,
+  recovery, candidate selection, immutable apply review, and guarded lifecycle
+  actions. Typed command forms remain available for scripts and diagnostics. Issue
+  [#640](https://github.com/5omeOtherGuy/iris-agent/issues/640). [Implemented]
 - **Worker set** — general, explore, and review kinds ship; user-defined profiles
   remain deferred. [Partial]
 - **Per-worker model routing** — each worker resolves its own provider/model/
