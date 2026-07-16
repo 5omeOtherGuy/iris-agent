@@ -113,6 +113,7 @@ pub(crate) enum HarnessCommand {
         mode: SteeringMode,
     },
     Goal(GoalCommand),
+    Delegation(crate::ui::delegation_dashboard::DelegationRequest),
     RefreshUiState,
     Shutdown,
     /// A non-steering slash command accepted while active. The TUI replays it
@@ -164,6 +165,7 @@ pub(crate) enum HarnessEvent {
     SettingsActionQueued {
         action: ModalAction,
     },
+    Delegation(crate::ui::delegation_dashboard::DelegationResponse),
     CommandQueued(String),
 }
 
@@ -381,6 +383,17 @@ impl AgentObserver for SettingsEventSink {
     }
 }
 
+fn dispatch_delegation(
+    backend: Option<Arc<crate::wayland::subagents::SubagentBackend>>,
+    request: crate::ui::delegation_dashboard::DelegationRequest,
+    events: UnboundedSender<HarnessEvent>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let response = crate::ui::delegation_dashboard::execute_request(backend, request);
+        let _ = events.send(HarnessEvent::Delegation(response));
+    });
+}
+
 pub(crate) struct HarnessActor<'a, 'b, P> {
     harness: &'a mut Harness<P>,
     switch: &'a mut Option<ModelSwitch<'b, P>>,
@@ -449,6 +462,7 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
         let mut active_state = self.state(Some(active_kind));
         let goal = self.harness.goal_runtime();
         let workspace = self.harness.workspace().to_path_buf();
+        let subagent_backend = self.harness.subagent_backend().ok().cloned();
         let _ = self
             .events
             .send(HarnessEvent::ActorState(Box::new(active_state.clone())));
@@ -529,6 +543,13 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                                     &self.events,
                                     &self.steering,
                                     &token,
+                                );
+                            }
+                            HarnessCommand::Delegation(request) => {
+                                dispatch_delegation(
+                                    subagent_backend.clone(),
+                                    request,
+                                    self.events.clone(),
                                 );
                             }
                             HarnessCommand::Goal(command) => {
@@ -759,7 +780,8 @@ fn settings_row(action: &ModalAction) -> Option<RowId> {
         | ModalAction::InsertSkillMention { .. }
         | ModalAction::ReplaceGoal(_)
         | ModalAction::EditGoal(_)
-        | ModalAction::ResolveUserQuestion(_) => None,
+        | ModalAction::ResolveUserQuestion(_)
+        | ModalAction::Delegation(_) => None,
     }
 }
 
@@ -921,6 +943,33 @@ mod tests {
         assert!(matches!(
             event_rx.try_recv(),
             Ok(HarnessEvent::InteractionCleared)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delegation_dispatch_runs_off_actor_and_returns_a_typed_error() {
+        let (event_tx, mut event_rx) = unbounded_channel();
+        dispatch_delegation(
+            None,
+            crate::ui::delegation_dashboard::DelegationRequest {
+                request_id: 7,
+                kind: crate::ui::delegation_dashboard::DelegationRequestKind::Snapshot {
+                    include_worktrees: false,
+                },
+            },
+            event_tx,
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("delegation task blocked the actor")
+            .expect("delegation response channel closed");
+        assert!(matches!(
+            event,
+            HarnessEvent::Delegation(crate::ui::delegation_dashboard::DelegationResponse {
+                request_id: 7,
+                result: Err(message),
+            }) if message.contains("not configured")
         ));
     }
 

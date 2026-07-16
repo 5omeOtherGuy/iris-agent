@@ -137,6 +137,7 @@ pub(crate) enum ModalAction {
     /// Save an edited objective while preserving the current goal id and usage.
     EditGoal(String),
     ResolveUserQuestion(crate::nexus::InteractionOutcome),
+    Delegation(crate::ui::delegation_dashboard::DelegationRequest),
 }
 
 /// What the loop does after a modal handled a key.
@@ -169,6 +170,7 @@ pub(crate) enum Modal {
     /// Codex-compatible native skills picker (#521): a composer affordance that
     /// inserts a path-qualified `skill://` mention. Not a settings surface.
     Skills(SkillPicker),
+    Delegation(Box<crate::ui::delegation_dashboard::DelegationDashboard>),
     AskUserQuestion(crate::ui::ask_user_question::AskUserDialog),
     LoginDialog(LoginDialog),
     ApiKeyDialog(ApiKeyDialog),
@@ -185,6 +187,7 @@ impl Modal {
             Modal::Session(picker) => picker.handle_key(key),
             Modal::Tasks(picker) => picker.handle_key(key),
             Modal::Skills(picker) => picker.handle_key(key),
+            Modal::Delegation(dashboard) => dashboard.handle_key(key),
             Modal::AskUserQuestion(dialog) => match dialog.handle_key(key) {
                 Some(outcome) => {
                     ModalOutcome::Emit(ModalAction::ResolveUserQuestion(outcome.into()))
@@ -219,6 +222,7 @@ impl Modal {
                 dialog.paste(text);
                 ModalOutcome::Redraw
             }
+            Modal::Delegation(dashboard) => dashboard.paste_text(text),
             _ => ModalOutcome::Ignore,
         }
     }
@@ -247,6 +251,7 @@ impl Modal {
     pub(crate) fn render_budgeted(&self, width: usize, budget: usize) -> Vec<Line<'static>> {
         match self {
             Modal::Settings(panel) => panel.render_budgeted(width, budget),
+            Modal::Delegation(dashboard) => dashboard.render_budgeted(width, budget),
             _ => Modal::render(self, u16::try_from(width).unwrap_or(u16::MAX)),
         }
     }
@@ -261,6 +266,7 @@ impl Modal {
             Modal::Session(picker) => picker.render(width),
             Modal::Tasks(picker) => picker.render(width),
             Modal::Skills(picker) => picker.render(width),
+            Modal::Delegation(dashboard) => dashboard.render(width),
             Modal::AskUserQuestion(dialog) => dialog.render(width),
             Modal::LoginDialog(dialog) => dialog.render(width),
             Modal::ApiKeyDialog(dialog) => dialog.render(width),

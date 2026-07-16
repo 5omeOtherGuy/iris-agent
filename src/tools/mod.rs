@@ -183,7 +183,7 @@ pub(crate) use read::read_file;
 #[cfg(test)]
 pub(crate) use registry::read_output_tool;
 
-pub(super) enum Preview {
+pub(crate) enum Preview {
     Available {
         path: String,
         old: String,
@@ -193,7 +193,7 @@ pub(super) enum Preview {
     Malformed,
 }
 
-fn render_preview(preview: Preview) -> Option<String> {
+pub(crate) fn render_preview(preview: Preview) -> Option<String> {
     match preview {
         Preview::Available { path, old, new } => {
             if old.len().saturating_add(new.len()) > MAX_DIFF_PREVIEW_BYTES {

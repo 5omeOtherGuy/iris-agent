@@ -823,6 +823,13 @@ is treated as ordinary prompt text, not hijacked as a command.
 | `/tree` | Open the directory tree. |
 | `/git` | Open branch/worktree/task console. |
 
+### Delegation
+
+| Command | Action |
+| --- | --- |
+| `/subagents` | Open the live worker/group/artifact dashboard. Typed `list`, `show`, `wait`, and `cancel` forms remain text fast paths. |
+| `/worktrees` | Open the live managed-worktree/recovery/apply dashboard. Typed `list`, `show`, `rm`, `gc`, `adopt`, `ignore`, and `rebuild` forms remain text fast paths. |
+
 ### Tasks
 
 | Command | Action |
@@ -903,6 +910,9 @@ Read [Architecture](docs/ARCHITECTURE.md), [Naming](docs/NAMING.md), and the
   mutation, dirty-tree protection, diff previews, and opt-in durable task
   checkpoints/rollback/verification.
 - Codex-compatible skills with progressive disclosure and turn-boundary refresh.
+- Durable delegated workers with capability/budget controls, groups, artifacts,
+  managed worktree isolation, recovery, best-of-N selection, reviewed apply, and a
+  live keyboard-driven operator dashboard.
 - Prebuilt install/update flow and a separate `iris-bench` executable for
   real-provider, replay, and report workflows.
 
@@ -925,11 +935,7 @@ Read [Architecture](docs/ARCHITECTURE.md), [Naming](docs/NAMING.md), and the
 
 The following are roadmap targets, not commands or guarantees:
 
-- named mode profiles that change prompt/tool/compaction policy;
-- general subagents as model-facing tools, background worker fleets, per-worker
-  routing/budgets, and mutable worker isolation;
-- a complete per-task linked-worktree service with explicit apply/settlement,
-  pooling, adoption, and remote restore;
+- named mode profiles and per-worker provider/model routing;
 - conversation branching/fork navigation and richer session search;
 - a full token-budget planner and context ledger with reason-based eviction,
   diff-aware file context, handle indexing/search, lifecycle management, and a

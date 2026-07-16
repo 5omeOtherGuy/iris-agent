@@ -404,6 +404,68 @@ pub(crate) fn ellipsize_to_width(text: &str, max: usize) -> String {
     out
 }
 
+/// Middle-ellipsize an escape-free string to `max` terminal columns while
+/// preserving grapheme clusters at both ends. IDs and paths use this when their
+/// stable prefix and final segment both carry operator meaning.
+pub(crate) fn ellipsize_middle_to_width(text: &str, max: usize) -> String {
+    if display_width(text) <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    if max == 1 {
+        return "\u{2026}".to_string();
+    }
+    let available = max - 1;
+    let left_budget = available.div_ceil(2);
+    let right_budget = available - left_budget;
+    let clusters = text.graphemes(true).collect::<Vec<_>>();
+    let mut left_index = 0usize;
+    let mut right_index = clusters.len();
+    let mut left = String::new();
+    let mut right = String::new();
+    let mut used = 0usize;
+    while left_index < right_index {
+        let width = cluster_width(clusters[left_index]);
+        if used + width > left_budget {
+            break;
+        }
+        left.push_str(clusters[left_index]);
+        left_index += 1;
+        used += width;
+    }
+    let mut right_used = 0usize;
+    while left_index < right_index {
+        let width = cluster_width(clusters[right_index - 1]);
+        if right_used + width > right_budget {
+            break;
+        }
+        right_index -= 1;
+        right.insert_str(0, clusters[right_index]);
+        right_used += width;
+    }
+    used += right_used;
+    while left_index < right_index {
+        let right_width = cluster_width(clusters[right_index - 1]);
+        if used + right_width <= available {
+            right_index -= 1;
+            right.insert_str(0, clusters[right_index]);
+            used += right_width;
+            continue;
+        }
+        let left_width = cluster_width(clusters[left_index]);
+        if used + left_width <= available {
+            left.push_str(clusters[left_index]);
+            left_index += 1;
+            used += left_width;
+            continue;
+        }
+        break;
+    }
+    format!("{left}\u{2026}{right}")
+}
+
 /// Greedy word-wrap `text` to `width` display columns, breaking at spaces. A
 /// word that fits is moved whole onto its own row (so a URL/path stays
 /// selectable as one unit); a word longer than the width hard-breaks at grapheme
@@ -596,6 +658,12 @@ mod tests {
         assert_eq!(ellipsize_to_width("already fits", 20), "already fits");
         assert_eq!(ellipsize_to_width("cut", 1), "…");
         assert_eq!(ellipsize_to_width("cut", 0), "");
+        assert_eq!(ellipsize_middle_to_width("abcdefghij", 7), "abc…hij");
+        assert_eq!(ellipsize_middle_to_width("工具呼び出し", 7), "工…出し");
+        assert_eq!(
+            display_width(&ellipsize_middle_to_width("工具呼び出し", 7)),
+            7
+        );
 
         let capped = truncate_clusters_with_ellipsis(&"界".repeat(8), 5);
         assert_eq!(capped, "界界界界…");
