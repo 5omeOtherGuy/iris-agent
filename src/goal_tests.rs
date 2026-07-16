@@ -313,8 +313,9 @@ fn create_goal_tool_requires_explicit_goal_and_budget_requests() {
     let tool = tools.by_name("create_goal").expect("create_goal tool");
 
     assert!(
-        tool.description()
-            .contains("only when explicitly requested by the user or system/developer instructions")
+        tool.description().contains(
+            "only when explicitly requested by the user or system/developer instructions"
+        )
     );
     assert!(
         tool.description()
