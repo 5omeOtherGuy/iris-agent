@@ -27,7 +27,7 @@ use super::text::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_head};
 
 const DEFAULT_FIND_LIMIT: usize = 1000;
 
-pub(super) const DESCRIPTION: &str = "Search for files by glob pattern. Returns matching file paths relative to the search directory. Sorted by modification time (newest first). Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first); a truncated result ends with a summary line carrying the exact total match count and the top directories by omitted-match count so the glob can be narrowed without a blind re-run.";
+pub(super) const DESCRIPTION: &str = "Find paths by glob, newest first, honoring ignore files. Results are relative to the search directory and capped at 1,000 matches or 50 KiB; truncated default results report the exact total and top omitted directories.";
 
 /// Number of top directories named in a truncation summary.
 const SUMMARY_TOP_DIRS: usize = 5;
@@ -36,9 +36,9 @@ pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "pattern": { "type": "string", "description": "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'" },
-            "path": { "type": "string", "description": "Directory to search in (default: current directory)" },
-            "limit": { "type": "integer", "description": "Maximum number of results (default: 1000)" }
+            "pattern": { "type": "string", "description": "Glob, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'." },
+            "path": { "type": "string", "default": ".", "description": "Search directory." },
+            "limit": { "type": "integer", "minimum": 1, "default": 1000, "description": "Maximum results." }
         },
         "required": ["pattern"]
     })
@@ -361,6 +361,14 @@ mod tests {
             .unwrap()
             .set_modified(time)
             .unwrap();
+    }
+
+    #[test]
+    fn schema_encodes_search_defaults() {
+        let schema = parameters();
+        assert_eq!(schema["properties"]["path"]["default"], ".");
+        assert_eq!(schema["properties"]["limit"]["minimum"], 1);
+        assert_eq!(schema["properties"]["limit"]["default"], 1_000);
     }
 
     #[test]

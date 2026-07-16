@@ -17,16 +17,16 @@ use super::text::{
 };
 use super::{ObservedFiles, Preview};
 
-pub(super) const DESCRIPTION: &str = "Edit a file by replacing text. By default old_string must match a unique region; set replace_all=true to replace every occurrence. old_string must match the file's current contents exactly.";
+pub(super) const DESCRIPTION: &str = "Replace text in an existing file. A prior non-skim read must match its current contents. Unless `replace_all` is true, `old_string` must identify exactly one region.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "file_path": { "type": "string", "description": "The absolute path to the file to modify" },
-            "old_string": { "type": "string", "description": "The text to replace" },
-            "new_string": { "type": "string", "description": "The text to replace it with (must be different from old_string)" },
-            "replace_all": { "type": "boolean", "description": "Replace all occurrences of old_string (default false)" }
+            "file_path": { "type": "string", "description": "File path, relative or absolute." },
+            "old_string": { "type": "string", "minLength": 1, "description": "Current text to replace." },
+            "new_string": { "type": "string", "description": "Replacement text; must differ from old_string." },
+            "replace_all": { "type": "boolean", "default": false, "description": "Replace every occurrence." }
         },
         "required": ["file_path", "old_string", "new_string"],
         "additionalProperties": false
@@ -493,6 +493,20 @@ mod tests {
 
     fn run(root: &Path, path: &str, old: &str, new: &str, replace_all: bool) -> Result<String> {
         run_output(root, path, old, new, replace_all).map(|output| output.content)
+    }
+
+    #[test]
+    fn schema_encodes_unique_replacement_defaults() {
+        let schema = parameters();
+        assert_eq!(schema["properties"]["old_string"]["minLength"], 1);
+        assert_eq!(schema["properties"]["replace_all"]["default"], false);
+        assert!(
+            schema["properties"]["file_path"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("relative or absolute")
+        );
+        assert!(DESCRIPTION.contains("prior non-skim read"));
     }
 
     #[test]

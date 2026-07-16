@@ -16,15 +16,15 @@ use crate::nexus::ToolOutputStore;
 
 use super::text::render_line_window;
 
-pub(super) const DESCRIPTION: &str = "Read back a large tool output that was stored out of context behind an output handle. When a tool result is too big it is replaced with a short preview plus an `outputHandle` id; pass that id as `handle_id` to retrieve the full stored output. Output is paged with the same 2000-line / 50KB window as the read tool -- use offset (1-indexed) and limit to continue through a large handle. Read-only.";
+pub(super) const DESCRIPTION: &str = "Page an oversized tool result by its `outputHandle`. Handles may be unknown or expired. Pages use `read`'s 2,000-line/50 KiB cap and include a continuation offset.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "handle_id": { "type": "string", "description": "The outputHandle id from a compacted (offloaded) tool result" },
-            "offset": { "type": "integer", "description": "Line number to start reading from (1-indexed)" },
-            "limit": { "type": "integer", "description": "Maximum number of lines to read" }
+            "handle_id": { "type": "string", "minLength": 1, "description": "outputHandle from a truncated result." },
+            "offset": { "type": "integer", "minimum": 1, "default": 1, "description": "First line (1-indexed)." },
+            "limit": { "type": "integer", "minimum": 1, "default": 2000, "description": "Maximum lines." }
         },
         "required": ["handle_id"]
     })
@@ -72,6 +72,17 @@ mod tests {
         let store = HandleStore::with_dir(dir.path.join("outputs"));
         let id = store.put(body).unwrap();
         (dir, store, id)
+    }
+
+    #[test]
+    fn schema_encodes_paging_defaults_and_expiry_recovery() {
+        let schema = parameters();
+        assert_eq!(schema["properties"]["handle_id"]["minLength"], 1);
+        assert_eq!(schema["properties"]["offset"]["minimum"], 1);
+        assert_eq!(schema["properties"]["offset"]["default"], 1);
+        assert_eq!(schema["properties"]["limit"]["minimum"], 1);
+        assert_eq!(schema["properties"]["limit"]["default"], 2_000);
+        assert!(DESCRIPTION.contains("expired"));
     }
 
     #[test]

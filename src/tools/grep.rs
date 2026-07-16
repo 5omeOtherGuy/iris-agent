@@ -35,23 +35,23 @@ const GREP_MAX_LINE_LENGTH: usize = 500;
 const DEFAULT_GREP_LIMIT: usize = 100;
 const DEFAULT_CONTEXT: usize = 2;
 
-pub(super) const DESCRIPTION: &str = "Search file contents for a pattern. Native ripgrep-style exact search: list matching files, show matching content with context, or count matches. Respects .gitignore. Workspace confinement is opt-in via IRIS_SECURITY_OPT_IN=1. Output is bounded by limit/headLimit, maxPerFile caps content-mode matches shown per file (the rest are summarized, never dropped), and long lines are truncated to 500 chars.";
+pub(super) const DESCRIPTION: &str = "Search text as regex or literal in content, file-list, or count mode while honoring ignore files. `limit` bounds scanning; `headLimit` and `offset` page rendered rows. Content-mode `maxPerFile` summarizes omitted matches. Output is capped at 2,000 lines/50 KiB; long lines are cut at 500 characters.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "pattern": { "type": "string", "description": "Search pattern (regex or literal string)" },
-            "path": { "type": "string", "description": "Directory or file to search (default: current directory)" },
-            "glob": { "type": "string", "description": "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" },
-            "ignoreCase": { "type": "boolean", "description": "Case-insensitive search (default: false)" },
-            "literal": { "type": "boolean", "description": "Treat pattern as literal string instead of regex (default: false)" },
-            "context": { "type": "integer", "description": "Lines of context before and after each match (default: 2)" },
-            "maxPerFile": { "type": "integer", "description": "content mode only: cap matches shown per file; omitted matches are summarized with a count, never dropped (default: unlimited)" },
-            "limit": { "type": "integer", "description": "Maximum number of matches or matching files to scan (default: 100)" },
-            "outputMode": { "type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Result shape: matching content, files containing matches, or per-file match counts (default: content)" },
-            "headLimit": { "type": "integer", "description": "Maximum number of output rows to show from the selected mode (default: all)" },
-            "offset": { "type": "integer", "description": "Output row offset for pagination (default: 0)" }
+            "pattern": { "type": "string", "description": "Regex unless literal is true." },
+            "path": { "type": "string", "default": ".", "description": "File or directory." },
+            "glob": { "type": "string", "description": "File glob, e.g. '*.ts' or '**/*.spec.ts'." },
+            "ignoreCase": { "type": "boolean", "default": false },
+            "literal": { "type": "boolean", "default": false },
+            "context": { "type": "integer", "minimum": 0, "default": 2, "description": "Context lines before and after matches." },
+            "maxPerFile": { "type": "integer", "minimum": 1, "description": "Content mode: matches shown per file." },
+            "limit": { "type": "integer", "minimum": 1, "default": 100, "description": "Matches or matching files to scan." },
+            "outputMode": { "type": "string", "enum": ["content", "files_with_matches", "count"], "default": "content" },
+            "headLimit": { "type": "integer", "minimum": 1, "description": "Rows per page; unset shows all rows within limit." },
+            "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Row offset." }
         },
         "required": ["pattern"]
     })
@@ -1051,6 +1051,21 @@ mod tests {
             head_limit: None,
             offset: None,
         }
+    }
+
+    #[test]
+    fn schema_encodes_search_and_paging_defaults() {
+        let schema = parameters();
+        let properties = &schema["properties"];
+        assert_eq!(properties["path"]["default"], ".");
+        assert_eq!(properties["ignoreCase"]["default"], false);
+        assert_eq!(properties["literal"]["default"], false);
+        assert_eq!(properties["context"]["default"], 2);
+        assert_eq!(properties["maxPerFile"]["minimum"], 1);
+        assert_eq!(properties["limit"]["default"], 100);
+        assert_eq!(properties["outputMode"]["default"], "content");
+        assert_eq!(properties["headLimit"]["minimum"], 1);
+        assert_eq!(properties["offset"]["default"], 0);
     }
 
     #[test]

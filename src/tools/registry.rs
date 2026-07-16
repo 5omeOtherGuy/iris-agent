@@ -261,7 +261,7 @@ impl Tool for SpawnSubagentTool {
     }
 
     fn description(&self) -> &str {
-        "Run one independently scheduled worker, or a group that receives the same request. Mutations stay in managed worktrees until separate apply."
+        "Start one worker or an identical best-of-N group. Mutations stay isolated until separately applied."
     }
 
     fn parameters(&self) -> Value {
@@ -271,80 +271,80 @@ impl Tool for SpawnSubagentTool {
                 "prompt": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Self-contained instruction for a fresh worker that does not receive the parent conversation. Include the goal, a verifiable definition of done, relevant context, scope, constraints, required verification, and expected return format."
+                    "description": "Self-contained task for a fresh worker with no parent context: goal, done criteria, context, scope/constraints, verification, and output format."
                 },
                 "description": {
                     "type": "string",
-                    "description": "Short operator-facing label; defaults to kind."
+                    "description": "Short label; defaults to kind."
                 },
                 "kind": {
                     "type": "string",
                     "enum": ["general", "explore", "review"],
                     "default": "general",
-                    "description": "Worker category. explore and review force read_only; categories do not inject a persona, so state any desired role in prompt."
+                    "description": "Policy category, not a persona; explore/review force read_only."
                 },
                 "model": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Optional child model. Use <model> to keep the current provider or <provider>/<model> to switch provider. Omit to inherit the spawn-time effective selection."
+                    "description": "Child model: <model> keeps the provider; <provider>/<model> switches it. Omit to inherit the spawn-time selection."
                 },
                 "effort": {
                     "type": "string",
                     "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
-                    "description": "Optional reasoning effort: off, minimal, low, medium, high, xhigh, or max. Omit to inherit and clamp the effective effort for the selected model."
+                    "description": "Omit to inherit the spawn-time effort, clamped for the selected model."
                 },
                 "capability": {
                     "type": "string",
                     "enum": ["read_only", "read_write", "execute", "all"],
                     "default": "read_only",
-                    "description": "Tool grant. read_only permits inspection; read_write adds edit/write; execute adds shell; all permits both writes and shell. Cannot exceed the parent/session ceiling."
+                    "description": "Grant: read_only=inspect, read_write=+edit/write, execute=+bash, all=both. Cannot exceed the parent ceiling."
                 },
                 "isolation": {
                     "type": "string",
                     "enum": ["none", "worktree"],
-                    "description": "Workspace mode. Omit to use none for read_only or worktree for mutation-capable workers. worktree and cwd are mutually exclusive."
+                    "description": "Defaults to none for read_only, worktree otherwise; incompatible with cwd."
                 },
                 "tools": {
                     "type": "array",
                     "items": { "type": "string" },
                     "uniqueItems": true,
-                    "description": "Optional tool-name allowlist applied after capability. It can only narrow the grant; omitted or empty keeps every granted tool."
+                    "description": "Allowlist applied after capability; only narrows. Omit/empty for all granted tools."
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Existing directory inside the parent workspace for a non-isolated read_only worker; incompatible with worktree isolation."
+                    "description": "Existing parent-workspace directory for non-isolated read_only work."
                 },
                 "allow_outside_workspace": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Allow read-only tools to follow paths outside the worker workspace. Mutation remains confined."
+                    "description": "Let read tools leave the worker workspace; mutation remains confined."
                 },
                 "background": {
                     "type": "boolean",
                     "default": true,
-                    "description": "When true, return queued IDs immediately. When false, wait for the worker or every group member to become terminal."
+                    "description": "true returns IDs immediately; false waits for terminal result(s)."
                 },
                 "max_provider_rounds": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional provider-call limit; exceeding it fails the worker."
+                    "description": "Provider-call limit; excess fails the worker."
                 },
                 "max_tool_rounds": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional tool round-trip limit."
+                    "description": "Tool-call limit."
                 },
                 "max_tokens": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional cumulative token limit; exceeding it fails the worker."
+                    "description": "Cumulative token limit; excess fails the worker."
                 },
                 "count": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 8,
                     "default": 1,
-                    "description": "Number of independent workers, from 1 through 8, that receive this identical request. Values above 1 return a group for best-of-N comparison."
+                    "description": "Identical workers; values above 1 return a best-of-N group."
                 }
             },
             "required": ["prompt"],
@@ -546,7 +546,7 @@ impl Tool for SubagentStatusTool {
         "subagent_status"
     }
     fn description(&self) -> &str {
-        "Return the current non-consuming snapshot for exactly one worker or group; group snapshots include every member."
+        "Return a non-waiting snapshot for exactly one worker or group; groups include every member."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -554,11 +554,13 @@ impl Tool for SubagentStatusTool {
             "properties": {
                 "worker_id": {
                     "type": "string",
-                    "description": "Worker ID returned by spawn_subagent."
+                    "minLength": 1,
+                    "description": "Worker ID from spawn_subagent."
                 },
                 "group_id": {
                     "type": "string",
-                    "description": "Group ID returned when spawn_subagent count is greater than 1."
+                    "minLength": 1,
+                    "description": "Group ID from spawn_subagent with count > 1."
                 }
             },
             "additionalProperties": false
@@ -598,7 +600,7 @@ impl Tool for SubagentArtifactTool {
     }
 
     fn description(&self) -> &str {
-        "Read one UTF-8 byte page from an output artifact referenced by a terminal subagent result."
+        "Page UTF-8 output from an artifact in a terminal worker result."
     }
 
     fn parameters(&self) -> Value {
@@ -607,20 +609,21 @@ impl Tool for SubagentArtifactTool {
             "properties": {
                 "artifact_id": {
                     "type": "string",
-                    "description": "Artifact ID from a terminal worker result."
+                    "minLength": 1,
+                    "description": "Artifact ID from a terminal result."
                 },
                 "offset": {
                     "type": "integer",
                     "minimum": 0,
                     "default": 0,
-                    "description": "UTF-8 byte offset; continue with next_offset from the previous page."
+                    "description": "UTF-8 byte offset; continue at next_offset."
                 },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 50000,
                     "default": 16000,
-                    "description": "Maximum bytes to return, from 1 through 50000."
+                    "description": "Bytes to return (1..=50000)."
                 }
             },
             "required": ["artifact_id"],
@@ -685,7 +688,7 @@ impl Tool for CancelSubagentTool {
         "cancel_subagent"
     }
     fn description(&self) -> &str {
-        "Cancel exactly one worker or group cooperatively; the runtime hard-aborts work that exceeds its cancellation grace period."
+        "Cancel exactly one worker or group cooperatively; hard-abort after the grace period."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -693,11 +696,13 @@ impl Tool for CancelSubagentTool {
             "properties": {
                 "worker_id": {
                     "type": "string",
-                    "description": "Worker ID returned by spawn_subagent."
+                    "minLength": 1,
+                    "description": "Worker ID from spawn_subagent."
                 },
                 "group_id": {
                     "type": "string",
-                    "description": "Group ID returned when spawn_subagent count is greater than 1."
+                    "minLength": 1,
+                    "description": "Group ID from spawn_subagent with count > 1."
                 }
             },
             "additionalProperties": false
@@ -736,7 +741,7 @@ impl Tool for PlanSubagentApplyTool {
         "plan_subagent_apply"
     }
     fn description(&self) -> &str {
-        "Create an immutable content-digested apply plan for a completed worker's isolated worktree. Group candidates must be selected first; parent files are not changed."
+        "Create an immutable, digest-checked apply plan for a completed isolated worker. Select group candidates first; parent files stay unchanged."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -744,6 +749,7 @@ impl Tool for PlanSubagentApplyTool {
             "properties": {
                 "worker_id": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "Completed worker with an isolated worktree."
                 }
             },
@@ -784,28 +790,29 @@ impl Tool for ApplySubagentTool {
             "properties": {
                 "plan_id": {
                     "type": "string",
-                    "description": "Immutable plan ID returned by plan_subagent_apply."
+                    "minLength": 1,
+                    "description": "ID from plan_subagent_apply."
                 },
                 "approved_overwrites": {
                     "type": "array",
                     "items": { "type": "string" },
                     "uniqueItems": true,
                     "default": [],
-                    "description": "Dirty or base-drifted workspace-relative paths explicitly authorized for overwrite."
+                    "description": "Dirty or base-drifted relative paths authorized for overwrite."
                 },
                 "approved_escaping_symlinks": {
                     "type": "array",
                     "items": { "type": "string" },
                     "uniqueItems": true,
                     "default": [],
-                    "description": "Workspace-relative symlink paths explicitly authorized to target outside the parent workspace."
+                    "description": "Relative symlink paths authorized to escape the parent workspace."
                 },
                 "skipped_paths": {
                     "type": "array",
                     "items": { "type": "string" },
                     "uniqueItems": true,
                     "default": [],
-                    "description": "Workspace-relative plan paths to leave unapplied; skipping takes precedence over approvals."
+                    "description": "Relative plan paths to skip; skipping overrides approvals."
                 }
             },
             "required": ["plan_id"],
@@ -902,7 +909,7 @@ impl Tool for SelectSubagentCandidateTool {
         "select_subagent_candidate"
     }
     fn description(&self) -> &str {
-        "Select one successful member after every best-of-N group member is terminal. Mutable selection may change before apply; this tool never applies files."
+        "Select a successful member after every best-of-N candidate is terminal. Selection can change before apply and never mutates files."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -910,11 +917,13 @@ impl Tool for SelectSubagentCandidateTool {
             "properties": {
                 "group_id": {
                     "type": "string",
-                    "description": "Completed group whose members were inspected."
+                    "minLength": 1,
+                    "description": "Terminal group whose members were inspected."
                 },
                 "worker_id": {
                     "type": "string",
-                    "description": "Successful member of group_id to select."
+                    "minLength": 1,
+                    "description": "Successful member to select."
                 }
             },
             "required": ["group_id", "worker_id"],
@@ -2229,6 +2238,177 @@ mod tests {
     }
 
     #[test]
+    fn fixed_context_contract_budget() {
+        let subagent_dir = temp_dir();
+        let workspace = root_of(&subagent_dir);
+        let backend = Arc::new(
+            crate::wayland::subagents::SubagentBackend::open(
+                workspace.clone(),
+                &workspace.join("worker-state-budget"),
+                workspace.join("worktrees-budget"),
+            )
+            .unwrap(),
+        );
+        let subagents = SubagentToolsConfig {
+            backend,
+            provider_factory: Arc::new(|_| Err(anyhow!("budget test must not execute a provider"))),
+            selection: test_selection(),
+            capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
+            session_id: "fixed-context-budget".to_string(),
+            nesting_depth: 0,
+            max_nesting_depth: 2,
+            approval: None,
+        };
+        let web = WebToolsConfig {
+            web_search: Some(web::SearchBackend::Native),
+            read_web_page: Some(web::ReadBackend::Native),
+            ..WebToolsConfig::default()
+        };
+        let registries = vec![
+            ("default", built_in_tools()),
+            ("bash", built_in_tools_for(true, false)),
+            ("compaction", built_in_tools_for(false, true)),
+            (
+                "web",
+                built_in_tools_with(&ToolsConfig {
+                    web: web.clone(),
+                    ..ToolsConfig::default()
+                }),
+            ),
+            (
+                "subagents",
+                built_in_tools_with(&ToolsConfig {
+                    subagents: Some(subagents.clone()),
+                    ..ToolsConfig::default()
+                }),
+            ),
+            (
+                "maximal",
+                built_in_tools_with(&ToolsConfig {
+                    model_compaction_tool: true,
+                    web,
+                    subagents: Some(subagents),
+                    ..ToolsConfig::default()
+                }),
+            ),
+        ];
+
+        for (name, tools) in registries {
+            let prompt = crate::wayland::system_prompt::assemble_defaults_at(
+                Path::new("/workspace/project"),
+                &tools,
+                "2026-07-15",
+            );
+            let usage = crate::print::UsageBase::estimate(&prompt, &tools);
+            let declarations = tools
+                .iter()
+                .map(|tool| {
+                    let json = serde_json::to_string(&serde_json::json!({
+                        "name": tool.name(),
+                        "description": tool.description(),
+                        "input_schema": tool.parameters(),
+                    }))
+                    .unwrap();
+                    (tool.name(), json.len())
+                })
+                .collect::<Vec<_>>();
+            let declaration_bytes = declarations.iter().map(|(_, bytes)| bytes).sum::<usize>();
+            eprintln!(
+                "CONTEXT_BUDGET {name} tools={} system_bytes={} system_tokens={} declaration_bytes={} declaration_tokens={} base_bytes={} base_tokens={}",
+                tools.iter().count(),
+                prompt.len(),
+                usage.system_prompt_tokens,
+                declaration_bytes,
+                usage.tools_total_tokens,
+                prompt.len() + declaration_bytes,
+                usage.base_total_tokens,
+            );
+            // Explicit profile ceilings leave small room for harmless JSON
+            // serialization drift while rejecting a lost fixed-context saving.
+            let (
+                system_bytes,
+                declarations_bytes,
+                base_bytes,
+                system_tokens,
+                declarations_tokens,
+                base_tokens,
+            ) = match name {
+                "default" => (7_525, 10_300, 17_900, 1_890, 2_580, 4_500),
+                "bash" => (7_450, 6_300, 13_850, 1_870, 1_580, 3_475),
+                "compaction" => (7_550, 10_550, 18_100, 1_895, 2_650, 4_550),
+                "web" => (7_675, 12_050, 19_800, 1_930, 3_025, 5_000),
+                "subagents" => (8_575, 16_100, 24_800, 2_150, 4_050, 6_250),
+                "maximal" => (8_725, 18_100, 26_900, 2_190, 4_550, 6_775),
+                _ => unreachable!("unknown registry budget"),
+            };
+            assert!(prompt.len() <= system_bytes, "{name} system bytes regrew");
+            assert!(
+                declaration_bytes <= declarations_bytes,
+                "{name} declaration bytes regrew"
+            );
+            assert!(
+                prompt.len() + declaration_bytes <= base_bytes,
+                "{name} combined fixed bytes regrew"
+            );
+            assert!(
+                usage.system_prompt_tokens <= system_tokens,
+                "{name} system tokens regrew"
+            );
+            assert!(
+                usage.tools_total_tokens <= declarations_tokens,
+                "{name} declaration tokens regrew"
+            );
+            assert!(
+                usage.base_total_tokens <= base_tokens,
+                "{name} combined fixed base regrew"
+            );
+            if name == "maximal" {
+                for ((tool_name, bytes), tool_usage) in declarations.iter().zip(&usage.tools) {
+                    eprintln!(
+                        "CONTEXT_TOOL {tool_name} bytes={bytes} tokens={}",
+                        tool_usage.schema_tokens
+                    );
+                    let (max_bytes, max_tokens) = match *tool_name {
+                        "read" => (750, 188),
+                        "bash" => (1_025, 257),
+                        "edit" => (690, 173),
+                        "write" => (380, 95),
+                        "grep" => (1_330, 333),
+                        "find" => (590, 148),
+                        "ls" => (980, 245),
+                        "AskUserQuestion" => (1_200, 300),
+                        "get_goal" => (210, 53),
+                        "create_goal" => (960, 240),
+                        "update_goal" => (360, 90),
+                        "read_output" => (560, 140),
+                        "recall" => (1_320, 330),
+                        "request_compaction" => (230, 58),
+                        "web_search" => (1_130, 283),
+                        "read_web_page" => (620, 155),
+                        "spawn_subagent" => (2_500, 625),
+                        "subagent_status" => (415, 104),
+                        "read_subagent_output" => (550, 138),
+                        "cancel_subagent" => (410, 103),
+                        "select_subagent_candidate" => (500, 125),
+                        "plan_subagent_apply" => (400, 100),
+                        "apply_subagent" => (960, 240),
+                        _ => panic!("unbudgeted tool: {tool_name}"),
+                    };
+                    assert!(
+                        *bytes <= max_bytes,
+                        "{tool_name} declaration regrew: {bytes} > {max_bytes} bytes"
+                    );
+                    assert!(
+                        tool_usage.schema_tokens <= max_tokens,
+                        "{tool_name} declaration regrew: {} > {max_tokens} tokens",
+                        tool_usage.schema_tokens
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn all_tool_schemas_stay_in_provider_safe_subset() {
         // Keep this scratch root alive until after every registry drops its
         // scheduler-backed subagent tools.
@@ -2317,41 +2497,43 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing {expected}");
         }
-        for (name, description) in [
-            (
-                "spawn_subagent",
-                "Run one independently scheduled worker, or a group that receives the same request. Mutations stay in managed worktrees until separate apply.",
-            ),
-            (
-                "subagent_status",
-                "Return the current non-consuming snapshot for exactly one worker or group; group snapshots include every member.",
-            ),
+        for (name, needles) in [
+            ("spawn_subagent", &["best-of-N", "isolated", "applied"][..]),
+            ("subagent_status", &["exactly one", "every member"][..]),
             (
                 "read_subagent_output",
-                "Read one UTF-8 byte page from an output artifact referenced by a terminal subagent result.",
+                &["UTF-8", "artifact", "terminal"][..],
             ),
             (
                 "cancel_subagent",
-                "Cancel exactly one worker or group cooperatively; the runtime hard-aborts work that exceeds its cancellation grace period.",
+                &["exactly one", "hard-abort", "grace"][..],
             ),
             (
                 "select_subagent_candidate",
-                "Select one successful member after every best-of-N group member is terminal. Mutable selection may change before apply; this tool never applies files.",
+                &["best-of-N", "terminal", "before apply", "never mutates"][..],
             ),
             (
                 "plan_subagent_apply",
-                "Create an immutable content-digested apply plan for a completed worker's isolated worktree. Group candidates must be selected first; parent files are not changed.",
+                &["immutable", "digest", "Select group", "unchanged"][..],
             ),
             (
                 "apply_subagent",
-                "Apply one immutable plan to the parent workspace after revalidation. This separately approval-gated step requires explicit authorization for dirty, base-drifted, and escaping-symlink paths.",
+                &[
+                    "revalidation",
+                    "approval-gated",
+                    "dirty",
+                    "base-drifted",
+                    "escaping-symlink",
+                ][..],
             ),
         ] {
-            assert_eq!(
-                subagent_tools.by_name(name).unwrap().description(),
-                description,
-                "stale {name} description"
-            );
+            let description = subagent_tools.by_name(name).unwrap().description();
+            for needle in needles {
+                assert!(
+                    description.contains(needle),
+                    "{name} missing {needle}: {description}"
+                );
+            }
         }
         assert!(
             names
@@ -2394,70 +2576,41 @@ mod tests {
             !properties.contains_key("profile"),
             "profiles must not be advertised before profile resolution exists"
         );
-        for (field, description) in [
+        for field in properties.keys() {
+            assert!(
+                properties[field]["description"].is_string(),
+                "spawn_subagent.{field} needs call-time guidance"
+            );
+        }
+        for (field, needles) in [
             (
                 "prompt",
-                "Self-contained instruction for a fresh worker that does not receive the parent conversation. Include the goal, a verifiable definition of done, relevant context, scope, constraints, required verification, and expected return format.",
+                &["fresh worker", "no parent context", "done criteria"][..],
             ),
-            (
-                "description",
-                "Short operator-facing label; defaults to kind.",
-            ),
-            (
-                "kind",
-                "Worker category. explore and review force read_only; categories do not inject a persona, so state any desired role in prompt.",
-            ),
+            ("kind", &["Policy", "not a persona", "force read_only"][..]),
             (
                 "model",
-                "Optional child model. Use <model> to keep the current provider or <provider>/<model> to switch provider. Omit to inherit the spawn-time effective selection.",
+                &["<model>", "<provider>/<model>", "spawn-time selection"][..],
             ),
-            (
-                "effort",
-                "Optional reasoning effort: off, minimal, low, medium, high, xhigh, or max. Omit to inherit and clamp the effective effort for the selected model.",
-            ),
-            (
-                "capability",
-                "Tool grant. read_only permits inspection; read_write adds edit/write; execute adds shell; all permits both writes and shell. Cannot exceed the parent/session ceiling.",
-            ),
-            (
-                "isolation",
-                "Workspace mode. Omit to use none for read_only or worktree for mutation-capable workers. worktree and cwd are mutually exclusive.",
-            ),
-            (
-                "tools",
-                "Optional tool-name allowlist applied after capability. It can only narrow the grant; omitted or empty keeps every granted tool.",
-            ),
-            (
-                "cwd",
-                "Existing directory inside the parent workspace for a non-isolated read_only worker; incompatible with worktree isolation.",
-            ),
+            ("effort", &["inherit", "clamped", "selected model"][..]),
+            ("capability", &["Cannot exceed", "parent ceiling"][..]),
+            ("isolation", &["worktree", "incompatible with cwd"][..]),
+            ("tools", &["only narrows", "all granted"][..]),
+            ("cwd", &["parent-workspace", "read_only"][..]),
             (
                 "allow_outside_workspace",
-                "Allow read-only tools to follow paths outside the worker workspace. Mutation remains confined.",
+                &["read tools", "mutation remains confined"][..],
             ),
-            (
-                "background",
-                "When true, return queued IDs immediately. When false, wait for the worker or every group member to become terminal.",
-            ),
-            (
-                "max_provider_rounds",
-                "Optional provider-call limit; exceeding it fails the worker.",
-            ),
-            ("max_tool_rounds", "Optional tool round-trip limit."),
-            (
-                "max_tokens",
-                "Optional cumulative token limit; exceeding it fails the worker.",
-            ),
-            (
-                "count",
-                "Number of independent workers, from 1 through 8, that receive this identical request. Values above 1 return a group for best-of-N comparison.",
-            ),
+            ("background", &["immediately", "waits for terminal"][..]),
+            ("count", &["Identical", "best-of-N group"][..]),
         ] {
-            assert_eq!(
-                properties[field]["description"],
-                json!(description),
-                "stale spawn_subagent.{field} description"
-            );
+            let description = properties[field]["description"].as_str().unwrap();
+            for needle in needles {
+                assert!(
+                    description.contains(needle),
+                    "{field} missing {needle}: {description}"
+                );
+            }
         }
         for (field, default) in [
             ("kind", json!("general")),
@@ -2473,65 +2626,17 @@ mod tests {
         }
 
         for (tool_name, fields) in [
-            (
-                "subagent_status",
-                vec![
-                    ("worker_id", "Worker ID returned by spawn_subagent."),
-                    (
-                        "group_id",
-                        "Group ID returned when spawn_subagent count is greater than 1.",
-                    ),
-                ],
-            ),
-            (
-                "cancel_subagent",
-                vec![
-                    ("worker_id", "Worker ID returned by spawn_subagent."),
-                    (
-                        "group_id",
-                        "Group ID returned when spawn_subagent count is greater than 1.",
-                    ),
-                ],
-            ),
-            (
-                "select_subagent_candidate",
-                vec![
-                    ("group_id", "Completed group whose members were inspected."),
-                    ("worker_id", "Successful member of group_id to select."),
-                ],
-            ),
-            (
-                "plan_subagent_apply",
-                vec![("worker_id", "Completed worker with an isolated worktree.")],
-            ),
-            (
-                "apply_subagent",
-                vec![
-                    (
-                        "plan_id",
-                        "Immutable plan ID returned by plan_subagent_apply.",
-                    ),
-                    (
-                        "approved_overwrites",
-                        "Dirty or base-drifted workspace-relative paths explicitly authorized for overwrite.",
-                    ),
-                    (
-                        "approved_escaping_symlinks",
-                        "Workspace-relative symlink paths explicitly authorized to target outside the parent workspace.",
-                    ),
-                    (
-                        "skipped_paths",
-                        "Workspace-relative plan paths to leave unapplied; skipping takes precedence over approvals.",
-                    ),
-                ],
-            ),
+            ("subagent_status", &["worker_id", "group_id"][..]),
+            ("cancel_subagent", &["worker_id", "group_id"][..]),
+            ("select_subagent_candidate", &["worker_id", "group_id"][..]),
+            ("plan_subagent_apply", &["worker_id"][..]),
+            ("apply_subagent", &["plan_id"][..]),
         ] {
             let schema = subagent_tools.by_name(tool_name).unwrap().parameters();
-            for (field, description) in fields {
+            for field in fields {
                 assert_eq!(
-                    schema["properties"][field]["description"],
-                    json!(description),
-                    "stale {tool_name}.{field} description"
+                    schema["properties"][field]["minLength"], 1,
+                    "{tool_name}.{field} must reject empty IDs"
                 );
             }
         }
@@ -2539,37 +2644,32 @@ mod tests {
             .by_name("apply_subagent")
             .unwrap()
             .parameters();
-        for field in [
-            "approved_overwrites",
-            "approved_escaping_symlinks",
-            "skipped_paths",
+        for (field, needle) in [
+            ("approved_overwrites", "base-drifted"),
+            ("approved_escaping_symlinks", "escape"),
+            ("skipped_paths", "overrides approvals"),
         ] {
             assert_eq!(
                 apply_schema["properties"][field]["default"],
                 json!([]),
                 "missing apply_subagent.{field} default"
             );
+            assert!(
+                apply_schema["properties"][field]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains(needle),
+                "apply_subagent.{field} missing {needle}"
+            );
         }
         let artifact_schema = subagent_tools
             .by_name("read_subagent_output")
             .unwrap()
             .parameters();
-        for (field, description) in [
-            ("artifact_id", "Artifact ID from a terminal worker result."),
-            (
-                "offset",
-                "UTF-8 byte offset; continue with next_offset from the previous page.",
-            ),
-            ("limit", "Maximum bytes to return, from 1 through 50000."),
-        ] {
-            assert_eq!(
-                artifact_schema["properties"][field]["description"],
-                json!(description),
-                "stale read_subagent_output.{field} description"
-            );
-        }
+        assert_eq!(artifact_schema["properties"]["artifact_id"]["minLength"], 1);
         assert_eq!(artifact_schema["properties"]["offset"]["default"], 0);
         assert_eq!(artifact_schema["properties"]["limit"]["default"], 16_000);
+        assert_eq!(artifact_schema["properties"]["limit"]["maximum"], 50_000);
 
         let state = std::cell::RefCell::new(ToolState::new());
         let env = bash_env(&subagent_workspace, &state, None);

@@ -881,9 +881,9 @@ fn builds_codex_request_from_conversation() {
     assert_eq!(request["stream"], true);
     let instructions = request["instructions"].as_str().unwrap();
     assert!(instructions.contains("You are iris, a coding assistant"));
-    assert!(instructions.contains("- read:"));
-    assert!(instructions.contains("- ls:"));
-    assert!(instructions.contains("No other tools are available"));
+    assert!(instructions.contains("Available tools: read, bash"));
+    assert!(instructions.contains(", ls,"));
+    assert!(instructions.contains("Use only these tools"));
     assert!(instructions.contains("Current working directory: /tmp/iris"));
     assert_eq!(request["input"].as_array().unwrap().len(), 2);
     assert_eq!(request["input"][0]["role"], "user");
@@ -891,7 +891,14 @@ fn builds_codex_request_from_conversation() {
     assert_eq!(request["input"][0]["content"][0]["text"], "hello");
     assert_eq!(request["input"][1]["role"], "assistant");
     assert_eq!(request["input"][1]["content"][0]["type"], "output_text");
-    assert_eq!(request["tools"][0]["name"], "read");
+    let read = &request["tools"][0];
+    assert_eq!(read["name"], "read");
+    assert!(
+        read["description"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(read["parameters"]["type"], "object");
 }
 
 #[test]

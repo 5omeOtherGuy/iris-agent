@@ -28,19 +28,19 @@ const SUMMARY_TOP_EXT: usize = 5;
 /// bound (`>=N ... scan capped`).
 const SCAN_BUDGET: usize = 10_000;
 
-pub(super) const DESCRIPTION: &str = "List directory contents: directories first, then files (case-insensitive), with '/' suffix for directories. Includes dotfiles. Set ignore to a glob or array of globs to filter relative paths. Set recursive=true (or depth>1) for an indented tree up to `depth` levels. Set long=true to prefix each entry with a type marker (d/f/l) and human-readable size. Output is truncated to 500 entries or 50KB (whichever is hit first); a truncated listing ends with a summary line carrying the exact total, the dirs/files split, and the dominant omitted extensions so what was cut is visible without a blind re-list.";
+pub(super) const DESCRIPTION: &str = "List directory entries, directories first, including dotfiles; symlinked directories are never descended. Results are capped at 500 entries or 50 KiB. Truncated output reports totals, dirs/files, and omitted extensions; a capped scan marks totals as lower bounds.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string", "description": "Directory to list (default: current directory)" },
-            "limit": { "type": "integer", "description": "Maximum number of entries to return (default: 500)" },
-            "recursive": { "type": "boolean", "description": "List subdirectories as an indented tree (default: false)" },
-            "depth": { "type": "integer", "description": "Levels to descend: 1 = immediate children (default), 2 = children and grandchildren, etc. recursive=true implies at least 2." },
-            "long": { "type": "boolean", "description": "Prefix each entry with a type marker (d/f/l) and human-readable size (default false)" },
+            "path": { "type": "string", "default": ".", "description": "Directory." },
+            "limit": { "type": "integer", "minimum": 1, "default": 500, "description": "Maximum entries." },
+            "recursive": { "type": "boolean", "default": false, "description": "Indented tree; depth defaults to 2." },
+            "depth": { "type": "integer", "description": "Levels to show; explicit depth overrides recursive and is coerced to at least 1." },
+            "long": { "type": "boolean", "default": false, "description": "Prefix d/f/l type and human-readable size." },
             "ignore": {
-                "description": "Glob pattern or array of patterns for relative paths to exclude",
+                "description": "Relative-path exclusion glob or array of globs.",
                 "anyOf": [
                     { "type": "string" },
                     { "type": "array", "items": { "type": "string" } }
@@ -428,6 +428,23 @@ mod tests {
         )
         .unwrap()
         .content
+    }
+
+    #[test]
+    fn schema_encodes_listing_defaults_and_depth_precedence() {
+        let schema = parameters();
+        let properties = &schema["properties"];
+        assert_eq!(properties["path"]["default"], ".");
+        assert_eq!(properties["limit"]["minimum"], 1);
+        assert_eq!(properties["limit"]["default"], 500);
+        assert_eq!(properties["recursive"]["default"], false);
+        assert_eq!(properties["long"]["default"], false);
+        assert!(
+            properties["depth"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("overrides recursive")
+        );
     }
 
     #[test]
