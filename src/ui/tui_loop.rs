@@ -3238,11 +3238,10 @@ async fn run_modal_phase<P: ChatProvider>(
     let mut settings_stash: Option<crate::ui::settings_menu::PanelView> = None;
     let (delegation_tx, mut delegation_rx) = unbounded_channel::<DelegationResponse>();
     let delegation_backend = harness.subagent_backend().ok().cloned();
-    if let Some(Modal::Delegation(dashboard)) = tui.screen.modal.as_mut() {
-        dashboard.reset_transport();
-        if let Some(request) = dashboard.request_initial() {
-            spawn_idle_delegation(delegation_backend.clone(), request, delegation_tx.clone());
-        }
+    if let Some(Modal::Delegation(dashboard)) = tui.screen.modal.as_mut()
+        && let Some(request) = dashboard.request_initial_if_needed()
+    {
+        spawn_idle_delegation(delegation_backend.clone(), request, delegation_tx.clone());
     }
     while tui.screen.focus() == FocusTarget::Modal {
         tokio::select! {

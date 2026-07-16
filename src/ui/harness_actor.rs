@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::ModelSwitch;
@@ -384,14 +385,48 @@ impl AgentObserver for SettingsEventSink {
 }
 
 fn dispatch_delegation(
+    tasks: &mut JoinSet<crate::ui::delegation_dashboard::DelegationResponse>,
     backend: Option<Arc<crate::wayland::subagents::SubagentBackend>>,
     request: crate::ui::delegation_dashboard::DelegationRequest,
-    events: UnboundedSender<HarnessEvent>,
 ) {
-    tokio::task::spawn_blocking(move || {
-        let response = crate::ui::delegation_dashboard::execute_request(backend, request);
-        let _ = events.send(HarnessEvent::Delegation(response));
+    tasks.spawn_blocking(move || {
+        let request_id = request.request_id;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::ui::delegation_dashboard::execute_request(backend, request)
+        }))
+        .unwrap_or_else(|_| crate::ui::delegation_dashboard::DelegationResponse {
+            request_id,
+            result: Err("delegation backend task panicked".to_string()),
+        })
     });
+}
+
+fn publish_delegation(
+    result: std::result::Result<
+        crate::ui::delegation_dashboard::DelegationResponse,
+        tokio::task::JoinError,
+    >,
+    events: &UnboundedSender<HarnessEvent>,
+) {
+    match result {
+        Ok(response) => {
+            let _ = events.send(HarnessEvent::Delegation(response));
+        }
+        Err(error) => {
+            let _ = events.send(HarnessEvent::UiEvent(UiEvent::Notice(format!(
+                "delegation backend task failed: {error}"
+            ))));
+        }
+    }
+}
+
+async fn finish_delegation(
+    tasks: &mut JoinSet<crate::ui::delegation_dashboard::DelegationResponse>,
+    events: &UnboundedSender<HarnessEvent>,
+) {
+    while let Some(result) = tasks.join_next().await {
+        publish_delegation(result, events);
+    }
 }
 
 pub(crate) struct HarnessActor<'a, 'b, P> {
@@ -476,6 +511,7 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
         };
         let mut pending_approval: Option<oneshot::Sender<ApprovalDecision>> = None;
         let mut pending_interaction: Option<oneshot::Sender<InteractionOutcome>> = None;
+        let mut delegation_tasks = JoinSet::new();
 
         let result = {
             let mut operation_future: futures::future::LocalBoxFuture<'_, Result<()>> =
@@ -495,6 +531,9 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
             loop {
                 tokio::select! {
                     biased;
+                    Some(result) = delegation_tasks.join_next(), if !delegation_tasks.is_empty() => {
+                        publish_delegation(result, &self.events);
+                    }
                     result = &mut operation_future => break result,
                     Some(request) = approval_rx.recv() => {
                         if let Some(previous) = pending_approval.replace(request.reply) {
@@ -547,9 +586,9 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                             }
                             HarnessCommand::Delegation(request) => {
                                 dispatch_delegation(
+                                    &mut delegation_tasks,
                                     subagent_backend.clone(),
                                     request,
-                                    self.events.clone(),
                                 );
                             }
                             HarnessCommand::Goal(command) => {
@@ -628,6 +667,12 @@ impl<'a, 'b, P: ChatProvider> HarnessActor<'a, 'b, P> {
                 }
             }
         };
+        while let Ok(command) = self.commands.try_recv() {
+            if let HarnessCommand::Delegation(request) = command {
+                dispatch_delegation(&mut delegation_tasks, subagent_backend.clone(), request);
+            }
+        }
+        finish_delegation(&mut delegation_tasks, &self.events).await;
         let result = result.and(self.harness.persist_goal());
 
         if let Some(reply) = pending_approval.take() {
@@ -947,29 +992,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn delegation_dispatch_runs_off_actor_and_returns_a_typed_error() {
+    async fn delegation_dispatch_is_drained_before_the_actor_boundary() {
         let (event_tx, mut event_rx) = unbounded_channel();
+        let mut tasks = tokio::task::JoinSet::new();
         dispatch_delegation(
+            &mut tasks,
             None,
             crate::ui::delegation_dashboard::DelegationRequest {
                 request_id: 7,
-                kind: crate::ui::delegation_dashboard::DelegationRequestKind::Snapshot {
-                    include_worktrees: false,
-                },
+                kind: crate::ui::delegation_dashboard::DelegationRequestKind::GcWorktrees,
             },
-            event_tx,
         );
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
-            .await
-            .expect("delegation task blocked the actor")
-            .expect("delegation response channel closed");
+        finish_delegation(&mut tasks, &event_tx).await;
+        assert!(tasks.is_empty());
+        event_tx.send(HarnessEvent::TurnFinished).unwrap();
+        let event = event_rx
+            .try_recv()
+            .expect("delegation response was published before boundary completion");
         assert!(matches!(
             event,
             HarnessEvent::Delegation(crate::ui::delegation_dashboard::DelegationResponse {
                 request_id: 7,
                 result: Err(message),
             }) if message.contains("not configured")
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(HarnessEvent::TurnFinished)
         ));
     }
 

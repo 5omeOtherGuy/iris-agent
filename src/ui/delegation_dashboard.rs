@@ -301,12 +301,12 @@ impl DelegationDashboard {
         }
     }
 
-    pub(crate) fn reset_transport(&mut self) {
-        self.pending_request = None;
-        self.pending_refresh = false;
-        self.in_flight = None;
-        self.last_worker_refresh = None;
-        self.last_worktree_refresh = None;
+    pub(crate) fn request_initial_if_needed(&mut self) -> Option<DelegationRequest> {
+        if self.loading {
+            self.request_initial()
+        } else {
+            None
+        }
     }
 
     pub(crate) fn request_initial(&mut self) -> Option<DelegationRequest> {
@@ -3055,6 +3055,17 @@ mod tests {
     fn artifact_text_is_escape_free_before_it_reaches_rendering() {
         let cleaned = textengine::clean_text("safe\x1b[31m red\x1b[0m\x07");
         assert_eq!(cleaned, "safe red");
+    }
+
+    #[test]
+    fn idle_handoff_only_requests_an_initial_snapshot_for_a_new_dashboard() {
+        let mut active = DelegationDashboard::new(DelegationScope::Workers);
+        let initial = active.request_initial().unwrap();
+        active.apply_response(response(initial.request_id, Vec::new()));
+        assert!(active.request_initial_if_needed().is_none());
+
+        let mut idle = DelegationDashboard::new(DelegationScope::Workers);
+        assert!(idle.request_initial_if_needed().is_some());
     }
 
     #[test]
