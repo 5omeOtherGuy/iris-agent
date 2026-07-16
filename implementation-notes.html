@@ -8,6 +8,7 @@
   <li><strong>Wrapper scope:</strong> The plain-Git worktree wrapper accepts only the four exact local-instruction entries committed in <code>.worktreeinclude</code>. It refuses unsupported patterns instead of copying arbitrary ignored files, so later additions require an explicit safety review.</li>
   <li><strong>Skill publication audit:</strong> Track <code>iris-release</code> after checking it against <code>docs/RELEASING.md</code>, <code>release-plz.toml</code>, and the release workflow and removing personal attribution. Track <code>compaction-tuning</code> after removing its private home-directory plan reference.</li>
   <li><strong>Durable handoff:</strong> No pull request or other remote review artifact was created because the task did not authorize an externally visible action. Retain this file until an operator provides a readable review surface; then transfer every entry, read it back, and delete this file.</li>
+  <li><strong>Gate flake:</strong> The full gate twice reproduced an unrelated scheduler test racing a fixed 100 ms sleep. Replace that test-only sleep/poll assertion with the runtime's terminal <code>wait</code> seam; this preserves the independent-worker assertion and removes host-load timing dependence.</li>
 </ul>
 </body>
 </html>
