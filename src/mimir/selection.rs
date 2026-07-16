@@ -613,6 +613,133 @@ impl ModelSelection {
     }
 }
 
+/// Apply optional model/provider and reasoning overrides to an already resolved
+/// selection. Calling this function in sequence composes defaults component by
+/// component: an omitted field keeps the value produced by the previous call.
+pub(crate) fn apply_selection_overrides(
+    base: &ModelSelection,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<ModelSelection> {
+    let mut selection = match model {
+        Some(target) => {
+            let target = target.trim();
+            if target.is_empty() {
+                return Err(UsageError::new(
+                    "model override must not be empty; use <model> or <provider>/<model>",
+                )
+                .into());
+            }
+            let (provider, model) = match target.split_once('/') {
+                Some((provider, model)) => (ProviderId::parse(provider)?, model.trim()),
+                None => (base.provider, target),
+            };
+            if model.is_empty() {
+                return Err(UsageError::new(
+                    "model override must not be empty; use <model> or <provider>/<model>",
+                )
+                .into());
+            }
+            candidate_for(base, provider, model)
+        }
+        None => base.clone(),
+    };
+
+    if let Some(effort) = effort {
+        selection.reasoning = Some(ReasoningEffort::parse(effort)?);
+    }
+    selection.resolve_context_management_for_provider()?;
+    crate::mimir::model_capabilities::validate(&selection)?;
+    Ok(selection)
+}
+
+/// Reconstruct a validated effective selection from host-owned persisted route
+/// fields. Non-route provider settings come from `base`; all route components
+/// are replaced from the accepted snapshot.
+pub(crate) fn selection_from_effective_route(
+    base: &ModelSelection,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    effort: Option<&str>,
+) -> Result<ModelSelection> {
+    let provider = ProviderId::parse(provider)?;
+    let model = model.trim();
+    if model.is_empty() {
+        return Err(UsageError::new("persisted worker route has an empty model").into());
+    }
+    let base_url = base_url.trim();
+    if base_url.is_empty() {
+        return Err(UsageError::new("persisted worker route has an empty base URL").into());
+    }
+    let mut selection = base.clone();
+    selection.provider = provider;
+    selection.model = model.to_string();
+    selection.base_url = base_url.to_string();
+    selection.reasoning = effort.map(ReasoningEffort::parse).transpose()?;
+    selection.resolve_context_management_for_provider()?;
+    crate::mimir::model_capabilities::validate(&selection)?;
+    Ok(selection)
+}
+
+/// Build a model candidate using the same provider-switch URL and carried-effort
+/// semantics as `/model` and direct worker routing.
+pub(crate) fn candidate_for(
+    current: &ModelSelection,
+    provider: ProviderId,
+    model: &str,
+) -> ModelSelection {
+    let base_url = if provider == current.provider {
+        current.base_url.clone()
+    } else {
+        let settings_base_url = settings_base_url_for_switch(provider);
+        base_url_for(provider, settings_base_url.as_deref())
+    };
+    let reasoning = carried_reasoning(current, provider, model);
+    ModelSelection {
+        provider,
+        model: model.to_string(),
+        base_url,
+        reasoning,
+        cache_retention: current.cache_retention,
+        codex_transport: current.codex_transport,
+        codex_stream_idle_timeout: current.codex_stream_idle_timeout,
+        context_management: current.context_management.clone(),
+        legacy_context_management: current.legacy_context_management.clone(),
+        tool_result_compaction: current.tool_result_compaction.clone(),
+        configured_tool_result_compaction: current.configured_tool_result_compaction.clone(),
+        retry_policy: current.retry_policy,
+        open_ai_compatible: current.open_ai_compatible,
+    }
+}
+
+pub(crate) fn carried_reasoning(
+    current: &ModelSelection,
+    provider: ProviderId,
+    model: &str,
+) -> Option<ReasoningEffort> {
+    if provider == ProviderId::OpenAiCompatible && !current.open_ai_compatible.reasoning {
+        None
+    } else {
+        current
+            .reasoning
+            .map(|level| crate::mimir::model_capabilities::clamp(provider, model, level))
+    }
+}
+
+fn settings_base_url_for_switch(provider: ProviderId) -> Option<String> {
+    let settings = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| Settings::load(&cwd).ok())?;
+    let configured_provider = settings
+        .default_provider
+        .as_deref()
+        .and_then(|value| ProviderId::parse(value).ok());
+    (configured_provider == Some(provider))
+        .then_some(settings.base_url)
+        .flatten()
+}
+
 const BUILT_IN_TOOL_NAMES: &[&str] = &[
     "read",
     "write",
@@ -1448,6 +1575,147 @@ mod tests {
             "http://localhost:11434/v1",
             "custom OpenAI-compatible endpoints still use the configured base URL"
         );
+    }
+
+    #[test]
+    fn selection_overrides_inherit_and_apply_components_independently() {
+        let mut parent = selection_for(
+            ProviderId::Anthropic,
+            "claude-sonnet-4-6",
+            PromptCacheRetention::Short,
+        );
+        parent.base_url = "https://api.anthropic.com".to_string();
+        parent.reasoning = Some(ReasoningEffort::High);
+
+        assert_eq!(
+            apply_selection_overrides(&parent, None, None).unwrap(),
+            parent
+        );
+
+        let model_only = apply_selection_overrides(&parent, Some("claude-opus-4-6"), None).unwrap();
+        assert_eq!(model_only.provider, ProviderId::Anthropic);
+        assert_eq!(model_only.model, "claude-opus-4-6");
+        assert_eq!(model_only.base_url, parent.base_url);
+        assert_eq!(model_only.reasoning, Some(ReasoningEffort::High));
+
+        let effort_only = apply_selection_overrides(&parent, None, Some("low")).unwrap();
+        assert_eq!(effort_only.provider, parent.provider);
+        assert_eq!(effort_only.model, parent.model);
+        assert_eq!(effort_only.reasoning, Some(ReasoningEffort::Low));
+
+        let both = apply_selection_overrides(
+            &parent,
+            Some("antigravity/gemini-3.5-flash"),
+            Some("medium"),
+        )
+        .unwrap();
+        assert_eq!(both.provider, ProviderId::Antigravity);
+        assert_eq!(both.model, "gemini-3.5-flash");
+        assert_eq!(both.base_url, "https://daily-cloudcode-pa.googleapis.com");
+        assert_eq!(both.reasoning, Some(ReasoningEffort::Medium));
+    }
+
+    #[test]
+    fn model_override_carries_and_clamps_existing_effort() {
+        let mut parent = selection_for(
+            ProviderId::OpenAiCodex,
+            "gpt-5.6-sol",
+            PromptCacheRetention::Short,
+        );
+        parent.base_url = "https://chatgpt.com/backend-api".to_string();
+        parent.reasoning = Some(ReasoningEffort::Max);
+
+        let routed = apply_selection_overrides(&parent, Some("gpt-5.5"), None).unwrap();
+
+        assert_eq!(routed.reasoning, Some(ReasoningEffort::XHigh));
+    }
+
+    #[test]
+    fn explicit_effort_is_strictly_validated_after_model_resolution() {
+        let parent = selection_for(
+            ProviderId::OpenAiCodex,
+            "gpt-5.6-sol",
+            PromptCacheRetention::Short,
+        );
+
+        let error = apply_selection_overrides(&parent, Some("openai/gpt-4.1"), Some("high"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("not supported by openai/gpt-4.1"), "{error}");
+    }
+
+    #[test]
+    fn selection_overrides_reject_empty_model_and_unknown_provider() {
+        let parent = selection_for(
+            ProviderId::OpenAiCodex,
+            "gpt-5.6-sol",
+            PromptCacheRetention::Short,
+        );
+
+        let empty = apply_selection_overrides(&parent, Some("  "), None)
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("model"), "{empty}");
+
+        let unknown = apply_selection_overrides(&parent, Some("unknown/model"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("unsupported provider"), "{unknown}");
+    }
+
+    #[test]
+    fn sequential_overrides_compose_profile_defaults_before_spawn_overrides() {
+        let mut parent = selection_for(
+            ProviderId::Anthropic,
+            "claude-sonnet-4-6",
+            PromptCacheRetention::Short,
+        );
+        parent.base_url = "https://api.anthropic.com".to_string();
+        parent.reasoning = Some(ReasoningEffort::High);
+
+        let profile =
+            apply_selection_overrides(&parent, Some("claude-haiku-4-5"), Some("low")).unwrap();
+        let spawn_model =
+            apply_selection_overrides(&profile, Some("claude-opus-4-6"), None).unwrap();
+        assert_eq!(spawn_model.model, "claude-opus-4-6");
+        assert_eq!(spawn_model.reasoning, Some(ReasoningEffort::Low));
+
+        let spawn_effort = apply_selection_overrides(&spawn_model, None, Some("xhigh")).unwrap();
+        assert_eq!(spawn_effort.reasoning, Some(ReasoningEffort::XHigh));
+    }
+
+    #[test]
+    fn persisted_effective_route_reconstructs_and_validates_the_selection() {
+        let parent = selection_for(
+            ProviderId::OpenAiCodex,
+            "gpt-5.6-sol",
+            PromptCacheRetention::Short,
+        );
+
+        let restored = selection_from_effective_route(
+            &parent,
+            "anthropic",
+            "claude-opus-4-6",
+            "https://api.anthropic.com",
+            Some("xhigh"),
+        )
+        .unwrap();
+        assert_eq!(restored.provider, ProviderId::Anthropic);
+        assert_eq!(restored.model, "claude-opus-4-6");
+        assert_eq!(restored.base_url, "https://api.anthropic.com");
+        assert_eq!(restored.reasoning, Some(ReasoningEffort::XHigh));
+
+        let error = selection_from_effective_route(
+            &parent,
+            "openai",
+            "gpt-4.1",
+            "https://api.openai.com/v1",
+            Some("high"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not supported"), "{error}");
     }
 
     #[test]

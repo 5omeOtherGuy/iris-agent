@@ -1071,8 +1071,9 @@ selection must be centralized in Nexus rather than duplicated in Iris CLI.
 engine are stable.
 
 **Status:** delegated-worker slice shipped 2026-07-14 under
-[#459](https://github.com/5omeOtherGuy/iris-agent/issues/459). Mode profiles
-and per-worker provider routing remain deferred.
+[#459](https://github.com/5omeOtherGuy/iris-agent/issues/459). Direct per-spawn
+model/provider and reasoning-effort routing shipped 2026-07-15. Named worker
+profiles are the immediate follow-up.
 
 Shipped scope:
 
@@ -1083,11 +1084,15 @@ Shipped scope:
 - Shared scheduler for delegated workers and compaction; provider/agent state may
   remain `!Send`.
 - Explicit best-of-N selection and reviewed apply. No model-authorized apply.
+- Direct `spawn_subagent` model/provider and effort overrides. Omitted components
+  inherit the spawn-time parent selection; accepted workers persist one effective
+  route and do not follow later parent switches.
 
 Remaining scope:
 
-- Simple mode profiles and mode-specific prompt/tool/model settings.
-- Per-worker model/provider routing.
+- Named worker profiles with prompt/tool/model defaults. Route defaults compose
+  before direct spawn overrides, giving component precedence `spawn -> profile ->
+  parent` without changing worker persistence or provider construction.
 
 Acceptance signal: Iris can delegate search/review/research work without bloating
 the main conversation and can report the token/latency cost of that delegation.

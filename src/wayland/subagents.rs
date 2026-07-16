@@ -1,6 +1,7 @@
 //! Wayland adapter between the host-neutral worker runtime and Nexus child agents.
 
 use std::cell::RefCell;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,6 +14,8 @@ use iris_subagent_runtime::{
     IsolationMode, LocalExecutorFuture, Usage, WorkerContext, WorkerExecutor, WorkerRequest,
     WorkerWorktree,
 };
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::nexus::{
@@ -23,9 +26,101 @@ use crate::tools::{ToolState, built_in_tools};
 use crate::wayland::worker_runtime::WorkerRuntime;
 use crate::wayland::{Harness, HarnessRuntimeConfig, MutationSafetyConfig};
 
+pub(crate) const IRIS_ROUTE_ID_PREFIX: &str = "iris_model_route_v1_";
+pub(crate) const IRIS_ROUTE_PAYLOAD_KIND: &str = "iris_model_route";
+const IRIS_ROUTE_SCHEMA_VERSION: u32 = 1;
+
+/// Persisted, non-secret effective provider route for one accepted worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChildRoute {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) base_url: String,
+    pub(crate) effort: Option<String>,
+}
+
+impl ChildRoute {
+    pub(crate) fn new(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        effort: Option<&str>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            base_url: base_url.into(),
+            effort: effort.map(str::to_string),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.provider.trim().is_empty() || self.model.trim().is_empty() {
+            anyhow::bail!("route provider and model must not be empty");
+        }
+        let url = reqwest::Url::parse(self.base_url.trim())
+            .context("route base URL must be an absolute URL")?;
+        if !url.username().is_empty() || url.password().is_some() {
+            anyhow::bail!("route base URL must not contain credentials");
+        }
+        Ok(())
+    }
+}
+
+/// Attach the effective route before durable worker acceptance. `profile_id` is
+/// left untouched so a later profile resolver can add provenance without
+/// changing this execution contract.
+pub(crate) fn attach_route(request: &mut WorkerRequest, route: &ChildRoute) -> Result<()> {
+    route.validate()?;
+    let value = serde_json::to_value(route)?;
+    let id = route_id(route)?;
+    request.route_id = Some(id);
+    let mut payload = iris_subagent_runtime::HostPayload::default();
+    payload.schema_version = IRIS_ROUTE_SCHEMA_VERSION;
+    payload.kind = IRIS_ROUTE_PAYLOAD_KIND.to_string();
+    payload.value = value;
+    request.host = payload;
+    Ok(())
+}
+
+/// Decode and authenticate the route persisted on an accepted request. Requests
+/// without `route_id` predate direct routing and retain live-parent inheritance.
+pub(crate) fn route_from_request(request: &WorkerRequest) -> Result<Option<ChildRoute>> {
+    let Some(id) = request.route_id.as_deref() else {
+        return Ok(None);
+    };
+    if !id.starts_with(IRIS_ROUTE_ID_PREFIX) {
+        anyhow::bail!("unsupported worker route identifier '{id}'");
+    }
+    let malformed = || anyhow::anyhow!("malformed Iris worker route '{id}'");
+    let payload = crate::wayland::worker_runtime::original_host_payload(request)
+        .map_err(|_| malformed())?
+        .ok_or_else(malformed)?;
+    if payload.schema_version != IRIS_ROUTE_SCHEMA_VERSION
+        || payload.kind != IRIS_ROUTE_PAYLOAD_KIND
+    {
+        return Err(malformed());
+    }
+    let route: ChildRoute = serde_json::from_value(payload.value).map_err(|_| malformed())?;
+    route.validate().map_err(|_| malformed())?;
+    if route_id(&route).map_err(|_| malformed())? != id {
+        return Err(malformed());
+    }
+    Ok(Some(route))
+}
+
+fn route_id(route: &ChildRoute) -> Result<String> {
+    let digest = Sha256::digest(serde_json::to_vec(route)?);
+    let mut suffix = String::with_capacity(32);
+    for byte in &digest[..16] {
+        write!(&mut suffix, "{byte:02x}")?;
+    }
+    Ok(format!("{IRIS_ROUTE_ID_PREFIX}{suffix}"))
+}
+
 /// Factory that constructs a fresh `!Send` provider on the scheduler thread.
 pub(crate) type ChildProviderFactory =
-    Arc<dyn Fn() -> Result<Box<dyn ChatProvider>> + Send + Sync + 'static>;
+    Arc<dyn Fn(&WorkerRequest) -> Result<Box<dyn ChatProvider>> + Send + Sync + 'static>;
 
 type ChildAgentConfigurator = fn(&WorkerRequest, &mut Agent<Box<dyn ChatProvider>>);
 
@@ -292,7 +387,7 @@ impl WorkerExecutor for NexusWorker {
                     "worker cancelled during initialization",
                 ));
             }
-            let provider = (self.provider_factory)().map_err(executor_error)?;
+            let provider = (self.provider_factory)(&request).map_err(executor_error)?;
             let grant = capability_grant(request.policy.capability);
             let mut tools = built_in_tools().into_capability(grant);
             if !request.policy.tool_allowlist.is_empty() {
@@ -643,6 +738,55 @@ mod tests {
     use crate::nexus::{AssistantTurn, CompletionReason, ProviderEvent, ProviderStream};
     use serde_json::json;
 
+    #[test]
+    fn effective_route_serialization_round_trips_and_sets_a_stable_id() {
+        let route = ChildRoute::new(
+            "anthropic",
+            "claude-opus-4-6",
+            "https://api.anthropic.com",
+            Some("high"),
+        );
+        let mut request = WorkerRequest::read_only("route");
+
+        attach_route(&mut request, &route).unwrap();
+
+        assert!(
+            request
+                .route_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with(IRIS_ROUTE_ID_PREFIX))
+        );
+        assert_eq!(route_from_request(&request).unwrap(), Some(route));
+        assert_eq!(request.profile_id, None);
+    }
+
+    #[test]
+    fn malformed_claimed_iris_route_fails_closed_while_legacy_requests_inherit() {
+        let legacy = WorkerRequest::read_only("legacy");
+        assert_eq!(route_from_request(&legacy).unwrap(), None);
+
+        let mut malformed = WorkerRequest::read_only("malformed");
+        malformed.route_id = Some(format!("{IRIS_ROUTE_ID_PREFIX}bad"));
+        malformed.host.kind = IRIS_ROUTE_PAYLOAD_KIND.to_string();
+        malformed.host.value = json!({ "provider": "anthropic" });
+
+        let error = route_from_request(&malformed).unwrap_err().to_string();
+        assert!(error.contains("malformed Iris worker route"), "{error}");
+
+        let credentialed = ChildRoute::new(
+            "openai-compatible",
+            "local",
+            "http://secret@localhost:11434/v1",
+            None,
+        );
+        let mut request = WorkerRequest::read_only("secret");
+        let error = attach_route(&mut request, &credentialed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must not contain credentials"), "{error}");
+        assert!(request.route_id.is_none());
+    }
+
     struct TextProvider(Rc<()>);
 
     impl ChatProvider for TextProvider {
@@ -949,20 +1093,20 @@ mod tests {
     }
 
     fn read_path_factory(path: String, expect_secret: bool) -> ChildProviderFactory {
-        Arc::new(move || {
+        Arc::new(move |_| {
             Ok(Box::new(ReadPathProvider::new(path.clone(), expect_secret))
                 as Box<dyn ChatProvider>)
         })
     }
 
     fn write_path_factory(path: String) -> ChildProviderFactory {
-        Arc::new(
-            move || Ok(Box::new(WritePathProvider::new(path.clone())) as Box<dyn ChatProvider>),
-        )
+        Arc::new(move |_| {
+            Ok(Box::new(WritePathProvider::new(path.clone())) as Box<dyn ChatProvider>)
+        })
     }
 
     fn bash_write_factory(command: String) -> ChildProviderFactory {
-        Arc::new(move || {
+        Arc::new(move |_| {
             Ok(Box::new(BashWriteProvider::new(command.clone())) as Box<dyn ChatProvider>)
         })
     }
@@ -1004,7 +1148,7 @@ mod tests {
         std::fs::create_dir(&workspace).unwrap();
         let backend =
             SubagentBackend::open(workspace, &root.join("state"), root.join("worktrees")).unwrap();
-        let factory: ChildProviderFactory = Arc::new(|| Ok(Box::new(TextProvider(Rc::new(())))));
+        let factory: ChildProviderFactory = Arc::new(|_| Ok(Box::new(TextProvider(Rc::new(())))));
         let id = backend
             .spawn(factory, WorkerRequest::read_only("run"), None)
             .unwrap();
@@ -1017,6 +1161,210 @@ mod tests {
             iris_subagent_runtime::WorkerStatus::Completed
         );
         assert_eq!(snapshot.result.unwrap().summary, "finished independently");
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn queued_worker_keeps_its_accepted_route_after_parent_switching() {
+        let root = std::env::temp_dir().join(format!(
+            "iris-wayland-worker-route-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let backend =
+            SubagentBackend::open(workspace, &root.join("state"), root.join("worktrees")).unwrap();
+
+        let mut blockers = Vec::new();
+        for _ in 0..4 {
+            blockers.push(
+                backend
+                    .spawn(
+                        Arc::new(|_| Ok(Box::new(HangingProvider(Rc::new(()))))),
+                        WorkerRequest::read_only("block"),
+                        None,
+                    )
+                    .unwrap(),
+            );
+        }
+        for _ in 0..200 {
+            if blockers.iter().all(|id| {
+                backend.poll(id).unwrap().status == iris_subagent_runtime::WorkerStatus::Running
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(blockers.iter().all(|id| {
+            backend.poll(id).unwrap().status == iris_subagent_runtime::WorkerStatus::Running
+        }));
+
+        let accepted = ChildRoute::new(
+            "anthropic",
+            "claude-opus-4-6",
+            "https://api.anthropic.com",
+            Some("low"),
+        );
+        let switched = ChildRoute::new(
+            "openai-codex",
+            "gpt-5.6-sol",
+            "https://chatgpt.com/backend-api",
+            Some("high"),
+        );
+        let parent = Arc::new(std::sync::Mutex::new(accepted.clone()));
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let factory_parent = parent.clone();
+        let factory_observed = observed.clone();
+        let factory: ChildProviderFactory = Arc::new(move |request| {
+            let fallback = factory_parent
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone();
+            let effective = route_from_request(request)?.unwrap_or(fallback);
+            *factory_observed
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(effective);
+            Ok(Box::new(TextProvider(Rc::new(()))))
+        });
+        let mut request = WorkerRequest::read_only("routed");
+        attach_route(&mut request, &accepted).unwrap();
+        let routed = backend.spawn(factory, request, None).unwrap();
+        assert_eq!(
+            backend.poll(&routed).unwrap().status,
+            iris_subagent_runtime::WorkerStatus::Queued
+        );
+
+        *parent.lock().unwrap_or_else(|poison| poison.into_inner()) = switched;
+        for id in &blockers {
+            backend.cancel(id).unwrap();
+        }
+        let result = wait_worker(&backend, &routed);
+        assert_eq!(
+            result.status,
+            iris_subagent_runtime::WorkerStatus::Completed
+        );
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_ref(),
+            Some(&accepted)
+        );
+        let snapshot = backend.poll(&routed).unwrap();
+        assert_eq!(
+            route_from_request(&snapshot.request).unwrap(),
+            Some(accepted)
+        );
+
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_request_without_route_uses_the_factory_live_parent_value() {
+        let root = std::env::temp_dir().join(format!(
+            "iris-wayland-worker-legacy-route-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let backend =
+            SubagentBackend::open(workspace, &root.join("state"), root.join("worktrees")).unwrap();
+        let live = ChildRoute::new(
+            "openai-codex",
+            "gpt-5.6-sol",
+            "https://chatgpt.com/backend-api",
+            Some("high"),
+        );
+        let parent = Arc::new(std::sync::Mutex::new(live.clone()));
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let factory_observed = observed.clone();
+        let factory: ChildProviderFactory = Arc::new(move |request| {
+            let fallback = parent
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone();
+            let effective = route_from_request(request)?.unwrap_or(fallback);
+            *factory_observed
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(effective);
+            Ok(Box::new(TextProvider(Rc::new(()))))
+        });
+
+        let id = backend
+            .spawn(factory, WorkerRequest::read_only("legacy"), None)
+            .unwrap();
+        assert_eq!(
+            wait_worker(&backend, &id).status,
+            iris_subagent_runtime::WorkerStatus::Completed
+        );
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_ref(),
+            Some(&live)
+        );
+        assert_eq!(backend.poll(&id).unwrap().request.route_id, None);
+
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn best_of_n_workers_share_one_auditable_route_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "iris-wayland-worker-group-route-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let backend =
+            SubagentBackend::open(workspace, &root.join("state"), root.join("worktrees")).unwrap();
+        let route = ChildRoute::new(
+            "anthropic",
+            "claude-opus-4-6",
+            "https://api.anthropic.com",
+            Some("xhigh"),
+        );
+        let mut request = WorkerRequest::read_only("candidate");
+        attach_route(&mut request, &route).unwrap();
+        let expected_id = request.route_id.clone();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let factory_observed = observed.clone();
+        let factory: ChildProviderFactory = Arc::new(move |request| {
+            factory_observed
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(route_from_request(request)?.expect("accepted route"));
+            Ok(Box::new(TextProvider(Rc::new(()))))
+        });
+
+        let group_id = backend
+            .spawn_group(factory, vec![request; 3], None)
+            .unwrap();
+        let result = wait_group(&backend, &group_id);
+        assert!(
+            result
+                .results
+                .iter()
+                .all(|result| { result.status == iris_subagent_runtime::WorkerStatus::Completed })
+        );
+        let group = backend.poll_group(&group_id).unwrap();
+        assert!(group.snapshots.iter().all(|snapshot| {
+            snapshot.request.route_id == expected_id
+                && snapshot.request.profile_id.is_none()
+                && route_from_request(&snapshot.request).unwrap() == Some(route.clone())
+        }));
+        assert_eq!(
+            *observed.lock().unwrap_or_else(|poison| poison.into_inner()),
+            vec![route; 3]
+        );
+
         drop(backend);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1135,7 +1483,8 @@ mod tests {
             root.join("worktrees"),
         )
         .unwrap();
-        let factory: ChildProviderFactory = Arc::new(|| Ok(Box::new(HangingProvider(Rc::new(())))));
+        let factory: ChildProviderFactory =
+            Arc::new(|_| Ok(Box::new(HangingProvider(Rc::new(())))));
         let id = backend
             .spawn(factory, mutable_request("wait"), None)
             .unwrap();
@@ -1179,7 +1528,7 @@ mod tests {
             root.join("worktrees"),
         )
         .unwrap();
-        let factory: ChildProviderFactory = Arc::new(|| {
+        let factory: ChildProviderFactory = Arc::new(|_| {
             Ok(Box::new(ScriptProvider::write(
                 "result.txt",
                 "child\n",
@@ -1252,7 +1601,7 @@ mod tests {
         )
         .unwrap();
         let sequence = Arc::new(AtomicUsize::new(0));
-        let factory: ChildProviderFactory = Arc::new(move || {
+        let factory: ChildProviderFactory = Arc::new(move |_| {
             let index = sequence.fetch_add(1, Ordering::SeqCst);
             if index == 2 {
                 anyhow::bail!("intentional candidate failure");

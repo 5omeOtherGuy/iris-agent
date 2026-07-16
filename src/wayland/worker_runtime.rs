@@ -4,12 +4,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use iris_subagent_runtime::{
-    ExecutorFactory, FilesystemArtifactStore, RuntimeConfig, RuntimeError, RuntimeHandle,
-    WorkerExecutor, WorkerId, WorkerRequest,
+    ExecutorFactory, FilesystemArtifactStore, HostPayload, RuntimeConfig, RuntimeError,
+    RuntimeHandle, WorkerExecutor, WorkerId, WorkerRequest,
 };
 use serde_json::json;
+
+pub(crate) const EXECUTOR_HOST_PAYLOAD_KIND: &str = "iris_executor_registration";
 
 /// One-shot executor constructor. The backend invokes it on its scheduler
 /// thread, preserving `!Send` Nexus/provider state.
@@ -18,6 +20,30 @@ type RegisteredFactory =
 
 struct IrisExecutorFactory {
     registrations: Arc<Mutex<HashMap<String, RegisteredFactory>>>,
+}
+
+fn register_executor(request: &mut WorkerRequest, registration: &str) {
+    let payload = std::mem::take(&mut request.host);
+    request.host.kind = EXECUTOR_HOST_PAYLOAD_KIND.to_string();
+    request.host.value = json!({
+        "registration": registration,
+        "payload": payload,
+    });
+}
+
+/// Recover the host payload that existed before the scheduler adapter attached
+/// its one-shot executor registration. Older persisted requests carried only the
+/// registration and therefore return `None`.
+pub(crate) fn original_host_payload(request: &WorkerRequest) -> Result<Option<HostPayload>> {
+    if request.host.kind != EXECUTOR_HOST_PAYLOAD_KIND {
+        return Ok(Some(request.host.clone()));
+    }
+    let Some(payload) = request.host.value.get("payload") else {
+        return Ok(None);
+    };
+    serde_json::from_value(payload.clone())
+        .context("Iris worker request has malformed nested host payload")
+        .map(Some)
 }
 
 impl ExecutorFactory for IrisExecutorFactory {
@@ -72,8 +98,7 @@ impl WorkerRuntime {
         factory: RegisteredFactory,
     ) -> Result<WorkerId> {
         let registration = format!("iris_{:032x}", rand::random::<u128>());
-        request.host.kind = "iris_executor_registration".to_string();
-        request.host.value = json!({ "registration": registration });
+        register_executor(&mut request, &registration);
         self.registrations
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -103,8 +128,7 @@ impl WorkerRuntime {
                 .unwrap_or_else(|poison| poison.into_inner());
             for (mut request, factory) in jobs {
                 let registration = format!("iris_{:032x}", rand::random::<u128>());
-                request.host.kind = "iris_executor_registration".to_string();
-                request.host.value = json!({ "registration": registration });
+                register_executor(&mut request, &registration);
                 registry.insert(registration.clone(), factory);
                 registrations.push(registration);
                 requests.push(request);
