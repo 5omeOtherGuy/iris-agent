@@ -385,11 +385,14 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 - **Fragment-based system prompt** — Wayland assembles provider-visible
   instructions from in-binary shipped fragments (the single source of truth,
   ADR-0026), machine-local user instructions (`~/.agents/AGENTS.md` followed by
-  Iris-specific `~/.iris/AGENTS.md`), root-to-leaf project docs
-  (`AGENTS.md`/`CLAUDE.md`), runtime context, and generated live-tool blocks. All
-  instruction files use bounded reads. The two user-level paths may be symlinks
-  to regular files; cwd-to-root project docs refuse symlinks and surface skipped
-  candidates as notices. No `.md` fragment files are loaded from disk. [Implemented]
+  Iris-specific `~/.iris/AGENTS.md`), and root-to-leaf project instructions.
+  Per directory, the first non-empty regular base is selected from
+  `AGENTS.override.md`, `AGENTS.md`, then `CLAUDE.md`; the first non-empty local
+  candidate from `AGENTS.local.md`, then `CLAUDE.local.md` is appended. Each
+  instruction document is capped at 32 KiB. User-level paths may be symlinks to
+  regular files; project candidates refuse symlinks and non-regular files and
+  emit deduplicated notices. An active shared hub suppresses redundant Iris
+  onboarding. No `.md` fragment files are loaded from disk. [Implemented]
 - **Fragment ordering** — internal fragments use `name` for XML tags and
   numeric `slot` ordering (`slot: 0` disables). [Implemented]
 - **Named slots and selector schema** — replace numeric slots with named slots
@@ -408,6 +411,11 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   `~/.iris/skills`, and administrator roots. Canonical-path dedupe, bounded
   depth/count, symlinked directories, and non-fatal load errors match Codex's
   local loader behavior. [Implemented]
+- **Tracked repository skill baseline** — public Iris workflows live once under
+  `.agents/skills`; tracked relative `.claude/skills` links expose the same
+  sources to Claude Code. Pi and Iris discover the canonical root directly, so
+  no `.pi/skills` projections are tracked. A gate check validates frontmatter,
+  directory/name parity, and projection integrity. [Implemented]
 - **Codex config compatibility** — honor `skills.include_instructions` and
   ordered name/path `skills.config` enable rules from Codex's config. Optional
   malformed metadata fails open. [Implemented]
@@ -549,6 +557,11 @@ task boundaries, checkpoint storage, or approval semantics — they are decided.
   file-level apply. ADR-0035 plus ADR-0063; issues
   [#271](https://github.com/5omeOtherGuy/iris-agent/issues/271) and
   [#459](https://github.com/5omeOtherGuy/iris-agent/issues/459). [Implemented]
+- **Repository task-worktree propagation** — `scripts/worktree-create.sh` runs
+  primary freshness preflight, creates a plain Git worktree from `origin/main`,
+  and copies only the four supported ignored regular instruction files named by
+  `.worktreeinclude`. Symlinks, non-regular sources, tracked destination
+  conflicts, and unsupported include entries are refused. [Implemented]
 
 ## GitHub
 

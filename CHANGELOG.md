@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- track portable repository agent guidance, canonical skills, local instruction layers, and safe worktree propagation ([#642](https://github.com/5omeOtherGuy/iris-agent/issues/642))
+
 ## [0.3.7](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.6...iris-agent-v0.3.7) - 2026-07-14
 
 ### Added

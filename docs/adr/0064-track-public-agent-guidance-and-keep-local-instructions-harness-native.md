@@ -1,7 +1,7 @@
 # ADR-0064: Track public agent guidance and keep local instructions harness-native
 
 **Date**: 2026-07-15
-**Status**: proposed (amends ADR-0026)
+**Status**: accepted; implemented by issue #642 (amends ADR-0026)
 **Deciders**: Iris maintainers, user, Iris agent session
 
 ## Context
@@ -22,6 +22,13 @@ Keep personal project instructions ignored and use harness-native layers:
 For each directory, Iris selects the first non-empty regular base from `AGENTS.override.md`, `AGENTS.md`, then `CLAUDE.md`, followed by the local candidate. Existing root-to-leaf ordering, bounded reads, regular-file checks, project symlink refusal, and warning behavior remain unchanged.
 
 Tracked instructions, skills, and projections are the portable worktree baseline. Harness-managed worktrees may copy ignored local files through `.worktreeinclude`; plain Git worktrees use a repository wrapper that copies only regular files and refuses overwrite conflicts.
+
+## Implementation
+
+- `AGENTS.md`, `CLAUDE.md`, `.agents/skills/`, and `.claude/skills/` are the tracked public baseline. No `.pi/skills` projections remain.
+- `src/wayland/system_prompt/` implements the base/local candidate order, bounded regular-file reads, diagnostics, and shared-hub-aware onboarding.
+- `.worktreeinclude` names the four supported ignored instruction files. `scripts/worktree-create.sh` runs preflight, creates from `origin/main`, and copies only those regular sources.
+- `scripts/check-repo-guidance.sh` validates guide size, skill metadata, projections, and duplicate-root absence in the local gate and CI.
 
 ## Alternatives Considered
 

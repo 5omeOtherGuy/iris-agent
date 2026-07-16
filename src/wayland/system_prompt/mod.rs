@@ -26,8 +26,9 @@
 //! 1. `identity` (anchored first),
 //! 2. middle fragments: slotted by ascending `slot` (same slot: alphabetical by
 //!    `name`), then unslotted fragments alphabetically,
-//! 3. dynamic context: `<project_context>` (AGENTS.md/CLAUDE.md), then the
-//!    `Current date` / `Current working directory` lines. Skills use separate
+//! 3. dynamic context: `<project_context>` (user, base, and additive local
+//!    instruction documents), then the `Current date` / `Current working
+//!    directory` lines. Skills use separate
 //!    lower-authority contextual messages (ADR-0053), not this system prompt.
 //! 4. the anchored tool tail: `available_tools` (generated), then
 //!    `available_tool_guidelines` (generated), then `tool_use` (authored).

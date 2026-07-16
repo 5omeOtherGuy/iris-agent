@@ -117,8 +117,8 @@ project guidance, not a security boundary.
   first non-empty regular base from `AGENTS.override.md`, `AGENTS.md`, then
   `CLAUDE.md`, followed by the first non-empty local file from
   `AGENTS.local.md`, then `CLAUDE.local.md`.
-- Commits, pushes, pull requests, reviews, merges, issue updates, and other
-  shared remote changes require explicit operator direction.
+- Pushes, pull requests, reviews, merges, issue updates, and other shared remote
+  changes require explicit operator direction.
 
 ## Release policy
 
