@@ -136,6 +136,24 @@ pub(crate) fn execute_request(
     DelegationResponse { request_id, result }
 }
 
+fn artifact_content(id: ArtifactId, bytes: Vec<u8>) -> ArtifactContent {
+    let total_bytes = bytes.len();
+    let truncated = total_bytes > ARTIFACT_DISPLAY_LIMIT;
+    let text = std::str::from_utf8(&bytes).ok().map(|text| {
+        let mut end = total_bytes.min(ARTIFACT_DISPLAY_LIMIT);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        textengine::clean_text(&text[..end])
+    });
+    ArtifactContent {
+        id,
+        total_bytes,
+        text,
+        truncated,
+    }
+}
+
 fn execute_with_backend(
     backend: &SubagentBackend,
     kind: DelegationRequestKind,
@@ -177,16 +195,7 @@ fn execute_with_backend(
         }
         DelegationRequestKind::ReadArtifact(id) => {
             let bytes = backend.read_artifact(&id)?;
-            let total_bytes = bytes.len();
-            let truncated = total_bytes > ARTIFACT_DISPLAY_LIMIT;
-            let shown = &bytes[..total_bytes.min(ARTIFACT_DISPLAY_LIMIT)];
-            let text = std::str::from_utf8(shown).ok().map(textengine::clean_text);
-            DelegationPayload::Artifact(ArtifactContent {
-                id,
-                total_bytes,
-                text,
-                truncated,
-            })
+            DelegationPayload::Artifact(artifact_content(id, bytes))
         }
         DelegationRequestKind::SelectCandidate(id) => {
             backend.select_worktree_candidate(&id)?;
@@ -268,6 +277,7 @@ pub(crate) struct DelegationDashboard {
     latest_requested: u64,
     pending_request: Option<u64>,
     pending_refresh: bool,
+    pending_detail: bool,
     in_flight: Option<String>,
     last_worker_refresh: Option<Instant>,
     last_worktree_refresh: Option<Instant>,
@@ -292,6 +302,7 @@ impl DelegationDashboard {
             latest_requested: 0,
             pending_request: None,
             pending_refresh: false,
+            pending_detail: false,
             in_flight: None,
             last_worker_refresh: None,
             last_worktree_refresh: None,
@@ -346,6 +357,10 @@ impl DelegationDashboard {
         self.latest_requested = request_id;
         self.pending_request = Some(request_id);
         self.pending_refresh = matches!(&kind, DelegationRequestKind::Snapshot { .. });
+        self.pending_detail = matches!(
+            &kind,
+            DelegationRequestKind::ReadArtifact(_) | DelegationRequestKind::PlanApply(_)
+        );
         self.in_flight = Some(label);
         Some(DelegationRequest { request_id, kind })
     }
@@ -359,6 +374,7 @@ impl DelegationDashboard {
         let was_refresh = self.pending_refresh;
         self.pending_request = None;
         self.pending_refresh = false;
+        self.pending_detail = false;
         self.in_flight = None;
         match response.result {
             Ok(DelegationPayload::Snapshot(snapshot)) => {
@@ -578,19 +594,30 @@ impl DelegationDashboard {
         }
     }
 
+    fn invalidate_pending_detail(&mut self) {
+        if self.pending_detail {
+            self.pending_request = None;
+            self.pending_detail = false;
+            self.in_flight = None;
+        }
+    }
+
     fn handle_detail_key(&mut self, key: ModalKey) -> ModalOutcome {
         match key {
             ModalKey::Left => {
+                self.invalidate_pending_detail();
                 self.detail = None;
                 self.detail_scroll = 0;
                 ModalOutcome::Redraw
             }
             ModalKey::Esc => {
+                self.invalidate_pending_detail();
                 self.detail = None;
                 self.detail_scroll = 0;
                 ModalOutcome::Redraw
             }
             ModalKey::Tab | ModalKey::BackTab => {
+                self.invalidate_pending_detail();
                 self.detail = None;
                 self.scope = self.scope.other();
                 ModalOutcome::Redraw
@@ -672,29 +699,36 @@ impl DelegationDashboard {
     fn open_linked(&mut self) {
         match self.detail.clone() {
             Some(Detail::Worker(id)) => {
-                if let Some(worktree) = self.worktrees.iter().find(|record| {
-                    record.worker_id.as_ref() == Some(&id)
-                        || self
-                            .workers
-                            .iter()
-                            .find(|worker| worker.worker_id == id)
-                            .and_then(|worker| worker.result.as_ref())
-                            .and_then(|result| result.worktree.as_ref())
-                            .is_some_and(|linked| linked.id == record.id)
-                }) {
-                    self.worktrees_state.selected_id = Some(worktree.id.to_string());
+                let worktree_id = self
+                    .worktrees
+                    .iter()
+                    .find(|record| {
+                        record.worker_id.as_ref() == Some(&id)
+                            || self
+                                .workers
+                                .iter()
+                                .find(|worker| worker.worker_id == id)
+                                .and_then(|worker| worker.result.as_ref())
+                                .and_then(|result| result.worktree.as_ref())
+                                .is_some_and(|linked| linked.id == record.id)
+                    })
+                    .map(|worktree| worktree.id.clone());
+                if let Some(worktree_id) = worktree_id {
+                    self.invalidate_pending_detail();
+                    self.restore_worktree_cursor(Some(worktree_id.as_str()));
                     self.scope = DelegationScope::Worktrees;
-                    self.detail = Some(Detail::Worktree(worktree.id.clone()));
+                    self.detail = Some(Detail::Worktree(worktree_id));
                 }
             }
             Some(Detail::Worktree(id)) => {
-                if let Some(worker_id) = self
+                let worker_id = self
                     .worktrees
                     .iter()
                     .find(|worktree| worktree.id == id)
-                    .and_then(|worktree| worktree.worker_id.clone())
-                {
-                    self.workers_state.selected_id = Some(worker_id.to_string());
+                    .and_then(|worktree| worktree.worker_id.clone());
+                if let Some(worker_id) = worker_id {
+                    self.invalidate_pending_detail();
+                    self.restore_worker_cursor(Some(worker_id.as_str()));
                     self.scope = DelegationScope::Workers;
                     self.detail = Some(Detail::Worker(worker_id));
                 }
@@ -953,7 +987,8 @@ impl DelegationDashboard {
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (Some(lg), Some(rg)) => group_creation_ms(&rg, &self.workers, &self.events)
-                    .cmp(&group_creation_ms(&lg, &self.workers, &self.events)),
+                    .cmp(&group_creation_ms(&lg, &self.workers, &self.events))
+                    .then_with(|| lg.cmp(&rg)),
                 (None, None) => {
                     creation_ms(right, &self.events).cmp(&creation_ms(left, &self.events))
                 }
@@ -3009,6 +3044,188 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn late_artifact_and_plan_responses_do_not_reopen_abandoned_details() {
+        let group = GroupId::new();
+        let worktree_id = WorktreeId::new();
+        let artifact_id = ArtifactId::new();
+        let candidate = completed_worker(
+            "wrk_00000000000000000000000000000001",
+            group.as_str(),
+            &worktree_id,
+            Some(&artifact_id),
+        );
+        let record = worktree(
+            &worktree_id,
+            Some(&candidate.worker_id),
+            Some(&group),
+            WorktreeStatus::Alive,
+            true,
+        );
+
+        let mut artifact_dashboard = DelegationDashboard::new(DelegationScope::Workers);
+        let initial = artifact_dashboard.request_initial().unwrap();
+        artifact_dashboard.apply_response(response(initial.request_id, vec![candidate.clone()]));
+        artifact_dashboard.handle_key(ModalKey::Enter);
+        let ModalOutcome::Emit(ModalAction::Delegation(artifact_request)) =
+            artifact_dashboard.handle_key(ModalKey::Enter)
+        else {
+            panic!("artifact request was not emitted");
+        };
+        artifact_dashboard.handle_key(ModalKey::Left);
+        assert!(!artifact_dashboard.apply_response(DelegationResponse {
+            request_id: artifact_request.request_id,
+            result: Ok(DelegationPayload::Artifact(ArtifactContent {
+                id: artifact_id,
+                total_bytes: 4,
+                text: Some("late".to_string()),
+                truncated: false,
+            })),
+        }));
+        assert!(artifact_dashboard.detail.is_none());
+
+        let mut plan_dashboard = DelegationDashboard::new(DelegationScope::Workers);
+        let initial = plan_dashboard.request_initial().unwrap();
+        let mut plan_response = response(initial.request_id, vec![candidate]);
+        let Ok(DelegationPayload::Snapshot(snapshot)) = &mut plan_response.result else {
+            unreachable!();
+        };
+        snapshot.worktrees = Some(vec![record]);
+        plan_dashboard.apply_response(plan_response);
+        plan_dashboard.handle_key(ModalKey::Enter);
+        let ModalOutcome::Emit(ModalAction::Delegation(plan_request)) =
+            plan_dashboard.handle_key(ModalKey::Char('p'))
+        else {
+            panic!("plan request was not emitted");
+        };
+        plan_dashboard.handle_key(ModalKey::Tab);
+        assert!(!plan_dashboard.apply_response(DelegationResponse {
+            request_id: plan_request.request_id,
+            result: Ok(DelegationPayload::Plan(apply_plan())),
+        }));
+        assert!(plan_dashboard.detail.is_none());
+        assert_eq!(plan_dashboard.scope, DelegationScope::Worktrees);
+    }
+
+    #[test]
+    fn linked_details_restore_the_linked_row_cursor_in_both_scopes() {
+        let group = GroupId::new();
+        let first_worktree = WorktreeId::new();
+        let second_worktree = WorktreeId::new();
+        let first = completed_worker(
+            "wrk_00000000000000000000000000000001",
+            group.as_str(),
+            &first_worktree,
+            None,
+        );
+        let second = completed_worker(
+            "wrk_00000000000000000000000000000002",
+            group.as_str(),
+            &second_worktree,
+            None,
+        );
+        let records = vec![
+            worktree(
+                &first_worktree,
+                Some(&first.worker_id),
+                Some(&group),
+                WorktreeStatus::Alive,
+                false,
+            ),
+            worktree(
+                &second_worktree,
+                Some(&second.worker_id),
+                Some(&group),
+                WorktreeStatus::Alive,
+                false,
+            ),
+        ];
+        let mut dashboard = DelegationDashboard::new(DelegationScope::Workers);
+        dashboard.workers = vec![first.clone(), second.clone()];
+        dashboard.worktrees = records;
+
+        dashboard.detail = Some(Detail::Worker(second.worker_id.clone()));
+        dashboard.open_linked();
+        dashboard.handle_key(ModalKey::Left);
+        assert_eq!(dashboard.selected_worktree().unwrap().id, second_worktree);
+
+        dashboard.detail = Some(Detail::Worktree(first_worktree));
+        dashboard.open_linked();
+        dashboard.handle_key(ModalKey::Left);
+        assert_eq!(
+            dashboard.selected_worker().unwrap().worker_id,
+            first.worker_id
+        );
+    }
+
+    #[test]
+    fn equal_timestamp_groups_remain_contiguous_and_sort_by_group_id() {
+        let first_group = "grp_00000000000000000000000000000001";
+        let second_group = "grp_00000000000000000000000000000002";
+        let mut dashboard = DelegationDashboard::new(DelegationScope::Workers);
+        let initial = dashboard.request_initial().unwrap();
+        dashboard.apply_response(response(
+            initial.request_id,
+            vec![
+                worker(
+                    "wrk_00000000000000000000000000000001",
+                    "queued",
+                    "a",
+                    Some(second_group),
+                ),
+                worker(
+                    "wrk_00000000000000000000000000000002",
+                    "queued",
+                    "b",
+                    Some(first_group),
+                ),
+                worker(
+                    "wrk_00000000000000000000000000000003",
+                    "queued",
+                    "c",
+                    Some(second_group),
+                ),
+                worker(
+                    "wrk_00000000000000000000000000000004",
+                    "queued",
+                    "d",
+                    Some(first_group),
+                ),
+            ],
+        ));
+        for worker in &dashboard.workers {
+            dashboard.events.insert(
+                worker.worker_id.clone(),
+                vec![event(worker.worker_id.as_str(), 1)],
+            );
+        }
+
+        let groups = dashboard
+            .visible_worker_indices()
+            .into_iter()
+            .map(|index| dashboard.workers[index].group_id.as_ref().unwrap().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            groups,
+            vec![first_group, first_group, second_group, second_group]
+        );
+    }
+
+    #[test]
+    fn artifact_truncation_preserves_valid_utf8_at_a_split_code_point() {
+        let mut bytes = vec![b'a'; ARTIFACT_DISPLAY_LIMIT - 1];
+        bytes.extend_from_slice("étail".as_bytes());
+        let content = artifact_content(ArtifactId::new(), bytes);
+
+        assert!(content.truncated);
+        let text = content.text.expect("valid UTF-8 remains text");
+        assert_eq!(text.len(), ARTIFACT_DISPLAY_LIMIT - 1);
+        assert!(text.bytes().all(|byte| byte == b'a'));
+
+        let binary = artifact_content(ArtifactId::new(), vec![0xff]);
+        assert!(binary.text.is_none());
     }
 
     #[test]
