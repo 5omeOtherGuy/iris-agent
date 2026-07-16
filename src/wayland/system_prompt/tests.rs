@@ -131,6 +131,13 @@ fn build_with(frags: Vec<Fragment>, docs: &[(String, String)]) -> String {
     )
 }
 
+fn docs_in_dir<'a>(docs: &'a [(String, String)], dir: &Path) -> Vec<(&'a str, &'a str)> {
+    docs.iter()
+        .filter(|(path, _)| Path::new(path).parent() == Some(dir))
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect()
+}
+
 // ---- ordering rules ---------------------------------------------------------
 
 #[test]
@@ -485,6 +492,127 @@ fn discover_prefers_agents_md_over_claude_md_per_dir() {
 }
 
 #[test]
+fn discover_override_replaces_the_same_directory_public_base() {
+    let dir = temp_dir();
+    fs::write(dir.path.join("AGENTS.override.md"), "OVERRIDE").unwrap();
+    fs::write(dir.path.join("AGENTS.md"), "PUBLIC").unwrap();
+    fs::write(dir.path.join("CLAUDE.md"), "CLAUDE").unwrap();
+
+    let docs = discover_project_docs(&dir.path);
+    let here = docs_in_dir(&docs, &dir.path);
+    assert_eq!(here.len(), 1);
+    assert!(here[0].0.ends_with("AGENTS.override.md"));
+    assert_eq!(here[0].1, "OVERRIDE");
+}
+
+#[test]
+fn discover_appends_the_first_local_candidate_after_the_base() {
+    let dir = temp_dir();
+    fs::write(dir.path.join("AGENTS.md"), "PUBLIC").unwrap();
+    fs::write(dir.path.join("AGENTS.local.md"), "IRIS LOCAL").unwrap();
+    fs::write(dir.path.join("CLAUDE.local.md"), "CLAUDE LOCAL").unwrap();
+
+    let docs = discover_project_docs(&dir.path);
+    let here = docs_in_dir(&docs, &dir.path);
+    assert_eq!(
+        here.iter().map(|(_, content)| *content).collect::<Vec<_>>(),
+        ["PUBLIC", "IRIS LOCAL"]
+    );
+    assert!(here[0].0.ends_with("AGENTS.md"));
+    assert!(here[1].0.ends_with("AGENTS.local.md"));
+}
+
+#[test]
+fn discover_empty_candidates_warn_and_fall_through_each_layer() {
+    let dir = temp_dir();
+    fs::write(dir.path.join("AGENTS.override.md"), "  \n").unwrap();
+    fs::write(dir.path.join("AGENTS.md"), "PUBLIC FALLBACK").unwrap();
+    fs::write(dir.path.join("AGENTS.local.md"), "\t\n").unwrap();
+    fs::write(dir.path.join("CLAUDE.local.md"), "LOCAL FALLBACK").unwrap();
+
+    let discovery = discover_project_docs_with_warnings(&dir.path);
+    let here = docs_in_dir(&discovery.docs, &dir.path);
+    assert_eq!(
+        here.iter().map(|(_, content)| *content).collect::<Vec<_>>(),
+        ["PUBLIC FALLBACK", "LOCAL FALLBACK"]
+    );
+    assert_eq!(
+        discovery
+            .notices
+            .iter()
+            .filter(|notice| notice.contains("empty after reading"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn discover_orders_each_directory_base_then_local_from_root_to_leaf() {
+    let root = temp_dir();
+    let leaf = root.path.join("a/b");
+    fs::create_dir_all(&leaf).unwrap();
+    fs::write(root.path.join("AGENTS.md"), "ROOT BASE").unwrap();
+    fs::write(root.path.join("AGENTS.local.md"), "ROOT LOCAL").unwrap();
+    fs::write(leaf.join("AGENTS.override.md"), "LEAF BASE").unwrap();
+    fs::write(leaf.join("CLAUDE.local.md"), "LEAF LOCAL").unwrap();
+
+    let docs = discover_project_docs(&leaf);
+    let positions = ["ROOT BASE", "ROOT LOCAL", "LEAF BASE", "LEAF LOCAL"].map(|needle| {
+        docs.iter()
+            .position(|(_, content)| content == needle)
+            .unwrap_or_else(|| panic!("missing {needle}"))
+    });
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[test]
+fn discover_refuses_non_regular_candidates_and_uses_regular_fallbacks() {
+    let dir = temp_dir();
+    fs::create_dir(dir.path.join("AGENTS.override.md")).unwrap();
+    fs::write(dir.path.join("AGENTS.md"), "PUBLIC").unwrap();
+    fs::create_dir(dir.path.join("AGENTS.local.md")).unwrap();
+    fs::write(dir.path.join("CLAUDE.local.md"), "LOCAL").unwrap();
+
+    let discovery = discover_project_docs_with_warnings(&dir.path);
+    let here = docs_in_dir(&discovery.docs, &dir.path);
+    assert_eq!(
+        here.iter().map(|(_, content)| *content).collect::<Vec<_>>(),
+        ["PUBLIC", "LOCAL"]
+    );
+    assert_eq!(
+        discovery
+            .notices
+            .iter()
+            .filter(|notice| notice.contains("not a regular file"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn discover_caps_each_selected_project_instruction_document() {
+    let dir = temp_dir();
+    fs::write(
+        dir.path.join("AGENTS.md"),
+        "b".repeat(MAX_DOC_BYTES as usize + 128),
+    )
+    .unwrap();
+    fs::write(
+        dir.path.join("AGENTS.local.md"),
+        "l".repeat(MAX_DOC_BYTES as usize + 128),
+    )
+    .unwrap();
+
+    let docs = discover_project_docs(&dir.path);
+    let here = docs_in_dir(&docs, &dir.path);
+    assert_eq!(here.len(), 2);
+    assert!(
+        here.iter()
+            .all(|(_, content)| content.len() == MAX_DOC_BYTES as usize)
+    );
+}
+
+#[test]
 fn discover_skips_empty_project_doc() {
     let dir = temp_dir();
     fs::write(dir.path.join("AGENTS.md"), "   \n\t\n").unwrap();
@@ -720,7 +848,7 @@ fn discover_prepends_iris_agents_when_present() {
 }
 
 #[test]
-fn discover_prepends_shared_hub_before_iris_and_project_docs() {
+fn discover_preserves_shared_iris_project_base_and_local_order() {
     let home = temp_dir();
     let _env = EnvGuard::with_home(&home.path);
     let hub_dir = home.path.join(".agents");
@@ -732,21 +860,23 @@ fn discover_prepends_shared_hub_before_iris_and_project_docs() {
 
     let ws = temp_dir();
     fs::write(ws.path.join("AGENTS.md"), "PROJECT RULES").unwrap();
+    fs::write(ws.path.join("AGENTS.local.md"), "PROJECT LOCAL RULES").unwrap();
 
     let docs = discover_project_docs(&ws.path);
     let pos = |needle: &str| {
         docs.iter()
-            .position(|(_, c)| c.contains(needle))
+            .position(|(_, content)| content.contains(needle))
             .unwrap_or_else(|| panic!("{needle} present"))
     };
-    let (hub, iris, project) = (
+    let (hub, iris, project, local) = (
         pos("SHARED HUB RULES"),
         pos("IRIS RULES"),
         pos("PROJECT RULES"),
+        pos("PROJECT LOCAL RULES"),
     );
     assert!(
-        hub < iris && iris < project,
-        "shared hub is outermost, then iris, then project (got {hub}, {iris}, {project})"
+        hub < iris && iris < project && project < local,
+        "shared hub, Iris, project base, then project local (got {hub}, {iris}, {project}, {local})"
     );
     assert!(docs[hub].0.contains(".agents/AGENTS.md"));
 }
@@ -901,7 +1031,7 @@ fn refused_user_level_symlink_targets_have_diagnostics() {
 
 #[cfg(unix)]
 #[test]
-fn walk_symlink_secret_is_refused_and_warned_once_per_assembler() {
+fn walk_override_symlink_is_refused_and_warned_once_per_assembler() {
     use std::os::unix::fs::symlink;
 
     let home = temp_dir();
@@ -910,13 +1040,16 @@ fn walk_symlink_secret_is_refused_and_warned_once_per_assembler() {
     let secret = outside.path.join("secret.txt");
     fs::write(&secret, "NEVER FOLD THIS SECRET").unwrap();
     let ws = temp_dir();
-    symlink(&secret, ws.path.join("AGENTS.md")).unwrap();
+    symlink(&secret, ws.path.join("AGENTS.override.md")).unwrap();
+    fs::write(ws.path.join("AGENTS.md"), "SAFE FALLBACK").unwrap();
 
     let mut assembler = PromptAssembler::default();
     let first = assembler.assemble(&ws.path, &built_in_tools());
     let second = assembler.assemble(&ws.path, &built_in_tools());
     assert!(!first.prompt.contains("NEVER FOLD THIS SECRET"));
     assert!(!second.prompt.contains("NEVER FOLD THIS SECRET"));
+    assert!(first.prompt.contains("SAFE FALLBACK"));
+    assert!(second.prompt.contains("SAFE FALLBACK"));
     assert_eq!(first.notices.len(), 1);
     assert!(first.notices[0].contains("possible exfiltration vector"));
     assert!(

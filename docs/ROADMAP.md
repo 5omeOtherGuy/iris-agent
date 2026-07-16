@@ -161,25 +161,31 @@ Implemented today:
   and Antigravity round-trips Gemini tool-call `thoughtSignature` continuity.
 - Harness-owned fragment/slot system-prompt / project-instruction assembly
   ([#56](https://github.com/5omeOtherGuy/iris-agent/issues/56),
-  [#74](https://github.com/5omeOtherGuy/iris-agent/pull/74)): the Tier-2
-  Wayland `system_prompt::assemble` builds in-binary shipped fragments +
-  generated live-tool blocks + user instructions (`~/.agents/AGENTS.md`, then
-  `~/.iris/AGENTS.md`) + dynamic root-to-leaf project docs
-  (`AGENTS.md`/`CLAUDE.md`) + runtime context in one place; fresh and resumed
-  sessions feed the same assembled string through the provider request path. Native filesystem skills
-  are implemented (issue #57); templates remain deferred, and named slots plus
-  selector-driven assembly remain open (#76/#73). ADR-0026 made fragments fully
-  internal (superseding the #202
-  user/repo `.md` loading and its per-project trust gate: no
-  `~/.iris/fragments` materialization, no repo `.iris/fragments` loading, no
-  fragment-trust prompt); project docs keep loading. ADR-0027 repurposed the
-  per-cwd store (`wayland::trust`, `~/.iris/trust.json`, canonical-dir keyed)
-  as a persistent project permission policy
-  ([#209](https://github.com/5omeOtherGuy/iris-agent/issues/209)): per-tool
-  `write`/`edit` grants and per-command `bash` allows (exact/prefix), granted
-  via `[p]` at the approval prompt and edited via `/trust` (`/permissions` alias); destructive
-  commands always re-prompt and are never grantable; per-project sandbox
-  posture is stored but not yet enforced.
+  [ADR-0064](adr/0064-track-public-agent-guidance-and-keep-local-instructions-harness-native.md)):
+  Tier-2 Wayland builds in-binary shipped fragments, generated live-tool blocks,
+  user instructions (`~/.agents/AGENTS.md`, then `~/.iris/AGENTS.md`), and
+  root-to-leaf project instructions. Each directory selects the first non-empty
+  regular base from `AGENTS.override.md`, `AGENTS.md`, then `CLAUDE.md`, followed
+  by the first non-empty additive local candidate from `AGENTS.local.md`, then
+  `CLAUDE.local.md`. Reads are capped at 32 KiB per document; project symlinks
+  and non-regular files are refused with deduplicated notices. Active shared-hub
+  guidance suppresses redundant first-run copying into `~/.iris/AGENTS.md`.
+  ADR-0026 keeps fragments fully internal; these project documents remain the
+  intentional steering channel.
+- Tracked public agent guidance and repository skills (issue #642): root
+  `AGENTS.md` is the portable public source, root `CLAUDE.md` imports it,
+  `.agents/skills` is canonical, and Claude Code receives relative projections.
+  `.worktreeinclude` plus `scripts/worktree-create.sh` propagates only supported
+  ignored regular instruction files to repository-created task worktrees. The
+  gate validates metadata and link integrity; no duplicate `.pi/skills` tree is
+  tracked. Native filesystem skills remain implemented; prompt templates, named
+  slots, and selector-driven assembly remain deferred.
+- Persistent project permission policy
+  ([ADR-0027](adr/0027-repurpose-trust-store-as-per-cwd-project-permission-policy.md)):
+  the canonical-cwd keyed `~/.iris/trust.json` stores per-tool `write`/`edit`
+  grants, exact/prefix `bash` allows, and a not-yet-enforced sandbox posture.
+  Grants are created through `[p]` at approval and edited through `/trust` or
+  `/permissions`; destructive commands always re-prompt and are never grantable.
 - Milestone 2 foundations: structured metadata, typed tool-result contracts,
   token estimates, handle-backed large tool outputs, session-scoped
   content-addressed sidecars, turn-boundary auto-compaction, formal

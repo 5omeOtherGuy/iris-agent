@@ -1,18 +1,20 @@
 //! First-run discovery of user-level agent instructions from peer tools.
 //!
-//! When `~/.iris/AGENTS.md` does not exist, this module scans known peer-tool
-//! home directories (`~/.pi/agent/AGENTS.md`, `~/.claude/CLAUDE.md`, etc.) for
-//! existing instruction files, presents them to the user on an interactive TTY,
-//! and persists the choice to `~/.iris/AGENTS.md`. A skip creates a zero-byte
-//! sentinel so the prompt never recurs.
+//! When neither `~/.iris/AGENTS.md` nor a non-empty shared
+//! `~/.agents/AGENTS.md` is active, this module scans known peer-tool home
+//! directories (`~/.pi/agent/AGENTS.md`, `~/.claude/CLAUDE.md`, etc.), presents
+//! existing instruction files to the user on an interactive TTY, and persists
+//! the choice to `~/.iris/AGENTS.md`. A skip creates a zero-byte sentinel so the
+//! prompt never recurs.
 //!
-//! All file reads go through [`super::read_regular_bounded`] (symlink-safe,
-//! 32 KB cap). The module never writes outside `~/.iris/`.
+//! Peer reads use [`super::read_regular_bounded`]. Shared-hub detection uses the
+//! same bounded symlink-following policy as prompt assembly. The module never
+//! writes outside `~/.iris/`.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use super::{MAX_DOC_BYTES, read_regular_bounded};
+use super::{LinkPolicy, MAX_DOC_BYTES, ReadOutcome, read_bounded, read_regular_bounded};
 
 /// Peer-tool candidate paths relative to `$HOME`, in display order.
 /// Each entry: `(relative_path, tool_display_name)`.
@@ -67,14 +69,20 @@ pub(crate) fn iris_agents_path() -> Option<PathBuf> {
     )
 }
 
-/// Returns `true` when Iris user-level AGENTS.md already exists (any content,
-/// including a zero-byte sentinel or a symlink -- broken or not). Uses
-/// `symlink_metadata` so a dangling symlink is still detected, preventing
-/// re-prompting and the write-through-symlink escape in `persist_choice`.
-pub(crate) fn iris_agents_exists() -> bool {
-    iris_agents_path()
-        .map(|p| std::fs::symlink_metadata(p).is_ok())
-        .unwrap_or(false)
+/// Return whether first-run copying is still useful for this home directory.
+/// A non-empty shared hub already supplies user guidance to Iris, so copying a
+/// peer file into the Iris-specific layer would only duplicate instructions.
+fn onboarding_needed(home: &Path) -> bool {
+    let iris_agents = home.join(IRIS_HOME_DIR).join(IRIS_AGENTS_FILENAME);
+    if std::fs::symlink_metadata(iris_agents).is_ok() {
+        return false;
+    }
+
+    let shared_agents = home.join(SHARED_AGENTS_DIR).join(IRIS_AGENTS_FILENAME);
+    !matches!(
+        read_bounded(&shared_agents, MAX_DOC_BYTES, LinkPolicy::Follow),
+        ReadOutcome::Content(content) if !content.trim().is_empty()
+    )
 }
 
 /// Scan peer-tool home directories for existing instruction files.
@@ -225,20 +233,20 @@ pub(crate) fn persist_choice(
 
 /// Top-level onboarding entry point. Call before `assemble()` in every startup
 /// path (fresh, resume, continue). Only acts when:
-/// 1. `~/.iris/AGENTS.md` does not exist,
+/// 1. neither `~/.iris/AGENTS.md` nor an active shared hub supplies user rules,
 /// 2. at least one peer doc is found,
 /// 3. both stdin and stderr are interactive TTYs.
 ///
 /// Non-interactive modes (--print, piped stdin, redirected stderr) never see a
 /// prompt.
 pub(crate) fn maybe_onboard() {
-    if iris_agents_exists() {
-        return;
-    }
     let home = match std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
         Some(h) => PathBuf::from(h),
         None => return,
     };
+    if !onboarding_needed(&home) {
+        return;
+    }
     let docs = discover_peer_docs(&home);
     if docs.is_empty() {
         return;
@@ -320,6 +328,22 @@ mod tests {
 
         let docs = discover_peer_docs(&home);
         assert!(docs.is_empty());
+
+        cleanup(&home);
+    }
+
+    #[test]
+    fn active_shared_hub_suppresses_redundant_iris_onboarding() {
+        let home = test_dir();
+        let hub_dir = home.join(".agents");
+        fs::create_dir_all(&hub_dir).unwrap();
+        fs::write(hub_dir.join("AGENTS.md"), "shared rules").unwrap();
+        let pi_dir = home.join(".pi/agent");
+        fs::create_dir_all(&pi_dir).unwrap();
+        fs::write(pi_dir.join("AGENTS.md"), "duplicate candidate").unwrap();
+
+        assert!(!onboarding_needed(&home));
+        assert!(!home.join(".iris/AGENTS.md").exists());
 
         cleanup(&home);
     }
@@ -493,15 +517,14 @@ mod tests {
 
     #[test]
     fn idempotent_second_run_no_prompt() {
-        // Once the sentinel or real file exists, discover should not be called.
-        // We test by checking iris_agents_exists after writing a sentinel.
+        // Once the sentinel or real file exists, onboarding is not needed.
         let dir = test_dir();
         let iris_agents = dir.join(".iris/AGENTS.md");
         fs::create_dir_all(iris_agents.parent().unwrap()).unwrap();
         fs::write(&iris_agents, "").unwrap();
 
-        // The file exists (even empty), so onboarding would be skipped.
         assert!(iris_agents.exists());
+        assert!(!onboarding_needed(&dir));
 
         cleanup(&dir);
     }

@@ -80,6 +80,9 @@ run_step "clippy (cargo clippy -D warnings)"       cargo clippy --all-targets --
 run_step "test (cargo test --locked)"              cargo test --locked                      || exit $?
 run_step "script tests (change scope)"             bash scripts/change-scope-tests.sh       || exit $?
 run_step "script tests (sync primary)"             bash scripts/sync-primary-tests.sh        || exit $?
+run_step "repository guidance integrity"           bash scripts/check-repo-guidance.sh       || exit $?
+run_step "script tests (repository guidance)"      bash scripts/repo-guidance-tests.sh       || exit $?
+run_step "script tests (worktree create)"          bash scripts/worktree-create-tests.sh     || exit $?
 
 printf 'gate: PASS — fmt OK, clippy OK, test OK, scripts OK\n'
 exit 0

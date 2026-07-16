@@ -7,8 +7,8 @@
 //! never loaded from disk: ADR-0026 removed the user (`~/.iris/fragments`) and
 //! repo (`<workspace>/.iris/fragments`) file loading -- and with it the
 //! system-prompt-injection surface and the fragment-trust gate. User and
-//! project steering happens through `AGENTS.md`/`CLAUDE.md`, which are still
-//! folded in as `<project_context>`.
+//! project steering happens through public, override, and additive local project
+//! instruction documents, which are folded in as `<project_context>`.
 //!
 //! Fragments remain the internal assembly abstraction: the selector schema
 //! (ADR-0013) and named slots (ADR-0015) still order and conditionally include
@@ -26,8 +26,9 @@
 //! 1. `identity` (anchored first),
 //! 2. middle fragments: slotted by ascending `slot` (same slot: alphabetical by
 //!    `name`), then unslotted fragments alphabetically,
-//! 3. dynamic context: `<project_context>` (AGENTS.md/CLAUDE.md), then the
-//!    `Current date` / `Current working directory` lines. Skills use separate
+//! 3. dynamic context: `<project_context>` (user, base, and additive local
+//!    instruction documents), then the `Current date` / `Current working
+//!    directory` lines. Skills use separate
 //!    lower-authority contextual messages (ADR-0053), not this system prompt.
 //! 4. the anchored tool tail: `available_tools` (generated), then
 //!    `available_tool_guidelines` (generated), then `tool_use` (authored).
@@ -84,9 +85,12 @@ const FRAGMENT_COMPACTION_RECALL: &str = "compaction_recall";
 const FRAGMENT_SUBAGENT_DELEGATION: &str = "subagent_delegation";
 const TOOL_SPAWN_SUBAGENT: &str = "spawn_subagent";
 
-/// Project-doc filenames discovered per directory, in priority order (first
-/// existing wins for that directory). Mirrors pi's candidate list.
-const DOC_CANDIDATES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+/// Base project-instruction filenames discovered per directory, in replacement
+/// priority. The first non-empty regular file is the base for that directory.
+const BASE_DOC_CANDIDATES: &[&str] = &["AGENTS.override.md", "AGENTS.md", "CLAUDE.md"];
+/// Additive project-instruction filenames discovered after the base. The first
+/// non-empty regular file is appended for that directory.
+const LOCAL_DOC_CANDIDATES: &[&str] = &["AGENTS.local.md", "CLAUDE.local.md"];
 
 /// Upper bound on bytes folded into the prompt per discovered project doc, so a
 /// runaway or hostile file cannot balloon every request / OOM the process.
@@ -409,18 +413,17 @@ fn discover_project_docs_with_warnings(cwd: &Path) -> ProjectDocDiscovery {
         }
     }
 
-    let mut walk_docs = Vec::new();
+    let mut walk_levels = Vec::new();
     let mut current = cwd.to_path_buf();
     loop {
-        if let Some(doc) = read_doc_in_dir(&current, &mut discovery.notices) {
-            walk_docs.push(doc);
-        }
+        walk_levels.push(read_docs_in_dir(&current, &mut discovery.notices));
         match current.parent() {
             Some(parent) => current = parent.to_path_buf(),
             None => break,
         }
     }
-    walk_docs.reverse();
+    walk_levels.reverse();
+    let mut walk_docs = walk_levels.into_iter().flatten().collect::<Vec<_>>();
     walk_docs.retain(|(path, _)| discovery.docs.iter().all(|(seen, _)| seen != path));
     discovery.docs.extend(walk_docs);
     discovery
@@ -433,10 +436,22 @@ fn discover_project_docs(cwd: &Path) -> Vec<(String, String)> {
     discover_project_docs_with_warnings(cwd).docs
 }
 
-/// Read the first accepted project doc in `dir`. Every cwd-to-root candidate
-/// refuses symlinks, including candidates in ancestor directories.
-fn read_doc_in_dir(dir: &Path, notices: &mut Vec<String>) -> Option<(String, String)> {
-    for candidate in DOC_CANDIDATES {
+/// Read the selected base and additive local project instructions in `dir`.
+/// Every cwd-to-root candidate refuses symlinks, including candidates in
+/// ancestor directories.
+fn read_docs_in_dir(dir: &Path, notices: &mut Vec<String>) -> Vec<(String, String)> {
+    [BASE_DOC_CANDIDATES, LOCAL_DOC_CANDIDATES]
+        .into_iter()
+        .filter_map(|candidates| read_first_doc_in_dir(dir, candidates, notices))
+        .collect()
+}
+
+fn read_first_doc_in_dir(
+    dir: &Path,
+    candidates: &[&str],
+    notices: &mut Vec<String>,
+) -> Option<(String, String)> {
+    for candidate in candidates {
         let path = dir.join(candidate);
         match read_bounded(&path, MAX_DOC_BYTES, LinkPolicy::Refuse) {
             ReadOutcome::Missing => {}
@@ -463,7 +478,7 @@ fn empty_doc_notice(path: &Path) -> String {
 fn refusal_notice(path: &Path, reason: ReadRefusal, walk_discovered: bool) -> String {
     match reason {
         ReadRefusal::Symlink if walk_discovered => format!(
-            "warning: skipping {}: symlinked AGENTS.md/CLAUDE.md in a discovered directory is refused for security (possible exfiltration vector). Use a regular file.",
+            "warning: skipping {}: symlinked project instruction document in a discovered directory is refused for security (possible exfiltration vector). Use a regular file.",
             path.display()
         ),
         ReadRefusal::Symlink => format!(

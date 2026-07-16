@@ -1153,14 +1153,13 @@ mod tests {
             .spawn(factory, WorkerRequest::read_only("run"), None)
             .unwrap();
 
-        std::thread::sleep(Duration::from_millis(100));
-        let snapshot = backend.runtime.handle().poll(&id).unwrap();
+        let result = wait_worker(&backend, &id);
 
         assert_eq!(
-            snapshot.status,
+            result.status,
             iris_subagent_runtime::WorkerStatus::Completed
         );
-        assert_eq!(snapshot.result.unwrap().summary, "finished independently");
+        assert_eq!(result.summary, "finished independently");
         drop(backend);
         std::fs::remove_dir_all(root).unwrap();
     }

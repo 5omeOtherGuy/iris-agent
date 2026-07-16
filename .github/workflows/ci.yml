@@ -90,6 +90,18 @@ jobs:
         if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         run: bash scripts/sync-primary-tests.sh
 
+      - name: Check repository guidance integrity
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
+        run: bash scripts/check-repo-guidance.sh
+
+      - name: Test repository guidance checks
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
+        run: bash scripts/repo-guidance-tests.sh
+
+      - name: Test worktree creation script
+        if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
+        run: bash scripts/worktree-create-tests.sh
+
       - name: Build
         if: needs.scope.result != 'success' || needs.scope.outputs.docs-only != 'true'
         run: cargo build --locked

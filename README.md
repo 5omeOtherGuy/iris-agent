@@ -129,8 +129,8 @@ adds an opt-in machine-readable run report without contaminating stdout.
 A normal turn follows one provider-neutral loop:
 
 1. Wayland assembles the system prompt from in-binary Iris instructions, bounded
-   `AGENTS.md`/`CLAUDE.md` files from root to working directory, current date and
-   cwd, skill metadata, and the live tool registry.
+   user and root-to-working-directory project instruction layers, current date
+   and cwd, skill metadata, and the live tool registry.
 2. Mimir translates that conversation and tool surface to the selected provider.
 3. Nexus consumes streamed text, reasoning summaries, tool-input deltas, activity,
    usage, and completion events. Provider-specific payloads do not leak into the
@@ -625,11 +625,24 @@ path-qualified `skill://` mention. The model may invoke from the catalog unless
 to `read`; it does not gain mutation access outside the workspace.
 
 System-prompt fragments themselves are compiled into Iris. Files under old
-`.iris/fragments` locations are not loaded. User/repository steering is the
-intentional `AGENTS.md`/`CLAUDE.md` channel. Each instruction file is bounded to
-32 KiB. The trusted user-level paths `~/.agents/AGENTS.md` and
-`~/.iris/AGENTS.md` may be symlinks to regular files; cwd-to-root project docs
-must themselves be regular files, and refused candidates produce a UI warning.
+`.iris/fragments` locations are not loaded. The tracked root `AGENTS.md` is the
+public repository guide; root `CLAUDE.md` imports it. Canonical repository skills
+live under `.agents/skills`, with relative `.claude/skills` projections for
+Claude Code and no duplicate `.pi/skills` tree.
+
+User instructions load from `~/.agents/AGENTS.md`, then
+`~/.iris/AGENTS.md`. Project instructions load root-to-leaf. Each directory
+selects the first non-empty regular base from `AGENTS.override.md`, `AGENTS.md`,
+then `CLAUDE.md`, followed by the first non-empty local candidate from
+`AGENTS.local.md`, then `CLAUDE.local.md`. Each selected document is capped at
+32 KiB. User-level paths may be symlinks to regular files; project candidates
+refuse symlinks and non-regular files and emit deduplicated warnings.
+
+Ignored local instruction files use harness-native semantics. Claude Code loads
+`CLAUDE.local.md`; trusted Pi projects may append `.pi/APPEND_SYSTEM.md`.
+`.worktreeinclude` supports harness-managed copies, while
+`scripts/worktree-create.sh` supplies the same regular-file-only local layer to
+repository-created plain Git worktrees.
 
 ---
 
@@ -943,9 +956,13 @@ runtime into other agents.
 Repository work uses task-specific Git worktrees. From a clean primary checkout:
 
 ```bash
-bash scripts/worktree-preflight.sh
-git worktree add ../iris-my-task -b feat/my-task origin/main
+bash scripts/worktree-create.sh ../iris-my-task feat/my-task
 ```
+
+The wrapper runs primary freshness preflight, creates from `origin/main`, and
+copies only the ignored regular instruction files listed in `.worktreeinclude`.
+A direct `git worktree add` receives tracked guidance and skills but not ignored
+local layers.
 
 Run the full CI-equivalent gate in the task worktree:
 
@@ -969,6 +986,7 @@ running a paid campaign.
 
 ## Documentation map
 
+- [Public agent guide](AGENTS.md) — repository commands, boundaries, checks, and worktree policy.
 - [Current codemap](docs/CODEMAPS/INDEX.md) — implemented modules and entry points.
 - [Feature inventory](docs/FEATURES.md) — status-tagged breadth; verify stale tags
   against code.

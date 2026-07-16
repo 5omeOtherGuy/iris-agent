@@ -23,6 +23,8 @@ expect_scope false
 expect_scope false src/lib.rs
 expect_scope false src/tools/web/testdata/excerpts_doc.md
 expect_scope false .agents/skills/example/SKILL.md
+expect_scope false AGENTS.md
+expect_scope false CLAUDE.md
 expect_scope false README.md src/lib.rs
 expect_scope false docs/benchmarks/campaign.toml
 expect_scope false .github/workflows/ci.yml
