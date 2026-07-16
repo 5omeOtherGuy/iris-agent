@@ -99,7 +99,7 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 | Host capabilities, if a plugin system is ever added (`host_read`, `host_ls`, later `host_*_plan`) | _exploratory (issue #18)_ |
 | Oversized tool-output handle storage | `handles.rs`, `wayland/mod.rs` |
 | Context compaction policy, range planning, stale-result revalidation, safe-boundary apply, mid-turn governor, hybrid measurement, and trigger ladder | `wayland/compaction.rs`, `wayland/compaction_governor.rs`, `wayland/compaction_background.rs`, `wayland/trigger.rs`, `wayland/mod.rs`, `session.rs` |
-| Iris adapters for the shared worker scheduler: `!Send` executor registration, child Nexus loops, compaction executors, and worktree linkage | `wayland/worker_runtime.rs`, `wayland/subagents.rs`, `wayland/compaction_background.rs` |
+| Iris adapters for the shared worker scheduler: `!Send` executor registration, versioned effective-route persistence, accepted-request provider construction, child Nexus loops, compaction executors, and worktree linkage | `wayland/worker_runtime.rs`, `wayland/subagents.rs`, `wayland/compaction_background.rs` |
 | System-prompt / project-instruction assembly (fragments + generated tool blocks + project docs + runtime context) | `wayland/system_prompt/` |
 | Skills: bounded repo/user/system/admin discovery, Codex metadata/config compatibility, metadata budgeting, contextual injection, confined resource reads, refresh-at-turn-boundary | `wayland/skills/`, `wayland/mod.rs`, `tools/read.rs` |
 
@@ -111,6 +111,22 @@ that run Nexus child loops or compaction calls; compaction retains policy and
 safe-boundary application. The `Harness` is the analogue of pi's `AgentHarness`
 (`agent-harness.ts`): it owns `env`/`session`, passes `env` into the run, and
 appends transcript messages itself.
+
+Direct worker routing preserves the tier split. Mimir applies optional model and
+reasoning overrides to a resolved `ModelSelection` and validates the result before
+worker acceptance. The Iris tool adapter snapshots provider, model, base URL, and
+normalized effort. Wayland stores that versioned, non-secret route on the
+host-owned `WorkerRequest` seams and passes the accepted request to
+`ChildProviderFactory`; the factory constructs the `!Send` provider on the
+scheduler thread. A queued worker therefore cannot follow later parent model or
+reasoning changes. Route-less legacy requests retain live-parent inheritance. A
+request that claims an Iris route but carries malformed metadata fails closed.
+
+Named worker profiles are the next routing layer. Profile defaults will apply to
+the snapshotted parent through Mimir's same override function, then explicit spawn
+overrides will apply through it again. The final route remains the execution
+contract; `profile_id` adds provenance without changing Wayland persistence or
+provider construction.
 
 pi equivalent: `src/harness/` — `agent-harness.ts`, `session/`, `compaction/`,
 `skills.ts`, `system-prompt.ts`, `env/nodejs.ts` (`ExecutionEnv` = `FileSystem`

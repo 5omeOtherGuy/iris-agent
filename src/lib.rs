@@ -454,6 +454,44 @@ fn resolve_tools_config(settings: &config::Settings) -> Result<tools::ToolsConfi
     })
 }
 
+fn child_selection_for_request(
+    parent: &mimir::selection::ModelSelection,
+    request: &iris_subagent_runtime::WorkerRequest,
+) -> Result<mimir::selection::ModelSelection> {
+    match wayland::subagents::route_from_request(request)? {
+        Some(route) => mimir::selection::selection_from_effective_route(
+            parent,
+            &route.provider,
+            &route.model,
+            &route.base_url,
+            route.effort.as_deref(),
+        ),
+        None => Ok(parent.clone()),
+    }
+}
+
+fn child_provider_factory(
+    selection: Arc<Mutex<mimir::selection::ModelSelection>>,
+    active_session_id: Arc<Mutex<String>>,
+) -> wayland::subagents::ChildProviderFactory {
+    Arc::new(move |request| {
+        let parent = selection
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let effective = child_selection_for_request(&parent, request)?;
+        let session_id = active_session_id
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        build_provider(
+            &effective,
+            "You are an isolated delegated Iris worker. Follow the supplied instruction, use only the advertised tools, and report exact results without claiming parent-workspace mutations.",
+            &session_id,
+        )
+    })
+}
+
 fn subagent_tools_config(
     cwd: &Path,
     session_id: &str,
@@ -468,25 +506,12 @@ fn subagent_tools_config(
         &wayland::subagents::resolve_worker_state_dir(session_id)?,
         wayland::subagents::resolve_worktree_root()?,
     )?);
-    let provider_factory: wayland::subagents::ChildProviderFactory = Arc::new(move || {
-        let selection = selection
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
-        let session_id = active_session_id
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
-        build_provider(
-            &selection,
-            "You are an isolated delegated Iris worker. Follow the supplied instruction, use only the advertised tools, and report exact results without claiming parent-workspace mutations.",
-            &session_id,
-        )
-    });
+    let provider_factory = child_provider_factory(selection.clone(), active_session_id);
     Ok((
         tools::SubagentToolsConfig {
             backend: backend.clone(),
             provider_factory,
+            selection,
             capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
             session_id: session_id.to_string(),
             nesting_depth: 0,
@@ -587,38 +612,14 @@ fn run_agent_inner(
     let session_id = session::new_session_id();
     let background_selection = Arc::new(Mutex::new(selection.clone()));
     let background_session_id = Arc::new(Mutex::new(session_id.clone()));
-    let subagent_backend = Arc::new(wayland::subagents::SubagentBackend::open(
-        cwd.clone(),
-        &wayland::subagents::resolve_worker_state_dir(&session_id)?,
-        wayland::subagents::resolve_worktree_root()?,
-    )?);
-    let child_selection = background_selection.clone();
-    let child_session_id = background_session_id.clone();
-    let child_provider_factory: wayland::subagents::ChildProviderFactory = Arc::new(move || {
-        let selection = child_selection
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
-        let session_id = child_session_id
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
-        build_provider(
-            &selection,
-            "You are an isolated delegated Iris worker. Follow the supplied instruction, use only the advertised tools, and report exact results without claiming parent-workspace mutations.",
-            &session_id,
-        )
-    });
+    let (subagent_config, subagent_backend) = subagent_tools_config(
+        &cwd,
+        &session_id,
+        background_selection.clone(),
+        background_session_id.clone(),
+    )?;
     let mut tools_config = resolve_tools_config(&settings)?;
-    tools_config.subagents = Some(tools::SubagentToolsConfig {
-        backend: subagent_backend.clone(),
-        provider_factory: child_provider_factory,
-        capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
-        session_id: session_id.clone(),
-        nesting_depth: 0,
-        max_nesting_depth: 2,
-        approval: None,
-    });
+    tools_config.subagents = Some(subagent_config);
     let tools = tools::built_in_tools_with(&tools_config);
     let prompt_assembly = wayland::system_prompt::assemble_with_notices(&cwd, &tools);
     let system_prompt = prompt_assembly.prompt;
@@ -1819,6 +1820,33 @@ mod tests {
         let (policy, _) = resolved_compaction_trigger(&settings, &selection).unwrap();
         assert_eq!(policy.displayed_context_window, 235_808);
         assert_eq!(policy.hard_compaction_threshold, 235_808);
+    }
+
+    #[test]
+    fn accepted_child_route_reconstructs_selection_and_legacy_inherits() {
+        let parent =
+            mimir::selection::ModelSelection::resolve(&config::Settings::default()).unwrap();
+        let legacy = iris_subagent_runtime::WorkerRequest::read_only("legacy");
+        assert_eq!(
+            child_selection_for_request(&parent, &legacy).unwrap(),
+            parent
+        );
+
+        let route = wayland::subagents::ChildRoute::new(
+            "anthropic",
+            "claude-opus-4-6",
+            "https://api.anthropic.com",
+            Some("xhigh"),
+        );
+        let mut request = iris_subagent_runtime::WorkerRequest::read_only("routed");
+        wayland::subagents::attach_route(&mut request, &route).unwrap();
+        let effective = child_selection_for_request(&parent, &request).unwrap();
+        assert_eq!(effective.provider, mimir::selection::ProviderId::Anthropic);
+        assert_eq!(effective.model, "claude-opus-4-6");
+        assert_eq!(
+            effective.reasoning,
+            Some(mimir::selection::ReasoningEffort::XHigh)
+        );
     }
 
     #[test]

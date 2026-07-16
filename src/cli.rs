@@ -737,79 +737,17 @@ fn handle_reasoning<P: ChatProvider>(
 /// Parse a `/model` argument into a candidate selection. Exact ids only: an
 /// unknown provider errors; an unknown model is allowed and passes through.
 fn parse_model_target(rest: &str, current: &ModelSelection) -> Result<ModelSelection> {
-    let (provider, model) = match rest.split_once('/') {
-        Some((provider, model)) => (ProviderId::parse(provider)?, model.trim().to_string()),
-        None => (current.provider, rest.trim().to_string()),
-    };
-    if model.is_empty() {
-        bail!("usage: /model <provider>/<model> or /model <model>");
-    }
-    Ok(candidate_for(current, provider, &model))
+    selection::apply_selection_overrides(current, Some(rest), None)
 }
 
-fn carried_reasoning(
-    current: &ModelSelection,
-    provider: ProviderId,
-    model: &str,
-) -> Option<ReasoningEffort> {
-    if provider == ProviderId::OpenAiCompatible && !current.open_ai_compatible.reasoning {
-        None
-    } else {
-        current
-            .reasoning
-            .map(|level| model_capabilities::clamp(provider, model, level))
-    }
-}
-
-/// Build a candidate selection for a (provider, model), carrying base-url and
-/// reasoning forward the same way `/model` does: a model-only switch keeps the
-/// resolved base url (which respected the global settings value); a provider
-/// switch recomputes from the new provider's env + default, since a configured
-/// base url binds to the originally selected provider and must not redirect a
-/// different one. The current reasoning is clamped to the new model. Reused by
-/// the model picker and Ctrl+P cycling so they switch exactly like `/model`.
+/// Build a candidate selection for a (provider, model), reusing Mimir's model
+/// switch semantics for the picker and Ctrl+P cycling.
 pub(crate) fn candidate_for(
     current: &ModelSelection,
     provider: ProviderId,
     model: &str,
 ) -> ModelSelection {
-    let base_url = if provider == current.provider {
-        current.base_url.clone()
-    } else {
-        let settings_base_url = settings_base_url_for_switch(provider);
-        selection::base_url_for(provider, settings_base_url.as_deref())
-    };
-    let reasoning = carried_reasoning(current, provider, model);
-    ModelSelection {
-        provider,
-        model: model.to_string(),
-        base_url,
-        reasoning,
-        cache_retention: current.cache_retention,
-        codex_transport: current.codex_transport,
-        codex_stream_idle_timeout: current.codex_stream_idle_timeout,
-        context_management: current.context_management.clone(),
-        legacy_context_management: current.legacy_context_management.clone(),
-        tool_result_compaction: current.tool_result_compaction.clone(),
-        configured_tool_result_compaction: current.configured_tool_result_compaction.clone(),
-        // A runtime model switch keeps the configured retry policy and custom
-        // endpoint metadata.
-        retry_policy: current.retry_policy,
-        open_ai_compatible: current.open_ai_compatible,
-    }
-}
-
-fn settings_base_url_for_switch(provider: ProviderId) -> Option<String> {
-    let settings = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| config::Settings::load(&cwd).ok())?;
-    let configured_provider = settings
-        .default_provider
-        .as_deref()
-        .and_then(|value| ProviderId::parse(value).ok());
-    (configured_provider == Some(provider))
-        .then_some(settings.base_url)
-        .flatten()
+    selection::candidate_for(current, provider, model)
 }
 
 /// What a candidate selection changes relative to the active one, ordered by
@@ -883,7 +821,8 @@ pub(crate) fn apply_selection<P: ChatProvider>(
     switch: &mut ModelSwitch<'_, P>,
 ) -> Vec<String> {
     let scope = switch_scope(&switch.selection, &candidate);
-    let carried = carried_reasoning(&switch.selection, candidate.provider, &candidate.model);
+    let carried =
+        selection::carried_reasoning(&switch.selection, candidate.provider, &candidate.model);
     let reasoning_fallback = if scope != SwitchScope::ReasoningOnly
         && switch.selection.reasoning != candidate.reasoning
         && candidate.reasoning == carried

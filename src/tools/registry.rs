@@ -64,6 +64,7 @@ pub(crate) struct ToolsConfig {
 pub(crate) struct SubagentToolsConfig {
     pub(crate) backend: Arc<crate::wayland::subagents::SubagentBackend>,
     pub(crate) provider_factory: crate::wayland::subagents::ChildProviderFactory,
+    pub(crate) selection: Arc<std::sync::Mutex<crate::mimir::selection::ModelSelection>>,
     pub(crate) capability_ceiling: iris_subagent_runtime::CapabilityMode,
     pub(crate) session_id: String,
     pub(crate) nesting_depth: u32,
@@ -282,6 +283,16 @@ impl Tool for SpawnSubagentTool {
                     "default": "general",
                     "description": "Worker category. explore and review force read_only; categories do not inject a persona, so state any desired role in prompt."
                 },
+                "model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Optional child model. Use <model> to keep the current provider or <provider>/<model> to switch provider. Omit to inherit the spawn-time effective selection."
+                },
+                "effort": {
+                    "type": "string",
+                    "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+                    "description": "Optional reasoning effort: off, minimal, low, medium, high, xhigh, or max. Omit to inherit and clamp the effective effort for the selected model."
+                },
                 "capability": {
                     "type": "string",
                     "enum": ["read_only", "read_write", "execute", "all"],
@@ -377,7 +388,29 @@ impl Tool for SpawnSubagentTool {
                 "explore" | "review" => iris_subagent_runtime::CapabilityMode::ReadOnly,
                 other => return Err(anyhow!("unknown subagent kind: {other}")),
             };
+            let model = optional_string_arg(args, "model")?;
+            let effort = optional_string_arg(args, "effort")?;
+            let parent_selection = self
+                .0
+                .selection
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone();
+            let effective_selection = crate::mimir::selection::apply_selection_overrides(
+                &parent_selection,
+                model,
+                effort,
+            )?;
+            let route = crate::wayland::subagents::ChildRoute::new(
+                effective_selection.provider.as_str(),
+                effective_selection.model.clone(),
+                effective_selection.base_url.clone(),
+                effective_selection
+                    .reasoning
+                    .map(crate::mimir::selection::ReasoningEffort::as_str),
+            );
             let mut request = iris_subagent_runtime::WorkerRequest::read_only(prompt);
+            crate::wayland::subagents::attach_route(&mut request, &route)?;
             request.description = args
                 .get("description")
                 .and_then(Value::as_str)
@@ -929,6 +962,14 @@ impl Tool for SelectSubagentCandidateTool {
             }
             Ok(ToolOutput::text(serde_json::to_string(&selected)?))
         })
+    }
+}
+
+fn optional_string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(anyhow!("spawn_subagent {key} must be a string")),
     }
 }
 
@@ -1745,6 +1786,13 @@ mod tests {
             .unwrap()
     }
 
+    fn test_selection() -> Arc<std::sync::Mutex<crate::mimir::selection::ModelSelection>> {
+        Arc::new(std::sync::Mutex::new(
+            crate::mimir::selection::ModelSelection::resolve(&crate::config::Settings::default())
+                .unwrap(),
+        ))
+    }
+
     fn bash_env<'a>(
         workspace: &'a std::path::Path,
         state: &'a std::cell::RefCell<ToolState>,
@@ -1772,10 +1820,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let selection = Arc::new(std::sync::Mutex::new(
-            crate::mimir::selection::ModelSelection::resolve(&crate::config::Settings::default())
-                .unwrap(),
-        ));
+        let selection = test_selection();
         let provider_factory: crate::wayland::subagents::ChildProviderFactory =
             Arc::new(|_| Err(anyhow!("invalid route must not construct a provider")));
         let tool = SpawnSubagentTool(SubagentToolsConfig {
@@ -1822,6 +1867,67 @@ mod tests {
     }
 
     #[test]
+    fn direct_routing_persists_one_effective_route_for_best_of_n() {
+        let dir = temp_dir();
+        let workspace = root_of(&dir);
+        let backend = Arc::new(
+            crate::wayland::subagents::SubagentBackend::open(
+                workspace.clone(),
+                &workspace.join("worker-state"),
+                workspace.join("worktrees"),
+            )
+            .unwrap(),
+        );
+        let provider_factory: crate::wayland::subagents::ChildProviderFactory =
+            Arc::new(|_| Ok(Box::new(PendingProvider(Rc::new(()))) as Box<dyn ChatProvider>));
+        let tool = SpawnSubagentTool(SubagentToolsConfig {
+            backend: backend.clone(),
+            provider_factory,
+            selection: test_selection(),
+            capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
+            session_id: "direct-route".to_string(),
+            nesting_depth: 0,
+            max_nesting_depth: 2,
+            approval: None,
+        });
+        let state = std::cell::RefCell::new(ToolState::new());
+        let env = bash_env(&workspace, &state, None);
+
+        let output = current_thread_runtime()
+            .block_on(tool.execute(
+                &json!({
+                    "prompt": "route",
+                    "model": "anthropic/claude-opus-4-6",
+                    "effort": "xhigh",
+                    "count": 3
+                }),
+                &env,
+                CancellationToken::new(),
+            ))
+            .unwrap();
+        let value: Value = serde_json::from_str(&output.content).unwrap();
+        let group_id: iris_subagent_runtime::GroupId =
+            value["group_id"].as_str().unwrap().parse().unwrap();
+        let group = backend.poll_group(&group_id).unwrap();
+        let route_ids = group
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.request.route_id.clone().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(route_ids.len(), 1);
+        for snapshot in &group.snapshots {
+            let route = crate::wayland::subagents::route_from_request(&snapshot.request)
+                .unwrap()
+                .unwrap();
+            assert_eq!(route.provider, "anthropic");
+            assert_eq!(route.model, "claude-opus-4-6");
+            assert_eq!(route.effort.as_deref(), Some("xhigh"));
+            assert!(snapshot.request.profile_id.is_none());
+        }
+        backend.cancel_group(&group_id).unwrap();
+    }
+
+    #[test]
     fn cancelling_foreground_spawn_cancels_the_independent_worker() {
         let dir = temp_dir();
         let workspace = root_of(&dir);
@@ -1834,10 +1940,11 @@ mod tests {
             .unwrap(),
         );
         let provider_factory: crate::wayland::subagents::ChildProviderFactory =
-            Arc::new(|| Ok(Box::new(PendingProvider(Rc::new(()))) as Box<dyn ChatProvider>));
+            Arc::new(|_| Ok(Box::new(PendingProvider(Rc::new(()))) as Box<dyn ChatProvider>));
         let tool = SpawnSubagentTool(SubagentToolsConfig {
             backend: backend.clone(),
             provider_factory,
+            selection: test_selection(),
             capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
             session_id: "foreground-cancel".to_string(),
             nesting_depth: 0,
@@ -2180,11 +2287,12 @@ mod tests {
             .unwrap(),
         );
         let provider_factory: crate::wayland::subagents::ChildProviderFactory =
-            Arc::new(|| Err(anyhow!("schema test must not execute a provider")));
+            Arc::new(|_| Err(anyhow!("schema test must not execute a provider")));
         let subagent_config = ToolsConfig {
             subagents: Some(SubagentToolsConfig {
                 backend,
                 provider_factory,
+                selection: test_selection(),
                 capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
                 session_id: "schema-test".to_string(),
                 nesting_depth: 0,
@@ -2281,6 +2389,10 @@ mod tests {
         assert!(
             !properties.contains_key("resume_from"),
             "unimplemented resume semantics must not be advertised"
+        );
+        assert!(
+            !properties.contains_key("profile"),
+            "profiles must not be advertised before profile resolution exists"
         );
         for (field, description) in [
             (
