@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Issue 642 implementation notes</title></head>
+<body>
+<h1>Issue 642 implementation notes</h1>
+<ul>
+  <li><strong>Current-main drift:</strong> Preserve the canonical <code>provider-stream-diagnostics</code> skill and its Claude projection added after the issue snapshot. Remove the tracked <code>.pi/skills/iris-tui</code> projection because the issue explicitly forbids redundant Pi projections and current Pi discovers <code>.agents/skills</code> natively.</li>
+  <li><strong>Wrapper scope:</strong> The plain-Git worktree wrapper accepts only the four exact local-instruction entries committed in <code>.worktreeinclude</code>. It refuses unsupported patterns instead of copying arbitrary ignored files, so later additions require an explicit safety review.</li>
+  <li><strong>Skill publication audit:</strong> Track <code>iris-release</code> after checking it against <code>docs/RELEASING.md</code>, <code>release-plz.toml</code>, and the release workflow and removing personal attribution. Track <code>compaction-tuning</code> after removing its private home-directory plan reference.</li>
+  <li><strong>Durable handoff:</strong> No pull request or other remote review artifact was created because the task did not authorize an externally visible action. Retain this file until an operator provides a readable review surface; then transfer every entry, read it back, and delete this file.</li>
+</ul>
+</body>
+</html>
