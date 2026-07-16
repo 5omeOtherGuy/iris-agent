@@ -14,16 +14,16 @@ use super::text::{
     READ_TOOL_MAX_BYTES, render_line_window, render_line_window_masked, validate_offset_limit,
 };
 
-pub(super) const DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete. For exploration-only reads, skim: true strips comments, docstrings, and blank lines; a full read (without skim) is still required before editing a file.";
+pub(super) const DESCRIPTION: &str = "Read a UTF-8 text file with numbered lines. Results are capped at 2,000 lines or 50 KiB and include a continuation offset. `skim` hides comments, docstrings, and blank lines for exploration but never satisfies the full-read prerequisite for mutation.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },
-            "offset": { "type": "integer", "description": "Line number to start reading from (1-indexed)" },
-            "limit": { "type": "integer", "description": "Maximum number of lines to read" },
-            "skim": { "type": "boolean", "description": "Exploration mode: strip comments, docstrings, and blank lines from source files (line numbers keep their original values). A skim read does not satisfy read-before-edit; do a full read before modifying the file." }
+            "path": { "type": "string", "description": "File path, relative or absolute." },
+            "offset": { "type": "integer", "minimum": 1, "default": 1, "description": "First line (1-indexed)." },
+            "limit": { "type": "integer", "minimum": 1, "default": 2000, "description": "Maximum lines." },
+            "skim": { "type": "boolean", "default": false, "description": "Hide comments, docstrings, and blank lines while preserving original line numbers." }
         },
         "required": ["path"]
     })
@@ -167,6 +167,17 @@ mod tests {
     use super::*;
     use crate::tools::test_support::{root_of, temp_dir};
     use crate::tools::text::DEFAULT_MAX_BYTES;
+
+    #[test]
+    fn schema_encodes_window_defaults_and_mutation_floor() {
+        let schema = parameters();
+        assert_eq!(schema["properties"]["offset"]["minimum"], 1);
+        assert_eq!(schema["properties"]["offset"]["default"], 1);
+        assert_eq!(schema["properties"]["limit"]["minimum"], 1);
+        assert_eq!(schema["properties"]["limit"]["default"], 2_000);
+        assert_eq!(schema["properties"]["skim"]["default"], false);
+        assert!(DESCRIPTION.contains("never satisfies"));
+    }
 
     #[test]
     fn read_returns_line_numbered_content() {

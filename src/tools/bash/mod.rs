@@ -38,18 +38,18 @@ const BASH_DRAIN_TIMEOUT_SECS: u64 = 5;
 // streams. This stays a memory-safety rail and is intentionally unchanged.
 const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 
-pub(super) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output from known-noisy commands (build/test runners, installers, linters) is filtered to keep errors, failures, and summaries; pass `raw: true` to get the unfiltered output for one call. Output is truncated to last 2000 lines or 50KB (whichever is hit first). No timeout by default; set `timeout` (seconds) to bound a call. Pass `session` (any id string) to run in a persistent shell where `cd`, environment, and shell variables carry across calls. `action` may be `run` (default), `reset`, `close`, `start` a background job, `poll`, `finalize`, `cancel`, or `list` jobs.";
+pub(super) const DESCRIPTION: &str = "Run or manage bash commands in the current working directory. Known noisy logs are filtered unless `raw`; final output keeps the last 2,000 lines or 50 KiB while preserving failures and exit status. Calls are approval-gated.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "command": { "type": "string", "description": "Bash command to execute" },
-            "timeout": { "type": "integer", "description": "Timeout in seconds (optional; no timeout when unset)" },
-            "session": { "type": "string", "description": "Persistent shell session id; state (cd/env/vars) persists across calls with the same id" },
-            "job": { "type": "string", "description": "Background job id for poll/finalize/cancel" },
-            "action": { "type": "string", "enum": ["run", "reset", "close", "start", "poll", "finalize", "cancel", "list"], "description": "Action (default run): run/reset/close a session, or start/poll/finalize/cancel/list background jobs" },
-            "raw": { "type": "boolean", "description": "Bypass output filtering for this call and return the full raw output" }
+            "command": { "type": "string", "minLength": 1, "description": "Command; required for run and start." },
+            "timeout": { "type": "integer", "minimum": 0, "default": 0, "description": "Seconds; 0 means no caller limit." },
+            "session": { "type": "string", "description": "ID for run/reset/close; run preserves cwd, environment, and variables." },
+            "job": { "type": "string", "description": "ID for poll/finalize/cancel." },
+            "action": { "type": "string", "enum": ["run", "reset", "close", "start", "poll", "finalize", "cancel", "list"], "default": "run", "description": "run/start require command; reset/close require session; poll/finalize/cancel require job; list requires neither." },
+            "raw": { "type": "boolean", "default": false, "description": "Return unfiltered output." }
         }
     })
 }
@@ -739,6 +739,20 @@ mod tests {
         fn emit_chunk(&self, chunk: &str) {
             self.chunks.borrow_mut().push(chunk.to_string());
         }
+    }
+
+    #[test]
+    fn schema_encodes_action_modes_and_defaults() {
+        let schema = parameters();
+        assert_eq!(schema["properties"]["action"]["default"], "run");
+        assert_eq!(schema["properties"]["timeout"]["minimum"], 0);
+        assert_eq!(schema["properties"]["timeout"]["default"], 0);
+        assert_eq!(schema["properties"]["raw"]["default"], false);
+        let action = schema["properties"]["action"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(action.contains("reset/close require session"));
+        assert!(action.contains("poll/finalize/cancel require job"));
     }
 
     #[test]

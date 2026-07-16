@@ -5,9 +5,10 @@ use serde_json::{Value, json};
 
 use crate::nexus::{GoalController, ToolOutput, ToolOutputStore};
 
-pub(crate) const GET_DESCRIPTION: &str = "Get the current session goal, including status, objective, token budget, usage, and elapsed time.";
-pub(crate) const CREATE_DESCRIPTION: &str = "Create a persistent long-running goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. Set each budget only when that specific limit was explicitly requested. Fails when an unfinished goal already exists. Token budgets count fresh input plus output while excluding cached input; time budgets count active goal-turn wall time.";
-pub(crate) const UPDATE_DESCRIPTION: &str = "Update the current long-running goal to complete or blocked. Mark complete only when the full objective is achieved. Mark blocked only after the same blocker recurs for at least three consecutive goal turns.";
+pub(crate) const GET_DESCRIPTION: &str =
+    "Get the current session goal, including status, objective, budgets, usage, and elapsed time.";
+pub(crate) const CREATE_DESCRIPTION: &str = "Create a persistent long-running goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. Set a budget only when that limit was explicitly requested. Fails while a goal is unfinished. Token budgets count fresh input plus output, excluding cache reads; time budgets count active goal-turn seconds.";
+pub(crate) const UPDATE_DESCRIPTION: &str = "Mark the current goal `complete` only when fully achieved, or `blocked` only after the same blocker recurs for at least three consecutive goal turns.";
 
 pub(crate) fn empty_parameters() -> Value {
     json!({
@@ -23,17 +24,17 @@ pub(crate) fn create_parameters() -> Value {
         "properties": {
             "objective": {
                 "type": "string",
-                "description": "The complete objective to pursue. Objectives over 4000 characters are stored as a session attachment and replaced with a read_output reference."
+                "description": "Goal objective. Values over 4,000 characters become a read_output attachment reference."
             },
             "token_budget": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Optional token budget. Omit unless explicitly requested. Counts fresh input plus output; excludes cache reads."
+                "description": "Optional token budget. Omit unless explicitly requested. Counts fresh input plus output, excluding cache reads."
             },
             "time_budget_seconds": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Optional active wall-clock budget in seconds across goal turns. Omit unless explicitly requested."
+                "description": "Optional active goal-turn seconds. Omit unless explicitly requested."
             }
         },
         "required": ["objective"],

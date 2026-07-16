@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub(crate) const DESCRIPTION: &str = "Ask the user 1-4 structured questions when you need preferences, clarification, or an implementation decision. The user can always choose Other and enter free text. Set multiSelect to true when choices are not mutually exclusive. To recommend an option, put it first and append (Recommended) to its label. Add markdown preview text when comparing concrete alternatives. Do not use this tool to ask for permission to run a tool or perform an action; Iris handles tool approvals separately.";
+pub(crate) const DESCRIPTION: &str = "Ask 1–4 structured questions for preferences, clarification, or implementation choices; never use this for tool or action approval. The host collects answers and always adds an `Other` free-text choice.";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -79,35 +79,15 @@ pub(crate) fn parameters() -> Value {
                                 "additionalProperties": false,
                                 "required": ["label", "description"],
                                 "properties": {
-                                    "label": { "type": "string", "minLength": 1 },
-                                    "description": { "type": "string", "minLength": 1 },
-                                    "preview": { "type": "string" }
+                                    "label": { "type": "string", "minLength": 1, "description": "Choice label; put a recommendation first and append `(Recommended)`." },
+                                    "description": { "type": "string", "minLength": 1, "description": "Decision-relevant difference." },
+                                    "preview": { "type": "string", "description": "Markdown comparison preview; unavailable with multiSelect." }
                                 }
                             }
                         },
-                        "multiSelect": { "type": "boolean", "default": false }
+                        "multiSelect": { "type": "boolean", "default": false, "description": "Allow multiple choices." }
                     }
                 }
-            },
-            "answers": {
-                "type": "object",
-                "additionalProperties": { "type": "string" }
-            },
-            "annotations": {
-                "type": "object",
-                "additionalProperties": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "preview": { "type": "string" },
-                        "notes": { "type": "string" }
-                    }
-                }
-            },
-            "metadata": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": { "source": { "type": "string" } }
             }
         }
     })
@@ -215,6 +195,14 @@ mod tests {
             item["properties"]["options"]["items"]["additionalProperties"],
             false
         );
+        assert_eq!(
+            schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["questions"]
+        );
     }
 
     #[test]
@@ -262,9 +250,17 @@ mod tests {
     #[test]
     fn guidance_covers_reference_usage_rules() {
         assert!(DESCRIPTION.contains("Other"));
-        assert!(DESCRIPTION.contains("multiSelect"));
-        assert!(DESCRIPTION.contains("(Recommended)"));
-        assert!(DESCRIPTION.contains("preview"));
-        assert!(DESCRIPTION.contains("Do not use this tool to ask for permission"));
+        assert!(DESCRIPTION.contains("never use this for tool or action approval"));
+        let schema = parameters();
+        let question = &schema["properties"]["questions"]["items"]["properties"];
+        assert!(question["multiSelect"]["description"].is_string());
+        let option = &question["options"]["items"]["properties"];
+        assert!(
+            option["label"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("(Recommended)")
+        );
+        assert!(option["preview"]["description"].is_string());
     }
 }

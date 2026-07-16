@@ -11,14 +11,14 @@ use super::path::resolve_for_write;
 use super::text::{WRITE_TOOL_MAX_BYTES, atomic_write};
 use super::{ObservedFiles, Preview};
 
-pub(super) const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.";
+pub(super) const DESCRIPTION: &str = "Create or overwrite a file, creating parent directories. Overwriting requires a prior read of the current contents.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string", "description": "Path to the file to write (relative or absolute)" },
-            "content": { "type": "string", "description": "Content to write to the file" }
+            "path": { "type": "string", "description": "File path, relative or absolute." },
+            "content": { "type": "string", "description": "Complete file contents." }
         },
         "required": ["path", "content"]
     })
@@ -125,6 +125,13 @@ mod tests {
     use super::*;
     use crate::tools::read::read_file;
     use crate::tools::test_support::{root_of, temp_dir};
+
+    #[test]
+    fn contract_exposes_overwrite_consequence() {
+        assert!(DESCRIPTION.contains("prior read"));
+        let schema = parameters();
+        assert_eq!(schema["required"], json!(["path", "content"]));
+    }
 
     #[test]
     fn write_success_payload_has_no_file_content() {

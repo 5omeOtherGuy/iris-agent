@@ -289,7 +289,7 @@ fn take_anchor_consumes_every_match_and_last_one_wins() {
 // ---- generated tool blocks reflect the registry ------------------------------
 
 #[test]
-fn available_tools_lists_every_registered_tool_with_the_guardrail() {
+fn available_tools_lists_only_registered_names_with_the_guardrail() {
     let tools = built_in_tools();
     let body = available_tools_body(&tools);
     assert!(body.starts_with("Available tools:"));
@@ -304,20 +304,24 @@ fn available_tools_lists_every_registered_tool_with_the_guardrail() {
         "read_output",
         "recall",
     ] {
-        assert!(body.contains(&format!("- {name}:")), "missing tool {name}");
+        assert!(
+            body.split_once(':').is_some_and(|(_, names)| names
+                .split_whitespace()
+                .any(|item| item.trim_end_matches(',') == name)),
+            "missing tool {name}: {body}"
+        );
     }
-    assert!(body.contains("No other tools are available"));
-    assert!(body.contains("do not assume") || body.contains("Do not assume"));
+    assert!(!body.contains("test tool"));
+    assert!(body.contains("Use only these tools"));
+    assert!(body.contains("hidden tools"));
 }
 
 #[test]
-fn available_tools_preserves_registration_order() {
-    let tools = built_in_tools();
+fn available_tools_preserves_registration_order_without_repeating_descriptions() {
+    let tools = named_tools(&["read", "bash", "ls"]);
     let body = available_tools_body(&tools);
-    let read_at = body.find("- read:").unwrap();
-    let bash_at = body.find("- bash:").unwrap();
-    let ls_at = body.find("- ls:").unwrap();
-    assert!(read_at < bash_at && bash_at < ls_at);
+    assert!(body.contains("Available tools: read, bash, ls"));
+    assert!(!body.contains("test tool"));
 }
 
 #[test]
@@ -325,16 +329,23 @@ fn bash_tool_mode_prompt_advertises_shell_operations_not_native_file_tools() {
     let tools = built_in_tools_for(true, false);
     let body = available_tools_body(&tools);
     for name in ["bash", "edit", "read_output", "recall"] {
-        assert!(body.contains(&format!("- {name}:")), "missing tool {name}");
+        assert!(
+            body.split_once(':').is_some_and(|(_, names)| names
+                .split_whitespace()
+                .any(|item| item.trim_end_matches(',') == name)),
+            "missing tool {name}: {body}"
+        );
     }
     for gone in ["read", "write", "grep", "find", "ls"] {
         assert!(
-            !body.contains(&format!("- {gone}:")),
-            "{gone} should be hidden"
+            !body.split_once(':').is_some_and(|(_, names)| names
+                .split_whitespace()
+                .any(|item| item.trim_end_matches(',') == gone)),
+            "{gone} should be hidden: {body}"
         );
     }
     let guidelines = tool_guidelines_body(&tools);
-    assert!(guidelines.contains("Use bash for file operations like ls, rg, find"));
+    assert!(guidelines.contains("Use bash for file operations such as ls, rg, and find."));
     assert!(!guidelines.contains("Prefer read, grep, find, and ls"));
 }
 
@@ -348,7 +359,7 @@ fn recall_fragment_renders_only_when_the_recall_tool_is_registered() {
         with_recall.contains("<compaction_recall>"),
         "recall fragment must render when the tool is registered"
     );
-    assert!(with_recall.contains("recall(handle="));
+    assert!(with_recall.contains("[recall]"));
     assert!(with_recall.contains("recall(tool_call_id="));
     // Not registered: the fragment must be absent, so no build advertises an
     // affordance the model cannot invoke (ADR-0046 / ADR-0014).
@@ -369,11 +380,11 @@ fn subagent_fragment_renders_only_with_the_live_spawn_tool() {
     let with_subagents = assemble_defaults(workspace, &tools);
     assert!(with_subagents.contains("<subagent_delegation>"));
     for rule in [
-        "Delegate only when it has a clear payoff",
-        "Delegate one outcome per worker",
-        "Use foreground execution when the result blocks further work",
+        "Delegate only for clear payoff",
+        "Give each worker one outcome",
+        "blocking work in the foreground",
         "Treat worker output as evidence, not completion",
-        "Never claim the parent workspace changed until apply succeeds",
+        "Never claim parent files changed before apply succeeds",
     ] {
         assert!(
             with_subagents.contains(rule),
@@ -385,22 +396,69 @@ fn subagent_fragment_renders_only_with_the_live_spawn_tool() {
 }
 
 #[test]
-fn no_other_tools_guardrail_mentions_subagents_only_when_they_are_absent() {
+fn no_other_tools_guardrail_is_registry_agnostic() {
     let without_subagents = available_tools_body(&built_in_tools());
-    assert!(without_subagents.contains("multi_tool wrappers, subagents, or hidden"));
-
     let with_subagents = available_tools_body(&named_tools(&["spawn_subagent"]));
-    assert!(!with_subagents.contains("multi_tool wrappers, subagents"));
-    assert!(with_subagents.contains("multi_tool wrappers, or hidden parallel tool APIs"));
+    for body in [&without_subagents, &with_subagents] {
+        assert!(body.contains("Use only these tools"));
+        assert!(body.contains("hidden tools"));
+        assert!(!body.contains("test tool"));
+    }
+    assert!(!without_subagents.contains("spawn_subagent"));
+    assert!(with_subagents.contains("spawn_subagent"));
 }
 
 #[test]
-fn tool_guidelines_have_conditional_and_always_bullets() {
+fn tool_guidelines_are_registry_conditional_without_style_duplication() {
     let body = tool_guidelines_body(&built_in_tools());
     assert!(body.starts_with("Guidelines:"));
     assert!(body.contains("Prefer read, grep, find, and ls for file inspection"));
-    assert!(body.contains("Be concise in your responses"));
-    assert!(body.contains("Show file paths clearly when working with files"));
+    assert!(!body.contains("Be concise"));
+    assert!(!body.contains("Show file paths"));
+
+    let web = tool_guidelines_body(&named_tools(&["web_search", "read_web_page"]));
+    assert!(web.contains("untrusted external data"));
+    assert!(web.contains("cite source URLs"));
+    let no_web = tool_guidelines_body(&named_tools(&["read"]));
+    assert!(!no_web.contains("web_search"));
+}
+
+#[test]
+fn disabled_optional_capabilities_are_not_advertised() {
+    let prompt = assemble_defaults(Path::new("/tmp/registry-gating"), &built_in_tools());
+    for absent in [
+        "request_compaction",
+        "web_search",
+        "read_web_page",
+        "spawn_subagent",
+        "subagent_status",
+        "apply_subagent",
+    ] {
+        assert!(
+            !prompt.contains(absent),
+            "disabled {absent} leaked into prompt"
+        );
+    }
+}
+
+#[test]
+fn shipped_prompt_preserves_safety_and_accountability_floors() {
+    let prompt = assemble_defaults(Path::new("/tmp/safety-floors"), &built_in_tools());
+    for rule in [
+        "Read referenced files before answering or editing",
+        "NEVER revert, undo, or modify changes you did not make",
+        "NEVER trade safety for brevity",
+        "ask whether code is needed",
+        "Every code line must execute at least once",
+        "never claim all tests pass when they do not",
+        "Confirm first before",
+        "Never bypass workspace-path, shell, or approval restrictions",
+    ] {
+        assert!(
+            prompt.contains(rule),
+            "missing safety/accountability rule: {rule}"
+        );
+    }
 }
 
 // ---- dynamic context (project docs + date/cwd) --------------------------------
@@ -765,7 +823,9 @@ fn shipped_identity_is_one_sentence_and_mission_follows_it() {
     );
     // mission carries the goal and sits between identity and response_style.
     assert!(prompt.contains("<mission>"));
-    assert!(prompt.contains("Your main goal: execute the user's instructions"));
+    assert!(
+        prompt.contains("Execute the user's instructions, verify the result works as intended")
+    );
     assert!(at(&prompt, "identity") < at(&prompt, "mission"));
     assert!(at(&prompt, "mission") < at(&prompt, "response_style"));
 }
@@ -782,9 +842,8 @@ fn assemble_with_only_defaults_is_equivalent_to_today_prompt_content() {
         "2026-06-18",
     );
     assert!(prompt.contains("<identity>"));
-    assert!(prompt.contains("- read:") && prompt.contains("- ls:"));
-    assert!(prompt.contains("No other tools are available"));
-    assert!(prompt.contains("Be concise in your responses"));
+    assert!(prompt.contains("Available tools: read, bash") && prompt.contains(", ls,"));
+    assert!(prompt.contains("Use only these tools"));
     assert!(prompt.contains("Current working directory: /tmp/iris"));
     // Shipped middle fragments appear in slot order.
     assert!(at(&prompt, "response_style") < at(&prompt, "file_links"));

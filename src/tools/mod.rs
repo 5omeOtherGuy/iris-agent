@@ -7,8 +7,8 @@
 //! output stored out of context behind a handle (issue #61).
 //!
 //! Fidelity notes:
-//! - The model-facing contract (tool name, description, and JSON Schema) is
-//!   copied verbatim from pi so the wire surface matches.
+//! - Model-facing names, descriptions, and schemas are Iris-owned and tested
+//!   against runtime behavior and the provider-safe schema subset.
 //! - Behavior is reimplemented for Iris's synchronous, std-only runtime rather
 //!   than pi's async runtime. `grep` and `find` search via the ripgrep library
 //!   crates (`grep`/`ignore`/`globset`), so neither needs an external binary on
@@ -375,7 +375,7 @@ mod tests {
         assert!(!tool.is_mutating());
         assert!(
             tool.description()
-                .contains("Do not use this tool to ask for permission")
+                .contains("never use this for tool or action approval")
         );
         assert_eq!(tool.parameters()["additionalProperties"], false);
     }

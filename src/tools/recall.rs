@@ -51,24 +51,24 @@ const SEARCH_PREVIEW_CHARS: usize = 200;
 // instead of a schema combinator, and enforced server-side in `execute`/
 // `normalize_args` -- see the mode-conflict checks there and the exhaustive
 // forbidden-combination tests in this module.
-pub(super) const DESCRIPTION: &str = "Retrieve ORIGINAL turns from this session. Address them by exactly one of three modes -- do not combine arguments across modes:\n\
-1. `handle` mode: `handle` is required. May be narrowed with `from`/`to`, and/or windowed with `offset`/`limit`, and/or searched with `pattern`. Must NOT be combined with `tool_call_id`.\n\
-2. Span mode: `from` AND `to` are both required together (neither alone). May also use `pattern`/`offset`/`limit`. Must NOT be combined with `handle` or `tool_call_id`.\n\
-3. Folded-tool-call mode: `tool_call_id` (from a folded tool-result stub) is required ALONE -- it must NOT be combined with `handle`, `from`, `to`, `pattern`, `offset`, or `limit`.\n\
-Tool-call/tool-result pairs stay intact in the output. Read-only over this session's own transcript: no file path, shell, or approval.";
+pub(super) const DESCRIPTION: &str = "Retrieve original turns from this session in exactly one mode:\n\
+1. Handle: pass `handle`; optionally narrow with `from`/`to`, search with `pattern`, or page with `offset`/`limit`.\n\
+2. Span: pass both `from` and `to`, without `handle`. It supports the same search or paging.\n\
+3. Folded call: pass `tool_call_id` alone.\n\
+Never combine `tool_call_id` with other arguments. Tool-call/result pairs stay intact.";
 
 pub(super) fn parameters() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "handle": { "type": "string", "minLength": 1, "description": "Mode 1 (handle mode). The recall handle id from a compaction reference. May be combined with from/to/pattern/offset/limit. Must NOT be combined with tool_call_id." },
-            "tool_call_id": { "type": "string", "minLength": 1, "description": "Mode 3 (folded tool call), used ALONE. A tool_call_id from a folded-result stub. Returns the original assistant tool call and result from this session. Must NOT be combined with handle, from, to, pattern, offset, or limit." },
-            "from": { "type": "string", "minLength": 1, "description": "Inclusive start entry id. With handle (mode 1), optionally narrows that range. Without handle (mode 2, span), must be paired with to; must NOT be combined with tool_call_id." },
-            "to": { "type": "string", "minLength": 1, "description": "Inclusive end entry id. With handle (mode 1), optionally narrows that range. Without handle (mode 2, span), must be paired with from; must NOT be combined with tool_call_id." },
-            "pattern": { "type": "string", "minLength": 1, "description": "Optional search, usable with handle mode or span mode: return only turns whose content contains this substring, with their entry ids (bounded count). Must NOT be combined with tool_call_id." },
-            "offset": { "type": "integer", "minimum": 1, "description": "1-indexed turn-group to start the window at (windowed reads only, usable with handle mode or span mode). Must NOT be combined with tool_call_id." },
-            "limit": { "type": "integer", "minimum": 1, "description": "Maximum turn-groups to return in a windowed read (usable with handle mode or span mode). Must NOT be combined with tool_call_id." }
+            "handle": { "type": "string", "minLength": 1, "description": "Compaction recall handle; unknown or expired handles error." },
+            "tool_call_id": { "type": "string", "minLength": 1, "description": "Folded-result call ID; must be the only argument." },
+            "from": { "type": "string", "minLength": 1, "description": "Inclusive hex entry ID; without handle, requires to." },
+            "to": { "type": "string", "minLength": 1, "description": "Inclusive hex entry ID; without handle, requires from." },
+            "pattern": { "type": "string", "minLength": 1, "description": "Handle/span substring search (up to 30 previews); ignores offset/limit." },
+            "offset": { "type": "integer", "minimum": 1, "default": 1, "description": "First turn-group (1-indexed)." },
+            "limit": { "type": "integer", "minimum": 1, "default": 20, "description": "Turn-groups to return; clamped to 100." }
         }
     })
 }
@@ -1049,6 +1049,20 @@ mod tests {
         assert_eq!(params["type"], json!("object"));
         assert_eq!(params["additionalProperties"], json!(false));
         assert!(!params.to_string().contains("toolCallId"));
+        assert_eq!(props["offset"]["default"], 1);
+        assert_eq!(props["limit"]["default"], DEFAULT_LIMIT);
+        assert!(
+            props["limit"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("clamped to 100")
+        );
+        assert!(
+            props["pattern"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("ignores offset/limit")
+        );
     }
 
     #[test]
