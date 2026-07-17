@@ -434,6 +434,22 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                     sgr(self.ansi, "2", &format!("note: {detail}"))
                 )?;
             }
+            UiEvent::WorkerLifecycle {
+                worker_id,
+                status,
+                changed_paths,
+            } => {
+                self.finish_assistant_stream()?;
+                self.in_tool_block = false;
+                self.exploring_open = false;
+                let message =
+                    crate::ui::worker_lifecycle_message(&worker_id, status, changed_paths);
+                writeln!(
+                    self.out,
+                    "{}",
+                    sgr(self.ansi, "2", &format!("note: {message}"))
+                )?;
+            }
             UiEvent::SessionStarted => {
                 self.finish_assistant_stream()?;
                 self.in_tool_block = false;

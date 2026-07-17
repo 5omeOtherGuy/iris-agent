@@ -1,7 +1,9 @@
 //! Replayable screen state, composer chrome, status rail, and working indicator rendering.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use iris_subagent_runtime::{WorkerEvent, WorkerId, WorkerSnapshot, WorkerStatus};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect, Size};
 use ratatui::style::{Modifier, Style};
@@ -17,6 +19,10 @@ use crate::nexus::{
     ApprovalDecision, CompactionLifecycleState, ContextPressureTier, ProviderUsage, ToolCall,
 };
 use crate::ui::UiEvent;
+use crate::ui::delegation_dashboard::{
+    DelegationPayload, DelegationRequest, DelegationResponse, DelegationSnapshot,
+    latest_worker_activity, short_id,
+};
 use crate::ui::modal::Modal;
 use crate::ui::slash::Palette;
 use crate::ui::terminal_surface::CURSOR_MARKER;
@@ -1001,6 +1007,172 @@ struct ReviewOffer {
     dirty_gate: bool,
 }
 
+const WORKER_LANE_REFRESH: Duration = Duration::from_millis(250);
+const WORKER_LANE_LINGER_TICKS: u8 = 5;
+const WORKER_LANE_MAX_ROWS: usize = 3;
+
+#[derive(Default)]
+struct AmbientWorkerLane {
+    known: BTreeSet<WorkerId>,
+    workers: Vec<WorkerSnapshot>,
+    events: BTreeMap<WorkerId, Vec<WorkerEvent>>,
+    notified_terminal: BTreeSet<WorkerId>,
+    pending_request: Option<u64>,
+    last_refresh: Option<Instant>,
+    snapshot_now_ms: u64,
+    linger_ticks: u8,
+}
+
+impl AmbientWorkerLane {
+    fn arm_from_spawn_result(&mut self, call: &ToolCall, content: &str) {
+        if call.name != "spawn_subagent"
+            || !call
+                .arguments
+                .get("background")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true)
+        {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+            return;
+        };
+        let ids = value
+            .get("worker_id")
+            .and_then(serde_json::Value::as_str)
+            .into_iter()
+            .chain(
+                value
+                    .get("worker_ids")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str),
+            )
+            .filter_map(|id| WorkerId::parse(id.to_string()).ok())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        self.known.extend(ids);
+        self.last_refresh = None;
+        self.linger_ticks = 0;
+    }
+
+    fn all_known_terminal(&self) -> bool {
+        !self.known.is_empty()
+            && self.workers.len() == self.known.len()
+            && self
+                .workers
+                .iter()
+                .all(|worker| worker.status.is_terminal())
+    }
+
+    fn request_refresh(&mut self, now: Instant) -> Option<DelegationRequest> {
+        if self.known.is_empty() || self.pending_request.is_some() || self.all_known_terminal() {
+            return None;
+        }
+        if self
+            .last_refresh
+            .is_some_and(|last| now.duration_since(last) < WORKER_LANE_REFRESH)
+        {
+            return None;
+        }
+        let request = DelegationRequest::snapshot(false);
+        self.last_refresh = Some(now);
+        self.pending_request = Some(request.request_id);
+        Some(request)
+    }
+
+    fn apply_response(
+        &mut self,
+        response: &DelegationResponse,
+        now_ms: u64,
+    ) -> Option<Vec<UiEvent>> {
+        if self.pending_request != Some(response.request_id) {
+            return None;
+        }
+        self.pending_request = None;
+        let Ok(DelegationPayload::Snapshot(snapshot)) = &response.result else {
+            return Some(Vec::new());
+        };
+        self.apply_snapshot(snapshot, now_ms);
+        let terminal = self
+            .workers
+            .iter()
+            .filter(|worker| {
+                worker.status.is_terminal() && !self.notified_terminal.contains(&worker.worker_id)
+            })
+            .map(|worker| {
+                let changed_paths = worker
+                    .result
+                    .as_ref()
+                    .map(|result| result.changed_paths.len())
+                    .filter(|count| *count > 0);
+                UiEvent::WorkerLifecycle {
+                    worker_id: worker.worker_id.clone(),
+                    status: worker.status,
+                    changed_paths,
+                }
+            })
+            .collect::<Vec<_>>();
+        self.notified_terminal.extend(
+            self.workers
+                .iter()
+                .filter(|worker| worker.status.is_terminal())
+                .map(|worker| worker.worker_id.clone()),
+        );
+        Some(terminal)
+    }
+
+    fn apply_snapshot(&mut self, snapshot: &DelegationSnapshot, now_ms: u64) {
+        self.workers = snapshot
+            .workers
+            .iter()
+            .filter(|worker| self.known.contains(&worker.worker_id))
+            .cloned()
+            .collect();
+        self.events = snapshot
+            .events
+            .iter()
+            .filter(|(worker_id, _)| self.known.contains(*worker_id))
+            .map(|(worker_id, events)| (worker_id.clone(), events.clone()))
+            .collect();
+        self.snapshot_now_ms = now_ms;
+        if self.all_known_terminal() {
+            self.linger_ticks = WORKER_LANE_LINGER_TICKS;
+        }
+    }
+
+    fn visible_workers(&self) -> Vec<&WorkerSnapshot> {
+        let live = self
+            .workers
+            .iter()
+            .filter(|worker| !worker.status.is_terminal())
+            .collect::<Vec<_>>();
+        if live.is_empty() && self.linger_ticks > 0 {
+            self.workers.iter().collect()
+        } else {
+            live
+        }
+    }
+
+    fn tick(&mut self) -> bool {
+        if self.linger_ticks == 0 {
+            return false;
+        }
+        self.linger_ticks -= 1;
+        if self.linger_ticks == 0 {
+            self.known.clear();
+            self.workers.clear();
+            self.events.clear();
+            self.notified_terminal.clear();
+            self.last_refresh = None;
+        }
+        true
+    }
+}
+
 /// UI state plus its rendering. Holds no terminal handle and no channels, so its
 /// behavior and rendered logical document are unit-testable without a TTY.
 pub(crate) struct Screen {
@@ -1037,6 +1209,9 @@ pub(crate) struct Screen {
     /// Quiet volatile chip while the one background compaction slot is running.
     /// Ready/terminal lifecycle states clear it; no transcript pane is opened.
     compaction_running: bool,
+    /// Volatile top chrome for background workers. The lane owns only display
+    /// snapshots and request cadence; worker execution remains Wayland-owned.
+    worker_lane: AmbientWorkerLane,
     /// The active picker/dialog, when one is open. While present it renders
     /// above the editor and the loop routes keys to it instead of the editor.
     pub(crate) modal: Option<Modal>,
@@ -1202,6 +1377,7 @@ impl Screen {
             goal: None,
             switch_status: None,
             compaction_running: false,
+            worker_lane: AmbientWorkerLane::default(),
             modal: None,
             queued: 0,
             phase: WorkPhase::default(),
@@ -1571,6 +1747,24 @@ impl Screen {
         self.compaction_running = running;
     }
 
+    pub(crate) fn request_worker_refresh(&mut self, now: Instant) -> Option<DelegationRequest> {
+        self.worker_lane.request_refresh(now)
+    }
+
+    pub(crate) fn apply_worker_snapshot_response(
+        &mut self,
+        response: &DelegationResponse,
+        now_ms: u64,
+    ) -> bool {
+        let Some(events) = self.worker_lane.apply_response(response, now_ms) else {
+            return false;
+        };
+        for event in events {
+            self.apply(event);
+        }
+        true
+    }
+
     // --- modal/picker ---
 
     /// Open a picker/dialog above the editor until it closes. A docked modal
@@ -1759,6 +1953,9 @@ impl Screen {
         }
         if let UiEvent::CompactionLifecycle { state, .. } = &event {
             self.compaction_running = matches!(state, CompactionLifecycleState::Running);
+        }
+        if let UiEvent::ToolResult { call, content, .. } = &event {
+            self.worker_lane.arm_from_spawn_result(call, content);
         }
         // Accumulate the session-scoped reduction accounting for `/context`
         // (issue #400): fold batches with their trigger tags, and compaction
@@ -2162,8 +2359,9 @@ impl Screen {
     /// shown the spinner is hidden behind the hint, so a tick changes nothing and
     /// requests no redraw -- the loop stays CPU-idle waiting on the decision.
     pub(crate) fn tick(&mut self) -> bool {
+        let worker_settling = self.worker_lane.tick();
         if self.awaiting_approval {
-            return false;
+            return worker_settling;
         }
         // Detent flashes decay on the same quantized cadence as everything
         // else; a live flash forces the redraws that let it settle. The
@@ -2185,7 +2383,7 @@ impl Screen {
         } else {
             self.spinner.tick()
         };
-        animated || settling || modal_settling
+        animated || settling || modal_settling || worker_settling
     }
 
     /// Drive one paced assistant-stream commit tick: migrate newly-stable
@@ -3169,6 +3367,121 @@ pub(crate) enum BarSegment {
     Git,
 }
 
+fn ambient_worker_state(status: WorkerStatus) -> (&'static str, Style) {
+    match status {
+        WorkerStatus::Queued => (crate::ui::symbols::EMPTY, dim_style()),
+        WorkerStatus::Initializing | WorkerStatus::Running => {
+            (crate::ui::symbols::RUNNING, prompt_style())
+        }
+        WorkerStatus::WaitingForApproval | WorkerStatus::Interrupted | WorkerStatus::Adoptable => {
+            (crate::ui::symbols::REVIEW, prompt_style())
+        }
+        WorkerStatus::Completed => (
+            crate::ui::symbols::DONE,
+            Style::default().fg(crate::ui::palette::green()),
+        ),
+        WorkerStatus::Failed => (crate::ui::symbols::ERROR, err_style()),
+        WorkerStatus::Cancelled => (crate::ui::symbols::CANCELLED, dim_style()),
+        _ => (crate::ui::symbols::ERROR, err_style()),
+    }
+}
+
+fn ambient_worker_lines(screen: &Screen, width: usize) -> Vec<Line<'static>> {
+    let workers = screen.worker_lane.visible_workers();
+    if workers.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = workers
+        .iter()
+        .take(WORKER_LANE_MAX_ROWS)
+        .map(|worker| {
+            let (glyph, state_style) = ambient_worker_state(worker.status);
+            let id = short_id(worker.worker_id.as_str());
+            let description = if worker.request.description.trim().is_empty() {
+                "worker"
+            } else {
+                worker.request.description.trim()
+            };
+            let activity = screen
+                .worker_lane
+                .events
+                .get(&worker.worker_id)
+                .and_then(|events| latest_worker_activity(events));
+            let body = if width < 65 {
+                activity.unwrap_or(description).to_string()
+            } else if let Some(activity) = activity {
+                format!("{description}  {activity}")
+            } else {
+                description.to_string()
+            };
+            let started_ms = screen
+                .worker_lane
+                .events
+                .get(&worker.worker_id)
+                .and_then(|events| events.first())
+                .map(|event| event.timestamp_ms);
+            let mut suffix = Vec::new();
+            if width >= 65 && worker.usage.total_tokens() > 0 {
+                suffix.push(format!(
+                    "↑{} ↓{}",
+                    compact_count(worker.usage.input_tokens),
+                    compact_count(worker.usage.output_tokens)
+                ));
+            }
+            if width >= 65
+                && let Some(started_ms) = started_ms
+            {
+                suffix.push(format_elapsed_compact(Duration::from_millis(
+                    screen
+                        .worker_lane
+                        .snapshot_now_ms
+                        .saturating_sub(started_ms),
+                )));
+            }
+            let suffix = suffix.join("  ");
+            let prefix_width = display_width(glyph)
+                .saturating_add(1)
+                .saturating_add(display_width(&id))
+                .saturating_add(2);
+            let suffix_width = if suffix.is_empty() {
+                0
+            } else {
+                display_width(&suffix).saturating_add(2)
+            };
+            let body = crate::ui::textengine::ellipsize_to_width(
+                &body,
+                width
+                    .saturating_sub(prefix_width)
+                    .saturating_sub(suffix_width),
+            );
+            let mut spans = vec![
+                Span::styled(glyph.to_string(), state_style),
+                Span::raw(" "),
+                Span::styled(id, Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled(body, panel_style()),
+            ];
+            if !suffix.is_empty() {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(suffix, dim_style()));
+            }
+            let mut line = Line::from(spans);
+            truncate_line(&mut line, width);
+            line
+        })
+        .collect::<Vec<_>>();
+    if workers.len() > WORKER_LANE_MAX_ROWS {
+        lines.push(Line::from(Span::styled(
+            crate::ui::textengine::ellipsize_to_width(
+                &format!("… {} more", workers.len() - WORKER_LANE_MAX_ROWS),
+                width,
+            ),
+            dim_style(),
+        )));
+    }
+    lines
+}
+
 /// The session bar block: the bar row, an open dropdown's rows (the tree or
 /// git console renders BETWEEN the bar and the hairline, pushing the
 /// transcript down), and the soft hairline (a dim `─` repeat, visibly lighter
@@ -3177,17 +3490,20 @@ pub(crate) enum BarSegment {
 /// footer yet. `height` caps the dropdown at [`MAX_DROPDOWN_ROWS`] or ⅓ of
 /// the pane, whichever is smaller.
 pub(super) fn session_bar_lines(screen: &Screen, width: u16, height: u16) -> Vec<Line<'static>> {
-    if screen.focus_mode_active(height) {
-        return Vec::new();
-    }
+    let focus_mode = screen.focus_mode_active(height);
     let inset = BOX_X_PADDING_U16.min(width.saturating_sub(1));
     let content_width = width.saturating_sub(inset.saturating_mul(2)).max(1);
-    let Some(mut bar) = session_bar(screen, content_width) else {
+    let lane = ambient_worker_lines(screen, usize::from(content_width));
+    if focus_mode && lane.is_empty() {
         return Vec::new();
-    };
-    pad_line_left(&mut bar, usize::from(inset));
-    let mut lines = vec![bar];
-    if let Some(menu) = &screen.session_menu {
+    }
+
+    let mut lines = Vec::new();
+    if !focus_mode && let Some(mut bar) = session_bar(screen, content_width) {
+        pad_line_left(&mut bar, usize::from(inset));
+        lines.push(bar);
+    }
+    if !focus_mode && let Some(menu) = &screen.session_menu {
         let max_rows = MAX_DROPDOWN_ROWS.min(usize::from(height) / 3).max(3);
         let referenced = referenced_paths(&screen.editor_text());
         for mut line in menu.render_lines(
@@ -3200,6 +3516,13 @@ pub(super) fn session_bar_lines(screen: &Screen, width: u16, height: u16) -> Vec
             pad_line_left(&mut line, usize::from(inset));
             lines.push(line);
         }
+    }
+    for mut line in lane {
+        pad_line_left(&mut line, usize::from(inset));
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        return Vec::new();
     }
     let mut rule = Line::from(Span::styled(
         "─".repeat(usize::from(content_width)),

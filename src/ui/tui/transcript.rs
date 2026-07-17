@@ -2676,6 +2676,18 @@ impl Transcript {
                     ),
                 );
             }
+            UiEvent::WorkerLifecycle {
+                worker_id,
+                status,
+                changed_paths,
+            } => {
+                self.finish_stream();
+                self.push_notice_row(
+                    crate::ui::symbols::SEP,
+                    dim_style(),
+                    &crate::ui::worker_lifecycle_message(&worker_id, status, changed_paths),
+                );
+            }
             UiEvent::ProviderTurnCancelled { .. } | UiEvent::ProviderTurnError { .. } => {
                 // A terminal provider event flushes the live tail (§2.2): finalize
                 // any still-active answer stream so escapement-held text is

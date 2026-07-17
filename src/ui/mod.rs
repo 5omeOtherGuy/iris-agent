@@ -206,6 +206,14 @@ pub(crate) enum UiEvent {
         original_tokens_estimate: u64,
         message: Option<String>,
     },
+    /// A background delegated worker reached a terminal state. Foreground
+    /// workers never emit this because their terminal result already occupies
+    /// the spawning tool block.
+    WorkerLifecycle {
+        worker_id: iris_subagent_runtime::WorkerId,
+        status: iris_subagent_runtime::WorkerStatus,
+        changed_paths: Option<usize>,
+    },
     /// A microcompaction fold batch was flushed (ADR-0048, issue #400). Counts
     /// and estimates only, tagged with the trigger class that released it.
     FoldApplied {
@@ -316,6 +324,29 @@ pub(crate) enum UiEvent {
         message: String,
     },
     TurnComplete,
+}
+
+pub(crate) fn worker_lifecycle_message(
+    worker_id: &iris_subagent_runtime::WorkerId,
+    status: iris_subagent_runtime::WorkerStatus,
+    changed_paths: Option<usize>,
+) -> String {
+    let status = match status {
+        iris_subagent_runtime::WorkerStatus::Completed => "completed",
+        iris_subagent_runtime::WorkerStatus::Failed => "failed",
+        iris_subagent_runtime::WorkerStatus::Cancelled => "cancelled",
+        iris_subagent_runtime::WorkerStatus::Interrupted => "interrupted",
+        iris_subagent_runtime::WorkerStatus::Adoptable => "adoptable",
+        _ => "finished",
+    };
+    let changed = changed_paths.map_or_else(String::new, |count| {
+        let noun = if count == 1 { "file" } else { "files" };
+        format!(" — {count} {noun} changed")
+    });
+    format!(
+        "subagent {} {status}{changed}",
+        delegation_dashboard::short_id(worker_id.as_str())
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

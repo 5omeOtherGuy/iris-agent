@@ -514,6 +514,51 @@ impl NexusWorker {
     }
 }
 
+const WORKER_PROGRESS_MAX_CHARS: usize = 120;
+
+fn worker_tool_activity(call: &ToolCall) -> String {
+    let preview = [
+        "command",
+        "description",
+        "path",
+        "file_path",
+        "pattern",
+        "query",
+        "worker_id",
+        "group_id",
+    ]
+    .into_iter()
+    .find_map(|key| call.arguments.get(key).and_then(serde_json::Value::as_str))
+    .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+    .filter(|value| !value.is_empty())
+    .unwrap_or_else(|| {
+        if call
+            .arguments
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            String::new()
+        } else {
+            call.arguments.to_string()
+        }
+    });
+    let activity = if preview.is_empty() {
+        format!("running {}", call.name)
+    } else {
+        format!("running {}: {preview}", call.name)
+    };
+    if activity.chars().count() <= WORKER_PROGRESS_MAX_CHARS {
+        activity
+    } else {
+        let mut bounded = activity
+            .chars()
+            .take(WORKER_PROGRESS_MAX_CHARS.saturating_sub(1))
+            .collect::<String>();
+        bounded.push('…');
+        bounded
+    }
+}
+
 struct ChildObserver {
     context: WorkerContext,
     usage: RefCell<Usage>,
@@ -539,7 +584,7 @@ impl AgentObserver for ChildObserver {
             AgentEvent::ToolStarted(call) => {
                 let mut usage = self.usage.borrow_mut();
                 usage.tool_rounds = usage.tool_rounds.saturating_add(1);
-                self.context.progress(format!("running {}", call.name));
+                self.context.progress(worker_tool_activity(&call));
                 self.context.usage(usage.clone());
             }
             _ => {}
@@ -737,6 +782,30 @@ mod tests {
 
     use crate::nexus::{AssistantTurn, CompletionReason, ProviderEvent, ProviderStream};
     use serde_json::json;
+
+    #[test]
+    fn worker_tool_activity_includes_a_bounded_argument_preview() {
+        let bash = ToolCall {
+            id: "bash-activity".to_string(),
+            thought_signature: None,
+            name: "bash".to_string(),
+            arguments: json!({ "command": "cargo test --locked worker_lane" }),
+        };
+        assert_eq!(
+            worker_tool_activity(&bash),
+            "running bash: cargo test --locked worker_lane"
+        );
+
+        let long = ToolCall {
+            id: "read-activity".to_string(),
+            thought_signature: None,
+            name: "read".to_string(),
+            arguments: json!({ "path": "界".repeat(200) }),
+        };
+        let activity = worker_tool_activity(&long);
+        assert!(activity.ends_with('…'), "{activity}");
+        assert!(activity.chars().count() <= WORKER_PROGRESS_MAX_CHARS);
+    }
 
     #[test]
     fn effective_route_serialization_round_trips_and_sets_a_stable_id() {

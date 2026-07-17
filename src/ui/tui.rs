@@ -590,9 +590,15 @@ mod tests {
     use super::*;
     use crate::nexus::{ApprovalDecision, CompactionLifecycleState, ToolCall};
     use crate::ui::UiEvent;
+    use crate::ui::delegation_dashboard::{
+        DelegationPayload, DelegationResponse, DelegationSnapshot,
+    };
     use crate::ui::terminal_surface::{RenderKind, TerminalSurface};
+    use iris_subagent_runtime::{WorkerEvent, WorkerId, WorkerSnapshot};
     use ratatui::style::{Color, Modifier};
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
 
     fn call(name: &str) -> ToolCall {
         call_args(name, json!({ "path": "note.txt", "content": "hi" }))
@@ -670,6 +676,298 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn lane_worker(
+        id: &WorkerId,
+        status: &str,
+        description: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> WorkerSnapshot {
+        serde_json::from_value(json!({
+            "request": {
+                "schema_version": 1,
+                "kind": {"type": "general"},
+                "prompt": description,
+                "description": description,
+                "priority": "normal",
+                "policy": {
+                    "capability": "read_only",
+                    "parent_capability": "all",
+                    "isolation": "none",
+                    "cwd": null,
+                    "tool_allowlist": [],
+                    "allow_outside_workspace": false,
+                    "nesting_depth": 0,
+                    "max_nesting_depth": 2
+                },
+                "budgets": {},
+                "recovery": "adoptable",
+                "parent_worker_id": null,
+                "session_id": "session-1",
+                "route_id": null,
+                "profile_id": null,
+                "resume_from": null,
+                "host": {"schema_version": 1, "kind": "none", "value": null}
+            },
+            "worker_id": id,
+            "status": status,
+            "group_id": null,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "provider_rounds": 1,
+                "tool_rounds": 1
+            },
+            "result": null,
+            "last_event_sequence": 3
+        }))
+        .expect("worker fixture")
+    }
+
+    fn lane_events(id: &WorkerId, activity: &str) -> Vec<WorkerEvent> {
+        serde_json::from_value(json!([
+            {
+                "schema_version": 1,
+                "worker_id": id,
+                "sequence": 1,
+                "timestamp_ms": 1_000,
+                "kind": {"type": "status", "data": "queued"}
+            },
+            {
+                "schema_version": 1,
+                "worker_id": id,
+                "sequence": 2,
+                "timestamp_ms": 2_000,
+                "kind": {"type": "progress", "data": {"message": activity}}
+            }
+        ]))
+        .expect("worker events fixture")
+    }
+
+    fn terminal_lane_worker(id: &WorkerId, status: &str, changed_paths: &[&str]) -> WorkerSnapshot {
+        let mut worker = serde_json::to_value(lane_worker(id, status, "Terminal worker", 20, 4))
+            .expect("serialize worker fixture");
+        worker["result"] = json!({
+            "schema_version": 1,
+            "worker_id": id,
+            "status": status,
+            "summary": "finished",
+            "inline_output": null,
+            "artifacts": [],
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 4,
+                "provider_rounds": 1,
+                "tool_rounds": 1
+            },
+            "changed_paths": changed_paths,
+            "worktree": null,
+            "apply_plan_id": null,
+            "host": {"schema_version": 1, "kind": "none", "value": null},
+            "message": null
+        });
+        serde_json::from_value(worker).expect("terminal worker fixture")
+    }
+
+    fn arm_background_workers(screen: &mut Screen, ids: &[WorkerId], background: bool) {
+        let content = if ids.len() == 1 {
+            json!({"worker_id": ids[0], "status": "queued"})
+        } else {
+            json!({"worker_ids": ids, "status": "queued"})
+        };
+        screen.apply(UiEvent::ToolResult {
+            call: call_args(
+                "spawn_subagent",
+                json!({"background": background, "description": "worker"}),
+            ),
+            content: content.to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(1)),
+        });
+    }
+
+    fn apply_lane_snapshot(
+        screen: &mut Screen,
+        now: Instant,
+        now_ms: u64,
+        workers: Vec<WorkerSnapshot>,
+        events: BTreeMap<WorkerId, Vec<WorkerEvent>>,
+    ) {
+        let request = screen
+            .request_worker_refresh(now)
+            .expect("worker refresh request");
+        assert!(screen.apply_worker_snapshot_response(
+            &DelegationResponse {
+                request_id: request.request_id,
+                result: Ok(DelegationPayload::Snapshot(DelegationSnapshot {
+                    workers,
+                    worktrees: None,
+                    events,
+                })),
+            },
+            now_ms,
+        ));
+    }
+
+    #[test]
+    fn ambient_worker_lane_matches_inline_and_pager_top_chrome() {
+        let mut screen = Screen::new();
+        screen.set_footer(
+            "gpt-5.5".to_string(),
+            Some("high".to_string()),
+            "~/repo".to_string(),
+        );
+        let worker_id = WorkerId::new();
+        arm_background_workers(&mut screen, std::slice::from_ref(&worker_id), true);
+        let worker = lane_worker(&worker_id, "running", "Run focused tests", 1_200, 34);
+        let activity = "running bash: cargo test --locked lane";
+        let events = BTreeMap::from([(worker_id.clone(), lane_events(&worker_id, activity))]);
+        apply_lane_snapshot(&mut screen, Instant::now(), 3_500, vec![worker], events);
+
+        let short = format!("wrk_{}", &worker_id.as_str()[4..12]);
+        let expected = format!(
+            "  {} {short}  Run focused tests  {activity}  ↑1.2k ↓34  2.5s",
+            crate::ui::symbols::RUNNING
+        );
+        let inline = rendered_lines(&mut screen, 100, 24);
+        assert_eq!(line_text(&inline[1]), expected);
+
+        let pager = pager::compose_frame(&mut screen, Size::new(100, 24));
+        assert_eq!(line_text(&pager.lines[1]), expected);
+    }
+
+    #[test]
+    fn ambient_worker_lane_caps_rows_and_degrades_at_narrow_width() {
+        let mut screen = Screen::new();
+        screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
+        let ids = (0..5).map(|_| WorkerId::new()).collect::<Vec<_>>();
+        arm_background_workers(&mut screen, &ids, true);
+        let workers = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| lane_worker(id, "running", &format!("Worker {index}"), 10, 2))
+            .collect::<Vec<_>>();
+        let events = ids
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    lane_events(id, "running bash: cargo test --locked worker_lane"),
+                )
+            })
+            .collect();
+        apply_lane_snapshot(&mut screen, Instant::now(), 2_000, workers, events);
+
+        let wide = screen::session_bar_lines(&screen, 100, 24)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert_eq!(wide[4], "  … 2 more");
+
+        let narrow = screen::session_bar_lines(&screen, 48, 24);
+        assert_eq!(narrow.len(), 6, "bar + three workers + overflow + rule");
+        assert!(
+            line_text(&narrow[1]).contains("running bash"),
+            "{}",
+            line_text(&narrow[1])
+        );
+        assert!(
+            narrow
+                .iter()
+                .all(|line| crate::ui::textengine::display_width(&line_text(line)) <= 48)
+        );
+    }
+
+    #[test]
+    fn ambient_worker_lane_polls_only_for_known_live_workers_and_lingers_five_ticks() {
+        let now = Instant::now();
+        let mut idle = Screen::new();
+        assert!(idle.request_worker_refresh(now).is_none());
+
+        let blocking_id = WorkerId::new();
+        arm_background_workers(&mut idle, std::slice::from_ref(&blocking_id), false);
+        assert!(
+            idle.request_worker_refresh(now).is_none(),
+            "blocking spawn must not arm ambient polling"
+        );
+
+        let mut screen = Screen::new();
+        screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
+        let worker_id = WorkerId::new();
+        arm_background_workers(&mut screen, std::slice::from_ref(&worker_id), true);
+        let worker = lane_worker(&worker_id, "completed", "Finished worker", 20, 4);
+        let events = BTreeMap::from([(
+            worker_id.clone(),
+            lane_events(&worker_id, "running read: src/lib.rs"),
+        )]);
+        apply_lane_snapshot(&mut screen, now, 2_000, vec![worker], events);
+
+        assert!(
+            screen
+                .request_worker_refresh(now + Duration::from_secs(1))
+                .is_none()
+        );
+        assert!(rendered_text(&mut screen, 80, 24).contains("Finished worker"));
+        for _ in 0..4 {
+            assert!(screen.tick());
+        }
+        assert!(rendered_text(&mut screen, 80, 24).contains("Finished worker"));
+        assert!(screen.tick());
+        assert!(!rendered_text(&mut screen, 80, 24).contains("Finished worker"));
+    }
+
+    #[test]
+    fn background_worker_terminal_states_append_durable_quiet_notices() {
+        let cases = [
+            ("completed", vec!["src/lib.rs", "src/ui.rs", "tests/ui.rs"]),
+            ("failed", Vec::new()),
+            ("cancelled", Vec::new()),
+        ];
+        for (status, changed_paths) in cases {
+            let mut screen = Screen::new();
+            screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
+            let worker_id = WorkerId::new();
+            arm_background_workers(&mut screen, std::slice::from_ref(&worker_id), true);
+            let worker = terminal_lane_worker(&worker_id, status, &changed_paths);
+            let events = BTreeMap::from([(
+                worker_id.clone(),
+                lane_events(&worker_id, "running read: src/lib.rs"),
+            )]);
+            apply_lane_snapshot(&mut screen, Instant::now(), 2_000, vec![worker], events);
+
+            let short = format!("wrk_{}", &worker_id.as_str()[4..12]);
+            let changed = if changed_paths.is_empty() {
+                String::new()
+            } else {
+                format!(" — {} files changed", changed_paths.len())
+            };
+            let notice = format!("┊ subagent {short} {status}{changed}");
+            assert!(
+                rendered_text(&mut screen, 100, 24).contains(&notice),
+                "{notice}"
+            );
+            for _ in 0..5 {
+                screen.tick();
+            }
+            assert!(
+                rendered_text(&mut screen, 100, 24).contains(&notice),
+                "terminal notice must outlive the lane: {notice}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocking_worker_completion_does_not_append_a_lifecycle_notice() {
+        let mut screen = Screen::new();
+        let worker_id = WorkerId::new();
+        arm_background_workers(&mut screen, std::slice::from_ref(&worker_id), false);
+        assert!(screen.request_worker_refresh(Instant::now()).is_none());
+        assert!(
+            !rendered_text(&mut screen, 100, 24).contains("┊ subagent"),
+            "blocking spawn results already have a tool block"
+        );
     }
 
     /// Drive stream beats on the tick grid until the escapement has released all
