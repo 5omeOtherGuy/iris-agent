@@ -15,8 +15,8 @@ use iris_subagent_runtime::worktree::{
     CreationMode, GcReport, RemoveOutcome, WorktreeKind, WorktreeRecord, WorktreeStatus,
 };
 use iris_subagent_runtime::{
-    ApplyPlanId, ArtifactId, GroupId, IsolationMode, WorkerEvent, WorkerId, WorkerSnapshot,
-    WorkerStatus, WorktreeId,
+    ApplyPlanId, ArtifactId, GroupId, IsolationMode, WorkerEvent, WorkerEventKind, WorkerId,
+    WorkerSnapshot, WorkerStatus, WorktreeId,
 };
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -99,6 +99,15 @@ pub(crate) enum DelegationRequestKind {
 pub(crate) struct DelegationRequest {
     pub(crate) request_id: u64,
     pub(crate) kind: DelegationRequestKind,
+}
+
+impl DelegationRequest {
+    pub(crate) fn snapshot(include_worktrees: bool) -> Self {
+        Self {
+            request_id: NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            kind: DelegationRequestKind::Snapshot { include_worktrees },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1230,6 +1239,10 @@ impl DelegationDashboard {
                     rows.extend(worker_rows(
                         worker,
                         &self.worktrees,
+                        self.events
+                            .get(&worker.worker_id)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
                         width,
                         position == self.workers_state.selected_index,
                     ));
@@ -1506,15 +1519,38 @@ fn status_style(status: WorkerStatus) -> Style {
     }
 }
 
+fn decay_finished_worker_rows(
+    mut rows: Vec<(Line<'static>, bool)>,
+    status: WorkerStatus,
+) -> Vec<(Line<'static>, bool)> {
+    if status.is_terminal() {
+        for (line, _) in &mut rows {
+            for span in &mut line.spans {
+                span.style = span.style.add_modifier(Modifier::DIM);
+            }
+        }
+    }
+    rows
+}
+
+pub(crate) fn latest_worker_activity(events: &[WorkerEvent]) -> Option<&str> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        WorkerEventKind::Progress { message } => Some(message.as_str()),
+        _ => None,
+    })
+}
+
 fn worker_rows(
     worker: &WorkerSnapshot,
     worktrees: &[WorktreeRecord],
+    events: &[WorkerEvent],
     width: usize,
     selected: bool,
 ) -> Vec<(Line<'static>, bool)> {
     let (glyph, label) = worker_state(worker.status);
     let id = short_id(&worker.worker_id.to_string());
     let description = worker_description(worker);
+    let activity = latest_worker_activity(events);
     let linked = worker
         .result
         .as_ref()
@@ -1534,19 +1570,26 @@ fn worker_rows(
                 review_style(),
             ));
         }
-        return vec![
-            (Line::from(first), selected),
-            (
-                Line::from(Span::styled(
-                    format!(
-                        "  {}",
-                        textengine::ellipsize_to_width(&description, width.saturating_sub(2))
-                    ),
-                    dim_style(),
-                )),
-                selected,
-            ),
-        ];
+        let detail = activity.map_or_else(
+            || description.clone(),
+            |activity| format!("{activity} · {description}"),
+        );
+        return decay_finished_worker_rows(
+            vec![
+                (Line::from(first), selected),
+                (
+                    Line::from(Span::styled(
+                        format!(
+                            "  {}",
+                            textengine::ellipsize_to_width(&detail, width.saturating_sub(2))
+                        ),
+                        Style::default(),
+                    )),
+                    selected,
+                ),
+            ],
+            worker.status,
+        );
     }
     let mut meta = Vec::new();
     if let Some(group) = &worker.group_id {
@@ -1576,21 +1619,32 @@ fn worker_rows(
     if width >= 100 && linked.is_some() {
         meta.push("linked".to_string());
     }
-    vec![(
-        Line::from(vec![
-            Span::styled(format!("{glyph} {label}"), status_style(worker.status)),
-            Span::raw("  "),
-            Span::styled(id, Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("  "),
-            Span::raw(textengine::ellipsize_to_width(
-                &description,
-                width.saturating_sub(35),
-            )),
-            Span::raw("  "),
-            Span::styled(meta.join(" · "), dim_style()),
-        ]),
-        selected,
-    )]
+    let state = format!("{glyph} {label}");
+    let meta = meta.join(" · ");
+    let body = activity.map_or_else(
+        || description.clone(),
+        |activity| format!("{activity} · {description}"),
+    );
+    let fixed_width = textengine::display_width(&state)
+        .saturating_add(textengine::display_width(&id))
+        .saturating_add(textengine::display_width(&meta))
+        .saturating_add(6);
+    let body = textengine::ellipsize_to_width(&body, width.saturating_sub(fixed_width));
+    decay_finished_worker_rows(
+        vec![(
+            Line::from(vec![
+                Span::styled(state, status_style(worker.status)),
+                Span::raw("  "),
+                Span::styled(id, Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::raw(body),
+                Span::raw("  "),
+                Span::styled(meta, dim_style()),
+            ]),
+            selected,
+        )],
+        worker.status,
+    )
 }
 
 fn worktree_rows(
@@ -2239,7 +2293,7 @@ fn creation_mode(mode: CreationMode) -> &'static str {
     }
 }
 
-fn short_id(id: &str) -> String {
+pub(crate) fn short_id(id: &str) -> String {
     id.split_once('_')
         .map(|(prefix, suffix)| format!("{prefix}_{}", &suffix[..suffix.len().min(8)]))
         .unwrap_or_else(|| textengine::ellipsize_to_width(id, 12))
@@ -2363,6 +2417,17 @@ mod tests {
         .unwrap()
     }
 
+    fn progress_event(worker_id: &str, sequence: u64, message: &str) -> WorkerEvent {
+        serde_json::from_value(json!({
+            "schema_version": 1,
+            "worker_id": worker_id,
+            "sequence": sequence,
+            "timestamp_ms": sequence,
+            "kind": {"type": "progress", "data": {"message": message}}
+        }))
+        .unwrap()
+    }
+
     fn response(id: u64, workers: Vec<WorkerSnapshot>) -> DelegationResponse {
         let events = workers
             .iter()
@@ -2477,6 +2542,100 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn finished_worker_rows_dim_without_losing_success_or_failure_hues() {
+        for width in [50, 100] {
+            for (status, expected_color) in [
+                ("completed", palette::green()),
+                ("failed", palette::red()),
+                ("cancelled", palette::muted()),
+            ] {
+                let worker = worker(
+                    "wrk_00000000000000000000000000000001",
+                    status,
+                    "Finished worker",
+                    None,
+                );
+                let rows = worker_rows(&worker, &[], &[], width, false);
+                let styled = rows
+                    .iter()
+                    .flat_map(|(line, _)| line.spans.iter())
+                    .filter(|span| !span.content.trim().is_empty())
+                    .collect::<Vec<_>>();
+                assert!(
+                    styled
+                        .iter()
+                        .all(|span| span.style.add_modifier.contains(Modifier::DIM)),
+                    "{status} at width {width} did not fully recede: {styled:?}"
+                );
+                assert_eq!(styled[0].style.fg, Some(expected_color));
+            }
+
+            let running = worker(
+                "wrk_00000000000000000000000000000002",
+                "running",
+                "Live worker",
+                None,
+            );
+            let events = [progress_event(
+                running.worker_id.as_str(),
+                2,
+                "running bash: cargo test",
+            )];
+            let rows = worker_rows(&running, &[], &events, width, false);
+            let state = &rows[0].0.spans[0];
+            assert!(
+                !state.style.add_modifier.contains(Modifier::DIM),
+                "running state must stay vivid at width {width}"
+            );
+            assert_eq!(state.style.fg, Some(palette::orange()));
+        }
+    }
+
+    #[test]
+    fn worker_rows_bound_long_activity_at_the_wide_layout_threshold() {
+        let worker_id = "wrk_00000000000000000000000000000001";
+        let worker = worker(
+            worker_id,
+            "running",
+            "A deliberately long worker description that competes for row width",
+            None,
+        );
+        let activity = format!("running bash: {}", "cargo test ".repeat(10));
+        let events = [progress_event(worker_id, 2, &activity)];
+        let rows = worker_rows(&worker, &[], &events, 65, false);
+        assert!(rows.iter().all(|(line, _)| {
+            textengine::display_width(
+                &line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+            ) <= 65
+        }));
+    }
+
+    #[test]
+    fn latest_progress_activity_is_rendered_verbatim_in_worker_rows() {
+        let worker_id = "wrk_00000000000000000000000000000001";
+        let worker = worker(worker_id, "running", "Run the focused tests", None);
+        let events = vec![
+            event(worker_id, 1),
+            progress_event(worker_id, 2, "provider round started"),
+            progress_event(worker_id, 3, "running bash: cargo test --locked lane"),
+        ];
+        let activity = latest_worker_activity(&events).expect("latest progress");
+        assert_eq!(activity, "running bash: cargo test --locked lane");
+
+        let rendered = text(
+            &worker_rows(&worker, &[], &events, 100, false)
+                .into_iter()
+                .map(|(line, _)| line)
+                .collect::<Vec<_>>(),
+        );
+        assert!(rendered.contains(activity), "{rendered}");
     }
 
     #[test]

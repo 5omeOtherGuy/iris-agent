@@ -79,6 +79,13 @@ const RESIZE_REDRAW_DEBOUNCE: Duration = Duration::from_millis(50);
 /// -- turn completion, tool terminal states, dropdown open -- refresh sooner).
 const GIT_POLL: Duration = Duration::from_secs(10);
 
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 /// What a [`RenderScheduler`] decides to do for a pending render request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderAction {
@@ -386,7 +393,9 @@ async fn session_loop<P: ChatProvider>(
                 &git_cache,
                 &mut git_generation,
             )
-            .await?;
+            .await;
+            tui.screen.abandon_worker_refresh();
+            let requested = requested?;
             if let Some(source) = requested
                 && perform_swap(&source, swap, harness, tui, switch)?
             {
@@ -440,15 +449,17 @@ async fn session_loop<P: ChatProvider>(
             tui.draw()?;
             continue;
         }
-        match idle_phase(
+        let idle_outcome = idle_phase(
             tui,
             &mut input_rx,
             &mut tick,
             &git_cache,
             &mut git_generation,
+            harness.subagent_backend().ok().cloned(),
         )
-        .await?
-        {
+        .await;
+        tui.screen.abandon_worker_refresh();
+        match idle_outcome? {
             IdleOutcome::Exit => break,
             IdleOutcome::ToggleGitMenu => {
                 toggle_git_menu(&mut tui.screen, &git_cache);
@@ -2221,7 +2232,9 @@ async fn idle_phase(
     tick: &mut tokio::time::Interval,
     git_cache: &GitStatusCache,
     git_generation: &mut u64,
+    delegation_backend: Option<Arc<crate::wayland::subagents::SubagentBackend>>,
 ) -> Result<IdleOutcome> {
+    let (delegation_tx, mut delegation_rx) = unbounded_channel::<DelegationResponse>();
     let mut last_resize_width = ratatui::crossterm::terminal::size()
         .ok()
         .map(|(width, _)| width);
@@ -2287,11 +2300,26 @@ async fn idle_phase(
                     pending_width_resize = Some(Instant::now() + RESIZE_REDRAW_DEBOUNCE);
                 }
             }
+            Some(response) = delegation_rx.recv() => {
+                if tui
+                    .screen
+                    .apply_worker_snapshot_response(&response, unix_time_ms())
+                {
+                    tui.draw()?;
+                }
+            }
             _ = sleep_until(resize_deadline), if pending_width_resize.is_some() => {
                 pending_width_resize = None;
                 tui.draw()?;
             }
             _ = tick.tick() => {
+                if let Some(request) = tui.screen.request_worker_refresh(Instant::now().into()) {
+                    spawn_idle_delegation(
+                        delegation_backend.clone(),
+                        request,
+                        delegation_tx.clone(),
+                    );
+                }
                 // Idle animation: the start page's IrisMark sweep. `tick`
                 // reports false while no start page is shown (the spinner is
                 // idle here) and under reduced motion, so a plain idle session
@@ -2975,6 +3003,9 @@ async fn run_harness_op<P: ChatProvider>(
                 sync_esc_cancel_enabled(current_turn, &pending, &tui.screen);
             }
             _ = tick.tick() => {
+                if let Some(request) = tui.screen.request_worker_refresh(Instant::now().into()) {
+                    let _ = channels.commands.send(HarnessCommand::Delegation(request));
+                }
                 if let Some(Modal::Delegation(dashboard)) = tui.screen.modal.as_mut()
                     && let Some(request) = dashboard.request_refresh(Instant::now().into())
                 {
@@ -3109,6 +3140,8 @@ fn apply_actor_event(
             deferred.push(DeferredReplay::Action(action));
         }
         HarnessEvent::Delegation(response) => {
+            tui.screen
+                .apply_worker_snapshot_response(&response, unix_time_ms());
             if let Some(Modal::Delegation(dashboard)) = tui.screen.modal.as_mut() {
                 dashboard.apply_response(response);
             }
@@ -3335,13 +3368,26 @@ async fn run_modal_phase<P: ChatProvider>(
                 tui.draw()?;
             }
             Some(response) = delegation_rx.recv() => {
-                if let Some(Modal::Delegation(dashboard)) = tui.screen.modal.as_mut()
-                    && dashboard.apply_response(response)
-                {
+                let lane_changed = tui
+                    .screen
+                    .apply_worker_snapshot_response(&response, unix_time_ms());
+                let dashboard_changed = if let Some(Modal::Delegation(dashboard)) = tui.screen.modal.as_mut() {
+                    dashboard.apply_response(response)
+                } else {
+                    false
+                };
+                if lane_changed || dashboard_changed {
                     tui.draw()?;
                 }
             }
             _ = tick.tick() => {
+                if let Some(request) = tui.screen.request_worker_refresh(Instant::now().into()) {
+                    spawn_idle_delegation(
+                        delegation_backend.clone(),
+                        request,
+                        delegation_tx.clone(),
+                    );
+                }
                 if let Some(Modal::Delegation(dashboard)) = tui.screen.modal.as_mut()
                     && let Some(request) = dashboard.request_refresh(Instant::now().into())
                 {
