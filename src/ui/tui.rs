@@ -919,6 +919,51 @@ mod tests {
     }
 
     #[test]
+    fn ambient_worker_lane_retries_after_its_phase_abandons_a_snapshot_request() {
+        let now = Instant::now();
+        let mut screen = Screen::new();
+        let worker_id = WorkerId::new();
+        arm_background_workers(&mut screen, std::slice::from_ref(&worker_id), true);
+
+        let abandoned = screen
+            .request_worker_refresh(now)
+            .expect("initial worker refresh request");
+        assert!(
+            screen
+                .request_worker_refresh(now + Duration::from_millis(100))
+                .is_none(),
+            "an in-flight request must not be duplicated"
+        );
+
+        screen.abandon_worker_refresh();
+        let retry = screen
+            .request_worker_refresh(now + Duration::from_millis(300))
+            .expect("the next phase must be able to refresh");
+        assert_ne!(abandoned.request_id, retry.request_id);
+
+        assert!(
+            !screen.apply_worker_snapshot_response(
+                &DelegationResponse {
+                    request_id: abandoned.request_id,
+                    result: Ok(DelegationPayload::Snapshot(DelegationSnapshot {
+                        workers: Vec::new(),
+                        worktrees: None,
+                        events: BTreeMap::new(),
+                    })),
+                },
+                0,
+            ),
+            "a late response must not clear the retry's request ID"
+        );
+        assert!(
+            screen
+                .request_worker_refresh(now + Duration::from_secs(1))
+                .is_none(),
+            "the retry must remain in flight after a stale response"
+        );
+    }
+
+    #[test]
     fn background_worker_terminal_states_append_durable_quiet_notices() {
         let cases = [
             ("completed", vec!["src/lib.rs", "src/ui.rs", "tests/ui.rs"]),

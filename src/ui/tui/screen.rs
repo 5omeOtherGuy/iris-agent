@@ -1084,6 +1084,10 @@ impl AmbientWorkerLane {
         Some(request)
     }
 
+    fn abandon_request(&mut self) {
+        self.pending_request = None;
+    }
+
     fn apply_response(
         &mut self,
         response: &DelegationResponse,
@@ -1749,6 +1753,11 @@ impl Screen {
 
     pub(crate) fn request_worker_refresh(&mut self, now: Instant) -> Option<DelegationRequest> {
         self.worker_lane.request_refresh(now)
+    }
+
+    /// Release a request whose temporary idle/modal response channel is closing.
+    pub(crate) fn abandon_worker_refresh(&mut self) {
+        self.worker_lane.abandon_request();
     }
 
     pub(crate) fn apply_worker_snapshot_response(

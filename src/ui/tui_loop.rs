@@ -393,7 +393,9 @@ async fn session_loop<P: ChatProvider>(
                 &git_cache,
                 &mut git_generation,
             )
-            .await?;
+            .await;
+            tui.screen.abandon_worker_refresh();
+            let requested = requested?;
             if let Some(source) = requested
                 && perform_swap(&source, swap, harness, tui, switch)?
             {
@@ -447,7 +449,7 @@ async fn session_loop<P: ChatProvider>(
             tui.draw()?;
             continue;
         }
-        match idle_phase(
+        let idle_outcome = idle_phase(
             tui,
             &mut input_rx,
             &mut tick,
@@ -455,8 +457,9 @@ async fn session_loop<P: ChatProvider>(
             &mut git_generation,
             harness.subagent_backend().ok().cloned(),
         )
-        .await?
-        {
+        .await;
+        tui.screen.abandon_worker_refresh();
+        match idle_outcome? {
             IdleOutcome::Exit => break,
             IdleOutcome::ToggleGitMenu => {
                 toggle_git_menu(&mut tui.screen, &git_cache);
