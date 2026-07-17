@@ -831,18 +831,20 @@ mod tests {
             "  {} {short}  Run focused tests  {activity}  ↑1.2k ↓34  2.5s",
             crate::ui::symbols::RUNNING
         );
+        // The card renders BELOW the session bar block (bar, rule) on both
+        // surfaces, then closes with its own rule.
         let inline = rendered_lines(&mut screen, 100, 24);
-        assert_eq!(line_text(&inline[1]), expected);
+        assert_eq!(line_text(&inline[2]), expected);
 
         let pager = pager::compose_frame(&mut screen, Size::new(100, 24));
-        assert_eq!(line_text(&pager.lines[1]), expected);
+        assert_eq!(line_text(&pager.lines[2]), expected);
     }
 
     #[test]
     fn ambient_worker_lane_caps_rows_and_degrades_at_narrow_width() {
         let mut screen = Screen::new();
         screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
-        let ids = (0..5).map(|_| WorkerId::new()).collect::<Vec<_>>();
+        let ids = (0..9).map(|_| WorkerId::new()).collect::<Vec<_>>();
         arm_background_workers(&mut screen, &ids, true);
         let workers = ids
             .iter()
@@ -860,23 +862,102 @@ mod tests {
             .collect();
         apply_lane_snapshot(&mut screen, Instant::now(), 2_000, workers, events);
 
-        let wide = screen::session_bar_lines(&screen, 100, 24)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>();
-        assert_eq!(wide[4], "  … 2 more");
+        let wide = screen::ambient_worker_lane_block(&screen, 100);
+        assert_eq!(wide.len(), 10, "eight worker rows + overflow + rule");
+        assert_eq!(line_text(&wide[8]), "  … 1 more");
 
-        let narrow = screen::session_bar_lines(&screen, 48, 24);
-        assert_eq!(narrow.len(), 6, "bar + three workers + overflow + rule");
+        let narrow = screen::ambient_worker_lane_block(&screen, 48);
+        assert_eq!(narrow.len(), 10, "the card height is width-independent");
         assert!(
-            line_text(&narrow[1]).contains("running bash"),
+            line_text(&narrow[0]).contains("running bash"),
             "{}",
-            line_text(&narrow[1])
+            line_text(&narrow[0])
         );
         assert!(
             narrow
                 .iter()
                 .all(|line| crate::ui::textengine::display_width(&line_text(line)) <= 48)
+        );
+    }
+
+    #[test]
+    fn ambient_worker_lane_keeps_finished_and_pending_rows_until_the_group_retires() {
+        let mut screen = Screen::new();
+        screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
+        let ids = (0..3).map(|_| WorkerId::new()).collect::<Vec<_>>();
+        arm_background_workers(&mut screen, &ids, true);
+
+        // Before the first snapshot the card is already at its final height:
+        // one starting placeholder per armed worker.
+        let block = screen::ambient_worker_lane_block(&screen, 100);
+        assert_eq!(block.len(), 4, "three placeholders + rule");
+        assert!(
+            block
+                .iter()
+                .take(3)
+                .all(|line| line_text(line).contains("starting…"))
+        );
+
+        // One finished, one live, one still absent from the snapshot: the
+        // height must not change and the finished row must stay visible.
+        let workers = vec![
+            terminal_lane_worker(&ids[0], "completed", &[]),
+            lane_worker(&ids[1], "running", "Live worker", 10, 2),
+        ];
+        apply_lane_snapshot(&mut screen, Instant::now(), 2_000, workers, BTreeMap::new());
+        let block = screen::ambient_worker_lane_block(&screen, 100);
+        assert_eq!(block.len(), 4, "card height is stable while the group runs");
+        let text = block.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            text.contains("Terminal worker"),
+            "finished row stays visible until the whole group retires: {text}"
+        );
+        assert!(text.contains("Live worker"), "{text}");
+        assert!(text.contains("starting…"), "{text}");
+        assert!(
+            !screen.tick(),
+            "a partially finished group must not start the linger countdown"
+        );
+    }
+
+    #[test]
+    fn pinned_prompt_band_stays_above_the_ambient_worker_card() {
+        let mut screen = Screen::new();
+        screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
+        screen.pager_active = true;
+        screen.commit_user("governing question");
+        for i in 0..60 {
+            screen.apply(UiEvent::Notice(format!("answer detail {i}")));
+        }
+        let worker_id = WorkerId::new();
+        arm_background_workers(&mut screen, std::slice::from_ref(&worker_id), true);
+        let worker = lane_worker(&worker_id, "running", "Lane worker", 10, 2);
+        apply_lane_snapshot(
+            &mut screen,
+            Instant::now(),
+            2_000,
+            vec![worker],
+            BTreeMap::new(),
+        );
+
+        let frame = pager::compose_frame(&mut screen, Size::new(80, 24)).lines;
+        let texts = frame.iter().map(line_text).collect::<Vec<_>>();
+        let band = texts
+            .iter()
+            .position(|text| text.contains("governing question"))
+            .expect("pinned prompt band");
+        let lane = texts
+            .iter()
+            .position(|text| text.contains("Lane worker"))
+            .expect("worker card row");
+        assert_eq!(
+            band, 2,
+            "the governing prompt pins directly under the session bar: {texts:?}"
+        );
+        assert!(
+            band < lane,
+            "the worker card renders below the pinned prompt, never above it: \
+             band {band} lane {lane}"
         );
     }
 

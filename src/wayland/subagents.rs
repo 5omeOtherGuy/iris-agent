@@ -531,17 +531,9 @@ fn worker_tool_activity(call: &ToolCall) -> String {
     .find_map(|key| call.arguments.get(key).and_then(serde_json::Value::as_str))
     .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
     .filter(|value| !value.is_empty())
-    .unwrap_or_else(|| {
-        if call
-            .arguments
-            .as_object()
-            .is_some_and(serde_json::Map::is_empty)
-        {
-            String::new()
-        } else {
-            call.arguments.to_string()
-        }
-    });
+    // No previewable argument: a bare "running {tool}" beats a raw JSON dump
+    // in a one-line status row.
+    .unwrap_or_default();
     let activity = if preview.is_empty() {
         format!("running {}", call.name)
     } else {
@@ -805,6 +797,16 @@ mod tests {
         let activity = worker_tool_activity(&long);
         assert!(activity.ends_with('…'), "{activity}");
         assert!(activity.chars().count() <= WORKER_PROGRESS_MAX_CHARS);
+
+        // No previewable argument: the label stays bare — raw JSON arguments
+        // never leak into the one-line status row.
+        let opaque = ToolCall {
+            id: "edit-activity".to_string(),
+            thought_signature: None,
+            name: "edit".to_string(),
+            arguments: json!({ "old_string": "{\"a\":1}", "new_string": "{\"b\":2}" }),
+        };
+        assert_eq!(worker_tool_activity(&opaque), "running edit");
     }
 
     #[test]
