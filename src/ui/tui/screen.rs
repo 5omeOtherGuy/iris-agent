@@ -1009,7 +1009,7 @@ struct ReviewOffer {
 
 const WORKER_LANE_REFRESH: Duration = Duration::from_millis(250);
 const WORKER_LANE_LINGER_TICKS: u8 = 5;
-const WORKER_LANE_MAX_ROWS: usize = 3;
+const WORKER_LANE_MAX_ROWS: usize = 8;
 
 #[derive(Default)]
 struct AmbientWorkerLane {
@@ -1148,17 +1148,21 @@ impl AmbientWorkerLane {
         }
     }
 
-    fn visible_workers(&self) -> Vec<&WorkerSnapshot> {
-        let live = self
-            .workers
+    /// One stable row per armed worker, in `known` (ID) order: the card keeps
+    /// its size for the whole run. A worker not yet present in a snapshot
+    /// renders as a starting placeholder; a finished worker stays visible as
+    /// finished until every sibling is terminal and the linger expires —
+    /// rows never pop in and out individually.
+    fn entries(&self) -> Vec<(&WorkerId, Option<&WorkerSnapshot>)> {
+        self.known
             .iter()
-            .filter(|worker| !worker.status.is_terminal())
-            .collect::<Vec<_>>();
-        if live.is_empty() && self.linger_ticks > 0 {
-            self.workers.iter().collect()
-        } else {
-            live
-        }
+            .map(|id| {
+                (
+                    id,
+                    self.workers.iter().find(|worker| worker.worker_id == *id),
+                )
+            })
+            .collect()
     }
 
     fn tick(&mut self) -> bool {
@@ -2597,7 +2601,11 @@ fn render_document_inner(screen: &mut Screen, size: Size, incremental: bool) -> 
     // silently drop the unchanged transcript prefix from the frame. A bar-only
     // change therefore forces a full transcript render (same cache, so the
     // next frame's incremental baseline stays correct).
-    let bar = session_bar_lines(screen, width, height);
+    let mut bar = session_bar_lines(screen, width, height);
+    // The ambient worker card follows the bar block on the inline surface
+    // (there is no pinned prompt band here); it shares the bar's stability
+    // check so a lane change forces a full transcript render.
+    bar.extend(ambient_worker_lane_block(screen, width));
     let bar_rows = bar.len();
     let bar_stable = screen
         .last_session_bar
@@ -3396,99 +3404,131 @@ fn ambient_worker_state(status: WorkerStatus) -> (&'static str, Style) {
 }
 
 fn ambient_worker_lines(screen: &Screen, width: usize) -> Vec<Line<'static>> {
-    let workers = screen.worker_lane.visible_workers();
-    if workers.is_empty() {
+    let entries = screen.worker_lane.entries();
+    if entries.is_empty() {
         return Vec::new();
     }
-    let mut lines = workers
+    let mut lines = entries
         .iter()
         .take(WORKER_LANE_MAX_ROWS)
-        .map(|worker| {
-            let (glyph, state_style) = ambient_worker_state(worker.status);
-            let id = short_id(worker.worker_id.as_str());
-            let description = if worker.request.description.trim().is_empty() {
-                "worker"
-            } else {
-                worker.request.description.trim()
-            };
-            let activity = screen
-                .worker_lane
-                .events
-                .get(&worker.worker_id)
-                .and_then(|events| latest_worker_activity(events));
-            let body = if width < 65 {
-                activity.unwrap_or(description).to_string()
-            } else if let Some(activity) = activity {
-                format!("{description}  {activity}")
-            } else {
-                description.to_string()
-            };
-            let started_ms = screen
-                .worker_lane
-                .events
-                .get(&worker.worker_id)
-                .and_then(|events| events.first())
-                .map(|event| event.timestamp_ms);
-            let mut suffix = Vec::new();
-            if width >= 65 && worker.usage.total_tokens() > 0 {
-                suffix.push(format!(
-                    "↑{} ↓{}",
-                    compact_count(worker.usage.input_tokens),
-                    compact_count(worker.usage.output_tokens)
-                ));
-            }
-            if width >= 65
-                && let Some(started_ms) = started_ms
-            {
-                suffix.push(format_elapsed_compact(Duration::from_millis(
-                    screen
-                        .worker_lane
-                        .snapshot_now_ms
-                        .saturating_sub(started_ms),
-                )));
-            }
-            let suffix = suffix.join("  ");
-            let prefix_width = display_width(glyph)
-                .saturating_add(1)
-                .saturating_add(display_width(&id))
-                .saturating_add(2);
-            let suffix_width = if suffix.is_empty() {
-                0
-            } else {
-                display_width(&suffix).saturating_add(2)
-            };
-            let body = crate::ui::textengine::ellipsize_to_width(
-                &body,
-                width
-                    .saturating_sub(prefix_width)
-                    .saturating_sub(suffix_width),
-            );
-            let mut spans = vec![
-                Span::styled(glyph.to_string(), state_style),
-                Span::raw(" "),
-                Span::styled(id, Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
-                Span::styled(body, panel_style()),
-            ];
-            if !suffix.is_empty() {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(suffix, dim_style()));
-            }
-            let mut line = Line::from(spans);
-            truncate_line(&mut line, width);
-            line
+        .map(|(worker_id, snapshot)| match snapshot {
+            Some(worker) => ambient_worker_row(screen, worker, width),
+            // Armed but not yet in a snapshot: a stable starting placeholder,
+            // so the card is born at its final height instead of popping in.
+            None => ambient_worker_placeholder(worker_id, width),
         })
         .collect::<Vec<_>>();
-    if workers.len() > WORKER_LANE_MAX_ROWS {
+    if entries.len() > WORKER_LANE_MAX_ROWS {
         lines.push(Line::from(Span::styled(
             crate::ui::textengine::ellipsize_to_width(
-                &format!("… {} more", workers.len() - WORKER_LANE_MAX_ROWS),
+                &format!("\u{2026} {} more", entries.len() - WORKER_LANE_MAX_ROWS),
                 width,
             ),
             dim_style(),
         )));
     }
     lines
+}
+
+fn ambient_worker_placeholder(worker_id: &WorkerId, width: usize) -> Line<'static> {
+    let mut line = Line::from(vec![
+        Span::styled(crate::ui::symbols::EMPTY.to_string(), dim_style()),
+        Span::raw(" "),
+        Span::styled(
+            short_id(worker_id.as_str()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled("starting\u{2026}".to_string(), dim_style()),
+    ]);
+    truncate_line(&mut line, width);
+    line
+}
+
+fn ambient_worker_row(screen: &Screen, worker: &WorkerSnapshot, width: usize) -> Line<'static> {
+    let terminal = worker.status.is_terminal();
+    let (glyph, state_style) = ambient_worker_state(worker.status);
+    let id = short_id(worker.worker_id.as_str());
+    let description = if worker.request.description.trim().is_empty() {
+        "worker"
+    } else {
+        worker.request.description.trim()
+    };
+    // A finished worker's last "running {tool}" activity is stale evidence;
+    // its row recedes to the description and the state glyph.
+    let activity = if terminal {
+        None
+    } else {
+        screen
+            .worker_lane
+            .events
+            .get(&worker.worker_id)
+            .and_then(|events| latest_worker_activity(events))
+    };
+    let body = if width < 65 {
+        activity.unwrap_or(description).to_string()
+    } else if let Some(activity) = activity {
+        format!("{description}  {activity}")
+    } else {
+        description.to_string()
+    };
+    let started_ms = screen
+        .worker_lane
+        .events
+        .get(&worker.worker_id)
+        .and_then(|events| events.first())
+        .map(|event| event.timestamp_ms);
+    let mut suffix = Vec::new();
+    if width >= 65 && worker.usage.total_tokens() > 0 {
+        suffix.push(format!(
+            "↑{} ↓{}",
+            compact_count(worker.usage.input_tokens),
+            compact_count(worker.usage.output_tokens)
+        ));
+    }
+    if width >= 65
+        && let Some(started_ms) = started_ms
+    {
+        suffix.push(format_elapsed_compact(Duration::from_millis(
+            screen
+                .worker_lane
+                .snapshot_now_ms
+                .saturating_sub(started_ms),
+        )));
+    }
+    let suffix = suffix.join("  ");
+    let prefix_width = display_width(glyph)
+        .saturating_add(1)
+        .saturating_add(display_width(&id))
+        .saturating_add(2);
+    let suffix_width = if suffix.is_empty() {
+        0
+    } else {
+        display_width(&suffix).saturating_add(2)
+    };
+    let body = crate::ui::textengine::ellipsize_to_width(
+        &body,
+        width
+            .saturating_sub(prefix_width)
+            .saturating_sub(suffix_width),
+    );
+    // Finished rows recede: the state glyph keeps its color, the text drops
+    // to the muted tone so live rows carry the attention.
+    let body_style = if terminal { dim_style() } else { panel_style() };
+    let mut spans = vec![
+        Span::styled(glyph.to_string(), state_style),
+        Span::raw(" "),
+        Span::styled(id, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(body, body_style),
+    ];
+    if !suffix.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(suffix, dim_style()));
+    }
+    let mut line = Line::from(spans);
+    truncate_line(&mut line, width);
+    line
 }
 
 /// The session bar block: the bar row, an open dropdown's rows (the tree or
@@ -3499,20 +3539,18 @@ fn ambient_worker_lines(screen: &Screen, width: usize) -> Vec<Line<'static>> {
 /// footer yet. `height` caps the dropdown at [`MAX_DROPDOWN_ROWS`] or ⅓ of
 /// the pane, whichever is smaller.
 pub(super) fn session_bar_lines(screen: &Screen, width: u16, height: u16) -> Vec<Line<'static>> {
-    let focus_mode = screen.focus_mode_active(height);
-    let inset = BOX_X_PADDING_U16.min(width.saturating_sub(1));
-    let content_width = width.saturating_sub(inset.saturating_mul(2)).max(1);
-    let lane = ambient_worker_lines(screen, usize::from(content_width));
-    if focus_mode && lane.is_empty() {
+    if screen.focus_mode_active(height) {
         return Vec::new();
     }
+    let inset = BOX_X_PADDING_U16.min(width.saturating_sub(1));
+    let content_width = width.saturating_sub(inset.saturating_mul(2)).max(1);
 
     let mut lines = Vec::new();
-    if !focus_mode && let Some(mut bar) = session_bar(screen, content_width) {
+    if let Some(mut bar) = session_bar(screen, content_width) {
         pad_line_left(&mut bar, usize::from(inset));
         lines.push(bar);
     }
-    if !focus_mode && let Some(menu) = &screen.session_menu {
+    if let Some(menu) = &screen.session_menu {
         let max_rows = MAX_DROPDOWN_ROWS.min(usize::from(height) / 3).max(3);
         let referenced = referenced_paths(&screen.editor_text());
         for mut line in menu.render_lines(
@@ -3526,12 +3564,35 @@ pub(super) fn session_bar_lines(screen: &Screen, width: u16, height: u16) -> Vec
             lines.push(line);
         }
     }
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let mut rule = Line::from(Span::styled(
+        "─".repeat(usize::from(content_width)),
+        dim_style(),
+    ));
+    pad_line_left(&mut rule, usize::from(inset));
+    lines.push(rule);
+    lines
+}
+
+/// The ambient worker card: one inset row per armed background worker plus a
+/// closing dim rule. It renders BELOW the session bar block — and, in the
+/// pager, below the pinned prompt band — so the governing prompt keeps the
+/// topmost position and the card reads as chrome for the content underneath.
+/// Empty when no workers are armed; visible even in focus mode (live worker
+/// activity outranks chrome suppression).
+pub(super) fn ambient_worker_lane_block(screen: &Screen, width: u16) -> Vec<Line<'static>> {
+    let inset = BOX_X_PADDING_U16.min(width.saturating_sub(1));
+    let content_width = width.saturating_sub(inset.saturating_mul(2)).max(1);
+    let lane = ambient_worker_lines(screen, usize::from(content_width));
+    if lane.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
     for mut line in lane {
         pad_line_left(&mut line, usize::from(inset));
         lines.push(line);
-    }
-    if lines.is_empty() {
-        return Vec::new();
     }
     let mut rule = Line::from(Span::styled(
         "─".repeat(usize::from(content_width)),

@@ -40,7 +40,9 @@ use ratatui::text::Line;
 use ratatui::style::Modifier;
 use ratatui::text::Span;
 
-use super::screen::{Screen, filler_lines, render_editor_chrome, session_bar_lines};
+use super::screen::{
+    Screen, ambient_worker_lane_block, filler_lines, render_editor_chrome, session_bar_lines,
+};
 use super::wrap::{display_width, ellipsize_to_width, pad_line_left, truncate_to_width};
 use super::{BOX_X_PADDING_U16, TEXT_COLUMN_X_PADDING, dim_style, panel_style};
 
@@ -382,6 +384,12 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
 
     let bar = session_bar_lines(screen, width, size.height.max(1));
     let bar_rows = bar.len().min(height);
+    // The ambient worker card is pinned separately from the bar: it renders
+    // BELOW the sticky prompt band (see the frame assembly), so the governing
+    // prompt keeps the topmost position and never shifts while the card
+    // appears, updates, or retires.
+    let lane = ambient_worker_lane_block(screen, width);
+    let lane_rows = lane.len().min(height.saturating_sub(bar_rows));
 
     // Bottom-pinned tail: blank-padded working indicator + composer chrome
     // (which carries the docked overlays/modals), exactly as inline.
@@ -395,7 +403,7 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     tail.extend(render_editor_chrome(screen, width, size.height.max(1)));
     // On very short viewports keep the BOTTOM of the tail (statusline edge),
     // mirroring the inline surface's bottom-anchored behavior.
-    let tail_budget = height - bar_rows;
+    let tail_budget = height.saturating_sub(bar_rows + lane_rows);
     if tail.len() > tail_budget {
         tail.drain(..tail.len() - tail_budget);
     }
@@ -471,6 +479,7 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
     // the transcript. Interactive transcript state wins the entire band
     // footprint: a selection or search hit under any expanded continuation or
     // rule row keeps its highlight, and the card yields as one stable overlay.
+    let mut band_rows = 0usize;
     if view_rows >= 5
         && top > 0
         && let Some(text) = screen.transcript.sticky_prompt_text(top)
@@ -489,6 +498,7 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
             if painted > 0 {
                 screen.pager_sticky_hit_row = u16::try_from(bar_rows).ok();
             }
+            band_rows = painted;
         }
     }
     // Bottom overlay row: an active search shows its position indicator;
@@ -521,14 +531,21 @@ pub(super) fn compose_frame(screen: &mut Screen, size: Size) -> ComposedFrame {
             let header = screen
                 .transcript
                 .header_row_at_visible_line(top.saturating_add(offset))?;
-            let row = u16::try_from(bar_rows.saturating_add(offset)).ok()?;
+            // Rows below the band are pushed down by the worker card.
+            let shift = if offset >= band_rows { lane_rows } else { 0 };
+            let row = u16::try_from(bar_rows.saturating_add(offset).saturating_add(shift)).ok()?;
             Some((row, header))
         })
         .collect();
 
     let mut frame = Vec::with_capacity(height);
     frame.extend(bar.into_iter().take(bar_rows));
+    // The worker card mounts between the pinned prompt band and the scrolled
+    // transcript content; with no band it sits directly under the bar block.
+    let rest = body.split_off(band_rows.min(body.len()));
     frame.extend(body);
+    frame.extend(lane.into_iter().take(lane_rows));
+    frame.extend(rest);
     frame.extend(tail);
 
     // OSC 8 hyperlink markers are stripped from the frame here and their

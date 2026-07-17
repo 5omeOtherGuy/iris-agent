@@ -182,12 +182,15 @@ struct ExploreRenderer;
 struct ShellRenderer;
 /// write/edit -> EDIT panel (standard body, `EDIT` title).
 struct EditRenderer;
+/// spawn_subagent -> DELEGATE dispatch card (count, model, effort, task).
+struct SubagentRenderer;
 /// Unknown tools -> generic TOOL fallback panel.
 struct GenericRenderer;
 
 static EXPLORE: ExploreRenderer = ExploreRenderer;
 static SHELL: ShellRenderer = ShellRenderer;
 static EDIT: EditRenderer = EditRenderer;
+static SUBAGENT: SubagentRenderer = SubagentRenderer;
 static GENERIC: GenericRenderer = GenericRenderer;
 
 /// The single source of the tool-name -> renderer map for the TUI. Unknown
@@ -198,6 +201,7 @@ pub(super) fn resolve(call: &ToolCall) -> &'static dyn ToolRenderer {
         "read" | "grep" | "find" | "ls" => &EXPLORE,
         "bash" => &SHELL,
         "write" | "edit" => &EDIT,
+        "spawn_subagent" => &SUBAGENT,
         _ => &GENERIC,
     }
 }
@@ -491,6 +495,169 @@ impl ToolRenderer for EditRenderer {
     fn body(&self, ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
         generic_body(ctx, call, outcome)
     }
+}
+
+impl ToolRenderer for SubagentRenderer {
+    fn kind(&self) -> ToolPanelKind {
+        ToolPanelKind::Generic
+    }
+
+    fn title(&self) -> &'static str {
+        "DELEGATE"
+    }
+
+    /// The dispatch line the operator actually cares about: how many workers,
+    /// on which model, at what effort, for which task. Raw JSON arguments
+    /// never reach the header.
+    fn header_meta(&self, call: &ToolCall) -> String {
+        let count = subagent_count(call);
+        let workers = if count == 1 {
+            "1 worker".to_string()
+        } else {
+            format!("{count} workers")
+        };
+        let model = subagent_str(call, "model").unwrap_or("inherited model");
+        let mut meta = format!("{workers} \u{b7} {model}");
+        if let Some(effort) = subagent_str(call, "effort") {
+            meta.push_str(&format!(" \u{b7} {effort} effort"));
+        }
+        if let Some(task) = subagent_task(call) {
+            meta.push_str(&format!(" \u{2014} {task}"));
+        }
+        meta
+    }
+
+    fn body(&self, ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
+        let mut body = PanelBody::new(ctx.width, ctx.preview_rows, None);
+        match outcome {
+            ToolOutcome::Running { .. } => body.line("delegating\u{2026}", dim_style()),
+            // Review/Denied: show exactly what is being authorized.
+            ToolOutcome::Review => body.line(&subagent_grant(call), dim_style()),
+            ToolOutcome::Done { content, .. } => match subagent_result_rows(content) {
+                Some(rows) => {
+                    for (text, style) in rows {
+                        body.line(&text, style);
+                    }
+                }
+                // Unrecognized result shape (e.g. a blocking group result):
+                // fall back to the honest raw output.
+                None => body.output(content),
+            },
+            ToolOutcome::Error { message, .. } => {
+                body.line(&format!("error: {message}"), err_style());
+            }
+            ToolOutcome::Cancelled { .. } => {}
+        }
+        body.into_rows()
+    }
+}
+
+/// The `count` argument, defaulting to a single worker (the tool's default).
+fn subagent_count(call: &ToolCall) -> u64 {
+    call.arguments
+        .get("count")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|count| *count >= 1)
+        .unwrap_or(1)
+}
+
+fn subagent_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
+    call.arguments
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// The task name: the short `description` when given, else the prompt's first
+/// non-empty line, whitespace-normalized and bounded.
+fn subagent_task(call: &ToolCall) -> Option<String> {
+    let task = subagent_str(call, "description")
+        .map(str::to_string)
+        .or_else(|| {
+            subagent_str(call, "prompt").and_then(|prompt| {
+                prompt
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(str::to_string)
+            })
+        })?;
+    let task = task.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(truncate_clusters_with_ellipsis(&task, 64))
+}
+
+/// The review body: the grant being authorized (kind, capability, run mode).
+fn subagent_grant(call: &ToolCall) -> String {
+    let kind = subagent_str(call, "kind").unwrap_or("general");
+    let capability = subagent_str(call, "capability").unwrap_or("read_only");
+    let mode = if call
+        .arguments
+        .get("background")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+    {
+        "background"
+    } else {
+        "blocking"
+    };
+    format!("{kind} \u{b7} {capability} \u{b7} {mode}")
+}
+
+/// Compact result rows for the recognized spawn result shapes; `None` defers
+/// to the raw-output fallback. Background dispatches point at the live lane's
+/// action surface instead of echoing JSON.
+fn subagent_result_rows(content: &str) -> Option<Vec<(String, Style)>> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let short = |id: &str| crate::ui::delegation_dashboard::short_id(id);
+    if let Some(ids) = value
+        .get("worker_ids")
+        .and_then(serde_json::Value::as_array)
+    {
+        let ids = ids
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(short)
+            .collect::<Vec<_>>();
+        return Some(vec![
+            (
+                format!("started {} background workers", ids.len()),
+                panel_style(),
+            ),
+            (format!("{}  (/subagents)", ids.join("  ")), dim_style()),
+        ]);
+    }
+    if let Some(id) = value.get("worker_id").and_then(serde_json::Value::as_str)
+        && value.get("summary").is_none()
+    {
+        return Some(vec![(
+            format!("started {} in the background  (/subagents)", short(id)),
+            panel_style(),
+        )]);
+    }
+    // Blocking single-worker result: status + summary + changed-path count.
+    let status = value.get("status").and_then(serde_json::Value::as_str)?;
+    let summary = value
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty());
+    let mut rows = vec![(
+        match summary {
+            Some(summary) => format!("{status} \u{2014} {summary}"),
+            None => status.to_string(),
+        },
+        panel_style(),
+    )];
+    if let Some(changed) = value
+        .get("changed_paths")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .filter(|count| *count > 0)
+    {
+        rows.push((format!("{changed} files changed"), dim_style()));
+    }
+    Some(rows)
 }
 
 impl ToolRenderer for GenericRenderer {
@@ -967,6 +1134,117 @@ mod tests {
         let renderer = resolve(&call("totally_unknown", json!({})));
         assert!(renderer.kind() == ToolPanelKind::Generic);
         assert_eq!(renderer.title(), "TOOL");
+    }
+
+    #[test]
+    fn subagent_header_names_count_model_effort_and_task() {
+        let spawn = call(
+            "spawn_subagent",
+            json!({
+                "count": 3,
+                "model": "sonnet-4-5",
+                "effort": "high",
+                "description": "audit provider adapters",
+                "prompt": "Audit every provider adapter for drift."
+            }),
+        );
+        let renderer = resolve(&spawn);
+        assert_eq!(renderer.title(), "DELEGATE");
+        assert_eq!(
+            renderer.header_meta(&spawn),
+            "3 workers \u{b7} sonnet-4-5 \u{b7} high effort \u{2014} audit provider adapters"
+        );
+
+        // Defaults: one worker, inherited model, no effort; the task falls
+        // back to the prompt's first non-empty line.
+        let bare = call(
+            "spawn_subagent",
+            json!({ "prompt": "\n  Fix the flaky test.\nDetails follow." }),
+        );
+        assert_eq!(
+            resolve(&bare).header_meta(&bare),
+            "1 worker \u{b7} inherited model \u{2014} Fix the flaky test."
+        );
+    }
+
+    #[test]
+    fn subagent_result_bodies_stay_compact_for_known_shapes() {
+        let ctx = RenderCtx::for_width(120);
+        let spawn = call("spawn_subagent", json!({ "description": "worker" }));
+        let renderer = resolve(&spawn);
+
+        let single = json!({
+            "worker_id": "wrk_0123456789abcdef",
+            "status": "queued"
+        })
+        .to_string();
+        let rows = renderer.body(
+            &ctx,
+            &spawn,
+            &ToolOutcome::Done {
+                content: &single,
+                exit_code: None,
+            },
+        );
+        let text = rows
+            .iter()
+            .filter_map(|row| body_line(row).map(|line| line.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("started wrk_01234567 in the background"),
+            "{text}"
+        );
+        assert!(!text.contains('{'), "no raw JSON in the body: {text}");
+
+        let group = json!({
+            "group_id": "grp_1",
+            "worker_ids": ["wrk_0123456789abcdef", "wrk_fedcba9876543210"],
+            "status": "queued"
+        })
+        .to_string();
+        let rows = renderer.body(
+            &ctx,
+            &spawn,
+            &ToolOutcome::Done {
+                content: &group,
+                exit_code: None,
+            },
+        );
+        let text = rows
+            .iter()
+            .filter_map(|row| body_line(row).map(|line| line.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("started 2 background workers"), "{text}");
+        assert!(
+            text.contains("wrk_01234567") && text.contains("wrk_fedcba98"),
+            "{text}"
+        );
+
+        // A blocking result renders status + summary + changed-path count.
+        let blocking = json!({
+            "worker_id": "wrk_0123456789abcdef",
+            "status": "completed",
+            "summary": "gate passed",
+            "changed_paths": ["src/a.rs", "src/b.rs"]
+        })
+        .to_string();
+        let rows = renderer.body(
+            &ctx,
+            &spawn,
+            &ToolOutcome::Done {
+                content: &blocking,
+                exit_code: None,
+            },
+        );
+        let text = rows
+            .iter()
+            .filter_map(|row| body_line(row).map(|line| line.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("completed \u{2014} gate passed"), "{text}");
+        assert!(text.contains("2 files changed"), "{text}");
     }
 
     #[test]
