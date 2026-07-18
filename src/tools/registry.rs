@@ -524,19 +524,6 @@ impl Tool for SpawnSubagentTool {
     fn supports_allow_always(&self) -> bool {
         false
     }
-
-    fn diff_preview(&self, _workspace: &Path, args: &Value) -> Option<String> {
-        Some(format!(
-            "Spawn {} subagent candidate(s) with capability={} and isolation={}",
-            args.get("count").and_then(Value::as_u64).unwrap_or(1),
-            args.get("capability")
-                .and_then(Value::as_str)
-                .unwrap_or("read_only"),
-            args.get("isolation")
-                .and_then(Value::as_str)
-                .unwrap_or("automatic")
-        ))
-    }
 }
 
 struct SubagentStatusTool(Arc<crate::wayland::subagents::SubagentBackend>);
@@ -2545,6 +2532,19 @@ mod tests {
             .by_name("spawn_subagent")
             .unwrap()
             .parameters();
+        // Dispatch is not a mutation: a diff preview would route the call
+        // through the EDIT diff panel and mask the DELEGATE dispatch card.
+        assert!(
+            subagent_tools
+                .by_name("spawn_subagent")
+                .unwrap()
+                .diff_preview(
+                    Path::new("/ws"),
+                    &serde_json::json!({ "count": 2, "capability": "read_only" })
+                )
+                .is_none(),
+            "spawn_subagent must not provide an EDIT diff preview"
+        );
         let properties = spawn_schema["properties"].as_object().unwrap();
         for required_field in [
             "prompt",

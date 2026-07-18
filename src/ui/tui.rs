@@ -812,6 +812,51 @@ mod tests {
     }
 
     #[test]
+    fn spawn_subagent_renders_a_delegate_card_not_an_edit_panel() {
+        let mut screen = Screen::new();
+        screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());
+        let call = call_args(
+            "spawn_subagent",
+            json!({
+                "count": 2,
+                "model": "sonnet-4-5",
+                "effort": "high",
+                "description": "smoke pair",
+                "prompt": "run the smoke suite"
+            }),
+        );
+        screen.apply(UiEvent::ToolStarted(call.clone()));
+        let ids = [WorkerId::new(), WorkerId::new()];
+        screen.apply(UiEvent::ToolResult {
+            call,
+            content: json!({
+                "group_id": "grp_1",
+                "worker_ids": ids,
+                "status": "queued"
+            })
+            .to_string(),
+            exit_code: Some(0),
+            duration: Some(Duration::from_millis(1)),
+        });
+        let rendered = rendered_text(&mut screen, 120, 30);
+        assert!(rendered.contains("DELEGATE"), "{rendered}");
+        assert!(
+            rendered.contains("2 workers · sonnet-4-5 · high effort — smoke pair"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("EDIT"),
+            "dispatch must not render as an EDIT panel: {rendered}"
+        );
+        // The card body echoes the worker-lane row grammar: one row per
+        // dispatched worker, state glyph + bold short ID.
+        for id in &ids {
+            let short = format!("wrk_{}", &id.as_str()[4..12]);
+            assert!(rendered.contains(&short), "{rendered}");
+        }
+    }
+
+    #[test]
     fn ambient_worker_lane_matches_inline_and_pager_top_chrome() {
         let mut screen = Screen::new();
         screen.set_footer(

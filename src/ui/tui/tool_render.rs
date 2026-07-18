@@ -46,7 +46,7 @@ use super::wrap::{
 };
 use super::{
     MAX_TOOL_OUTPUT_LINE_CHARS, PANEL_BODY_CHROME_WIDTH, dim_style, err_style, panel_style,
-    stdout_style,
+    prompt_style, stdout_style,
 };
 
 /// The panel family a tool renders as. Selects the stateful dispatch path in
@@ -528,21 +528,19 @@ impl ToolRenderer for SubagentRenderer {
     }
 
     fn body(&self, ctx: &RenderCtx, call: &ToolCall, outcome: &ToolOutcome) -> Vec<TranscriptRow> {
+        if let ToolOutcome::Done { content, .. } = outcome
+            && let Some(rows) = subagent_result_rows(content)
+        {
+            return rows;
+        }
         let mut body = PanelBody::new(ctx.width, ctx.preview_rows, None);
         match outcome {
             ToolOutcome::Running { .. } => body.line("delegating\u{2026}", dim_style()),
             // Review/Denied: show exactly what is being authorized.
             ToolOutcome::Review => body.line(&subagent_grant(call), dim_style()),
-            ToolOutcome::Done { content, .. } => match subagent_result_rows(content) {
-                Some(rows) => {
-                    for (text, style) in rows {
-                        body.line(&text, style);
-                    }
-                }
-                // Unrecognized result shape (e.g. a blocking group result):
-                // fall back to the honest raw output.
-                None => body.output(content),
-            },
+            // Unrecognized result shape (e.g. a blocking group result):
+            // fall back to the honest raw output.
+            ToolOutcome::Done { content, .. } => body.output(content),
             ToolOutcome::Error { message, .. } => {
                 body.line(&format!("error: {message}"), err_style());
             }
@@ -605,59 +603,93 @@ fn subagent_grant(call: &ToolCall) -> String {
 }
 
 /// Compact result rows for the recognized spawn result shapes; `None` defers
-/// to the raw-output fallback. Background dispatches point at the live lane's
-/// action surface instead of echoing JSON.
-fn subagent_result_rows(content: &str) -> Option<Vec<(String, Style)>> {
+/// to the raw-output fallback. The rows follow the ambient worker-lane
+/// grammar — state glyph, bold short ID, row text — so the dispatch card and
+/// the live lane read as one system. Background dispatches close with a quiet
+/// pointer at the action surface instead of echoing JSON.
+fn subagent_result_rows(content: &str) -> Option<Vec<TranscriptRow>> {
     let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let short = |id: &str| crate::ui::delegation_dashboard::short_id(id);
+    let status = value.get("status").and_then(serde_json::Value::as_str)?;
     if let Some(ids) = value
         .get("worker_ids")
         .and_then(serde_json::Value::as_array)
     {
-        let ids = ids
+        let mut rows = ids
             .iter()
             .filter_map(serde_json::Value::as_str)
-            .map(short)
+            .map(|id| subagent_worker_row(id, status, status))
             .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return None;
+        }
+        rows.push(styled_row(
+            "background \u{b7} /subagents".to_string(),
+            dim_style(),
+        ));
+        return Some(rows);
+    }
+    let worker_id = value.get("worker_id").and_then(serde_json::Value::as_str)?;
+    if value.get("summary").is_none() {
+        // Background single dispatch: `{worker_id, status}`.
         return Some(vec![
-            (
-                format!("started {} background workers", ids.len()),
-                panel_style(),
-            ),
-            (format!("{}  (/subagents)", ids.join("  ")), dim_style()),
+            subagent_worker_row(worker_id, status, status),
+            styled_row("background \u{b7} /subagents".to_string(), dim_style()),
         ]);
     }
-    if let Some(id) = value.get("worker_id").and_then(serde_json::Value::as_str)
-        && value.get("summary").is_none()
-    {
-        return Some(vec![(
-            format!("started {} in the background  (/subagents)", short(id)),
-            panel_style(),
-        )]);
-    }
     // Blocking single-worker result: status + summary + changed-path count.
-    let status = value.get("status").and_then(serde_json::Value::as_str)?;
     let summary = value
         .get("summary")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|summary| !summary.is_empty());
-    let mut rows = vec![(
-        match summary {
-            Some(summary) => format!("{status} \u{2014} {summary}"),
-            None => status.to_string(),
-        },
-        panel_style(),
-    )];
+    let mut text = match summary {
+        Some(summary) => format!("{status} \u{2014} {summary}"),
+        None => status.to_string(),
+    };
     if let Some(changed) = value
         .get("changed_paths")
         .and_then(serde_json::Value::as_array)
         .map(Vec::len)
         .filter(|count| *count > 0)
     {
-        rows.push((format!("{changed} files changed"), dim_style()));
+        text.push_str(&format!(" \u{b7} {changed} files changed"));
     }
-    Some(rows)
+    Some(vec![subagent_worker_row(worker_id, status, &text)])
+}
+
+/// One card body row in the worker-lane grammar: state glyph, bold short
+/// worker ID, row text.
+fn subagent_worker_row(worker_id: &str, status: &str, text: &str) -> TranscriptRow {
+    let (glyph, glyph_style) = subagent_status_glyph(status);
+    let short = crate::ui::delegation_dashboard::short_id(worker_id);
+    let plain = format!("{glyph} {short}  {text}");
+    let line = Line::from(vec![
+        Span::styled(glyph, glyph_style),
+        Span::raw(" "),
+        Span::styled(
+            short,
+            Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(text.to_string(), panel_style()),
+    ]);
+    TranscriptRow::chrome_with_text(ChromeRow::Body { line, bg: None }, plain, panel_style())
+}
+
+/// The lane's state-glyph mapping, keyed by the runtime's status strings.
+/// Never color alone: the glyph shape carries the state too.
+fn subagent_status_glyph(status: &str) -> (&'static str, Style) {
+    use crate::ui::symbols;
+    match status {
+        "completed" => (
+            symbols::DONE,
+            Style::default().fg(crate::ui::palette::green()),
+        ),
+        "failed" => (symbols::ERROR, err_style()),
+        "cancelled" => (symbols::CANCELLED, dim_style()),
+        "initializing" | "running" => (symbols::RUNNING, prompt_style()),
+        _ => (symbols::EMPTY, dim_style()),
+    }
 }
 
 impl ToolRenderer for GenericRenderer {
@@ -1192,9 +1224,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("started wrk_01234567 in the background"),
-            "{text}"
+            text.contains("wrk_01234567  queued"),
+            "lane-grammar worker row: {text}"
         );
+        assert!(text.contains("background \u{b7} /subagents"), "{text}");
         assert!(!text.contains('{'), "no raw JSON in the body: {text}");
 
         let group = json!({
@@ -1216,13 +1249,14 @@ mod tests {
             .filter_map(|row| body_line(row).map(|line| line.to_string()))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("started 2 background workers"), "{text}");
         assert!(
-            text.contains("wrk_01234567") && text.contains("wrk_fedcba98"),
-            "{text}"
+            text.contains("wrk_01234567  queued") && text.contains("wrk_fedcba98  queued"),
+            "one lane-grammar row per dispatched worker: {text}"
         );
+        assert!(text.contains("background \u{b7} /subagents"), "{text}");
 
-        // A blocking result renders status + summary + changed-path count.
+        // A blocking result renders one settled worker row: state glyph,
+        // short ID, status + summary + changed-path count.
         let blocking = json!({
             "worker_id": "wrk_0123456789abcdef",
             "status": "completed",
@@ -1243,8 +1277,13 @@ mod tests {
             .filter_map(|row| body_line(row).map(|line| line.to_string()))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("completed \u{2014} gate passed"), "{text}");
-        assert!(text.contains("2 files changed"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "{} wrk_01234567  completed \u{2014} gate passed \u{b7} 2 files changed",
+                crate::ui::symbols::DONE
+            )),
+            "{text}"
+        );
     }
 
     #[test]
