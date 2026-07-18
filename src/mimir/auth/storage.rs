@@ -115,6 +115,38 @@ impl AuthStore {
         auth.write(&self.path)
     }
 
+    /// Take an exclusive advisory lock on a sibling lockfile so that OAuth
+    /// refreshes are single-flight across iris PROCESSES sharing this auth
+    /// file, not just across workers inside one process. The provider rotates
+    /// the refresh token on use, so two processes refreshing concurrently
+    /// invalidate each other. The lockfile carries no credential material and
+    /// the lock releases when the returned guard drops. Advisory only: it
+    /// serializes cooperating refreshers, it does not protect the auth file
+    /// from arbitrary writers.
+    pub(crate) fn lock_for_refresh(&self) -> Result<AuthRefreshLock> {
+        let lock_path = self.path.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
+            .open(&lock_path)
+            .with_context(|| format!("failed to open {}", lock_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("failed to lock {}", lock_path.display()));
+            }
+        }
+        Ok(AuthRefreshLock { _file: file })
+    }
+
     /// Whether a credential of any kind is stored for `provider_id` in the auth
     /// file. Used by tests to assert removal semantics without reading secret material.
     #[cfg(test)]
@@ -154,6 +186,13 @@ impl AuthStore {
         auth.write(&self.path)?;
         Ok(true)
     }
+}
+
+/// Guard for the cross-process refresh lock; the advisory lock is released
+/// when the guard (and its file handle) drops.
+#[derive(Debug)]
+pub(crate) struct AuthRefreshLock {
+    _file: fs::File,
 }
 
 /// A stored credential's provider and kind, with no secret material attached.
@@ -492,6 +531,52 @@ mod tests {
         assert!(store.stored_credentials()?.is_empty());
         assert!(!store.has_credentials("openai-codex")?);
         assert!(!store.remove_credentials("openai-codex")?);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_lock_is_exclusive_across_independent_opens() -> Result<()> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = unique_test_dir()?;
+        let path = dir.join("auth.json");
+        let holder = AuthStore::from_path(path.clone());
+        let contender = AuthStore::from_path(path.clone());
+
+        let guard = holder.lock_for_refresh()?;
+        // The lockfile is a sibling of the auth file with restricted permissions
+        // and never carries credential material.
+        let lock_path = path.with_extension("lock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&lock_path)?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _guard = contender.lock_for_refresh().unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        // The second open must block while the first guard is held.
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "lock_for_refresh did not exclude an independent open"
+        );
+        drop(guard);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("contender never acquired the lock after release");
+        worker.join().unwrap();
         fs::remove_dir_all(dir)?;
         Ok(())
     }
