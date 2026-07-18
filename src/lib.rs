@@ -507,11 +507,22 @@ fn subagent_tools_config(
         wayland::subagents::resolve_worktree_root()?,
     )?);
     let provider_factory = child_provider_factory(selection.clone(), active_session_id);
+    // Snapshot the authenticated catalog once so the spawn_subagent schema enum
+    // and its pre-spawn resolution share one source of truth. A missing auth
+    // store degrades to an empty catalog (model override then errors loudly).
+    let catalog = {
+        let settings = config::Settings::load(cwd).unwrap_or_default();
+        match mimir::auth::storage::AuthStore::from_env() {
+            Ok(auth) => mimir::model_catalog::available_models(&auth, &settings),
+            Err(_) => Vec::new(),
+        }
+    };
     Ok((
         tools::SubagentToolsConfig {
             backend: backend.clone(),
             provider_factory,
             selection,
+            catalog,
             capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
             session_id: session_id.to_string(),
             nesting_depth: 0,

@@ -13,7 +13,10 @@
 //! record in `auth.json` (or, for Anthropic, an existing Claude Code login). It
 //! never reads, refreshes, or exposes the secret material.
 
+use anyhow::Result;
+
 use crate::config::Settings;
+use crate::errors::UsageError;
 use crate::mimir::auth::anthropic;
 use crate::mimir::auth::api_key;
 use crate::mimir::auth::storage::{AuthStore, CredentialKind};
@@ -229,6 +232,96 @@ pub(crate) fn available_models(auth: &AuthStore, settings: &Settings) -> Vec<Cat
         models.push(model);
     }
     models
+}
+
+/// Distinct model ids and provider wire ids in `models`, in registry order.
+/// Backs the `spawn_subagent` schema `enum`s so the delegating model is offered
+/// only exact, authenticated identifiers instead of guessing spelling.
+pub(crate) fn schema_choices_from(models: &[CatalogModel]) -> (Vec<String>, Vec<String>) {
+    let mut providers = Vec::new();
+    for model in models {
+        let provider = model.provider.as_str().to_string();
+        if !providers.contains(&provider) {
+            providers.push(provider);
+        }
+    }
+    (distinct_ids(models), providers)
+}
+
+/// Resolve a `(model, optional provider)` subagent request against an
+/// authenticated catalog snapshot. `provider` disambiguates a model id offered
+/// by more than one authenticated provider; a unique id needs no provider.
+pub(crate) fn resolve_model_in(
+    models: &[CatalogModel],
+    model: &str,
+    provider: Option<&str>,
+) -> Result<CatalogModel> {
+    let model = model.trim();
+    let provider = provider.map(str::trim).filter(|value| !value.is_empty());
+    let matches: Vec<&CatalogModel> = models
+        .iter()
+        .filter(|entry| {
+            entry.id == model && provider.is_none_or(|want| entry.provider.as_str() == want)
+        })
+        .collect();
+    match matches.as_slice() {
+        [only] => Ok((*only).clone()),
+        [] => Err(unresolved_model_error(models, model, provider)),
+        many => {
+            let providers = many
+                .iter()
+                .map(|entry| entry.provider.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(UsageError::new(format!(
+                "model '{model}' is offered by multiple providers; set provider to one of: {providers}"
+            ))
+            .into())
+        }
+    }
+}
+
+fn unresolved_model_error(
+    models: &[CatalogModel],
+    model: &str,
+    provider: Option<&str>,
+) -> anyhow::Error {
+    if let Some(want) = provider {
+        let offered: Vec<&str> = models
+            .iter()
+            .filter(|entry| entry.id == model)
+            .map(|entry| entry.provider.as_str())
+            .collect();
+        if !offered.is_empty() {
+            return UsageError::new(format!(
+                "model '{model}' is not available from provider '{want}'; it is offered by: {}",
+                offered.join(", ")
+            ))
+            .into();
+        }
+    }
+    let available = distinct_ids(models).join(", ");
+    if available.is_empty() {
+        UsageError::new(format!(
+            "model '{model}' is not available; no authenticated provider offers a subagent model"
+        ))
+        .into()
+    } else {
+        UsageError::new(format!(
+            "unknown or unauthenticated model '{model}'; available models: {available}"
+        ))
+        .into()
+    }
+}
+
+fn distinct_ids(models: &[CatalogModel]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for model in models {
+        if !ids.iter().any(|id| id == &model.id) {
+            ids.push(model.id.clone());
+        }
+    }
+    ids
 }
 
 fn openai_compatible_model(auth: &AuthStore, settings: &Settings) -> Option<CatalogModel> {
@@ -742,5 +835,89 @@ mod tests {
         assert!(AuthStatus::StoredOAuth.is_configured());
         assert!(AuthStatus::StoredApiKey.is_configured());
         assert!(AuthStatus::EnvApiKey.is_configured());
+    }
+
+    #[test]
+    fn schema_choices_are_distinct_and_registry_ordered() {
+        let catalog = [
+            model(ProviderId::OpenAiCodex, "gpt-5.4-mini"),
+            model(ProviderId::OpenAi, "gpt-4.1"),
+            model(ProviderId::Anthropic, "shared"),
+            model(ProviderId::OpenAi, "shared"),
+        ];
+        let (models, providers) = schema_choices_from(&catalog);
+        assert_eq!(models, vec!["gpt-5.4-mini", "gpt-4.1", "shared"]);
+        assert_eq!(providers, vec!["openai-codex", "openai", "anthropic"]);
+    }
+
+    #[test]
+    fn resolve_model_matches_a_unique_id_without_a_provider() {
+        let catalog = [
+            model(ProviderId::OpenAiCodex, "gpt-5.4-mini"),
+            model(ProviderId::Anthropic, "claude-opus-4-6"),
+        ];
+        let resolved = resolve_model_in(&catalog, "gpt-5.4-mini", None).unwrap();
+        assert_eq!(resolved.provider, ProviderId::OpenAiCodex);
+        assert_eq!(resolved.id, "gpt-5.4-mini");
+        // Surrounding whitespace is tolerated.
+        assert_eq!(
+            resolve_model_in(&catalog, "  gpt-5.4-mini  ", None)
+                .unwrap()
+                .provider,
+            ProviderId::OpenAiCodex
+        );
+    }
+
+    #[test]
+    fn resolve_model_rejects_unknown_ids_and_lists_available_ones() {
+        let catalog = [model(ProviderId::OpenAiCodex, "gpt-5.4-mini")];
+        let error = resolve_model_in(&catalog, "gpt-9", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("gpt-9"), "{error}");
+        assert!(error.contains("gpt-5.4-mini"), "{error}");
+
+        let empty = resolve_model_in(&[], "gpt-9", None)
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("no authenticated provider"), "{empty}");
+    }
+
+    #[test]
+    fn resolve_model_rejects_a_wrong_provider_for_a_known_id() {
+        let catalog = [model(ProviderId::OpenAiCodex, "gpt-5.4-mini")];
+        let error = resolve_model_in(&catalog, "gpt-5.4-mini", Some("openai"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not available from provider 'openai'"),
+            "{error}"
+        );
+        assert!(error.contains("openai-codex"), "{error}");
+    }
+
+    #[test]
+    fn resolve_model_disambiguates_a_shared_id_by_provider() {
+        let catalog = [
+            model(ProviderId::OpenAi, "shared"),
+            model(ProviderId::Anthropic, "shared"),
+        ];
+        // Ambiguous without a provider: refuse and name the candidates.
+        let error = resolve_model_in(&catalog, "shared", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("multiple providers"), "{error}");
+        assert!(
+            error.contains("openai") && error.contains("anthropic"),
+            "{error}"
+        );
+
+        // A provider selects the intended one.
+        assert_eq!(
+            resolve_model_in(&catalog, "shared", Some("anthropic"))
+                .unwrap()
+                .provider,
+            ProviderId::Anthropic
+        );
     }
 }
