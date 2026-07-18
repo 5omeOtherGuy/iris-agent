@@ -65,6 +65,11 @@ pub(crate) struct SubagentToolsConfig {
     pub(crate) backend: Arc<crate::wayland::subagents::SubagentBackend>,
     pub(crate) provider_factory: crate::wayland::subagents::ChildProviderFactory,
     pub(crate) selection: Arc<std::sync::Mutex<crate::mimir::selection::ModelSelection>>,
+    /// Authenticated model catalog captured at session start. Drives the
+    /// `spawn_subagent` model/provider `enum`s and the pre-spawn resolution so
+    /// schema and execution share one source of truth and stay deterministic in
+    /// tests. A mid-session `/login` is not reflected until the next start.
+    pub(crate) catalog: Vec<crate::mimir::model_catalog::CatalogModel>,
     pub(crate) capability_ceiling: iris_subagent_runtime::CapabilityMode,
     pub(crate) session_id: String,
     pub(crate) nesting_depth: u32,
@@ -265,6 +270,22 @@ impl Tool for SpawnSubagentTool {
     }
 
     fn parameters(&self) -> Value {
+        let (models, providers) = crate::mimir::model_catalog::schema_choices_from(&self.0.catalog);
+        let mut model_field = serde_json::json!({
+            "type": "string",
+            "minLength": 1,
+            "description": "Exact worker model id from the listed values; omit to inherit the spawn-time selection."
+        });
+        if !models.is_empty() {
+            model_field["enum"] = serde_json::json!(models);
+        }
+        let mut provider_field = serde_json::json!({
+            "type": "string",
+            "description": "Disambiguates a model offered by more than one authenticated provider; omit unless ambiguous."
+        });
+        if !providers.is_empty() {
+            provider_field["enum"] = serde_json::json!(providers);
+        }
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -283,11 +304,8 @@ impl Tool for SpawnSubagentTool {
                     "default": "general",
                     "description": "Policy category, not a persona; explore/review force read_only."
                 },
-                "model": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Child model: <model> keeps the provider; <provider>/<model> switches it. Omit to inherit the spawn-time selection."
-                },
+                "model": model_field,
+                "provider": provider_field,
                 "effort": {
                     "type": "string",
                     "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
@@ -389,6 +407,7 @@ impl Tool for SpawnSubagentTool {
                 other => return Err(anyhow!("unknown subagent kind: {other}")),
             };
             let model = optional_string_arg(args, "model")?;
+            let provider = optional_string_arg(args, "provider")?;
             let effort = optional_string_arg(args, "effort")?;
             let parent_selection = self
                 .0
@@ -396,9 +415,11 @@ impl Tool for SpawnSubagentTool {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .clone();
-            let effective_selection = crate::mimir::selection::apply_selection_overrides(
+            let effective_selection = resolve_subagent_selection(
                 &parent_selection,
+                &self.0.catalog,
                 model,
+                provider,
                 effort,
             )?;
             let route = crate::wayland::subagents::ChildRoute::new(
@@ -952,6 +973,44 @@ fn optional_string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>
         None => Ok(None),
         Some(Value::String(value)) => Ok(Some(value)),
         Some(_) => Err(anyhow!("spawn_subagent {key} must be a string")),
+    }
+}
+
+/// Resolve the child worker's effective selection.
+///
+/// - No `model`: inherit the parent selection; a lone `provider` is meaningless
+///   and rejected. An `effort` override still applies.
+/// - `model` given: resolve the exact `(provider, model)` pair against the
+///   authenticated catalog snapshot, then build the selection. Unknown or
+///   ambiguous ids fail before a worker is queued, so the delegating model never
+///   silently lands on the wrong provider (e.g. an API-key lane instead of OAuth).
+fn resolve_subagent_selection(
+    parent: &crate::mimir::selection::ModelSelection,
+    catalog: &[crate::mimir::model_catalog::CatalogModel],
+    model: Option<&str>,
+    provider: Option<&str>,
+    effort: Option<&str>,
+) -> Result<crate::mimir::selection::ModelSelection> {
+    match model.map(str::trim).filter(|value| !value.is_empty()) {
+        None => {
+            if provider.is_some_and(|value| !value.trim().is_empty()) {
+                return Err(anyhow!(
+                    "spawn_subagent provider requires model; set model to the target id"
+                ));
+            }
+            Ok(crate::mimir::selection::apply_selection_overrides(
+                parent, None, effort,
+            )?)
+        }
+        Some(model) => {
+            let resolved = crate::mimir::model_catalog::resolve_model_in(catalog, model, provider)?;
+            Ok(crate::mimir::selection::selection_for_catalog_model(
+                parent,
+                resolved.provider,
+                &resolved.id,
+                effort,
+            )?)
+        }
     }
 }
 
@@ -1819,6 +1878,26 @@ mod tests {
         ))
     }
 
+    /// A fixed authenticated catalog for subagent routing tests: one OAuth Codex
+    /// model and one Anthropic model, so resolution is deterministic and does not
+    /// depend on the machine's real auth store.
+    fn test_catalog() -> Vec<crate::mimir::model_catalog::CatalogModel> {
+        use crate::mimir::model_catalog::CatalogModel;
+        use crate::mimir::selection::ProviderId;
+        vec![
+            CatalogModel {
+                provider: ProviderId::OpenAiCodex,
+                id: "gpt-5.4-mini".to_string(),
+                ctx_label: None,
+            },
+            CatalogModel {
+                provider: ProviderId::Anthropic,
+                id: "claude-opus-4-6".to_string(),
+                ctx_label: None,
+            },
+        ]
+    }
+
     fn bash_env<'a>(
         workspace: &'a std::path::Path,
         state: &'a std::cell::RefCell<ToolState>,
@@ -1853,6 +1932,7 @@ mod tests {
             backend: backend.clone(),
             provider_factory,
             selection,
+            catalog: test_catalog(),
             capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
             session_id: "invalid-route".to_string(),
             nesting_depth: 0,
@@ -1863,14 +1943,14 @@ mod tests {
         let env = bash_env(&workspace, &state, None);
 
         for invalid in [
-            json!({ "prompt": "invalid", "model": "" }),
-            json!({ "prompt": "invalid", "model": "unknown/model" }),
+            // Not in the authenticated catalog at all.
+            json!({ "prompt": "invalid", "model": "gpt-4.1" }),
+            // A valid id, but not offered by the named provider.
+            json!({ "prompt": "invalid", "model": "gpt-5.4-mini", "provider": "openai" }),
+            // provider without model has nothing to disambiguate.
+            json!({ "prompt": "invalid", "provider": "anthropic" }),
+            // Bad reasoning level still fails before acceptance.
             json!({ "prompt": "invalid", "effort": "ultra" }),
-            json!({
-                "prompt": "invalid",
-                "model": "openai/gpt-4.1",
-                "effort": "high"
-            }),
         ] {
             let error = current_thread_runtime()
                 .block_on(tool.execute(&invalid, &env, CancellationToken::new()))
@@ -1910,6 +1990,7 @@ mod tests {
             backend: backend.clone(),
             provider_factory,
             selection: test_selection(),
+            catalog: test_catalog(),
             capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
             session_id: "direct-route".to_string(),
             nesting_depth: 0,
@@ -1923,7 +2004,7 @@ mod tests {
             .block_on(tool.execute(
                 &json!({
                     "prompt": "route",
-                    "model": "anthropic/claude-opus-4-6",
+                    "model": "claude-opus-4-6",
                     "effort": "xhigh",
                     "count": 3
                 }),
@@ -1971,6 +2052,7 @@ mod tests {
             backend: backend.clone(),
             provider_factory,
             selection: test_selection(),
+            catalog: Vec::new(),
             capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
             session_id: "foreground-cancel".to_string(),
             nesting_depth: 0,
@@ -2270,6 +2352,7 @@ mod tests {
             backend,
             provider_factory: Arc::new(|_| Err(anyhow!("budget test must not execute a provider"))),
             selection: test_selection(),
+            catalog: Vec::new(),
             capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
             session_id: "fixed-context-budget".to_string(),
             nesting_depth: 0,
@@ -2402,7 +2485,10 @@ mod tests {
                         "request_compaction" => (230, 58),
                         "web_search" => (1_130, 283),
                         "read_web_page" => (620, 155),
-                        "spawn_subagent" => (2_500, 625),
+                        // Budget covers the fixed structure only; the dynamic
+                        // model/provider enums are authenticated-catalog content
+                        // (empty here), like web keys, and are not budgeted.
+                        "spawn_subagent" => (2_650, 665),
                         "subagent_status" => (435, 109),
                         "read_subagent_output" => (550, 138),
                         "cancel_subagent" => (430, 108),
@@ -2490,6 +2576,7 @@ mod tests {
                 backend,
                 provider_factory,
                 selection: test_selection(),
+                catalog: Vec::new(),
                 capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
                 session_id: "schema-test".to_string(),
                 nesting_depth: 0,
@@ -2581,6 +2668,7 @@ mod tests {
             "description",
             "kind",
             "model",
+            "provider",
             "effort",
             "capability",
             "isolation",
@@ -2620,8 +2708,13 @@ mod tests {
             ("kind", &["Policy", "not a persona", "force read_only"][..]),
             (
                 "model",
-                &["<model>", "<provider>/<model>", "spawn-time selection"][..],
+                &[
+                    "Exact worker model id",
+                    "listed values",
+                    "spawn-time selection",
+                ][..],
             ),
+            ("provider", &["Disambiguates", "authenticated provider"][..]),
             ("effort", &["inherit", "clamped", "selected model"][..]),
             ("capability", &["Cannot exceed", "parent ceiling"][..]),
             ("isolation", &["worktree", "incompatible with cwd"][..]),

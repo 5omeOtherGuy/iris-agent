@@ -621,7 +621,7 @@ pub(crate) fn apply_selection_overrides(
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<ModelSelection> {
-    let mut selection = match model {
+    let selection = match model {
         Some(target) => {
             let target = target.trim();
             if target.is_empty() {
@@ -645,6 +645,28 @@ pub(crate) fn apply_selection_overrides(
         None => base.clone(),
     };
 
+    finalize_selection(selection, effort)
+}
+
+/// Build an effective selection from an already catalog-resolved provider/model,
+/// applying an optional reasoning override. This is the subagent path: the
+/// provider/model pair is validated against the authenticated catalog before it
+/// reaches here, so no string parsing or catalog membership is repeated.
+pub(crate) fn selection_for_catalog_model(
+    base: &ModelSelection,
+    provider: ProviderId,
+    model: &str,
+    effort: Option<&str>,
+) -> Result<ModelSelection> {
+    finalize_selection(candidate_for(base, provider, model), effort)
+}
+
+/// Shared tail for selection overrides: apply an optional reasoning level, then
+/// resolve provider context management and validate capabilities.
+fn finalize_selection(
+    mut selection: ModelSelection,
+    effort: Option<&str>,
+) -> Result<ModelSelection> {
     if let Some(effort) = effort {
         selection.reasoning = Some(ReasoningEffort::parse(effort)?);
     }
@@ -1628,6 +1650,37 @@ mod tests {
         let routed = apply_selection_overrides(&parent, Some("gpt-5.5"), None).unwrap();
 
         assert_eq!(routed.reasoning, Some(ReasoningEffort::XHigh));
+    }
+
+    #[test]
+    fn selection_for_catalog_model_switches_provider_and_carries_effort() {
+        let mut parent = selection_for(
+            ProviderId::OpenAiCodex,
+            "gpt-5.6-sol",
+            PromptCacheRetention::Short,
+        );
+        parent.base_url = "https://chatgpt.com/backend-api".to_string();
+        parent.reasoning = Some(ReasoningEffort::High);
+
+        // No effort override: switch provider/model, adopt the provider's base
+        // URL, and carry the parent effort clamped for the target model.
+        let switched =
+            selection_for_catalog_model(&parent, ProviderId::Anthropic, "claude-opus-4-6", None)
+                .unwrap();
+        assert_eq!(switched.provider, ProviderId::Anthropic);
+        assert_eq!(switched.model, "claude-opus-4-6");
+        assert_eq!(switched.base_url, "https://api.anthropic.com");
+        assert_eq!(switched.reasoning, Some(ReasoningEffort::High));
+
+        // An explicit effort override wins and is validated for the target.
+        let with_effort = selection_for_catalog_model(
+            &parent,
+            ProviderId::Anthropic,
+            "claude-opus-4-6",
+            Some("low"),
+        )
+        .unwrap();
+        assert_eq!(with_effort.reasoning, Some(ReasoningEffort::Low));
     }
 
     #[test]
