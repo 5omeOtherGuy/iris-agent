@@ -38,6 +38,24 @@ pub(crate) struct OpenAiCodexTokenStore {
     storage: AuthStore,
 }
 
+/// Serializes token refreshes process-wide. OpenAI rotates the refresh token
+/// on every use, so concurrent refreshes (observed live: an 8-worker subagent
+/// group spawning at once) race the rotation and the losers fail their turn
+/// with an auth rejection. One caller refreshes; the rest reuse its result.
+static REFRESH_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Decide, after acquiring [`REFRESH_GUARD`], whether the caller still needs
+/// its own refresh or can reuse a peer's freshly persisted credentials.
+///
+/// `stale_access` is `None` on the expiry path (`access_token`) and the
+/// server-rejected bearer on the forced path (`force_refresh`).
+fn needs_refresh(stale_access: Option<&str>, current: &OAuthCredentials, now: u128) -> bool {
+    match stale_access {
+        None => current.expires <= now,
+        Some(stale) => current.access == stale,
+    }
+}
+
 impl OpenAiCodexTokenStore {
     pub(crate) fn from_env() -> Result<Self> {
         Ok(Self {
@@ -49,9 +67,7 @@ impl OpenAiCodexTokenStore {
         let mut credentials = self.storage.oauth_credentials(AUTH_PROVIDER)?;
 
         if credentials.expires <= now_millis() {
-            credentials = refresh_access_token(client, &credentials.refresh)?;
-            self.storage
-                .set_oauth_credentials(AUTH_PROVIDER, credentials.clone())?;
+            credentials = self.refresh_synchronized(client, None)?;
         }
 
         let account_id = extract_account_id(&credentials.access)?;
@@ -61,21 +77,40 @@ impl OpenAiCodexTokenStore {
         })
     }
 
-    /// Refresh the access token unconditionally and persist the result.
+    /// Refresh the access token and persist the result.
     ///
     /// Used when the provider receives an auth rejection (HTTP 401/403) even
     /// though the locally cached token had not yet expired, so a single forced
-    /// refresh can recover a server-side-invalidated token.
+    /// refresh can recover a server-side-invalidated token. If a concurrent
+    /// caller already rotated the rejected token, its replacement is reused
+    /// instead of refreshing again.
     pub(crate) fn force_refresh(&self, client: &Client) -> Result<AccessToken> {
-        let credentials = self.storage.oauth_credentials(AUTH_PROVIDER)?;
-        let refreshed = refresh_access_token(client, &credentials.refresh)?;
-        self.storage
-            .set_oauth_credentials(AUTH_PROVIDER, refreshed.clone())?;
+        let stale = self.storage.oauth_credentials(AUTH_PROVIDER)?;
+        let refreshed = self.refresh_synchronized(client, Some(&stale.access))?;
         let account_id = extract_account_id(&refreshed.access)?;
         Ok(AccessToken {
             bearer: refreshed.access,
             account_id,
         })
+    }
+
+    fn refresh_synchronized(
+        &self,
+        client: &Client,
+        stale_access: Option<&str>,
+    ) -> Result<OAuthCredentials> {
+        let _guard = REFRESH_GUARD
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // Re-read after the lock: a peer may have refreshed while we waited.
+        let current = self.storage.oauth_credentials(AUTH_PROVIDER)?;
+        if !needs_refresh(stale_access, &current, now_millis()) {
+            return Ok(current);
+        }
+        let refreshed = refresh_access_token(client, &current.refresh)?;
+        self.storage
+            .set_oauth_credentials(AUTH_PROVIDER, refreshed.clone())?;
+        Ok(refreshed)
     }
 }
 
@@ -394,6 +429,35 @@ fn now_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn credentials(access: &str, expires: u128) -> OAuthCredentials {
+        OAuthCredentials {
+            access: access.to_string(),
+            refresh: "refresh-token".to_string(),
+            expires,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn refresh_after_lock_reuses_a_peer_refreshed_token() {
+        // Concurrent workers (live: an 8-worker group spawn) must not race the
+        // rotating refresh token; only the first caller through the lock may
+        // refresh, the rest reuse its result.
+        let fresh = credentials("rotated-token", u128::MAX);
+        // access_token: a peer's refresh made the stored token valid again.
+        assert!(!needs_refresh(None, &fresh, 1_000));
+        // access_token: still expired after waiting -> refresh.
+        assert!(needs_refresh(None, &credentials("old", 500), 1_000));
+        // force_refresh: the rejected token is still stored -> refresh.
+        assert!(needs_refresh(
+            Some("rejected"),
+            &credentials("rejected", u128::MAX),
+            1_000
+        ));
+        // force_refresh: a peer already rotated the rejected token -> reuse.
+        assert!(!needs_refresh(Some("rejected"), &fresh, 1_000));
+    }
 
     #[test]
     fn extracts_account_id_from_jwt_payload() -> Result<()> {

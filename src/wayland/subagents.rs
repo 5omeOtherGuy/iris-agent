@@ -469,8 +469,16 @@ impl NexusWorker {
                         .with_context(|| format!("worker cwd does not exist: {}", cwd.display()))?,
                     None => root.clone(),
                 };
-                if !workspace.is_dir() || (workspace != root && !workspace.starts_with(&root)) {
-                    anyhow::bail!("worker cwd must stay inside the validated parent workspace");
+                // A cwd outside the parent workspace (typically a sibling task
+                // worktree) needs the same explicit grant that lets read tools
+                // leave the workspace; the child agent still confines mutation
+                // to its own workspace root.
+                let inside = workspace == root || workspace.starts_with(&root);
+                if !workspace.is_dir() || (!inside && !request.policy.allow_outside_workspace) {
+                    anyhow::bail!(
+                        "worker cwd must stay inside the validated parent workspace; \
+                         pass allow_outside_workspace=true to grant an outside cwd"
+                    );
                 }
                 Ok((workspace, None))
             }
@@ -1433,6 +1441,62 @@ mod tests {
         assert_eq!(
             *observed.lock().unwrap_or_else(|poison| poison.into_inner()),
             vec![route; 3]
+        );
+
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_cwd_outside_parent_workspace_requires_explicit_grant() {
+        let root = std::env::temp_dir().join(format!(
+            "iris-wayland-worker-cwd-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        // Sibling task worktrees are the observed live case: the parent session
+        // runs in the primary checkout and delegates work rooted next to it.
+        let outside = root.join("sibling-worktree");
+        std::fs::create_dir(&outside).unwrap();
+        let backend =
+            SubagentBackend::open(workspace, &root.join("state"), root.join("worktrees")).unwrap();
+
+        let mut confined = WorkerRequest::read_only("outside cwd denied");
+        confined.policy.cwd = Some(outside.clone());
+        let id = backend
+            .spawn(
+                Arc::new(|_| Ok(Box::new(TextProvider(Rc::new(()))))),
+                confined,
+                None,
+            )
+            .unwrap();
+        let result = wait_worker(&backend, &id);
+        assert_eq!(result.status, iris_subagent_runtime::WorkerStatus::Failed);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("worker cwd"),
+            "{result:?}"
+        );
+
+        let mut granted = WorkerRequest::read_only("outside cwd granted");
+        granted.policy.cwd = Some(outside);
+        granted.policy.allow_outside_workspace = true;
+        let id = backend
+            .spawn(
+                Arc::new(|_| Ok(Box::new(TextProvider(Rc::new(()))))),
+                granted,
+                None,
+            )
+            .unwrap();
+        let result = wait_worker(&backend, &id);
+        assert_eq!(
+            result.status,
+            iris_subagent_runtime::WorkerStatus::Completed
         );
 
         drop(backend);

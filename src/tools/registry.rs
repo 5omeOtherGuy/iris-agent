@@ -312,12 +312,12 @@ impl Tool for SpawnSubagentTool {
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Existing parent-workspace directory for non-isolated read_only work."
+                    "description": "Existing parent-workspace directory for non-isolated read_only work; outside dirs need allow_outside_workspace."
                 },
                 "allow_outside_workspace": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Let read tools leave the worker workspace; mutation remains confined."
+                    "description": "Let read tools leave the worker workspace and permit an outside cwd; mutation remains confined."
                 },
                 "background": {
                     "type": "boolean",
@@ -533,7 +533,7 @@ impl Tool for SubagentStatusTool {
         "subagent_status"
     }
     fn description(&self) -> &str {
-        "Return a non-waiting snapshot for exactly one worker or group; groups include every member."
+        "Return a non-waiting snapshot for one worker or group; groups include every member. worker_id wins if both are set."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -563,16 +563,9 @@ impl Tool for SubagentStatusTool {
         _cancel: CancellationToken,
     ) -> ToolFuture<'a> {
         Box::pin(async move {
-            let worker_id = parse_optional_worker_id(args)?;
-            let group_id = parse_optional_group_id(args)?;
-            let value = match (worker_id, group_id) {
-                (Some(id), None) => serde_json::to_value(self.0.poll(&id)?)?,
-                (None, Some(id)) => serde_json::to_value(self.0.poll_group(&id)?)?,
-                _ => {
-                    return Err(anyhow!(
-                        "subagent_status requires exactly one of worker_id or group_id"
-                    ));
-                }
+            let value = match resolve_subagent_selector(args, "subagent_status")? {
+                SubagentSelector::Worker(id) => serde_json::to_value(self.0.poll(&id)?)?,
+                SubagentSelector::Group(id) => serde_json::to_value(self.0.poll_group(&id)?)?,
             };
             Ok(ToolOutput::text(serde_json::to_string(&value)?))
         })
@@ -675,7 +668,7 @@ impl Tool for CancelSubagentTool {
         "cancel_subagent"
     }
     fn description(&self) -> &str {
-        "Cancel exactly one worker or group cooperatively; hard-abort after the grace period."
+        "Cancel one worker or group cooperatively; hard-abort after the grace period. worker_id wins if both are set."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -705,16 +698,9 @@ impl Tool for CancelSubagentTool {
         _cancel: CancellationToken,
     ) -> ToolFuture<'a> {
         Box::pin(async move {
-            let worker_id = parse_optional_worker_id(args)?;
-            let group_id = parse_optional_group_id(args)?;
-            let value = match (worker_id, group_id) {
-                (Some(id), None) => serde_json::to_value(self.0.cancel(&id)?)?,
-                (None, Some(id)) => serde_json::to_value(self.0.cancel_group(&id)?)?,
-                _ => {
-                    return Err(anyhow!(
-                        "cancel_subagent requires exactly one of worker_id or group_id"
-                    ));
-                }
+            let value = match resolve_subagent_selector(args, "cancel_subagent")? {
+                SubagentSelector::Worker(id) => serde_json::to_value(self.0.cancel(&id)?)?,
+                SubagentSelector::Group(id) => serde_json::to_value(self.0.cancel_group(&id)?)?,
             };
             Ok(ToolOutput::text(serde_json::to_string(&value)?))
         })
@@ -975,6 +961,44 @@ fn parse_optional_worker_id(args: &Value) -> Result<Option<iris_subagent_runtime
         .map(str::parse)
         .transpose()
         .map_err(Into::into)
+}
+
+enum SubagentSelector {
+    Worker(iris_subagent_runtime::WorkerId),
+    Group(iris_subagent_runtime::GroupId),
+}
+
+/// Resolve the worker/group target of `subagent_status` and `cancel_subagent`
+/// from model-authored arguments.
+///
+/// Models routinely fill BOTH id fields even when targeting one record --
+/// live sessions used placeholders like `:invalid`, blanks, or the worker id
+/// pasted into `group_id` -- and a strict "exactly one" contract made status
+/// and cancellation unreachable for them. Classify every provided value by
+/// what it actually parses as, ignore junk, and prefer the worker when both
+/// resolve.
+fn resolve_subagent_selector(args: &Value, tool: &str) -> Result<SubagentSelector> {
+    let mut worker = None;
+    let mut group = None;
+    for key in ["worker_id", "group_id"] {
+        let Some(raw) = args.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let raw = raw.trim();
+        if let Ok(id) = raw.parse::<iris_subagent_runtime::WorkerId>() {
+            worker.get_or_insert(id);
+        } else if let Ok(id) = raw.parse::<iris_subagent_runtime::GroupId>() {
+            group.get_or_insert(id);
+        }
+    }
+    match (worker, group) {
+        (Some(worker), _) => Ok(SubagentSelector::Worker(worker)),
+        (None, Some(group)) => Ok(SubagentSelector::Group(group)),
+        (None, None) => Err(anyhow!(
+            "{tool} needs a valid worker_id (wrk_...) or group_id (grp_...); \
+             the unused field may be omitted"
+        )),
+    }
 }
 
 fn parse_optional_group_id(args: &Value) -> Result<Option<iris_subagent_runtime::GroupId>> {
@@ -2373,9 +2397,9 @@ mod tests {
                         "web_search" => (1_130, 283),
                         "read_web_page" => (620, 155),
                         "spawn_subagent" => (2_500, 625),
-                        "subagent_status" => (415, 104),
+                        "subagent_status" => (435, 109),
                         "read_subagent_output" => (550, 138),
-                        "cancel_subagent" => (410, 103),
+                        "cancel_subagent" => (430, 108),
                         "select_subagent_candidate" => (500, 125),
                         "plan_subagent_apply" => (400, 100),
                         "apply_subagent" => (960, 240),
@@ -2486,14 +2510,14 @@ mod tests {
         }
         for (name, needles) in [
             ("spawn_subagent", &["best-of-N", "isolated", "applied"][..]),
-            ("subagent_status", &["exactly one", "every member"][..]),
+            ("subagent_status", &["worker_id wins", "every member"][..]),
             (
                 "read_subagent_output",
                 &["UTF-8", "artifact", "terminal"][..],
             ),
             (
                 "cancel_subagent",
-                &["exactly one", "hard-abort", "grace"][..],
+                &["worker_id wins", "hard-abort", "grace"][..],
             ),
             (
                 "select_subagent_candidate",
@@ -2706,18 +2730,45 @@ mod tests {
         let group_id = iris_subagent_runtime::GroupId::new().to_string();
         for tool_name in ["subagent_status", "cancel_subagent"] {
             let tool = subagent_tools.by_name(tool_name).unwrap();
+            // Nothing usable in either field: a guidance error naming both
+            // accepted id shapes.
             for invalid in [
                 json!({}),
-                json!({ "worker_id": worker_id, "group_id": group_id }),
+                json!({ "worker_id": ":invalid", "group_id": " " }),
             ] {
                 let error = current_thread_runtime()
                     .block_on(tool.execute(&invalid, &env, CancellationToken::new()))
                     .unwrap_err();
                 assert!(
-                    error
-                        .to_string()
-                        .contains("requires exactly one of worker_id or group_id"),
+                    error.to_string().contains("worker_id (wrk_"),
                     "unexpected {tool_name} selector error: {error:#}"
+                );
+            }
+            // Models routinely fill BOTH id fields (live sessions used
+            // placeholders like \":invalid\" or pasted the worker id into
+            // group_id); junk is ignored, valid ids resolve, and worker_id
+            // wins when both parse.
+            for (args, needle) in [
+                (
+                    json!({ "worker_id": worker_id, "group_id": ":invalid" }),
+                    "worker not found",
+                ),
+                (json!({ "group_id": worker_id }), "worker not found"),
+                (
+                    json!({ "worker_id": worker_id, "group_id": group_id }),
+                    "worker not found",
+                ),
+                (
+                    json!({ "worker_id": ":invalid", "group_id": group_id }),
+                    "group not found",
+                ),
+            ] {
+                let error = current_thread_runtime()
+                    .block_on(tool.execute(&args, &env, CancellationToken::new()))
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains(needle),
+                    "unexpected {tool_name} error for {args}: {error:#}"
                 );
             }
         }
