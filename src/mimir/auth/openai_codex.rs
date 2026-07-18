@@ -102,7 +102,13 @@ impl OpenAiCodexTokenStore {
         let _guard = REFRESH_GUARD
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        // Re-read after the lock: a peer may have refreshed while we waited.
+        // Serialize against OTHER iris processes sharing this auth file (a
+        // concurrent session forcing a refresh rotates the refresh token out
+        // from under us just like a concurrent worker would). Taken inside
+        // REFRESH_GUARD so lock order is fixed.
+        let _file_lock = self.storage.lock_for_refresh()?;
+        // Re-read after the locks: a peer (thread or process) may have
+        // refreshed while we waited.
         let current = self.storage.oauth_credentials(AUTH_PROVIDER)?;
         if !needs_refresh(stale_access, &current, now_millis()) {
             return Ok(current);
