@@ -974,26 +974,32 @@ enum SubagentSelector {
 /// Models routinely fill BOTH id fields even when targeting one record --
 /// live sessions used placeholders like `:invalid`, blanks, or the worker id
 /// pasted into `group_id` -- and a strict "exactly one" contract made status
-/// and cancellation unreachable for them. Classify every provided value by
-/// what it actually parses as, ignore junk, and prefer the worker when both
-/// resolve.
+/// and cancellation unreachable for them. A value in its named field is
+/// authoritative (worker_id wins when both match their fields); junk is
+/// ignored; a single valid id in the wrong field is rescued. A full
+/// cross-swap carries two distinct valid targets with no field to trust, so
+/// it is refused rather than guessed.
 fn resolve_subagent_selector(args: &Value, tool: &str) -> Result<SubagentSelector> {
-    let mut worker = None;
-    let mut group = None;
-    for key in ["worker_id", "group_id"] {
-        let Some(raw) = args.get(key).and_then(Value::as_str) else {
-            continue;
-        };
-        let raw = raw.trim();
-        if let Ok(id) = raw.parse::<iris_subagent_runtime::WorkerId>() {
-            worker.get_or_insert(id);
-        } else if let Ok(id) = raw.parse::<iris_subagent_runtime::GroupId>() {
-            group.get_or_insert(id);
-        }
+    let field = |key| args.get(key).and_then(Value::as_str).map(str::trim);
+    let worker_field = field("worker_id");
+    let group_field = field("group_id");
+    if let Some(Ok(id)) = worker_field.map(str::parse::<iris_subagent_runtime::WorkerId>) {
+        return Ok(SubagentSelector::Worker(id));
     }
-    match (worker, group) {
-        (Some(worker), _) => Ok(SubagentSelector::Worker(worker)),
-        (None, Some(group)) => Ok(SubagentSelector::Group(group)),
+    if let Some(Ok(id)) = group_field.map(str::parse::<iris_subagent_runtime::GroupId>) {
+        return Ok(SubagentSelector::Group(id));
+    }
+    let swapped_worker =
+        group_field.and_then(|raw| raw.parse::<iris_subagent_runtime::WorkerId>().ok());
+    let swapped_group =
+        worker_field.and_then(|raw| raw.parse::<iris_subagent_runtime::GroupId>().ok());
+    match (swapped_worker, swapped_group) {
+        (Some(id), None) => Ok(SubagentSelector::Worker(id)),
+        (None, Some(id)) => Ok(SubagentSelector::Group(id)),
+        (Some(_), Some(_)) => Err(anyhow!(
+            "{tool} got a group id in worker_id and a worker id in group_id; \
+             resend with each id in its named field"
+        )),
         (None, None) => Err(anyhow!(
             "{tool} needs a valid worker_id (wrk_...) or group_id (grp_...); \
              the unused field may be omitted"
@@ -2771,6 +2777,17 @@ mod tests {
                     "unexpected {tool_name} error for {args}: {error:#}"
                 );
             }
+            // A full cross-swap -- a group id in worker_id AND a worker id in
+            // group_id -- carries two distinct valid targets with no field to
+            // trust: refuse rather than guess which entity was meant.
+            let swapped = json!({ "worker_id": group_id, "group_id": worker_id });
+            let error = current_thread_runtime()
+                .block_on(tool.execute(&swapped, &env, CancellationToken::new()))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("named field"),
+                "unexpected {tool_name} cross-swap error: {error:#}"
+            );
         }
 
         let failed = current_thread_runtime()
