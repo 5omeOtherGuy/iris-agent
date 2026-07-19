@@ -873,7 +873,7 @@ fn websocket_close_diagnostics_keep_code_and_only_safe_reason() {
 }
 
 #[test]
-fn only_close_before_any_event_on_a_reused_socket_is_silently_recovered() {
+fn only_transport_termination_before_any_event_on_a_reused_socket_is_silently_recovered() {
     assert!(should_recover_stale_reuse(true, None));
     assert!(!should_recover_stale_reuse(false, None));
     assert!(!should_recover_stale_reuse(true, Some("response.created")));

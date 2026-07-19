@@ -1195,6 +1195,11 @@ impl OpenAiCodexResponsesProvider {
                 }
             };
             let Some(message) = next else {
+                if should_recover_stale_reuse(socket_reused, parser.last_event_type.as_deref()) {
+                    let error: anyhow::Error =
+                        stale_reuse_close(None, reusable_socket_age_ms(&reusable)).into();
+                    return Err((WsFallback::RetryWebSocket, error));
+                }
                 let error: anyhow::Error = CodexStreamProtocolAnomaly::closed_before_completed(
                     parser.last_event_type.clone(),
                 )
@@ -1264,13 +1269,8 @@ impl OpenAiCodexResponsesProvider {
                 Ok(WsMessage::Close(frame)) => {
                     if should_recover_stale_reuse(socket_reused, parser.last_event_type.as_deref())
                     {
-                        let socket_age_ms = reusable
-                            .opened_at
-                            .elapsed()
-                            .as_millis()
-                            .min(u128::from(u64::MAX))
-                            as u64;
-                        let error: anyhow::Error = stale_reuse_close(frame, socket_age_ms).into();
+                        let error: anyhow::Error =
+                            stale_reuse_close(frame, reusable_socket_age_ms(&reusable)).into();
                         return Err((WsFallback::RetryWebSocket, error));
                     }
                     let close = websocket_close_error(frame, parser.last_event_type.clone());
@@ -1283,6 +1283,12 @@ impl OpenAiCodexResponsesProvider {
                 }
                 Ok(WsMessage::Frame(_)) => {}
                 Err(error) => {
+                    if should_recover_stale_reuse(socket_reused, parser.last_event_type.as_deref())
+                    {
+                        let error: anyhow::Error =
+                            stale_reuse_close(None, reusable_socket_age_ms(&reusable)).into();
+                        return Err((WsFallback::RetryWebSocket, error));
+                    }
                     let model = safe_error_field(&self.model).unwrap_or("redacted");
                     let error = anyhow!(
                         "Codex WebSocket read failed [classification=websocket_read_error provider={PROVIDER_ID} model={model} transport=websocket phase={phase} last_event={} error={}]",
@@ -2263,6 +2269,14 @@ where
 
 fn should_recover_stale_reuse(socket_reused: bool, last_event: Option<&str>) -> bool {
     socket_reused && last_event.is_none()
+}
+
+fn reusable_socket_age_ms(socket: &ReusableCodexWs) -> u64 {
+    socket
+        .opened_at
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn stale_reuse_close(
