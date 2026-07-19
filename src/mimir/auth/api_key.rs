@@ -25,6 +25,10 @@ pub(crate) fn api_key_for_provider(
     Ok(env_api_key(provider))
 }
 
+pub(crate) fn env_api_key_available(provider: ProviderId) -> bool {
+    env_api_key(provider).is_some()
+}
+
 fn env_api_key(provider: ProviderId) -> Option<String> {
     let names: &[&str] = match provider {
         ProviderId::OpenAi => &["OPENAI_API_KEY"],
