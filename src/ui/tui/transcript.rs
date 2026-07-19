@@ -2921,6 +2921,7 @@ impl Transcript {
                 // matches provider context.
                 self.commit_user(&text);
             }
+            UiEvent::ProviderTransportRecovery => {}
             UiEvent::Notice(message) => {
                 self.push_notice_row(crate::ui::symbols::SEP, dim_style(), &message);
             }

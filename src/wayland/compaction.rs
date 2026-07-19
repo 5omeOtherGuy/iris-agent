@@ -423,6 +423,18 @@ impl CompactionEngine {
         }
     }
 
+    pub(super) fn persist_transport_recovery(&mut self, recovery: &ProviderTransportRecovery) {
+        let Some(log) = self.session.as_mut() else {
+            return;
+        };
+        if let Err(error) = log.append_provider_transport_recovery(recovery) {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "failed to persist provider transport recovery"
+            );
+        }
+    }
+
     /// Parent-owned compaction mutation shared by turn-edge and governed
     /// mid-turn callers. It validates shrink, registers recall/carry, appends
     /// the durable entry, updates the engine's id map, and returns the exact

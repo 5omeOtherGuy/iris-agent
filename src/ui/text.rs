@@ -594,6 +594,7 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                 self.exploring_open = false;
                 writeln!(self.out, "{}", sgr(self.ansi, "1", &format!("> {text}")))?;
             }
+            UiEvent::ProviderTransportRecovery => {}
             UiEvent::Notice(message) => {
                 self.finish_assistant_stream()?;
                 self.in_tool_block = false;

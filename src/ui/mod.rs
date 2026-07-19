@@ -304,6 +304,8 @@ pub(crate) enum UiEvent {
     /// matches provider context. See [`AgentEvent::UserMessage`].
     UserMessage(String),
     Notice(String),
+    /// Silent operational metadata consumed by Wayland for session diagnostics.
+    ProviderTransportRecovery,
     /// The task's final net diff (issue #264, `/diff`): a per-file summary plus
     /// the combined unified diff. Rendered through the existing diff colorizer
     /// in the TUI and as plain text on the non-TTY path. A UI-only event -- it
@@ -447,6 +449,7 @@ impl UiEvent {
             AgentEvent::ProviderReconnect(reconnect) => {
                 UiEvent::Notice(provider_reconnect_notice(&reconnect))
             }
+            AgentEvent::ProviderTransportRecovery(_) => UiEvent::ProviderTransportRecovery,
             AgentEvent::ToolLifecycle {
                 provider_turn_id,
                 call_id,

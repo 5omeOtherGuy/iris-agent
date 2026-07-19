@@ -53,7 +53,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::goal::Goal;
-use crate::nexus::{Message, ModelOrigin, ProviderTransportFallback, Role};
+use crate::nexus::{
+    Message, ModelOrigin, ProviderTransportFallback, ProviderTransportRecovery, Role,
+};
 
 /// Durable detail for one range-compaction entry. This is an inspection view,
 /// not provider context: originals are counted from raw message rows and remain
@@ -551,6 +553,39 @@ impl SessionLog {
         write_line(&mut self.file, &entry).with_context(|| {
             format!(
                 "failed to append provider transport fallback to session {}",
+                self.path.display()
+            )
+        })?;
+        self.last_id = Some(id.clone());
+        Ok(id)
+    }
+
+    /// Append safe metadata for a silent provider transport recovery. Like the
+    /// fallback audit row, this never enters reconstructed provider context.
+    pub(crate) fn append_provider_transport_recovery(
+        &mut self,
+        recovery: &ProviderTransportRecovery,
+    ) -> Result<String> {
+        let id = self.next_id();
+        let entry = json!({
+            "type": "providerTransportRecovery",
+            "id": id,
+            "parentId": self.last_id.as_deref(),
+            "timestamp": now_ms(),
+            "provider": recovery.provider,
+            "model": recovery.model,
+            "transport": recovery.transport,
+            "reason": recovery.reason,
+            "phase": recovery.phase,
+            "closeCode": recovery.close_code,
+            "closeReason": recovery.close_reason,
+            "socketReused": recovery.socket_reused,
+            "socketAgeMs": recovery.socket_age_ms,
+            "lastEvent": recovery.last_event,
+        });
+        write_line(&mut self.file, &entry).with_context(|| {
+            format!(
+                "failed to append provider transport recovery to session {}",
                 self.path.display()
             )
         })?;

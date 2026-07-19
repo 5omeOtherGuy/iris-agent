@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::mimir::retry::RetryPolicy;
 use crate::nexus::{
     AssistantTurn, ProviderEvent, ProviderReconnect, ProviderStream, ProviderTransportFallback,
+    ProviderTransportRecovery,
 };
 
 /// How long to wait for a TCP connect + TLS handshake before classifying the
@@ -253,6 +254,15 @@ impl ChannelSink {
             .unbounded_send(Ok(ProviderEvent::Reconnect(reconnect)))
             .map_err(|_| anyhow!("response stream dropped by consumer"))
     }
+
+    pub(super) fn on_transport_recovery(
+        &mut self,
+        recovery: ProviderTransportRecovery,
+    ) -> Result<()> {
+        self.tx
+            .unbounded_send(Ok(ProviderEvent::TransportRecovery(recovery)))
+            .map_err(|_| anyhow!("response stream dropped by consumer"))
+    }
 }
 
 impl TurnSink for ChannelSink {
@@ -436,6 +446,7 @@ fn provider_event_label(event: &Result<ProviderEvent>) -> &'static str {
         Ok(ProviderEvent::Activity) => "activity",
         Ok(ProviderEvent::TransportFallback(_)) => "transport_fallback",
         Ok(ProviderEvent::Reconnect(_)) => "reconnect",
+        Ok(ProviderEvent::TransportRecovery(_)) => "transport_recovery",
         Ok(ProviderEvent::TextDelta(_)) => "text_delta",
         Ok(ProviderEvent::ReasoningDelta(_)) => "reasoning_delta",
         Ok(ProviderEvent::RawReasoningDelta(_)) => "raw_reasoning_delta",

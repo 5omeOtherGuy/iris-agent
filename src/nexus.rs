@@ -375,6 +375,22 @@ pub(crate) struct ProviderReconnect {
     pub(crate) phase: String,
 }
 
+/// Safe metadata for a transport recovery that does not consume the bounded
+/// retry budget or require a user-facing notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderTransportRecovery {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) transport: String,
+    pub(crate) reason: String,
+    pub(crate) phase: String,
+    pub(crate) close_code: Option<u16>,
+    pub(crate) close_reason: Option<String>,
+    pub(crate) socket_reused: bool,
+    pub(crate) socket_age_ms: u64,
+    pub(crate) last_event: Option<String>,
+}
+
 /// The semantic events the loop emits during a turn. Provider- and UI-neutral:
 /// a front-end maps these onto its own rendering. Mirrors pi's `AgentEvent`
 /// union (`packages/agent/src/types.ts`).
@@ -428,6 +444,9 @@ pub(crate) enum AgentEvent {
     /// A provider transport is reconnecting within its bounded retry budget.
     /// Operational classifications only; no provider error text or payload.
     ProviderReconnect(ProviderReconnect),
+    /// A provider silently replaced a stale reusable transport before model
+    /// output. Wayland persists the safe metadata without rendering a warning.
+    ProviderTransportRecovery(ProviderTransportRecovery),
     /// Provider-neutral tool lifecycle metadata for observability. The existing
     /// display events remain for UI compatibility; this compact event carries
     /// only ids/state and never includes tool arguments, output, provider
@@ -714,6 +733,8 @@ pub(crate) enum ProviderEvent {
     TransportFallback(ProviderTransportFallback),
     /// The adapter is reconnecting a transport after a retryable failure.
     Reconnect(ProviderReconnect),
+    /// The adapter silently replaced a stale reusable transport.
+    TransportRecovery(ProviderTransportRecovery),
     /// Incremental assistant text.
     TextDelta(String),
     /// Incremental reasoning-summary text (never raw chain-of-thought or
@@ -2735,6 +2756,9 @@ impl<P: ChatProvider> Agent<P> {
                     }
                     Some(Ok(ProviderEvent::Reconnect(reconnect))) => {
                         obs.on_event(AgentEvent::ProviderReconnect(reconnect))?;
+                    }
+                    Some(Ok(ProviderEvent::TransportRecovery(recovery))) => {
+                        obs.on_event(AgentEvent::ProviderTransportRecovery(recovery))?;
                     }
                     Some(Ok(ProviderEvent::Activity)) => {}
                     Some(Ok(ProviderEvent::Completed(turn))) => {
