@@ -167,7 +167,7 @@ pub(crate) struct ChildRoute {
     pub(crate) model: String,
     pub(crate) base_url: String,
     pub(crate) effort: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) credential_lane: Option<crate::mimir::model_catalog::CredentialLaneKind>,
 }
 
@@ -271,6 +271,19 @@ fn configure_child_agent(request: &WorkerRequest, agent: &mut Agent<Box<dyn Chat
     config.allow_outside_workspace_reads = request.policy.allow_outside_workspace;
 }
 
+fn tools_for_worker(request: &WorkerRequest) -> Result<crate::nexus::Tools> {
+    let tools = match &request.policy.tools {
+        Some(names) => built_in_tools().into_allowlist(names),
+        None => built_in_tools().into_capability(WorkerCapabilityGrant::ReadOnly),
+    };
+    if request.policy.isolation != IsolationMode::Worktree
+        && tools.iter().any(|tool| tool.is_mutating())
+    {
+        anyhow::bail!("mutation-capable worker tools require worktree isolation");
+    }
+    Ok(tools)
+}
+
 /// Iris-owned child-agent adapter sharing the single backend scheduler.
 pub(crate) struct SubagentBackend {
     runtime: Arc<WorkerRuntime>,
@@ -299,6 +312,7 @@ impl SubagentBackend {
         request: WorkerRequest,
         approval: Option<Arc<dyn ApprovalPort>>,
     ) -> Result<iris_subagent_runtime::WorkerId> {
+        tools_for_worker(&request)?;
         let workspace = self.workspace.clone();
         let worktrees = self.worktrees.clone();
         let worker_runtime = self.runtime.clone();
@@ -327,6 +341,9 @@ impl SubagentBackend {
         requests: Vec<WorkerRequest>,
         approval: Option<Arc<dyn ApprovalPort>>,
     ) -> Result<iris_subagent_runtime::GroupId> {
+        for request in &requests {
+            tools_for_worker(request)?;
+        }
         let configure_agent = self.configure_agent;
         let jobs = requests
             .into_iter()
@@ -521,6 +538,7 @@ impl WorkerExecutor for NexusWorker {
     fn execute<'a>(&'a mut self, context: WorkerContext) -> LocalExecutorFuture<'a> {
         Box::pin(async move {
             let request = context.request().clone();
+            let tools = tools_for_worker(&request).map_err(executor_error)?;
             let (workspace, worktree) = self
                 .resolve_workspace(&request, &context)
                 .await
@@ -531,10 +549,6 @@ impl WorkerExecutor for NexusWorker {
                 ));
             }
             let provider = (self.provider_factory)(&request).map_err(executor_error)?;
-            let tools = match &request.policy.tools {
-                Some(names) => built_in_tools().into_allowlist(names),
-                None => built_in_tools().into_capability(WorkerCapabilityGrant::ReadOnly),
-            };
             let mut agent = Agent::new(provider, tools);
             (self.configure_agent)(&request, &mut agent);
             let mut harness = Harness::new_configured(
@@ -993,6 +1007,44 @@ mod tests {
     }
 
     #[test]
+    fn persisted_pre_credential_lane_route_id_still_authenticates() {
+        #[derive(Serialize)]
+        struct LegacyChildRoute<'a> {
+            provider: &'a str,
+            model: &'a str,
+            base_url: &'a str,
+            effort: Option<&'a str>,
+        }
+
+        let legacy = LegacyChildRoute {
+            provider: "anthropic",
+            model: "claude-opus-4-6",
+            base_url: "https://api.anthropic.com",
+            effort: Some("high"),
+        };
+        let digest = Sha256::digest(serde_json::to_vec(&legacy).unwrap());
+        let mut suffix = String::with_capacity(32);
+        for byte in &digest[..16] {
+            write!(&mut suffix, "{byte:02x}").unwrap();
+        }
+        let mut request = WorkerRequest::read_only("legacy routed worker");
+        request.route_id = Some(format!("{IRIS_ROUTE_ID_PREFIX}{suffix}"));
+        request.host.schema_version = IRIS_ROUTE_SCHEMA_VERSION;
+        request.host.kind = IRIS_ROUTE_PAYLOAD_KIND.to_string();
+        request.host.value = serde_json::to_value(legacy).unwrap();
+
+        assert_eq!(
+            route_from_request(&request).unwrap(),
+            Some(ChildRoute::new(
+                "anthropic",
+                "claude-opus-4-6",
+                "https://api.anthropic.com",
+                Some("high"),
+            ))
+        );
+    }
+
+    #[test]
     fn malformed_claimed_iris_route_fails_closed_while_legacy_requests_inherit() {
         let legacy = WorkerRequest::read_only("legacy");
         assert_eq!(route_from_request(&legacy).unwrap(), None);
@@ -1446,6 +1498,35 @@ mod tests {
             iris_subagent_runtime::WorkerStatus::Completed
         );
         assert_eq!(result.summary, "filtered before first turn");
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn direct_mutating_tool_grants_require_worktree_isolation() {
+        let root = std::env::temp_dir().join(format!(
+            "iris-wayland-worker-direct-mutating-tools-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let backend =
+            SubagentBackend::open(workspace, &root.join("state"), root.join("worktrees")).unwrap();
+        let factory: ChildProviderFactory = Arc::new(|_| Ok(Box::new(TextProvider(Rc::new(())))));
+        let mut request = WorkerRequest::read_only("unsafe direct grant");
+        request.policy.tools = Some(vec!["write".to_string()]);
+
+        let result = backend.spawn(factory, request, None);
+        if let Ok(id) = &result {
+            backend.cancel(id).unwrap();
+        }
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("mutation-capable worker tools require worktree isolation"),
+            "{error}"
+        );
+
         drop(backend);
         std::fs::remove_dir_all(root).unwrap();
     }
