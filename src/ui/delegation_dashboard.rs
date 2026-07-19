@@ -1733,6 +1733,10 @@ fn worker_detail_lines(
 ) -> Vec<String> {
     let (glyph, label) = worker_state(worker.status);
     let request = &worker.request;
+    let tool_policy = request.policy.tools.as_ref().map_or_else(
+        || "default tools".to_string(),
+        |tools| format!("{} tools", tools.len()),
+    );
     let mut lines = vec![
         format!("{glyph} {label}  {}", worker.worker_id),
         format!("description  {}", worker_description(worker)),
@@ -1741,8 +1745,7 @@ fn worker_detail_lines(
             request.kind, request.priority
         ),
         format!(
-            "policy       capability {:?} · isolation {:?} · outside reads {}",
-            request.policy.capability,
+            "policy       {tool_policy} · isolation {:?} · outside reads {}",
             request.policy.isolation,
             if request.policy.allow_outside_workspace {
                 "allowed"
@@ -2236,12 +2239,6 @@ fn budget_line(budgets: &iris_subagent_runtime::WorkerBudgets) -> String {
     if let Some(rounds) = budgets.max_provider_rounds {
         fields.push(format!("{rounds} provider rounds"));
     }
-    if let Some(rounds) = budgets.max_tool_rounds {
-        fields.push(format!("{rounds} tool rounds"));
-    }
-    if let Some(tokens) = budgets.max_tokens {
-        fields.push(format!("{} tokens", compact_count(tokens)));
-    }
     fields.join(" · ")
 }
 
@@ -2375,14 +2372,13 @@ mod tests {
                 "schema_version": 1,
                 "kind": {"type": "general"},
                 "prompt": description,
+                "system_prompt": "delegated worker",
                 "description": description,
                 "priority": "normal",
                 "policy": {
-                    "capability": "read_only",
-                    "parent_capability": "all",
+                    "tools": null,
                     "isolation": "none",
                     "cwd": null,
-                    "tool_allowlist": [],
                     "allow_outside_workspace": false,
                     "nesting_depth": 0,
                     "max_nesting_depth": 2

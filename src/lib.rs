@@ -484,10 +484,17 @@ fn child_provider_factory(
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone();
-        build_provider(
+        let system_prompt = if request.system_prompt.trim().is_empty() {
+            "You are an isolated delegated Iris worker. Follow the supplied instruction, use only the advertised tools, and report exact results without claiming parent-workspace mutations."
+        } else {
+            &request.system_prompt
+        };
+        build_provider_for_lane(
             &effective,
-            "You are an isolated delegated Iris worker. Follow the supplied instruction, use only the advertised tools, and report exact results without claiming parent-workspace mutations.",
+            system_prompt,
             &session_id,
+            wayland::subagents::route_from_request(request)?
+                .and_then(|route| route.credential_lane),
         )
     })
 }
@@ -513,17 +520,21 @@ fn subagent_tools_config(
     let catalog = {
         let settings = config::Settings::load(cwd).unwrap_or_default();
         match mimir::auth::storage::AuthStore::from_env() {
-            Ok(auth) => mimir::model_catalog::available_models(&auth, &settings),
+            Ok(auth) => mimir::model_catalog::subagent_catalog(&auth, &settings),
             Err(_) => Vec::new(),
         }
     };
+    let manifests = wayland::subagents::default_subagent_type_manifests();
+    wayland::subagents::validate_subagent_type_manifests(&manifests)?;
     Ok((
         tools::SubagentToolsConfig {
             backend: backend.clone(),
             provider_factory,
             selection,
             catalog,
+            manifests,
             capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
+            approved_api_vendors: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             session_id: session_id.to_string(),
             nesting_depth: 0,
             max_nesting_depth: 2,
@@ -1329,6 +1340,15 @@ fn build_provider(
     system_prompt: &str,
     session_id: &str,
 ) -> Result<Box<dyn ChatProvider>> {
+    build_provider_for_lane(selection, system_prompt, session_id, None)
+}
+
+fn build_provider_for_lane(
+    selection: &mimir::selection::ModelSelection,
+    system_prompt: &str,
+    session_id: &str,
+    credential_lane: Option<mimir::model_catalog::CredentialLaneKind>,
+) -> Result<Box<dyn ChatProvider>> {
     use mimir::selection::ProviderId;
     let model = selection.model.as_str();
     let base_url = selection.base_url.as_str();
@@ -1370,7 +1390,7 @@ fn build_provider(
             )
         }
         ProviderId::Anthropic => Box::new(
-            mimir::providers::anthropic_messages::AnthropicProvider::new(
+            mimir::providers::anthropic_messages::AnthropicProvider::new_with_lane(
                 model,
                 base_url,
                 reasoning,
@@ -1378,6 +1398,7 @@ fn build_provider(
                 selection.cache_retention,
                 selection.context_management.clone(),
                 selection.retry_policy,
+                credential_lane,
             )?,
         ),
         ProviderId::Antigravity => {

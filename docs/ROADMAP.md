@@ -1078,31 +1078,32 @@ engine are stable.
 
 **Status:** delegated-worker slice shipped 2026-07-14 under
 [#459](https://github.com/5omeOtherGuy/iris-agent/issues/459). Direct per-spawn
-model/provider and reasoning-effort routing and the live operator surface
+routing and the live operator surface
 ([#640](https://github.com/5omeOtherGuy/iris-agent/issues/640)) shipped 2026-07-15.
-Named worker profiles are the immediate follow-up.
+Manifest-defined worker types and the reduced spawn surface shipped under
+[#665](https://github.com/5omeOtherGuy/iris-agent/issues/665).
 
 Shipped scope:
 
 - Read-only and worktree-isolated mutation-capable subagents as model tools.
-- Per-worker tool allowlists, capability ceilings, token/turn budgets, durable
-  background lifecycle, groups, cancellation, recovery, and artifact-backed
-  outputs.
-- Shared scheduler for delegated workers and compaction; provider/agent state may
-  remain `!Send`.
-- Explicit best-of-N selection and reviewed apply. No model-authorized apply.
-- Direct `spawn_subagent` model/provider and effort overrides. Omitted components
-  inherit the spawn-time parent selection; accepted workers persist one effective
-  route and do not follow later parent switches.
+- Manifest-defined general, explore, and review workers with their own prompts,
+  model fallback chains, tool profiles, child policies, and provider-round caps.
+- Provider-agnostic tool grants replace manifest defaults when explicit, clamp to
+  the parent ceiling, and are hard-filtered before child inference.
+- Active-credential model routing with OAuth preference and an API-lane approval
+  boundary. Accepted workers persist one effective route.
+- Durable background lifecycle, cancellation, recovery, artifact-backed output,
+  and a scheduler shared with compaction; provider/agent state may remain `!Send`.
+- Reviewed apply. Runtime group scheduling and candidate selection remain
+  available to operator surfaces but are not model-facing.
 - One live `DELEGATION` dashboard for worker/group/artifact/worktree inspection,
   recovery actions, candidate selection, and exact-plan apply authorization. Bare
   `/subagents` and `/worktrees` open it; typed forms remain text fast paths.
 
 Remaining scope:
 
-- Named worker profiles with prompt/tool/model defaults. Route defaults compose
-  before direct spawn overrides, giving component precedence `spawn -> profile ->
-  parent` without changing worker persistence or provider construction.
+- A config/CLI editor for worker type manifests.
+- Skill-driven workflow composition, including any later best-of-N workflow.
 
 Acceptance signal: Iris can delegate search/review/research work without bloating
 the main conversation and can report the token/latency cost of that delegation.

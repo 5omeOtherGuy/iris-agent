@@ -135,6 +135,7 @@ impl AnthropicProvider {
     /// owned by `mimir::selection`). `system_prompt` is the harness-assembled
     /// instruction string; the provider prepends the required Claude Code
     /// identity block and forwards the rest.
+    #[allow(dead_code)]
     pub(crate) fn new(
         model: &str,
         base_url: &str,
@@ -143,6 +144,29 @@ impl AnthropicProvider {
         cache_retention: PromptCacheRetention,
         context_management: ContextManagement,
         retry_policy: crate::mimir::retry::RetryPolicy,
+    ) -> Result<Self> {
+        Self::new_with_lane(
+            model,
+            base_url,
+            reasoning,
+            system_prompt,
+            cache_retention,
+            context_management,
+            retry_policy,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_lane(
+        model: &str,
+        base_url: &str,
+        reasoning: Option<ReasoningEffort>,
+        system_prompt: &str,
+        cache_retention: PromptCacheRetention,
+        context_management: ContextManagement,
+        retry_policy: crate::mimir::retry::RetryPolicy,
+        credential_lane: Option<crate::mimir::model_catalog::CredentialLaneKind>,
     ) -> Result<Self> {
         context_management.validate_supported()?;
         Ok(Self {
@@ -157,7 +181,7 @@ impl AnthropicProvider {
             cache_retention,
             context_management,
             cache_prefix: Arc::new(Mutex::new(super::PromptCachePrefix::default())),
-            auth: resolve_anthropic_auth()?,
+            auth: resolve_anthropic_auth(credential_lane)?,
             retry_policy,
         })
     }
@@ -478,8 +502,26 @@ impl AnthropicProvider {
     }
 }
 
-fn resolve_anthropic_auth() -> Result<AnthropicAuthSource> {
+fn resolve_anthropic_auth(
+    credential_lane: Option<crate::mimir::model_catalog::CredentialLaneKind>,
+) -> Result<AnthropicAuthSource> {
+    use crate::mimir::model_catalog::CredentialLaneKind;
+
     let auth_store = AuthStore::from_env()?;
+    match credential_lane {
+        Some(CredentialLaneKind::OAuth) => {
+            return Ok(AnthropicAuthSource::OAuth(AnthropicTokenStore::from_env()?));
+        }
+        Some(CredentialLaneKind::Api) => {
+            let key = api_key::api_key_for_explicit_lane(ProviderId::Anthropic, &auth_store)?
+                .ok_or_else(|| anyhow!("Anthropic API credential lane is unavailable"))?;
+            return Ok(AnthropicAuthSource::ApiKey(key));
+        }
+        Some(CredentialLaneKind::Configured) => {
+            anyhow::bail!("configured credential lane is invalid for Anthropic");
+        }
+        None => {}
+    }
     if auth_store.credential_kind(PROVIDER_ID)? == Some(CredentialKind::ApiKey) {
         return Ok(AnthropicAuthSource::ApiKey(
             auth_store.api_key_credentials(PROVIDER_ID)?.key,

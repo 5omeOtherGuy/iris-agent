@@ -95,6 +95,7 @@ implementation.
 | [0062](0062-keep-codex-prompt-caches-session-scoped.md) | Keep Codex prompt caches session-scoped | accepted | 2026-07-14 |
 | [0063](0063-extract-subagent-runtime-and-centralize-worker-scheduling.md) | Extract the subagent runtime and centralize worker scheduling | accepted; supersedes 0035 in part | 2026-07-14 |
 | [0064](0064-track-public-agent-guidance-and-keep-local-instructions-harness-native.md) | Track public agent guidance and keep local instructions harness-native | accepted; implemented | 2026-07-15 |
+| [0065](0065-kind-driven-spawn-subagent-schema.md) | Kind-driven `spawn_subagent` schema with enforced tool grants | accepted; implemented | 2026-07-19 |
 
 Two historical number collisions exist: ADR-0051 and ADR-0058 each name two
 records. The `-A`/`-B` labels above are index disambiguators only; filenames and

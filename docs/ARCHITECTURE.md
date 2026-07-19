@@ -122,11 +122,11 @@ scheduler thread. A queued worker therefore cannot follow later parent model or
 reasoning changes. Route-less legacy requests retain live-parent inheritance. A
 request that claims an Iris route but carries malformed metadata fails closed.
 
-Named worker profiles are the next routing layer. Profile defaults will apply to
-the snapshotted parent through Mimir's same override function, then explicit spawn
-overrides will apply through it again. The final route remains the execution
-contract; `profile_id` adds provenance without changing Wayland persistence or
-provider construction.
+Worker type manifests supply model fallback chains, system prompts, tool profiles,
+child policy, and provider-round defaults. The Iris tool adapter applies explicit
+spawn overrides, clamps the resolved tool set to the parent ceiling, and persists
+the final route as the execution contract. Manifests do not change Wayland
+persistence or provider construction.
 
 pi equivalent: `src/harness/` — `agent-harness.ts`, `session/`, `compaction/`,
 `skills.ts`, `system-prompt.ts`, `env/nodejs.ts` (`ExecutionEnv` = `FileSystem`
@@ -144,7 +144,7 @@ translate wire formats into the Tier 1 `ChatProvider` contract.
 | Terminal I/O behind the `Ui` trait | `ui/`, `tool_display.rs` |
 | Render backends: screen-mode policy (ADR-0029) selects the alt-screen pager (full-frame ratatui `Terminal`) or the inline terminal surface (ADR-0006); both render the same `Screen` state | `ui/screen_mode.rs`, `ui/tui/pager.rs`, `ui/terminal_surface.rs` |
 | Approval prompt UX + `ApprovalGate`/`AgentObserver` adapter (`UiBridge`); decision parsing | `ui/` (`UiBridge`, `request_approval`), `approval.rs` (`parse_decision`) |
-| Tool implementations: workspace tools plus model-facing subagent spawn/status/cancel/selection/apply adapters | `tools/*`, `tools/registry.rs` |
+| Tool implementations: workspace tools plus model-facing subagent spawn/status/cancel/output/plan/apply adapters | `tools/*`, `tools/registry.rs` |
 | Subagent/worktree operator commands and apply authorization UX | `cli.rs`, `ui/tui_loop.rs`, `ui/slash.rs` |
 | Plugin runtime + registration, if a plugin system is ever added: executor (WASM/Extism or subprocess), manifest parsing, registry wiring | _exploratory (issue #18)_ |
 | Trusted approval-preview diff rendering | `tools/mod.rs` (`diff_preview`) → Tier 3 |

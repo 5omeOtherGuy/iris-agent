@@ -182,7 +182,7 @@ struct ExploreRenderer;
 struct ShellRenderer;
 /// write/edit -> EDIT panel (standard body, `EDIT` title).
 struct EditRenderer;
-/// spawn_subagent -> DELEGATE dispatch card (count, model, effort, task).
+/// spawn_subagent -> DELEGATE dispatch card (type, model, effort, task).
 struct SubagentRenderer;
 /// Unknown tools -> generic TOOL fallback panel.
 struct GenericRenderer;
@@ -506,18 +506,12 @@ impl ToolRenderer for SubagentRenderer {
         "DELEGATE"
     }
 
-    /// The dispatch line the operator actually cares about: how many workers,
-    /// on which model, at what effort, for which task. Raw JSON arguments
-    /// never reach the header.
+    /// The dispatch line the operator cares about: which worker type, on which
+    /// model, at what effort, for which task. Raw JSON never reaches the header.
     fn header_meta(&self, call: &ToolCall) -> String {
-        let count = subagent_count(call);
-        let workers = if count == 1 {
-            "1 worker".to_string()
-        } else {
-            format!("{count} workers")
-        };
-        let model = subagent_str(call, "model").unwrap_or("inherited model");
-        let mut meta = format!("{workers} \u{b7} {model}");
+        let subagent_type = subagent_str(call, "subagent_type").unwrap_or("general");
+        let model = subagent_str(call, "model").unwrap_or("default model");
+        let mut meta = format!("{subagent_type} \u{b7} {model}");
         if let Some(effort) = subagent_str(call, "effort") {
             meta.push_str(&format!(" \u{b7} {effort} effort"));
         }
@@ -538,8 +532,7 @@ impl ToolRenderer for SubagentRenderer {
             ToolOutcome::Running { .. } => body.line("delegating\u{2026}", dim_style()),
             // Review/Denied: show exactly what is being authorized.
             ToolOutcome::Review => body.line(&subagent_grant(call), dim_style()),
-            // Unrecognized result shape (e.g. a blocking group result):
-            // fall back to the honest raw output.
+            // Unrecognized result shape falls back to the honest raw output.
             ToolOutcome::Done { content, .. } => body.output(content),
             ToolOutcome::Error { message, .. } => {
                 body.line(&format!("error: {message}"), err_style());
@@ -550,15 +543,6 @@ impl ToolRenderer for SubagentRenderer {
     }
 }
 
-/// The `count` argument, defaulting to a single worker (the tool's default).
-fn subagent_count(call: &ToolCall) -> u64 {
-    call.arguments
-        .get("count")
-        .and_then(serde_json::Value::as_u64)
-        .filter(|count| *count >= 1)
-        .unwrap_or(1)
-}
-
 fn subagent_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
     call.arguments
         .get(key)
@@ -567,15 +551,14 @@ fn subagent_str<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-/// The task name: the short `description` when given, else the prompt's first
+/// The task name: the short `description` when given, else the task's first
 /// non-empty line, whitespace-normalized and bounded.
 fn subagent_task(call: &ToolCall) -> Option<String> {
     let task = subagent_str(call, "description")
         .map(str::to_string)
         .or_else(|| {
-            subagent_str(call, "prompt").and_then(|prompt| {
-                prompt
-                    .lines()
+            subagent_str(call, "task").and_then(|task| {
+                task.lines()
                     .map(str::trim)
                     .find(|line| !line.is_empty())
                     .map(str::to_string)
@@ -585,10 +568,28 @@ fn subagent_task(call: &ToolCall) -> Option<String> {
     Some(truncate_clusters_with_ellipsis(&task, 64))
 }
 
-/// The review body: the grant being authorized (kind, capability, run mode).
+/// The review body: worker type, tool grant, and run mode.
 fn subagent_grant(call: &ToolCall) -> String {
-    let kind = subagent_str(call, "kind").unwrap_or("general");
-    let capability = subagent_str(call, "capability").unwrap_or("read_only");
+    let subagent_type = subagent_str(call, "subagent_type").unwrap_or("general");
+    let tools = match call
+        .arguments
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+    {
+        None => "manifest tools".to_string(),
+        Some(values) if values.is_empty() => "no tools".to_string(),
+        Some(values) => {
+            let names = values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>();
+            if names.len() != values.len() {
+                "invalid tools".to_string()
+            } else {
+                truncate_clusters_with_ellipsis(&names.join(", "), 64)
+            }
+        }
+    };
     let mode = if call
         .arguments
         .get("background")
@@ -599,7 +600,7 @@ fn subagent_grant(call: &ToolCall) -> String {
     } else {
         "blocking"
     };
-    format!("{kind} \u{b7} {capability} \u{b7} {mode}")
+    format!("{subagent_type} \u{b7} {tools} \u{b7} {mode}")
 }
 
 /// Compact result rows for the recognized spawn result shapes; `None` defers
@@ -610,24 +611,6 @@ fn subagent_grant(call: &ToolCall) -> String {
 fn subagent_result_rows(content: &str) -> Option<Vec<TranscriptRow>> {
     let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
     let status = value.get("status").and_then(serde_json::Value::as_str)?;
-    if let Some(ids) = value
-        .get("worker_ids")
-        .and_then(serde_json::Value::as_array)
-    {
-        let mut rows = ids
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .map(|id| subagent_worker_row(id, status, status))
-            .collect::<Vec<_>>();
-        if rows.is_empty() {
-            return None;
-        }
-        rows.push(styled_row(
-            "background \u{b7} /subagents".to_string(),
-            dim_style(),
-        ));
-        return Some(rows);
-    }
     let worker_id = value.get("worker_id").and_then(serde_json::Value::as_str)?;
     if value.get("summary").is_none() {
         // Background single dispatch: `{worker_id, status}`.
@@ -1169,33 +1152,53 @@ mod tests {
     }
 
     #[test]
-    fn subagent_header_names_count_model_effort_and_task() {
+    fn subagent_header_names_type_model_effort_and_task() {
         let spawn = call(
             "spawn_subagent",
             json!({
-                "count": 3,
+                "subagent_type": "review",
                 "model": "sonnet-4-5",
                 "effort": "high",
                 "description": "audit provider adapters",
-                "prompt": "Audit every provider adapter for drift."
+                "task": "Audit every provider adapter for drift.",
+                "tools": ["read_only", "bash"],
+                "background": false
             }),
         );
         let renderer = resolve(&spawn);
         assert_eq!(renderer.title(), "DELEGATE");
         assert_eq!(
             renderer.header_meta(&spawn),
-            "3 workers \u{b7} sonnet-4-5 \u{b7} high effort \u{2014} audit provider adapters"
+            "review \u{b7} sonnet-4-5 \u{b7} high effort \u{2014} audit provider adapters"
+        );
+        assert_eq!(
+            subagent_grant(&spawn),
+            "review \u{b7} read_only, bash \u{b7} blocking"
         );
 
-        // Defaults: one worker, inherited model, no effort; the task falls
-        // back to the prompt's first non-empty line.
+        // Defaults: general manifest, manifest route/tools, no effort; the task
+        // falls back to the first non-empty task line.
         let bare = call(
             "spawn_subagent",
-            json!({ "prompt": "\n  Fix the flaky test.\nDetails follow." }),
+            json!({ "task": "\n  Fix the flaky test.\nDetails follow." }),
         );
         assert_eq!(
             resolve(&bare).header_meta(&bare),
-            "1 worker \u{b7} inherited model \u{2014} Fix the flaky test."
+            "general \u{b7} default model \u{2014} Fix the flaky test."
+        );
+        assert_eq!(
+            subagent_grant(&bare),
+            "general \u{b7} manifest tools \u{b7} background"
+        );
+        let empty = call("spawn_subagent", json!({ "task": "inspect", "tools": [] }));
+        assert_eq!(
+            subagent_grant(&empty),
+            "general \u{b7} no tools \u{b7} background"
+        );
+        let invalid = call("spawn_subagent", json!({ "task": "inspect", "tools": [1] }));
+        assert_eq!(
+            subagent_grant(&invalid),
+            "general \u{b7} invalid tools \u{b7} background"
         );
     }
 
@@ -1229,31 +1232,6 @@ mod tests {
         );
         assert!(text.contains("background \u{b7} /subagents"), "{text}");
         assert!(!text.contains('{'), "no raw JSON in the body: {text}");
-
-        let group = json!({
-            "group_id": "grp_1",
-            "worker_ids": ["wrk_0123456789abcdef", "wrk_fedcba9876543210"],
-            "status": "queued"
-        })
-        .to_string();
-        let rows = renderer.body(
-            &ctx,
-            &spawn,
-            &ToolOutcome::Done {
-                content: &group,
-                exit_code: None,
-            },
-        );
-        let text = rows
-            .iter()
-            .filter_map(|row| body_line(row).map(|line| line.to_string()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            text.contains("wrk_01234567  queued") && text.contains("wrk_fedcba98  queued"),
-            "one lane-grammar row per dispatched worker: {text}"
-        );
-        assert!(text.contains("background \u{b7} /subagents"), "{text}");
 
         // A blocking result renders one settled worker row: state glyph,
         // short ID, status + summary + changed-path count.

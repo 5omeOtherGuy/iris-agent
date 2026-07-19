@@ -115,6 +115,7 @@ impl WorkerRuntime {
         }
     }
 
+    #[allow(dead_code)] // Host-neutral best-of-N scheduling remains dormant by ADR-0065.
     pub(crate) fn spawn_group(
         &self,
         jobs: Vec<(WorkerRequest, RegisteredFactory)>,

@@ -13,7 +13,10 @@
 //! record in `auth.json` (or, for Anthropic, an existing Claude Code login). It
 //! never reads, refreshes, or exposes the secret material.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Settings;
 use crate::errors::UsageError;
@@ -118,6 +121,46 @@ impl CatalogModel {
     pub(crate) fn qualified(&self) -> String {
         format!("{}/{}", self.provider.as_str(), self.id)
     }
+}
+
+/// Provider vendor used to decide whether a credential-lane selector is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ProviderVendor {
+    OpenAi,
+    Anthropic,
+    Google,
+    Custom,
+}
+
+/// Authentication mechanism for one active model route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CredentialLaneKind {
+    OAuth,
+    Api,
+    Configured,
+}
+
+/// One active, non-secret credential lane for a model route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubagentCredentialLane {
+    pub(crate) id: String,
+    pub(crate) vendor: ProviderVendor,
+    pub(crate) provider: ProviderId,
+    pub(crate) kind: CredentialLaneKind,
+}
+
+/// One model/lane pair captured for delegated-worker schema and routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubagentCatalogEntry {
+    pub(crate) model: CatalogModel,
+    pub(crate) lane: Option<SubagentCredentialLane>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubagentSchemaChoices {
+    pub(crate) models: Vec<String>,
+    pub(crate) providers: Option<Vec<String>>,
 }
 
 /// Whether a provider has a credential Iris can use, and where it comes from.
@@ -234,84 +277,159 @@ pub(crate) fn available_models(auth: &AuthStore, settings: &Settings) -> Vec<Cat
     models
 }
 
-/// Distinct model ids and provider wire ids in `models`, in registry order.
-/// Backs the `spawn_subagent` schema `enum`s so the delegating model is offered
-/// only exact, authenticated identifiers instead of guessing spelling.
-pub(crate) fn schema_choices_from(models: &[CatalogModel]) -> (Vec<String>, Vec<String>) {
-    let mut providers = Vec::new();
-    for model in models {
-        let provider = model.provider.as_str().to_string();
-        if !providers.contains(&provider) {
-            providers.push(provider);
-        }
-    }
-    (distinct_ids(models), providers)
+/// Capture active credential lanes for delegated-worker schema and routing.
+pub(crate) fn subagent_catalog(auth: &AuthStore, settings: &Settings) -> Vec<SubagentCatalogEntry> {
+    available_models(auth, settings)
+        .into_iter()
+        .flat_map(|model| {
+            active_lanes(auth, settings, model.provider)
+                .into_iter()
+                .map(move |lane| SubagentCatalogEntry {
+                    model: model.clone(),
+                    lane: Some(lane),
+                })
+        })
+        .collect()
 }
 
-/// Resolve a `(model, optional provider)` subagent request against an
-/// authenticated catalog snapshot. `provider` disambiguates a model id offered
-/// by more than one authenticated provider; a unique id needs no provider.
-pub(crate) fn resolve_model_in(
-    models: &[CatalogModel],
+fn active_lanes(
+    auth: &AuthStore,
+    settings: &Settings,
+    provider: ProviderId,
+) -> Vec<SubagentCredentialLane> {
+    let stored = auth.credential_kind(provider.as_str()).ok().flatten();
+    let oauth = stored == Some(CredentialKind::OAuth)
+        || (provider == ProviderId::Anthropic && anthropic::claude_code_credentials_available());
+    let api = stored == Some(CredentialKind::ApiKey) || api_key::env_api_key_available(provider);
+    let (vendor, oauth_id, api_id) = match provider {
+        ProviderId::OpenAiCodex => (ProviderVendor::OpenAi, Some("openai-codex"), None),
+        ProviderId::OpenAi => (ProviderVendor::OpenAi, None, Some("openai")),
+        ProviderId::Anthropic => (
+            ProviderVendor::Anthropic,
+            Some("anthropic-oauth"),
+            Some("anthropic-api"),
+        ),
+        ProviderId::Antigravity => (ProviderVendor::Google, Some("antigravity"), None),
+        ProviderId::OpenAiCompatible => (ProviderVendor::Custom, None, Some("openai-compatible")),
+    };
+    let mut lanes = Vec::new();
+    if oauth && let Some(id) = oauth_id {
+        lanes.push(SubagentCredentialLane {
+            id: id.to_string(),
+            vendor,
+            provider,
+            kind: CredentialLaneKind::OAuth,
+        });
+    }
+    if api && let Some(id) = api_id {
+        lanes.push(SubagentCredentialLane {
+            id: id.to_string(),
+            vendor,
+            provider,
+            kind: CredentialLaneKind::Api,
+        });
+    }
+    if provider == ProviderId::OpenAiCompatible
+        && lanes.is_empty()
+        && settings
+            .open_ai_compatible
+            .as_ref()
+            .is_some_and(|config| config.api_key_required == Some(false))
+    {
+        lanes.push(SubagentCredentialLane {
+            id: "openai-compatible".to_string(),
+            vendor,
+            provider,
+            kind: CredentialLaneKind::Configured,
+        });
+    }
+    lanes
+}
+
+/// Model enum values and the optional credential-lane selector.
+pub(crate) fn subagent_schema_choices_from(
+    entries: &[SubagentCatalogEntry],
+) -> SubagentSchemaChoices {
+    let active: Vec<&SubagentCatalogEntry> = entries
+        .iter()
+        .filter(|entry| entry.lane.is_some())
+        .collect();
+    let models = distinct_ids(
+        &active
+            .iter()
+            .map(|entry| entry.model.clone())
+            .collect::<Vec<_>>(),
+    );
+    let mut lane_ids = Vec::new();
+    let mut vendor_lanes: BTreeMap<ProviderVendor, BTreeSet<String>> = BTreeMap::new();
+    for lane in active.iter().filter_map(|entry| entry.lane.as_ref()) {
+        if !lane_ids.contains(&lane.id) {
+            lane_ids.push(lane.id.clone());
+        }
+        vendor_lanes
+            .entry(lane.vendor)
+            .or_default()
+            .insert(lane.id.clone());
+    }
+    let providers = vendor_lanes
+        .values()
+        .any(|lanes| lanes.len() >= 2)
+        .then_some(lane_ids);
+    SubagentSchemaChoices { models, providers }
+}
+
+/// Resolve an active delegated-worker model, preferring OAuth when no lane is named.
+pub(crate) fn resolve_subagent_model_in(
+    entries: &[SubagentCatalogEntry],
     model: &str,
     provider: Option<&str>,
-) -> Result<CatalogModel> {
+) -> Result<SubagentCatalogEntry> {
     let model = model.trim();
     let provider = provider.map(str::trim).filter(|value| !value.is_empty());
-    let matches: Vec<&CatalogModel> = models
+    let mut matches: Vec<&SubagentCatalogEntry> = entries
         .iter()
         .filter(|entry| {
-            entry.id == model && provider.is_none_or(|want| entry.provider.as_str() == want)
+            entry.model.id == model
+                && entry
+                    .lane
+                    .as_ref()
+                    .is_some_and(|lane| provider.is_none_or(|requested| lane.id == requested))
         })
         .collect();
-    match matches.as_slice() {
-        [only] => Ok((*only).clone()),
-        [] => Err(unresolved_model_error(models, model, provider)),
-        many => {
-            let providers = many
-                .iter()
-                .map(|entry| entry.provider.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(UsageError::new(format!(
-                "model '{model}' is offered by multiple providers; set provider to one of: {providers}"
-            ))
-            .into())
-        }
+    if matches.is_empty() {
+        let available = subagent_schema_choices_from(entries).models.join(", ");
+        let message = if available.is_empty() {
+            format!(
+                "model '{model}' is not available; no active credential lane offers a subagent model"
+            )
+        } else if let Some(provider) = provider {
+            format!("model '{model}' is not available from provider lane '{provider}'")
+        } else {
+            format!("unknown or unauthenticated model '{model}'; available models: {available}")
+        };
+        return Err(UsageError::new(message).into());
     }
-}
-
-fn unresolved_model_error(
-    models: &[CatalogModel],
-    model: &str,
-    provider: Option<&str>,
-) -> anyhow::Error {
-    if let Some(want) = provider {
-        let offered: Vec<&str> = models
-            .iter()
-            .filter(|entry| entry.id == model)
-            .map(|entry| entry.provider.as_str())
-            .collect();
-        if !offered.is_empty() {
-            return UsageError::new(format!(
-                "model '{model}' is not available from provider '{want}'; it is offered by: {}",
-                offered.join(", ")
-            ))
-            .into();
-        }
-    }
-    let available = distinct_ids(models).join(", ");
-    if available.is_empty() {
-        UsageError::new(format!(
-            "model '{model}' is not available; no authenticated provider offers a subagent model"
+    matches.sort_by_key(|entry| match entry.lane.as_ref().map(|lane| lane.kind) {
+        Some(CredentialLaneKind::OAuth) => 0,
+        Some(CredentialLaneKind::Configured) => 1,
+        Some(CredentialLaneKind::Api) => 2,
+        None => 3,
+    });
+    let preferred = matches[0];
+    if provider.is_none()
+        && matches.get(1).is_some_and(|next| {
+            next.lane.as_ref().map(|lane| lane.kind)
+                == preferred.lane.as_ref().map(|lane| lane.kind)
+                && next.lane.as_ref().map(|lane| lane.vendor)
+                    != preferred.lane.as_ref().map(|lane| lane.vendor)
+        })
+    {
+        return Err(UsageError::new(format!(
+            "model '{model}' is offered by multiple provider vendors; select a provider lane"
         ))
-        .into()
-    } else {
-        UsageError::new(format!(
-            "unknown or unauthenticated model '{model}'; available models: {available}"
-        ))
-        .into()
+        .into());
     }
+    Ok(preferred.clone())
 }
 
 fn distinct_ids(models: &[CatalogModel]) -> Vec<String> {
@@ -837,87 +955,138 @@ mod tests {
         assert!(AuthStatus::EnvApiKey.is_configured());
     }
 
-    #[test]
-    fn schema_choices_are_distinct_and_registry_ordered() {
-        let catalog = [
-            model(ProviderId::OpenAiCodex, "gpt-5.4-mini"),
-            model(ProviderId::OpenAi, "gpt-4.1"),
-            model(ProviderId::Anthropic, "shared"),
-            model(ProviderId::OpenAi, "shared"),
-        ];
-        let (models, providers) = schema_choices_from(&catalog);
-        assert_eq!(models, vec!["gpt-5.4-mini", "gpt-4.1", "shared"]);
-        assert_eq!(providers, vec!["openai-codex", "openai", "anthropic"]);
+    fn subagent_entry(
+        provider: ProviderId,
+        model_id: &str,
+        lane: Option<SubagentCredentialLane>,
+    ) -> SubagentCatalogEntry {
+        SubagentCatalogEntry {
+            model: model(provider, model_id),
+            lane,
+        }
+    }
+
+    fn lane(
+        id: &str,
+        vendor: ProviderVendor,
+        provider: ProviderId,
+        kind: CredentialLaneKind,
+    ) -> SubagentCredentialLane {
+        SubagentCredentialLane {
+            id: id.to_string(),
+            vendor,
+            provider,
+            kind,
+        }
     }
 
     #[test]
-    fn resolve_model_matches_a_unique_id_without_a_provider() {
+    fn subagent_schema_excludes_models_without_an_active_credential_lane() {
         let catalog = [
-            model(ProviderId::OpenAiCodex, "gpt-5.4-mini"),
-            model(ProviderId::Anthropic, "claude-opus-4-6"),
+            subagent_entry(
+                ProviderId::OpenAiCodex,
+                "gpt-authenticated",
+                Some(lane(
+                    "openai-codex",
+                    ProviderVendor::OpenAi,
+                    ProviderId::OpenAiCodex,
+                    CredentialLaneKind::OAuth,
+                )),
+            ),
+            subagent_entry(ProviderId::Anthropic, "claude-unconfigured", None),
         ];
-        let resolved = resolve_model_in(&catalog, "gpt-5.4-mini", None).unwrap();
-        assert_eq!(resolved.provider, ProviderId::OpenAiCodex);
-        assert_eq!(resolved.id, "gpt-5.4-mini");
-        // Surrounding whitespace is tolerated.
+
+        let choices = subagent_schema_choices_from(&catalog);
+
+        assert_eq!(choices.models, vec!["gpt-authenticated"]);
+        assert_eq!(choices.providers, None);
+    }
+
+    #[test]
+    fn subagent_provider_schema_is_only_exposed_for_multiple_lanes_per_vendor() {
+        let single_lane_vendors = [
+            subagent_entry(
+                ProviderId::OpenAiCodex,
+                "gpt-oauth",
+                Some(lane(
+                    "openai-codex",
+                    ProviderVendor::OpenAi,
+                    ProviderId::OpenAiCodex,
+                    CredentialLaneKind::OAuth,
+                )),
+            ),
+            subagent_entry(
+                ProviderId::Anthropic,
+                "claude-oauth",
+                Some(lane(
+                    "anthropic-oauth",
+                    ProviderVendor::Anthropic,
+                    ProviderId::Anthropic,
+                    CredentialLaneKind::OAuth,
+                )),
+            ),
+        ];
         assert_eq!(
-            resolve_model_in(&catalog, "  gpt-5.4-mini  ", None)
-                .unwrap()
-                .provider,
-            ProviderId::OpenAiCodex
+            subagent_schema_choices_from(&single_lane_vendors).providers,
+            None
         );
-    }
 
-    #[test]
-    fn resolve_model_rejects_unknown_ids_and_lists_available_ones() {
-        let catalog = [model(ProviderId::OpenAiCodex, "gpt-5.4-mini")];
-        let error = resolve_model_in(&catalog, "gpt-9", None)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("gpt-9"), "{error}");
-        assert!(error.contains("gpt-5.4-mini"), "{error}");
-
-        let empty = resolve_model_in(&[], "gpt-9", None)
-            .unwrap_err()
-            .to_string();
-        assert!(empty.contains("no authenticated provider"), "{empty}");
-    }
-
-    #[test]
-    fn resolve_model_rejects_a_wrong_provider_for_a_known_id() {
-        let catalog = [model(ProviderId::OpenAiCodex, "gpt-5.4-mini")];
-        let error = resolve_model_in(&catalog, "gpt-5.4-mini", Some("openai"))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("not available from provider 'openai'"),
-            "{error}"
-        );
-        assert!(error.contains("openai-codex"), "{error}");
-    }
-
-    #[test]
-    fn resolve_model_disambiguates_a_shared_id_by_provider() {
-        let catalog = [
-            model(ProviderId::OpenAi, "shared"),
-            model(ProviderId::Anthropic, "shared"),
+        let multiple_openai_lanes = [
+            subagent_entry(
+                ProviderId::OpenAiCodex,
+                "shared",
+                Some(lane(
+                    "openai-codex",
+                    ProviderVendor::OpenAi,
+                    ProviderId::OpenAiCodex,
+                    CredentialLaneKind::OAuth,
+                )),
+            ),
+            subagent_entry(
+                ProviderId::OpenAi,
+                "shared",
+                Some(lane(
+                    "openai",
+                    ProviderVendor::OpenAi,
+                    ProviderId::OpenAi,
+                    CredentialLaneKind::Api,
+                )),
+            ),
         ];
-        // Ambiguous without a provider: refuse and name the candidates.
-        let error = resolve_model_in(&catalog, "shared", None)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("multiple providers"), "{error}");
-        assert!(
-            error.contains("openai") && error.contains("anthropic"),
-            "{error}"
-        );
-
-        // A provider selects the intended one.
         assert_eq!(
-            resolve_model_in(&catalog, "shared", Some("anthropic"))
-                .unwrap()
-                .provider,
-            ProviderId::Anthropic
+            subagent_schema_choices_from(&multiple_openai_lanes).providers,
+            Some(vec!["openai-codex".to_string(), "openai".to_string()])
         );
+    }
+
+    #[test]
+    fn subagent_resolution_prefers_oauth_and_accepts_an_explicit_active_lane() {
+        let catalog = [
+            subagent_entry(
+                ProviderId::OpenAi,
+                "shared",
+                Some(lane(
+                    "openai",
+                    ProviderVendor::OpenAi,
+                    ProviderId::OpenAi,
+                    CredentialLaneKind::Api,
+                )),
+            ),
+            subagent_entry(
+                ProviderId::OpenAiCodex,
+                "shared",
+                Some(lane(
+                    "openai-codex",
+                    ProviderVendor::OpenAi,
+                    ProviderId::OpenAiCodex,
+                    CredentialLaneKind::OAuth,
+                )),
+            ),
+        ];
+
+        let preferred = resolve_subagent_model_in(&catalog, "shared", None).unwrap();
+        assert_eq!(preferred.lane.unwrap().id, "openai-codex");
+        let explicit = resolve_subagent_model_in(&catalog, "shared", Some("openai")).unwrap();
+        assert_eq!(explicit.lane.unwrap().id, "openai");
     }
 }
