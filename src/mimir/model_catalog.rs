@@ -920,4 +920,139 @@ mod tests {
             ProviderId::Anthropic
         );
     }
+
+    fn subagent_entry(
+        provider: ProviderId,
+        model_id: &str,
+        lane: Option<SubagentCredentialLane>,
+    ) -> SubagentCatalogEntry {
+        SubagentCatalogEntry {
+            model: model(provider, model_id),
+            lane,
+        }
+    }
+
+    fn lane(
+        id: &str,
+        vendor: ProviderVendor,
+        provider: ProviderId,
+        kind: CredentialLaneKind,
+    ) -> SubagentCredentialLane {
+        SubagentCredentialLane {
+            id: id.to_string(),
+            vendor,
+            provider,
+            kind,
+        }
+    }
+
+    #[test]
+    fn subagent_schema_excludes_models_without_an_active_credential_lane() {
+        let catalog = [
+            subagent_entry(
+                ProviderId::OpenAiCodex,
+                "gpt-authenticated",
+                Some(lane(
+                    "openai-codex",
+                    ProviderVendor::OpenAi,
+                    ProviderId::OpenAiCodex,
+                    CredentialLaneKind::OAuth,
+                )),
+            ),
+            subagent_entry(ProviderId::Anthropic, "claude-unconfigured", None),
+        ];
+
+        let choices = subagent_schema_choices_from(&catalog);
+
+        assert_eq!(choices.models, vec!["gpt-authenticated"]);
+        assert_eq!(choices.providers, None);
+    }
+
+    #[test]
+    fn subagent_provider_schema_is_only_exposed_for_multiple_lanes_per_vendor() {
+        let single_lane_vendors = [
+            subagent_entry(
+                ProviderId::OpenAiCodex,
+                "gpt-oauth",
+                Some(lane(
+                    "openai-codex",
+                    ProviderVendor::OpenAi,
+                    ProviderId::OpenAiCodex,
+                    CredentialLaneKind::OAuth,
+                )),
+            ),
+            subagent_entry(
+                ProviderId::Anthropic,
+                "claude-oauth",
+                Some(lane(
+                    "anthropic-oauth",
+                    ProviderVendor::Anthropic,
+                    ProviderId::Anthropic,
+                    CredentialLaneKind::OAuth,
+                )),
+            ),
+        ];
+        assert_eq!(
+            subagent_schema_choices_from(&single_lane_vendors).providers,
+            None
+        );
+
+        let multiple_openai_lanes = [
+            subagent_entry(
+                ProviderId::OpenAiCodex,
+                "shared",
+                Some(lane(
+                    "openai-codex",
+                    ProviderVendor::OpenAi,
+                    ProviderId::OpenAiCodex,
+                    CredentialLaneKind::OAuth,
+                )),
+            ),
+            subagent_entry(
+                ProviderId::OpenAi,
+                "shared",
+                Some(lane(
+                    "openai",
+                    ProviderVendor::OpenAi,
+                    ProviderId::OpenAi,
+                    CredentialLaneKind::Api,
+                )),
+            ),
+        ];
+        assert_eq!(
+            subagent_schema_choices_from(&multiple_openai_lanes).providers,
+            Some(vec!["openai-codex".to_string(), "openai".to_string()])
+        );
+    }
+
+    #[test]
+    fn subagent_resolution_prefers_oauth_and_accepts_an_explicit_active_lane() {
+        let catalog = [
+            subagent_entry(
+                ProviderId::OpenAi,
+                "shared",
+                Some(lane(
+                    "openai",
+                    ProviderVendor::OpenAi,
+                    ProviderId::OpenAi,
+                    CredentialLaneKind::Api,
+                )),
+            ),
+            subagent_entry(
+                ProviderId::OpenAiCodex,
+                "shared",
+                Some(lane(
+                    "openai-codex",
+                    ProviderVendor::OpenAi,
+                    ProviderId::OpenAiCodex,
+                    CredentialLaneKind::OAuth,
+                )),
+            ),
+        ];
+
+        let preferred = resolve_subagent_model_in(&catalog, "shared", None).unwrap();
+        assert_eq!(preferred.lane.unwrap().id, "openai-codex");
+        let explicit = resolve_subagent_model_in(&catalog, "shared", Some("openai")).unwrap();
+        assert_eq!(explicit.lane.unwrap().id, "openai");
+    }
 }
