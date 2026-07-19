@@ -232,11 +232,11 @@ fn oversized_output_is_preserved_behind_an_artifact() {
 }
 
 #[test]
-fn token_budget_fails_the_result_without_losing_output() {
+fn provider_round_budget_fails_the_result_without_losing_output() {
     let root = TestDir::new("budget");
     let runtime = runtime(&root, Stats::new(), 1);
     let mut request = WorkerRequest::read_only("budget");
-    request.budgets.max_tokens = Some(1);
+    request.budgets.max_provider_rounds = Some(0);
     request.budgets.max_inline_output_bytes = Some(1);
     let id = runtime.spawn(request).unwrap();
 

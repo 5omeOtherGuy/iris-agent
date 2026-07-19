@@ -942,16 +942,8 @@ fn truncate_utf8(mut value: String, max: usize) -> String {
 fn exceeds_usage(request: &WorkerRequest, usage: &Usage) -> bool {
     request
         .budgets
-        .max_tokens
-        .is_some_and(|limit| usage.total_tokens() > limit)
-        || request
-            .budgets
-            .max_provider_rounds
-            .is_some_and(|limit| usage.provider_rounds > limit)
-        || request
-            .budgets
-            .max_tool_rounds
-            .is_some_and(|limit| usage.tool_rounds > limit)
+        .max_provider_rounds
+        .is_some_and(|limit| usage.provider_rounds > limit)
 }
 
 fn snapshot(state: &WorkerState) -> WorkerSnapshot {

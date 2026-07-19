@@ -29,6 +29,106 @@ use crate::wayland::{Harness, HarnessRuntimeConfig, MutationSafetyConfig};
 pub(crate) const IRIS_ROUTE_ID_PREFIX: &str = "iris_model_route_v1_";
 pub(crate) const IRIS_ROUTE_PAYLOAD_KIND: &str = "iris_model_route";
 const IRIS_ROUTE_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_SUBAGENT_MAX_PROVIDER_ROUNDS: u64 = 200;
+
+/// Data-driven defaults for one model-facing `subagent_type`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubagentTypeManifest {
+    pub(crate) id: String,
+    pub(crate) when_to_use: String,
+    pub(crate) worker_kind: iris_subagent_runtime::WorkerKind,
+    pub(crate) model_fallbacks: Vec<String>,
+    pub(crate) system_prompt: String,
+    pub(crate) tool_profile: Vec<String>,
+    pub(crate) allowed_children: Vec<String>,
+    pub(crate) max_provider_rounds: u64,
+    pub(crate) allow_outside_workspace: bool,
+}
+
+impl SubagentTypeManifest {
+    fn new(
+        id: &str,
+        when_to_use: &str,
+        worker_kind: iris_subagent_runtime::WorkerKind,
+        system_prompt: &str,
+        tool_profile: &[&str],
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            when_to_use: when_to_use.to_string(),
+            worker_kind,
+            model_fallbacks: Vec::new(),
+            system_prompt: system_prompt.to_string(),
+            tool_profile: tool_profile
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+            allowed_children: Vec::new(),
+            max_provider_rounds: DEFAULT_SUBAGENT_MAX_PROVIDER_ROUNDS,
+            allow_outside_workspace: false,
+        }
+    }
+}
+
+pub(crate) fn default_subagent_type_manifests() -> Arc<[SubagentTypeManifest]> {
+    Arc::from([
+        SubagentTypeManifest::new(
+            "general",
+            "Use for implementation, debugging, or other end-to-end delegated work.",
+            iris_subagent_runtime::WorkerKind::General,
+            "You are a delegated Iris worker. Complete the supplied task independently, use only the available tools, verify the result, and report exact outcomes.",
+            &["all"],
+        ),
+        SubagentTypeManifest::new(
+            "explore",
+            "Use for read-only codebase investigation and evidence gathering.",
+            iris_subagent_runtime::WorkerKind::Explore,
+            "You are a read-only Iris investigator. Inspect the supplied scope, gather concrete evidence, and report file and symbol references without modifying the workspace.",
+            &["read_only"],
+        ),
+        SubagentTypeManifest::new(
+            "review",
+            "Use for read-only review of changes, risks, and verification gaps.",
+            iris_subagent_runtime::WorkerKind::Review,
+            "You are a read-only Iris reviewer. Find correctness, security, maintainability, and test risks in the supplied scope and report prioritized evidence without modifying files.",
+            &["read_only"],
+        ),
+    ])
+}
+
+pub(crate) fn validate_subagent_type_manifests(manifests: &[SubagentTypeManifest]) -> Result<()> {
+    let ids = manifests
+        .iter()
+        .map(|manifest| manifest.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if ids.len() != manifests.len() || !ids.contains("general") {
+        anyhow::bail!("subagent manifests require unique ids and a general entry");
+    }
+    for manifest in manifests {
+        if manifest.id.trim().is_empty()
+            || manifest.when_to_use.trim().is_empty()
+            || manifest.system_prompt.trim().is_empty()
+            || manifest.tool_profile.is_empty()
+            || manifest.max_provider_rounds == 0
+        {
+            anyhow::bail!(
+                "subagent manifest '{}' has incomplete defaults",
+                manifest.id
+            );
+        }
+        if let Some(unknown) = manifest
+            .allowed_children
+            .iter()
+            .find(|child| !ids.contains(child.as_str()))
+        {
+            anyhow::bail!(
+                "subagent manifest '{}' names unknown child '{unknown}'",
+                manifest.id
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Persisted, non-secret effective provider route for one accepted worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +137,8 @@ pub(crate) struct ChildRoute {
     pub(crate) model: String,
     pub(crate) base_url: String,
     pub(crate) effort: Option<String>,
+    #[serde(default)]
+    pub(crate) credential_lane: Option<crate::mimir::model_catalog::CredentialLaneKind>,
 }
 
 impl ChildRoute {
@@ -51,7 +153,16 @@ impl ChildRoute {
             model: model.into(),
             base_url: base_url.into(),
             effort: effort.map(str::to_string),
+            credential_lane: None,
         }
+    }
+
+    pub(crate) fn with_credential_lane(
+        mut self,
+        credential_lane: Option<crate::mimir::model_catalog::CredentialLaneKind>,
+    ) -> Self {
+        self.credential_lane = credential_lane;
+        self
     }
 
     fn validate(&self) -> Result<()> {
@@ -388,16 +499,11 @@ impl WorkerExecutor for NexusWorker {
                 ));
             }
             let provider = (self.provider_factory)(&request).map_err(executor_error)?;
-            let grant = capability_grant(request.policy.capability);
-            let mut tools = built_in_tools().into_capability(grant);
-            if !request.policy.tool_allowlist.is_empty() {
-                tools = tools.into_allowlist(&request.policy.tool_allowlist);
-            }
-            let max_rounds = request
-                .budgets
-                .max_tool_rounds
-                .and_then(|value| usize::try_from(value).ok());
-            let mut agent = Agent::new(provider, tools).with_max_tool_roundtrips(max_rounds);
+            let tools = match &request.policy.tools {
+                Some(names) => built_in_tools().into_allowlist(names),
+                None => built_in_tools().into_capability(WorkerCapabilityGrant::ReadOnly),
+            };
+            let mut agent = Agent::new(provider, tools);
             (self.configure_agent)(&request, &mut agent);
             let mut harness = Harness::new_configured(
                 agent,
@@ -634,16 +740,6 @@ impl ApprovalGate for ChildApprovalGate {
                 _ => ApprovalDecision::Deny,
             })
         })
-    }
-}
-
-fn capability_grant(mode: iris_subagent_runtime::CapabilityMode) -> WorkerCapabilityGrant {
-    match mode {
-        iris_subagent_runtime::CapabilityMode::ReadOnly => WorkerCapabilityGrant::ReadOnly,
-        iris_subagent_runtime::CapabilityMode::ReadWrite => WorkerCapabilityGrant::ReadWrite,
-        iris_subagent_runtime::CapabilityMode::Execute => WorkerCapabilityGrant::Execute,
-        iris_subagent_runtime::CapabilityMode::All => WorkerCapabilityGrant::All,
-        _ => WorkerCapabilityGrant::ReadOnly,
     }
 }
 
@@ -1165,7 +1261,7 @@ mod tests {
 
     fn mutable_request(prompt: &str) -> WorkerRequest {
         let mut request = WorkerRequest::read_only(prompt);
-        request.policy.capability = iris_subagent_runtime::CapabilityMode::ReadWrite;
+        request.policy.tools = Some(vec!["read".to_string(), "write".to_string()]);
         request.policy.isolation = IsolationMode::Worktree;
         request.session_id = Some("test-session".to_string());
         request
@@ -1580,7 +1676,7 @@ mod tests {
         );
 
         let mut shell_worker = mutable_request("attempt parent write through shell");
-        shell_worker.policy.capability = iris_subagent_runtime::CapabilityMode::All;
+        shell_worker.policy.tools = Some(vec!["bash".to_string()]);
         let command = format!(
             "printf forged > {}",
             workspace.join("candidate.txt").display()

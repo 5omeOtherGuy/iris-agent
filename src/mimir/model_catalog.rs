@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Settings;
 use crate::errors::UsageError;
@@ -132,7 +133,8 @@ pub(crate) enum ProviderVendor {
 }
 
 /// Authentication mechanism for one active model route.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum CredentialLaneKind {
     OAuth,
     Api,

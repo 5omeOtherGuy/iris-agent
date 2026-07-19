@@ -136,21 +136,18 @@ pub enum RecoveryPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct WorkerPolicy {
-    /// Effective capability grant.
+    /// Effective abstract tool ids resolved and clamped by the host.
+    ///
+    /// `None` retains the host's legacy/default delegated surface. `Some`,
+    /// including an empty set, is the complete enforced worker tool set.
     #[serde(default)]
-    pub capability: CapabilityMode,
-    /// Maximum grant inherited from the parent/session/profile.
-    #[serde(default = "default_all")]
-    pub parent_capability: CapabilityMode,
+    pub tools: Option<Vec<String>>,
     /// Requested isolation.
     #[serde(default)]
     pub isolation: IsolationMode,
     /// Explicit validated working directory; mutually exclusive with worktree isolation.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
-    /// Tool-name narrowing applied after capability filtering.
-    #[serde(default)]
-    pub tool_allowlist: Vec<String>,
     /// Explicitly permits read-only filesystem tools to follow paths outside the workspace.
     ///
     /// Mutation and shell writes remain confined to the effective workspace.
@@ -164,10 +161,6 @@ pub struct WorkerPolicy {
     pub max_nesting_depth: u32,
 }
 
-fn default_all() -> CapabilityMode {
-    CapabilityMode::All
-}
-
 const fn default_max_depth() -> u32 {
     2
 }
@@ -175,11 +168,9 @@ const fn default_max_depth() -> u32 {
 impl Default for WorkerPolicy {
     fn default() -> Self {
         Self {
-            capability: CapabilityMode::ReadOnly,
-            parent_capability: CapabilityMode::All,
+            tools: None,
             isolation: IsolationMode::None,
             cwd: None,
-            tool_allowlist: Vec::new(),
             allow_outside_workspace: false,
             nesting_depth: 0,
             max_nesting_depth: default_max_depth(),
@@ -197,12 +188,6 @@ pub struct WorkerBudgets {
     /// Provider/model round limit.
     #[serde(default)]
     pub max_provider_rounds: Option<u64>,
-    /// Tool round-trip limit.
-    #[serde(default)]
-    pub max_tool_rounds: Option<u64>,
-    /// Aggregate input/output token limit.
-    #[serde(default)]
-    pub max_tokens: Option<u64>,
     /// Maximum inline output bytes before artifact offload.
     #[serde(default)]
     pub max_inline_output_bytes: Option<usize>,
@@ -224,8 +209,11 @@ pub struct WorkerRequest {
     /// Worker category.
     #[serde(default)]
     pub kind: WorkerKind,
-    /// Full worker prompt or instruction.
+    /// Full worker task or instruction.
     pub prompt: String,
+    /// Host-selected worker system prompt.
+    #[serde(default)]
+    pub system_prompt: String,
     /// Short operator-facing description.
     #[serde(default)]
     pub description: String,
@@ -269,6 +257,7 @@ impl WorkerRequest {
             schema_version: SCHEMA_VERSION,
             kind: WorkerKind::General,
             prompt: prompt.into(),
+            system_prompt: String::new(),
             description: String::new(),
             priority: WorkerPriority::Normal,
             policy: WorkerPolicy::default(),
@@ -295,25 +284,9 @@ impl WorkerRequest {
                 "worker prompt must not be empty".to_string(),
             ));
         }
-        if !self
-            .policy
-            .capability
-            .is_within(self.policy.parent_capability)
-        {
-            return Err(crate::RuntimeError::InvalidRequest(
-                "worker capability exceeds parent/session/profile grant".to_string(),
-            ));
-        }
         if self.policy.cwd.is_some() && self.policy.isolation == IsolationMode::Worktree {
             return Err(crate::RuntimeError::InvalidRequest(
                 "cwd and worktree isolation are mutually exclusive".to_string(),
-            ));
-        }
-        if self.policy.capability.is_mutation_capable()
-            && self.policy.isolation != IsolationMode::Worktree
-        {
-            return Err(crate::RuntimeError::InvalidRequest(
-                "mutation-capable workers require worktree isolation".to_string(),
             ));
         }
         if self.policy.nesting_depth > self.policy.max_nesting_depth {
@@ -641,27 +614,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capability_and_isolation_validation_fail_closed() {
+    fn isolation_and_nesting_validation_fail_closed() {
         let mut request = WorkerRequest::read_only("work");
-        request.policy.capability = CapabilityMode::All;
-        request.policy.parent_capability = CapabilityMode::ReadOnly;
-        assert!(
-            request
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds")
-        );
-
-        request.policy.parent_capability = CapabilityMode::All;
-        assert!(
-            request
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("worktree")
-        );
-
         request.policy.isolation = IsolationMode::Worktree;
         request.policy.cwd = Some(PathBuf::from("."));
         assert!(
@@ -672,7 +626,6 @@ mod tests {
                 .contains("mutually")
         );
 
-        request.policy.capability = CapabilityMode::ReadOnly;
         request.policy.isolation = IsolationMode::None;
         request.policy.cwd = None;
         request.policy.nesting_depth = 3;

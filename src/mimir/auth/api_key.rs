@@ -25,6 +25,16 @@ pub(crate) fn api_key_for_provider(
     Ok(env_api_key(provider))
 }
 
+pub(crate) fn api_key_for_explicit_lane(
+    provider: ProviderId,
+    auth: &AuthStore,
+) -> Result<Option<String>> {
+    if auth.credential_kind(provider.as_str())? == Some(CredentialKind::ApiKey) {
+        return Ok(Some(auth.api_key_credentials(provider.as_str())?.key));
+    }
+    Ok(env_api_key(provider))
+}
+
 pub(crate) fn env_api_key_available(provider: ProviderId) -> bool {
     env_api_key(provider).is_some()
 }

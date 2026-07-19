@@ -69,8 +69,12 @@ pub(crate) struct SubagentToolsConfig {
     /// `spawn_subagent` model/provider `enum`s and the pre-spawn resolution so
     /// schema and execution share one source of truth and stay deterministic in
     /// tests. A mid-session `/login` is not reflected until the next start.
-    pub(crate) catalog: Vec<crate::mimir::model_catalog::CatalogModel>,
+    pub(crate) catalog: Vec<crate::mimir::model_catalog::SubagentCatalogEntry>,
+    pub(crate) manifests: Arc<[crate::wayland::subagents::SubagentTypeManifest]>,
     pub(crate) capability_ceiling: iris_subagent_runtime::CapabilityMode,
+    pub(crate) approved_api_vendors: Arc<
+        std::sync::Mutex<std::collections::BTreeSet<crate::mimir::model_catalog::ProviderVendor>>,
+    >,
     pub(crate) session_id: String,
     pub(crate) nesting_depth: u32,
     pub(crate) max_nesting_depth: u32,
@@ -158,13 +162,10 @@ pub(crate) fn built_in_tools_with(config: &ToolsConfig) -> Tools {
         )));
     }
     if let Some(config) = &config.subagents {
-        tools.push(Box::new(SpawnSubagentTool(config.clone())));
+        tools.push(Box::new(SpawnSubagentTool::new(config.clone())));
         tools.push(Box::new(SubagentStatusTool(config.backend.clone())));
         tools.push(Box::new(SubagentArtifactTool(config.backend.clone())));
         tools.push(Box::new(CancelSubagentTool(config.backend.clone())));
-        tools.push(Box::new(SelectSubagentCandidateTool(
-            config.backend.clone(),
-        )));
         tools.push(Box::new(PlanSubagentApplyTool(config.backend.clone())));
         tools.push(Box::new(ApplySubagentTool(config.backend.clone())));
     }
@@ -258,7 +259,145 @@ fn render(workspace: &Path, preview: impl FnOnce(&Path) -> Preview) -> Option<St
     render_preview(preview(&root))
 }
 
-struct SpawnSubagentTool(SubagentToolsConfig);
+struct SpawnSubagentTool {
+    config: SubagentToolsConfig,
+    description: String,
+}
+
+impl SpawnSubagentTool {
+    fn new(config: SubagentToolsConfig) -> Self {
+        let triggers = config
+            .manifests
+            .iter()
+            .map(|manifest| format!("{}: {}", manifest.id, manifest.when_to_use))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Self {
+            config,
+            description: format!(
+                "Start one delegated worker; mutations stay isolated until separately applied. Subagent types: {triggers}"
+            ),
+        }
+    }
+}
+
+struct ResolvedWorkerTools {
+    names: Vec<String>,
+    mutation_capable: bool,
+}
+
+fn delegated_capability(capability: ToolCapability) -> bool {
+    matches!(
+        capability,
+        ToolCapability::Read | ToolCapability::Write | ToolCapability::Execute
+    )
+}
+
+fn grant_allows(grant: iris_subagent_runtime::CapabilityMode, capability: ToolCapability) -> bool {
+    match grant {
+        iris_subagent_runtime::CapabilityMode::ReadOnly => capability == ToolCapability::Read,
+        iris_subagent_runtime::CapabilityMode::ReadWrite => {
+            matches!(capability, ToolCapability::Read | ToolCapability::Write)
+        }
+        iris_subagent_runtime::CapabilityMode::Execute => {
+            matches!(capability, ToolCapability::Read | ToolCapability::Execute)
+        }
+        iris_subagent_runtime::CapabilityMode::All => delegated_capability(capability),
+        _ => false,
+    }
+}
+
+fn shorthand_allows(token: &str, capability: ToolCapability) -> Option<bool> {
+    match token {
+        "read_only" => Some(capability == ToolCapability::Read),
+        "read_write" => Some(matches!(
+            capability,
+            ToolCapability::Read | ToolCapability::Write
+        )),
+        "shell" => Some(matches!(
+            capability,
+            ToolCapability::Read | ToolCapability::Execute
+        )),
+        "all" => Some(delegated_capability(capability)),
+        _ => None,
+    }
+}
+
+fn delegated_tool_tokens() -> Vec<String> {
+    let mut values = vec![
+        "read_only".to_string(),
+        "read_write".to_string(),
+        "shell".to_string(),
+        "all".to_string(),
+    ];
+    values.extend(
+        built_in_tools()
+            .iter()
+            .filter(|tool| delegated_capability(tool.capability()))
+            .map(|tool| tool.name().to_string()),
+    );
+    values
+}
+
+fn resolve_worker_tools(
+    tokens: &[String],
+    ceiling: iris_subagent_runtime::CapabilityMode,
+) -> Result<ResolvedWorkerTools> {
+    let tools = built_in_tools();
+    let mut requested = std::collections::BTreeSet::new();
+    for token in tokens {
+        if shorthand_allows(token, ToolCapability::Read).is_some() {
+            for tool in tools
+                .iter()
+                .filter(|tool| shorthand_allows(token, tool.capability()).unwrap_or(false))
+            {
+                requested.insert(tool.name().to_string());
+            }
+            continue;
+        }
+        let tool = tools
+            .by_name(token)
+            .ok_or_else(|| anyhow!("unknown delegated tool id: {token}"))?;
+        if !delegated_capability(tool.capability()) {
+            return Err(anyhow!("tool '{token}' is not delegatable"));
+        }
+        requested.insert(token.clone());
+    }
+    let mut names = Vec::new();
+    let mut mutation_capable = false;
+    for tool in tools
+        .iter()
+        .filter(|tool| requested.contains(tool.name()) && grant_allows(ceiling, tool.capability()))
+    {
+        names.push(tool.name().to_string());
+        mutation_capable |= tool.is_mutating();
+    }
+    Ok(ResolvedWorkerTools {
+        names,
+        mutation_capable,
+    })
+}
+
+fn requested_tool_tokens(
+    args: &Value,
+    manifest: &crate::wayland::subagents::SubagentTypeManifest,
+) -> Result<Vec<String>> {
+    let Some(value) = args.get("tools") else {
+        return Ok(manifest.tool_profile.clone());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| anyhow!("spawn_subagent tools must be an array"))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("spawn_subagent tools entries must be strings"))
+        })
+        .collect()
+}
 
 impl Tool for SpawnSubagentTool {
     fn name(&self) -> &str {
@@ -266,106 +405,89 @@ impl Tool for SpawnSubagentTool {
     }
 
     fn description(&self) -> &str {
-        "Start one worker or an identical best-of-N group. Mutations stay isolated until separately applied."
+        &self.description
     }
 
     fn parameters(&self) -> Value {
-        let (models, providers) = crate::mimir::model_catalog::schema_choices_from(&self.0.catalog);
-        let mut model_field = serde_json::json!({
-            "type": "string",
-            "minLength": 1,
-            "description": "Exact worker model id from the listed values; omit to inherit the spawn-time selection."
-        });
-        if !models.is_empty() {
-            model_field["enum"] = serde_json::json!(models);
-        }
-        let mut provider_field = serde_json::json!({
-            "type": "string",
-            "description": "Disambiguates a model offered by more than one authenticated provider; omit unless ambiguous."
-        });
-        if !providers.is_empty() {
-            provider_field["enum"] = serde_json::json!(providers);
+        let choices =
+            crate::mimir::model_catalog::subagent_schema_choices_from(&self.config.catalog);
+        let manifest_ids = self
+            .config
+            .manifests
+            .iter()
+            .map(|manifest| manifest.id.clone())
+            .collect::<Vec<_>>();
+        let mut properties = serde_json::json!({
+            "task": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Self-contained work order for a fresh worker."
+            },
+            "subagent_type": {
+                "type": "string",
+                "enum": manifest_ids,
+                "default": "general",
+                "description": "Manifest id; defaults to general."
+            },
+            "model": {
+                "type": "string",
+                "enum": choices.models,
+                "description": "Active-credential worker model; omit to use manifest fallbacks."
+            },
+            "effort": {
+                "type": "string",
+                "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+                "description": "Reasoning effort; omit to inherit."
+            },
+            "tools": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": delegated_tool_tokens()
+                },
+                "uniqueItems": true,
+                "description": "Tool ids or grant shorthands; replaces the manifest profile and is clamped to the parent ceiling."
+            },
+            "system_prompt": {
+                "type": "string",
+                "description": "Worker system-prompt override; defaults to the manifest prompt."
+            },
+            "description": {
+                "type": "string",
+                "description": "Short label; defaults to subagent_type."
+            },
+            "background": {
+                "type": "boolean",
+                "default": true,
+                "description": "Return immediately when true; wait for completion when false."
+            },
+            "isolation": {
+                "type": "string",
+                "enum": ["none", "worktree"],
+                "description": "Execution isolation; defaults to worktree when resolved tools can mutate."
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Existing in-workspace directory for non-isolated work."
+            }
+        })
+        .as_object()
+        .expect("spawn properties are an object")
+        .clone();
+        if let Some(providers) = choices.providers {
+            properties.insert(
+                "provider".to_string(),
+                serde_json::json!({
+                    "type": "string",
+                    "enum": providers,
+                    "description": "Credential lane; use only when multiple active lanes share a vendor."
+                }),
+            );
         }
         serde_json::json!({
             "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Self-contained task for a fresh worker with no parent context: goal, done criteria, context, scope/constraints, verification, and output format."
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Short label; defaults to kind."
-                },
-                "kind": {
-                    "type": "string",
-                    "enum": ["general", "explore", "review"],
-                    "default": "general",
-                    "description": "Policy category, not a persona; explore/review force read_only."
-                },
-                "model": model_field,
-                "provider": provider_field,
-                "effort": {
-                    "type": "string",
-                    "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
-                    "description": "Omit to inherit the spawn-time effort, clamped for the selected model."
-                },
-                "capability": {
-                    "type": "string",
-                    "enum": ["read_only", "read_write", "execute", "all"],
-                    "default": "read_only",
-                    "description": "Grant: read_only=inspect, read_write=+edit/write, execute=+bash, all=both. Cannot exceed the parent ceiling."
-                },
-                "isolation": {
-                    "type": "string",
-                    "enum": ["none", "worktree"],
-                    "description": "Defaults to none for read_only, worktree otherwise; incompatible with cwd."
-                },
-                "tools": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "uniqueItems": true,
-                    "description": "Allowlist applied after capability; only narrows. Omit/empty for all granted tools."
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "Existing parent-workspace directory for non-isolated read_only work; outside dirs need allow_outside_workspace."
-                },
-                "allow_outside_workspace": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Let read tools leave the worker workspace and permit an outside cwd; mutation remains confined."
-                },
-                "background": {
-                    "type": "boolean",
-                    "default": true,
-                    "description": "true returns IDs immediately; false waits for terminal result(s)."
-                },
-                "max_provider_rounds": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Provider-call limit; excess fails the worker."
-                },
-                "max_tool_rounds": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Tool-call limit."
-                },
-                "max_tokens": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Cumulative token limit; excess fails the worker."
-                },
-                "count": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 8,
-                    "default": 1,
-                    "description": "Identical workers; values above 1 return a best-of-N group."
-                }
-            },
-            "required": ["prompt"],
+            "properties": properties,
+            "required": ["task"],
             "additionalProperties": false
         })
     }
@@ -381,159 +503,125 @@ impl Tool for SpawnSubagentTool {
         cancel: CancellationToken,
     ) -> ToolFuture<'a> {
         Box::pin(async move {
-            let prompt = args
-                .get("prompt")
+            let task = args
+                .get("task")
                 .and_then(Value::as_str)
                 .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| anyhow!("spawn_subagent requires a non-empty prompt"))?;
-            let kind = args
-                .get("kind")
+                .ok_or_else(|| anyhow!("spawn_subagent requires a non-empty task"))?;
+            let subagent_type = args
+                .get("subagent_type")
                 .and_then(Value::as_str)
                 .unwrap_or("general");
-            let requested = match args
-                .get("capability")
-                .and_then(Value::as_str)
-                .unwrap_or("read_only")
-            {
-                "read_only" => iris_subagent_runtime::CapabilityMode::ReadOnly,
-                "read_write" => iris_subagent_runtime::CapabilityMode::ReadWrite,
-                "execute" => iris_subagent_runtime::CapabilityMode::Execute,
-                "all" => iris_subagent_runtime::CapabilityMode::All,
-                other => return Err(anyhow!("unsupported subagent capability: {other}")),
-            };
-            let kind_ceiling = match kind {
-                "general" => self.0.capability_ceiling,
-                "explore" | "review" => iris_subagent_runtime::CapabilityMode::ReadOnly,
-                other => return Err(anyhow!("unknown subagent kind: {other}")),
+            let manifest = self
+                .config
+                .manifests
+                .iter()
+                .find(|manifest| manifest.id == subagent_type)
+                .ok_or_else(|| anyhow!("unknown subagent_type: {subagent_type}"))?;
+            let tokens = requested_tool_tokens(args, manifest)?;
+            let resolved_tools = resolve_worker_tools(&tokens, self.config.capability_ceiling)?;
+            let isolation = match args.get("isolation").and_then(Value::as_str) {
+                Some("none") if resolved_tools.mutation_capable => {
+                    return Err(anyhow!(
+                        "mutation-capable worker tools require worktree isolation"
+                    ));
+                }
+                Some("none") => iris_subagent_runtime::IsolationMode::None,
+                Some("worktree") => iris_subagent_runtime::IsolationMode::Worktree,
+                Some(other) => return Err(anyhow!("unsupported subagent isolation: {other}")),
+                None if resolved_tools.mutation_capable => {
+                    iris_subagent_runtime::IsolationMode::Worktree
+                }
+                None => iris_subagent_runtime::IsolationMode::None,
             };
             let model = optional_string_arg(args, "model")?;
             let provider = optional_string_arg(args, "provider")?;
             let effort = optional_string_arg(args, "effort")?;
             let parent_selection = self
-                .0
+                .config
                 .selection
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .clone();
-            let effective_selection = resolve_subagent_selection(
+            let approved_api_vendors = self
+                .config
+                .approved_api_vendors
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone();
+            let resolved = resolve_subagent_selection(
                 &parent_selection,
-                &self.0.catalog,
+                &self.config.catalog,
+                manifest,
                 model,
                 provider,
                 effort,
+                &approved_api_vendors,
             )?;
+            if let Some(lane) = &resolved.lane
+                && lane.kind == crate::mimir::model_catalog::CredentialLaneKind::Api
+            {
+                self.config
+                    .approved_api_vendors
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .insert(lane.vendor);
+            }
             let route = crate::wayland::subagents::ChildRoute::new(
-                effective_selection.provider.as_str(),
-                effective_selection.model.clone(),
-                effective_selection.base_url.clone(),
-                effective_selection
+                resolved.selection.provider.as_str(),
+                resolved.selection.model.clone(),
+                resolved.selection.base_url.clone(),
+                resolved
+                    .selection
                     .reasoning
                     .map(crate::mimir::selection::ReasoningEffort::as_str),
-            );
-            let mut request = iris_subagent_runtime::WorkerRequest::read_only(prompt);
+            )
+            .with_credential_lane(resolved.lane.as_ref().map(|lane| lane.kind));
+            let mut request = iris_subagent_runtime::WorkerRequest::read_only(task);
             crate::wayland::subagents::attach_route(&mut request, &route)?;
             request.description = args
                 .get("description")
                 .and_then(Value::as_str)
-                .unwrap_or(kind)
+                .unwrap_or(subagent_type)
                 .to_string();
-            request.kind = match kind {
-                "explore" => iris_subagent_runtime::WorkerKind::Explore,
-                "review" => iris_subagent_runtime::WorkerKind::Review,
-                _ => iris_subagent_runtime::WorkerKind::General,
-            };
-            request.policy.capability = requested;
-            request.policy.parent_capability = kind_ceiling;
-            request.policy.isolation = match args.get("isolation").and_then(Value::as_str) {
-                Some("none") => iris_subagent_runtime::IsolationMode::None,
-                Some("worktree") => iris_subagent_runtime::IsolationMode::Worktree,
-                Some(other) => return Err(anyhow!("unsupported subagent isolation: {other}")),
-                None if requested.is_mutation_capable() => {
-                    iris_subagent_runtime::IsolationMode::Worktree
-                }
-                None => iris_subagent_runtime::IsolationMode::None,
-            };
+            request.kind = manifest.worker_kind.clone();
+            request.system_prompt = args
+                .get("system_prompt")
+                .and_then(Value::as_str)
+                .unwrap_or(&manifest.system_prompt)
+                .to_string();
+            request.policy.tools = Some(resolved_tools.names);
+            request.policy.isolation = isolation;
             request.policy.cwd = args.get("cwd").and_then(Value::as_str).map(PathBuf::from);
-            request.policy.tool_allowlist = args
-                .get("tools")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            request.policy.allow_outside_workspace = args
-                .get("allow_outside_workspace")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            request.policy.nesting_depth = self.0.nesting_depth.saturating_add(1);
-            request.policy.max_nesting_depth = self.0.max_nesting_depth;
-            request.session_id = Some(self.0.session_id.clone());
-            request.budgets.max_provider_rounds =
-                args.get("max_provider_rounds").and_then(Value::as_u64);
-            request.budgets.max_tool_rounds = args.get("max_tool_rounds").and_then(Value::as_u64);
-            request.budgets.max_tokens = args.get("max_tokens").and_then(Value::as_u64);
-            let count = args.get("count").and_then(Value::as_u64).unwrap_or(1);
-            if !(1..=8).contains(&count) {
-                return Err(anyhow!("subagent count must be between 1 and 8"));
-            }
+            request.policy.allow_outside_workspace = manifest.allow_outside_workspace;
+            request.policy.nesting_depth = self.config.nesting_depth.saturating_add(1);
+            request.policy.max_nesting_depth = self.config.max_nesting_depth;
+            request.session_id = Some(self.config.session_id.clone());
+            request.budgets.max_provider_rounds = Some(manifest.max_provider_rounds);
             let background = args
                 .get("background")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            if count == 1 {
-                let id = self.0.backend.spawn(
-                    self.0.provider_factory.clone(),
-                    request,
-                    self.0.approval.clone(),
-                )?;
-                if background {
-                    Ok(ToolOutput::text(
-                        serde_json::json!({ "worker_id": id, "status": "queued" }).to_string(),
-                    ))
-                } else {
-                    let wait = self.0.backend.runtime().handle().wait(&id);
-                    tokio::pin!(wait);
-                    let result = tokio::select! {
-                        result = &mut wait => result?,
-                        _ = cancel.cancelled() => {
-                            self.0.backend.cancel(&id)?;
-                            return Err(anyhow!("foreground subagent cancelled"));
-                        }
-                    };
-                    Ok(ToolOutput::text(serde_json::to_string(&result)?))
-                }
+            let id = self.config.backend.spawn(
+                self.config.provider_factory.clone(),
+                request,
+                self.config.approval.clone(),
+            )?;
+            if background {
+                Ok(ToolOutput::text(
+                    serde_json::json!({ "worker_id": id, "status": "queued" }).to_string(),
+                ))
             } else {
-                let group_id = self.0.backend.spawn_group(
-                    self.0.provider_factory.clone(),
-                    vec![request; count as usize],
-                    self.0.approval.clone(),
-                )?;
-                if background {
-                    let group = self.0.backend.poll_group(&group_id)?;
-                    Ok(ToolOutput::text(
-                        serde_json::json!({
-                            "group_id": group_id,
-                            "worker_ids": group.workers,
-                            "status": "queued"
-                        })
-                        .to_string(),
-                    ))
-                } else {
-                    let wait = self.0.backend.runtime().handle().wait_group(&group_id);
-                    tokio::pin!(wait);
-                    let result = tokio::select! {
-                        result = &mut wait => result?,
-                        _ = cancel.cancelled() => {
-                            self.0.backend.cancel_group(&group_id)?;
-                            return Err(anyhow!("foreground subagent group cancelled"));
-                        }
-                    };
-                    Ok(ToolOutput::text(serde_json::to_string(&result)?))
-                }
+                let wait = self.config.backend.runtime().handle().wait(&id);
+                tokio::pin!(wait);
+                let result = tokio::select! {
+                    result = &mut wait => result?,
+                    _ = cancel.cancelled() => {
+                        self.config.backend.cancel(&id)?;
+                        return Err(anyhow!("foreground subagent cancelled"));
+                    }
+                };
+                Ok(ToolOutput::text(serde_json::to_string(&result)?))
             }
         })
     }
@@ -554,7 +642,7 @@ impl Tool for SubagentStatusTool {
         "subagent_status"
     }
     fn description(&self) -> &str {
-        "Return a non-waiting snapshot for one worker or group; groups include every member. worker_id wins if both are set."
+        "Return a non-waiting snapshot for one worker."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -564,13 +652,9 @@ impl Tool for SubagentStatusTool {
                     "type": "string",
                     "minLength": 1,
                     "description": "Worker ID from spawn_subagent."
-                },
-                "group_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Group ID from spawn_subagent with count > 1."
                 }
             },
+            "required": ["worker_id"],
             "additionalProperties": false
         })
     }
@@ -584,10 +668,9 @@ impl Tool for SubagentStatusTool {
         _cancel: CancellationToken,
     ) -> ToolFuture<'a> {
         Box::pin(async move {
-            let value = match resolve_subagent_selector(args, "subagent_status")? {
-                SubagentSelector::Worker(id) => serde_json::to_value(self.0.poll(&id)?)?,
-                SubagentSelector::Group(id) => serde_json::to_value(self.0.poll_group(&id)?)?,
-            };
+            let id = parse_optional_worker_id(args)?
+                .ok_or_else(|| anyhow!("subagent_status requires worker_id"))?;
+            let value = serde_json::to_value(self.0.poll(&id)?)?;
             Ok(ToolOutput::text(serde_json::to_string(&value)?))
         })
     }
@@ -689,7 +772,7 @@ impl Tool for CancelSubagentTool {
         "cancel_subagent"
     }
     fn description(&self) -> &str {
-        "Cancel one worker or group cooperatively; hard-abort after the grace period. worker_id wins if both are set."
+        "Cancel one worker cooperatively; hard-abort after the grace period."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -699,13 +782,9 @@ impl Tool for CancelSubagentTool {
                     "type": "string",
                     "minLength": 1,
                     "description": "Worker ID from spawn_subagent."
-                },
-                "group_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Group ID from spawn_subagent with count > 1."
                 }
             },
+            "required": ["worker_id"],
             "additionalProperties": false
         })
     }
@@ -719,10 +798,9 @@ impl Tool for CancelSubagentTool {
         _cancel: CancellationToken,
     ) -> ToolFuture<'a> {
         Box::pin(async move {
-            let value = match resolve_subagent_selector(args, "cancel_subagent")? {
-                SubagentSelector::Worker(id) => serde_json::to_value(self.0.cancel(&id)?)?,
-                SubagentSelector::Group(id) => serde_json::to_value(self.0.cancel_group(&id)?)?,
-            };
+            let id = parse_optional_worker_id(args)?
+                .ok_or_else(|| anyhow!("cancel_subagent requires worker_id"))?;
+            let value = serde_json::to_value(self.0.cancel(&id)?)?;
             Ok(ToolOutput::text(serde_json::to_string(&value)?))
         })
     }
@@ -735,7 +813,7 @@ impl Tool for PlanSubagentApplyTool {
         "plan_subagent_apply"
     }
     fn description(&self) -> &str {
-        "Create an immutable, digest-checked apply plan for a completed isolated worker. Select group candidates first; parent files stay unchanged."
+        "Create an immutable, digest-checked apply plan for a completed isolated worker; parent files stay unchanged."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -896,78 +974,6 @@ fn path_set(args: &Value, key: &str) -> std::collections::BTreeSet<PathBuf> {
         .collect()
 }
 
-struct SelectSubagentCandidateTool(Arc<crate::wayland::subagents::SubagentBackend>);
-
-impl Tool for SelectSubagentCandidateTool {
-    fn name(&self) -> &str {
-        "select_subagent_candidate"
-    }
-    fn description(&self) -> &str {
-        "Select a successful member after every best-of-N candidate is terminal. Selection can change before apply and never mutates files."
-    }
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "group_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Terminal group whose members were inspected."
-                },
-                "worker_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Successful member to select."
-                }
-            },
-            "required": ["group_id", "worker_id"],
-            "additionalProperties": false
-        })
-    }
-    fn capability(&self) -> ToolCapability {
-        ToolCapability::Read
-    }
-    fn execute<'a>(
-        &'a self,
-        args: &'a Value,
-        _env: &'a ToolEnv<'_>,
-        _cancel: CancellationToken,
-    ) -> ToolFuture<'a> {
-        Box::pin(async move {
-            let group_id =
-                parse_optional_group_id(args)?.ok_or_else(|| anyhow!("group_id is required"))?;
-            let worker_id =
-                parse_optional_worker_id(args)?.ok_or_else(|| anyhow!("worker_id is required"))?;
-            let group = self.0.poll_group(&group_id)?;
-            if !group.workers.contains(&worker_id) {
-                return Err(anyhow!("selected worker is not a member of the group"));
-            }
-            if group
-                .snapshots
-                .iter()
-                .any(|snapshot| !snapshot.status.is_terminal())
-            {
-                return Err(anyhow!(
-                    "all group candidates must be terminal before selection"
-                ));
-            }
-            let selected = group
-                .snapshots
-                .into_iter()
-                .find(|snapshot| snapshot.worker_id == worker_id)
-                .and_then(|snapshot| snapshot.result)
-                .ok_or_else(|| anyhow!("selected candidate has no terminal result"))?;
-            if selected.status != iris_subagent_runtime::WorkerStatus::Completed {
-                return Err(anyhow!("selected candidate did not complete successfully"));
-            }
-            if let Some(worktree) = &selected.worktree {
-                self.0.select_worktree_candidate(&worktree.id)?;
-            }
-            Ok(ToolOutput::text(serde_json::to_string(&selected)?))
-        })
-    }
-}
-
 fn optional_string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
     match args.get(key) {
         None => Ok(None),
@@ -976,98 +982,74 @@ fn optional_string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>
     }
 }
 
-/// Resolve the child worker's effective selection.
-///
-/// - No `model`: inherit the parent selection; a lone `provider` is meaningless
-///   and rejected. An `effort` override still applies.
-/// - `model` given: resolve the exact `(provider, model)` pair against the
-///   authenticated catalog snapshot, then build the selection. Unknown or
-///   ambiguous ids fail before a worker is queued, so the delegating model never
-///   silently lands on the wrong provider (e.g. an API-key lane instead of OAuth).
+struct ResolvedSubagentSelection {
+    selection: crate::mimir::selection::ModelSelection,
+    lane: Option<crate::mimir::model_catalog::SubagentCredentialLane>,
+}
+
+fn selection_for_subagent_entry(
+    parent: &crate::mimir::selection::ModelSelection,
+    entry: crate::mimir::model_catalog::SubagentCatalogEntry,
+    effort: Option<&str>,
+) -> Result<ResolvedSubagentSelection> {
+    let lane = entry
+        .lane
+        .ok_or_else(|| anyhow!("subagent model has no active credential lane"))?;
+    let selection = crate::mimir::selection::selection_for_catalog_model(
+        parent,
+        lane.provider,
+        &entry.model.id,
+        effort,
+    )?;
+    Ok(ResolvedSubagentSelection {
+        selection,
+        lane: Some(lane),
+    })
+}
+
 fn resolve_subagent_selection(
     parent: &crate::mimir::selection::ModelSelection,
-    catalog: &[crate::mimir::model_catalog::CatalogModel],
+    catalog: &[crate::mimir::model_catalog::SubagentCatalogEntry],
+    manifest: &crate::wayland::subagents::SubagentTypeManifest,
     model: Option<&str>,
     provider: Option<&str>,
     effort: Option<&str>,
-) -> Result<crate::mimir::selection::ModelSelection> {
-    match model.map(str::trim).filter(|value| !value.is_empty()) {
-        None => {
-            if provider.is_some_and(|value| !value.trim().is_empty()) {
-                return Err(anyhow!(
-                    "spawn_subagent provider requires model; set model to the target id"
-                ));
-            }
-            Ok(crate::mimir::selection::apply_selection_overrides(
-                parent, None, effort,
-            )?)
-        }
-        Some(model) => {
-            let resolved = crate::mimir::model_catalog::resolve_model_in(catalog, model, provider)?;
-            Ok(crate::mimir::selection::selection_for_catalog_model(
-                parent,
-                resolved.provider,
-                &resolved.id,
-                effort,
-            )?)
-        }
+    approved_api_vendors: &std::collections::BTreeSet<crate::mimir::model_catalog::ProviderVendor>,
+) -> Result<ResolvedSubagentSelection> {
+    if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
+        let entry =
+            crate::mimir::model_catalog::resolve_subagent_model_in(catalog, model, provider)?;
+        return selection_for_subagent_entry(parent, entry, effort);
     }
+    if provider.is_some_and(|value| !value.trim().is_empty()) {
+        return Err(anyhow!(
+            "spawn_subagent provider requires model; set model to the target id"
+        ));
+    }
+    for fallback in &manifest.model_fallbacks {
+        let Ok(entry) =
+            crate::mimir::model_catalog::resolve_subagent_model_in(catalog, fallback, None)
+        else {
+            continue;
+        };
+        let Some(lane) = entry.lane.as_ref() else {
+            continue;
+        };
+        if lane.kind == crate::mimir::model_catalog::CredentialLaneKind::Api
+            && !approved_api_vendors.contains(&lane.vendor)
+        {
+            continue;
+        }
+        return selection_for_subagent_entry(parent, entry, effort);
+    }
+    Ok(ResolvedSubagentSelection {
+        selection: crate::mimir::selection::apply_selection_overrides(parent, None, effort)?,
+        lane: None,
+    })
 }
 
 fn parse_optional_worker_id(args: &Value) -> Result<Option<iris_subagent_runtime::WorkerId>> {
     args.get("worker_id")
-        .and_then(Value::as_str)
-        .map(str::parse)
-        .transpose()
-        .map_err(Into::into)
-}
-
-enum SubagentSelector {
-    Worker(iris_subagent_runtime::WorkerId),
-    Group(iris_subagent_runtime::GroupId),
-}
-
-/// Resolve the worker/group target of `subagent_status` and `cancel_subagent`
-/// from model-authored arguments.
-///
-/// Models routinely fill BOTH id fields even when targeting one record --
-/// live sessions used placeholders like `:invalid`, blanks, or the worker id
-/// pasted into `group_id` -- and a strict "exactly one" contract made status
-/// and cancellation unreachable for them. A value in its named field is
-/// authoritative (worker_id wins when both match their fields); junk is
-/// ignored; a single valid id in the wrong field is rescued. A full
-/// cross-swap carries two distinct valid targets with no field to trust, so
-/// it is refused rather than guessed.
-fn resolve_subagent_selector(args: &Value, tool: &str) -> Result<SubagentSelector> {
-    let field = |key| args.get(key).and_then(Value::as_str).map(str::trim);
-    let worker_field = field("worker_id");
-    let group_field = field("group_id");
-    if let Some(Ok(id)) = worker_field.map(str::parse::<iris_subagent_runtime::WorkerId>) {
-        return Ok(SubagentSelector::Worker(id));
-    }
-    if let Some(Ok(id)) = group_field.map(str::parse::<iris_subagent_runtime::GroupId>) {
-        return Ok(SubagentSelector::Group(id));
-    }
-    let swapped_worker =
-        group_field.and_then(|raw| raw.parse::<iris_subagent_runtime::WorkerId>().ok());
-    let swapped_group =
-        worker_field.and_then(|raw| raw.parse::<iris_subagent_runtime::GroupId>().ok());
-    match (swapped_worker, swapped_group) {
-        (Some(id), None) => Ok(SubagentSelector::Worker(id)),
-        (None, Some(id)) => Ok(SubagentSelector::Group(id)),
-        (Some(_), Some(_)) => Err(anyhow!(
-            "{tool} got a group id in worker_id and a worker id in group_id; \
-             resend with each id in its named field"
-        )),
-        (None, None) => Err(anyhow!(
-            "{tool} needs a valid worker_id (wrk_...) or group_id (grp_...); \
-             the unused field may be omitted"
-        )),
-    }
-}
-
-fn parse_optional_group_id(args: &Value) -> Result<Option<iris_subagent_runtime::GroupId>> {
-    args.get("group_id")
         .and_then(Value::as_str)
         .map(str::parse)
         .transpose()
@@ -1881,21 +1863,64 @@ mod tests {
     /// A fixed authenticated catalog for subagent routing tests: one OAuth Codex
     /// model and one Anthropic model, so resolution is deterministic and does not
     /// depend on the machine's real auth store.
-    fn test_catalog() -> Vec<crate::mimir::model_catalog::CatalogModel> {
-        use crate::mimir::model_catalog::CatalogModel;
+    fn test_catalog() -> Vec<crate::mimir::model_catalog::SubagentCatalogEntry> {
+        use crate::mimir::model_catalog::{
+            CatalogModel, CredentialLaneKind, ProviderVendor, SubagentCatalogEntry,
+            SubagentCredentialLane,
+        };
         use crate::mimir::selection::ProviderId;
-        vec![
-            CatalogModel {
-                provider: ProviderId::OpenAiCodex,
-                id: "gpt-5.4-mini".to_string(),
-                ctx_label: None,
-            },
-            CatalogModel {
-                provider: ProviderId::Anthropic,
-                id: "claude-opus-4-6".to_string(),
-                ctx_label: None,
-            },
+        [
+            (
+                ProviderId::OpenAiCodex,
+                "gpt-5.4-mini",
+                "openai-codex",
+                ProviderVendor::OpenAi,
+            ),
+            (
+                ProviderId::Anthropic,
+                "claude-opus-4-6",
+                "anthropic-oauth",
+                ProviderVendor::Anthropic,
+            ),
         ]
+        .into_iter()
+        .map(|(provider, id, lane_id, vendor)| SubagentCatalogEntry {
+            model: CatalogModel {
+                provider,
+                id: id.to_string(),
+                ctx_label: None,
+            },
+            lane: Some(SubagentCredentialLane {
+                id: lane_id.to_string(),
+                vendor,
+                provider,
+                kind: CredentialLaneKind::OAuth,
+            }),
+        })
+        .collect()
+    }
+
+    fn test_subagent_config(
+        backend: Arc<crate::wayland::subagents::SubagentBackend>,
+        provider_factory: crate::wayland::subagents::ChildProviderFactory,
+        catalog: Vec<crate::mimir::model_catalog::SubagentCatalogEntry>,
+        session_id: &str,
+    ) -> SubagentToolsConfig {
+        SubagentToolsConfig {
+            backend,
+            provider_factory,
+            selection: test_selection(),
+            catalog,
+            manifests: crate::wayland::subagents::default_subagent_type_manifests(),
+            capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
+            approved_api_vendors: Arc::new(
+                std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            ),
+            session_id: session_id.to_string(),
+            nesting_depth: 0,
+            max_nesting_depth: 2,
+            approval: None,
+        }
     }
 
     #[test]
@@ -1910,19 +1935,12 @@ mod tests {
             )
             .unwrap(),
         );
-        let config = SubagentToolsConfig {
+        let config = test_subagent_config(
             backend,
-            provider_factory: Arc::new(|_| {
-                Err(anyhow!("schema contract must not construct a provider"))
-            }),
-            selection: test_selection(),
-            catalog: test_catalog(),
-            capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
-            session_id: "schema-contract".to_string(),
-            nesting_depth: 0,
-            max_nesting_depth: 2,
-            approval: None,
-        };
+            Arc::new(|_| Err(anyhow!("schema contract must not construct a provider"))),
+            test_catalog(),
+            "schema-contract",
+        );
         let tools = built_in_tools_with(&ToolsConfig {
             subagents: Some(config),
             ..ToolsConfig::default()
@@ -1992,32 +2010,26 @@ mod tests {
             )
             .unwrap(),
         );
-        let selection = test_selection();
         let provider_factory: crate::wayland::subagents::ChildProviderFactory =
             Arc::new(|_| Err(anyhow!("invalid route must not construct a provider")));
-        let tool = SpawnSubagentTool(SubagentToolsConfig {
-            backend: backend.clone(),
+        let tool = SpawnSubagentTool::new(test_subagent_config(
+            backend.clone(),
             provider_factory,
-            selection,
-            catalog: test_catalog(),
-            capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
-            session_id: "invalid-route".to_string(),
-            nesting_depth: 0,
-            max_nesting_depth: 2,
-            approval: None,
-        });
+            test_catalog(),
+            "invalid-route",
+        ));
         let state = std::cell::RefCell::new(ToolState::new());
         let env = bash_env(&workspace, &state, None);
 
         for invalid in [
             // Not in the authenticated catalog at all.
-            json!({ "prompt": "invalid", "model": "gpt-4.1" }),
+            json!({ "task": "invalid", "model": "gpt-4.1" }),
             // A valid id, but not offered by the named provider.
-            json!({ "prompt": "invalid", "model": "gpt-5.4-mini", "provider": "openai" }),
+            json!({ "task": "invalid", "model": "gpt-5.4-mini", "provider": "openai" }),
             // provider without model has nothing to disambiguate.
-            json!({ "prompt": "invalid", "provider": "anthropic" }),
+            json!({ "task": "invalid", "provider": "anthropic" }),
             // Bad reasoning level still fails before acceptance.
-            json!({ "prompt": "invalid", "effort": "ultra" }),
+            json!({ "task": "invalid", "effort": "ultra" }),
         ] {
             let error = current_thread_runtime()
                 .block_on(tool.execute(&invalid, &env, CancellationToken::new()))
@@ -2040,7 +2052,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_routing_persists_one_effective_route_for_best_of_n() {
+    fn omitted_subagent_type_uses_general_manifest_prompt_and_turn_budget() {
         let dir = temp_dir();
         let workspace = root_of(&dir);
         let backend = Arc::new(
@@ -2053,52 +2065,107 @@ mod tests {
         );
         let provider_factory: crate::wayland::subagents::ChildProviderFactory =
             Arc::new(|_| Ok(Box::new(PendingProvider(Rc::new(()))) as Box<dyn ChatProvider>));
-        let tool = SpawnSubagentTool(SubagentToolsConfig {
-            backend: backend.clone(),
+        let tool = SpawnSubagentTool::new(test_subagent_config(
+            backend.clone(),
             provider_factory,
-            selection: test_selection(),
-            catalog: test_catalog(),
-            capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
-            session_id: "direct-route".to_string(),
-            nesting_depth: 0,
-            max_nesting_depth: 2,
-            approval: None,
-        });
+            test_catalog(),
+            "direct-route",
+        ));
+        let general_prompt = tool
+            .config
+            .manifests
+            .iter()
+            .find(|manifest| manifest.id == "general")
+            .unwrap()
+            .system_prompt
+            .clone();
         let state = std::cell::RefCell::new(ToolState::new());
         let env = bash_env(&workspace, &state, None);
 
         let output = current_thread_runtime()
             .block_on(tool.execute(
                 &json!({
-                    "prompt": "route",
+                    "task": "route",
                     "model": "claude-opus-4-6",
-                    "effort": "xhigh",
-                    "count": 3
+                    "effort": "xhigh"
                 }),
                 &env,
                 CancellationToken::new(),
             ))
             .unwrap();
         let value: Value = serde_json::from_str(&output.content).unwrap();
-        let group_id: iris_subagent_runtime::GroupId =
-            value["group_id"].as_str().unwrap().parse().unwrap();
-        let group = backend.poll_group(&group_id).unwrap();
-        let route_ids = group
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot.request.route_id.clone().unwrap())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(route_ids.len(), 1);
-        for snapshot in &group.snapshots {
-            let route = crate::wayland::subagents::route_from_request(&snapshot.request)
-                .unwrap()
-                .unwrap();
-            assert_eq!(route.provider, "anthropic");
-            assert_eq!(route.model, "claude-opus-4-6");
-            assert_eq!(route.effort.as_deref(), Some("xhigh"));
-            assert!(snapshot.request.profile_id.is_none());
-        }
-        backend.cancel_group(&group_id).unwrap();
+        let worker_id: iris_subagent_runtime::WorkerId =
+            value["worker_id"].as_str().unwrap().parse().unwrap();
+        let snapshot = backend.poll(&worker_id).unwrap();
+        let route = crate::wayland::subagents::route_from_request(&snapshot.request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.provider, "anthropic");
+        assert_eq!(route.model, "claude-opus-4-6");
+        assert_eq!(route.effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            route.credential_lane,
+            Some(crate::mimir::model_catalog::CredentialLaneKind::OAuth)
+        );
+        assert_eq!(
+            snapshot.request.kind,
+            iris_subagent_runtime::WorkerKind::General
+        );
+        assert_eq!(snapshot.request.system_prompt, general_prompt);
+        assert_ne!(snapshot.request.system_prompt, snapshot.request.prompt);
+        assert_eq!(snapshot.request.budgets.max_provider_rounds, Some(200));
+        assert!(snapshot.request.profile_id.is_none());
+        backend.cancel(&worker_id).unwrap();
+    }
+
+    #[test]
+    fn explicit_tools_replace_manifest_profile_and_clamp_to_parent_ceiling() {
+        let dir = temp_dir();
+        let workspace = root_of(&dir);
+        let backend = Arc::new(
+            crate::wayland::subagents::SubagentBackend::open(
+                workspace.clone(),
+                &workspace.join("worker-state-tools"),
+                workspace.join("worktrees-tools"),
+            )
+            .unwrap(),
+        );
+        let provider_factory: crate::wayland::subagents::ChildProviderFactory =
+            Arc::new(|_| Ok(Box::new(PendingProvider(Rc::new(()))) as Box<dyn ChatProvider>));
+        let mut config = test_subagent_config(
+            backend.clone(),
+            provider_factory,
+            test_catalog(),
+            "tool-override",
+        );
+        config.capability_ceiling = iris_subagent_runtime::CapabilityMode::ReadOnly;
+        let tool = SpawnSubagentTool::new(config);
+        let state = std::cell::RefCell::new(ToolState::new());
+        let env = bash_env(&workspace, &state, None);
+
+        let output = current_thread_runtime()
+            .block_on(tool.execute(
+                &json!({
+                    "task": "inspect",
+                    "tools": ["grep", "bash"]
+                }),
+                &env,
+                CancellationToken::new(),
+            ))
+            .unwrap();
+        let value: Value = serde_json::from_str(&output.content).unwrap();
+        let worker_id: iris_subagent_runtime::WorkerId =
+            value["worker_id"].as_str().unwrap().parse().unwrap();
+        let snapshot = backend.poll(&worker_id).unwrap();
+        assert_eq!(
+            snapshot.request.policy.tools,
+            Some(vec!["grep".to_string()])
+        );
+        assert_eq!(
+            snapshot.request.policy.isolation,
+            iris_subagent_runtime::IsolationMode::None
+        );
+        backend.cancel(&worker_id).unwrap();
     }
 
     #[test]
@@ -2115,17 +2182,12 @@ mod tests {
         );
         let provider_factory: crate::wayland::subagents::ChildProviderFactory =
             Arc::new(|_| Ok(Box::new(PendingProvider(Rc::new(()))) as Box<dyn ChatProvider>));
-        let tool = SpawnSubagentTool(SubagentToolsConfig {
-            backend: backend.clone(),
+        let tool = SpawnSubagentTool::new(test_subagent_config(
+            backend.clone(),
             provider_factory,
-            selection: test_selection(),
-            catalog: Vec::new(),
-            capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
-            session_id: "foreground-cancel".to_string(),
-            nesting_depth: 0,
-            max_nesting_depth: 2,
-            approval: None,
-        });
+            Vec::new(),
+            "foreground-cancel",
+        ));
         let state = std::cell::RefCell::new(ToolState::new());
         let env = bash_env(&workspace, &state, None);
         let cancel = CancellationToken::new();
@@ -2137,7 +2199,7 @@ mod tests {
 
         let error = current_thread_runtime()
             .block_on(tool.execute(
-                &json!({ "prompt": "wait", "background": false }),
+                &json!({ "task": "wait", "background": false }),
                 &env,
                 cancel,
             ))
@@ -2415,17 +2477,12 @@ mod tests {
             )
             .unwrap(),
         );
-        let subagents = SubagentToolsConfig {
+        let subagents = test_subagent_config(
             backend,
-            provider_factory: Arc::new(|_| Err(anyhow!("budget test must not execute a provider"))),
-            selection: test_selection(),
-            catalog: Vec::new(),
-            capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
-            session_id: "fixed-context-budget".to_string(),
-            nesting_depth: 0,
-            max_nesting_depth: 2,
-            approval: None,
-        };
+            Arc::new(|_| Err(anyhow!("budget test must not execute a provider"))),
+            Vec::new(),
+            "fixed-context-budget",
+        );
         let web = WebToolsConfig {
             web_search: Some(web::SearchBackend::Native),
             read_web_page: Some(web::ReadBackend::Native),
@@ -2639,17 +2696,12 @@ mod tests {
         let provider_factory: crate::wayland::subagents::ChildProviderFactory =
             Arc::new(|_| Err(anyhow!("schema test must not execute a provider")));
         let subagent_config = ToolsConfig {
-            subagents: Some(SubagentToolsConfig {
+            subagents: Some(test_subagent_config(
                 backend,
                 provider_factory,
-                selection: test_selection(),
-                catalog: Vec::new(),
-                capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
-                session_id: "schema-test".to_string(),
-                nesting_depth: 0,
-                max_nesting_depth: 2,
-                approval: None,
-            }),
+                Vec::new(),
+                "schema-test",
+            )),
             ..ToolsConfig::default()
         };
         let subagent_tools = built_in_tools_with(&subagent_config);
@@ -2866,18 +2918,18 @@ mod tests {
         let spawn = subagent_tools.by_name("spawn_subagent").unwrap();
         for invalid in [
             json!({
-                "prompt": "invalid",
+                "task": "invalid",
                 "kind": "review",
                 "capability": "read_write"
             }),
             json!({
-                "prompt": "invalid",
+                "task": "invalid",
                 "capability": "read_only",
                 "isolation": "worktree",
                 "cwd": "."
             }),
             json!({
-                "prompt": "invalid",
+                "task": "invalid",
                 "capability": "read_write",
                 "isolation": "none"
             }),
@@ -2953,7 +3005,7 @@ mod tests {
         let failed = current_thread_runtime()
             .block_on(spawn.execute(
                 &json!({
-                    "prompt": "must fail before inference",
+                    "task": "must fail before inference",
                     "capability": "read_write",
                     "background": false
                 }),
