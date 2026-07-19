@@ -698,4 +698,18 @@ mod tests {
         let decoded: WorkerRequest = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, request);
     }
+
+    #[test]
+    fn request_contract_carries_resolved_tools_and_no_unsafe_budget_knobs() {
+        let value = serde_json::to_value(WorkerRequest::read_only("inspect")).unwrap();
+        let policy = value["policy"].as_object().unwrap();
+        assert!(policy.contains_key("tools"));
+        assert!(!policy.contains_key("capability"));
+        assert!(!policy.contains_key("parent_capability"));
+        let budgets = value["budgets"].as_object().unwrap();
+        assert!(budgets.contains_key("max_provider_rounds"));
+        assert!(!budgets.contains_key("max_tool_rounds"));
+        assert!(!budgets.contains_key("max_tokens"));
+        assert_eq!(value["system_prompt"], "");
+    }
 }

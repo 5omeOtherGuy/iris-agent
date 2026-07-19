@@ -1898,6 +1898,73 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn spawn_subagent_schema_matches_the_manifest_driven_surface() {
+        let dir = temp_dir();
+        let workspace = root_of(&dir);
+        let backend = Arc::new(
+            crate::wayland::subagents::SubagentBackend::open(
+                workspace.clone(),
+                &workspace.join("worker-state-schema-red"),
+                workspace.join("worktrees-schema-red"),
+            )
+            .unwrap(),
+        );
+        let config = SubagentToolsConfig {
+            backend,
+            provider_factory: Arc::new(|_| {
+                Err(anyhow!("schema contract must not construct a provider"))
+            }),
+            selection: test_selection(),
+            catalog: test_catalog(),
+            capability_ceiling: iris_subagent_runtime::CapabilityMode::All,
+            session_id: "schema-contract".to_string(),
+            nesting_depth: 0,
+            max_nesting_depth: 2,
+            approval: None,
+        };
+        let tools = built_in_tools_with(&ToolsConfig {
+            subagents: Some(config),
+            ..ToolsConfig::default()
+        });
+        let spawn = tools.by_name("spawn_subagent").unwrap();
+        let schema = spawn.parameters();
+        let properties = schema["properties"].as_object().unwrap();
+        let mut fields = properties.keys().map(String::as_str).collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            vec![
+                "background",
+                "cwd",
+                "description",
+                "effort",
+                "isolation",
+                "model",
+                "subagent_type",
+                "system_prompt",
+                "task",
+                "tools",
+            ]
+        );
+        assert_eq!(schema["required"], json!(["task"]));
+        assert_eq!(properties["subagent_type"]["default"], "general");
+        assert!(spawn.description().contains("general:"));
+        assert!(spawn.description().contains("explore:"));
+        assert!(spawn.description().contains("review:"));
+        assert!(tools.by_name("select_subagent_candidate").is_none());
+        assert!(
+            tools.by_name("subagent_status").unwrap().parameters()["properties"]
+                .get("group_id")
+                .is_none()
+        );
+        assert!(
+            tools.by_name("cancel_subagent").unwrap().parameters()["properties"]
+                .get("group_id")
+                .is_none()
+        );
+    }
+
     fn bash_env<'a>(
         workspace: &'a std::path::Path,
         state: &'a std::cell::RefCell<ToolState>,
