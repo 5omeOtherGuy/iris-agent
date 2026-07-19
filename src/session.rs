@@ -2267,6 +2267,40 @@ mod tests {
     }
 
     #[test]
+    fn append_provider_transport_recovery_writes_safe_diagnostic_metadata() {
+        let dir = temp_dir();
+        let mut log = SessionLog::create_in(&dir.path, Path::new("/w")).unwrap();
+        let recovery = crate::nexus::ProviderTransportRecovery {
+            provider: "openai-codex".to_string(),
+            model: "gpt-test".to_string(),
+            transport: "websocket".to_string(),
+            reason: "stale_reused_socket".to_string(),
+            phase: "websocket_read".to_string(),
+            close_code: Some(1000),
+            close_reason: Some("normal".to_string()),
+            socket_reused: true,
+            socket_age_ms: 42_000,
+            last_event: None,
+        };
+
+        log.append_provider_transport_recovery(&recovery).unwrap();
+        let entries = lines(log.path());
+        let entry = &entries[1];
+
+        assert_eq!(entry["type"], "providerTransportRecovery");
+        assert_eq!(entry["provider"], "openai-codex");
+        assert_eq!(entry["model"], "gpt-test");
+        assert_eq!(entry["transport"], "websocket");
+        assert_eq!(entry["reason"], "stale_reused_socket");
+        assert_eq!(entry["phase"], "websocket_read");
+        assert_eq!(entry["closeCode"], 1000);
+        assert_eq!(entry["closeReason"], "normal");
+        assert_eq!(entry["socketReused"], true);
+        assert_eq!(entry["socketAgeMs"], 42_000);
+        assert!(entry["lastEvent"].is_null());
+    }
+
+    #[test]
     fn append_dangerous_mode_writes_an_audit_entry() {
         // ADR-0049: the skip-permissions mode is recorded as transcript
         // metadata so a resumed/audited session shows it was active.

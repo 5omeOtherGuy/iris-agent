@@ -305,7 +305,7 @@ fn stale_reused_socket_close_reconnects_immediately_without_retry_event() -> Res
             first
                 .send(WsMessage::Close(Some(CloseFrame {
                     code: CloseCode::Normal,
-                    reason: "response complete".into(),
+                    reason: "normal".into(),
                 })))
                 .await?;
             let _ = close_sent_tx.send(());
@@ -362,10 +362,12 @@ fn stale_reused_socket_close_reconnects_immediately_without_retry_event() -> Res
         );
 
         let mut reconnects = Vec::new();
+        let mut recoveries = Vec::new();
         let mut completed = false;
         while let Some(event) = stream.next().await {
             match event? {
                 ProviderEvent::Reconnect(reconnect) => reconnects.push(reconnect),
+                ProviderEvent::TransportRecovery(recovery) => recoveries.push(recovery),
                 ProviderEvent::Completed(_) => completed = true,
                 _ => {}
             }
@@ -376,6 +378,17 @@ fn stale_reused_socket_close_reconnects_immediately_without_retry_event() -> Res
             reconnects.is_empty(),
             "stale reuse consumed normal retry path"
         );
+        assert_eq!(recoveries.len(), 1);
+        let recovery = &recoveries[0];
+        assert_eq!(recovery.provider, PROVIDER_ID);
+        assert_eq!(recovery.model, "gpt-test");
+        assert_eq!(recovery.transport, "websocket");
+        assert_eq!(recovery.reason, "stale_reused_socket");
+        assert_eq!(recovery.phase, "websocket_read");
+        assert_eq!(recovery.close_code, Some(1000));
+        assert_eq!(recovery.close_reason.as_deref(), Some("normal"));
+        assert!(recovery.socket_reused);
+        assert_eq!(recovery.last_event, None);
         server.await??;
         Ok(())
     })
