@@ -1319,16 +1319,8 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             continue;
         };
-        // `message`, `compaction`, `fold`, `modelSelection`, `taskLifecycle`,
-        // `providerTransportFallback`, and `dangerousMode` entries all occupy
-        // the leaf chain and an entry-id slot, so a resumed append must link its
-        // `parentId` past, and count its `next_seq` beyond, whichever kind is the
-        // current leaf. (`fold`, `modelSelection`, `taskLifecycle`,
-        // `providerTransportFallback`, and `dangerousMode` are audit records;
-        // the read/rebuild path skips them, but the chain must
-        // still flow through them or `parentId` breaks -- and `append_fold`
-        // consumes a seq, so ignoring `fold` here would let the next append
-        // reuse the fold's id (issue #378).)
+        // Every recognized row occupies the leaf chain and an entry-id slot.
+        // Resume must advance through audit rows even though context rebuild skips them.
         if value.get("type").and_then(Value::as_str) == Some("goalState")
             && let Some(snapshot) = value.get("goal")
         {
@@ -1345,6 +1337,7 @@ fn scan_for_resume(path: &Path) -> Result<ResumeState> {
             | Some("modelSelection")
             | Some("taskLifecycle")
             | Some("providerTransportFallback")
+            | Some("providerTransportRecovery")
             | Some("dangerousMode")
             | Some("goalState") => {}
             _ => continue,
@@ -2318,8 +2311,13 @@ mod tests {
             last_event: None,
         };
 
-        log.append_provider_transport_recovery(&recovery).unwrap();
-        let entries = lines(log.path());
+        let recovery_id = log.append_provider_transport_recovery(&recovery).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+        let mut resumed = SessionLog::resume(&path).unwrap();
+        let message_id = resumed.append(&Message::assistant("recovered")).unwrap();
+        drop(resumed);
+        let entries = lines(&path);
         let entry = &entries[1];
 
         assert_eq!(entry["type"], "providerTransportRecovery");
@@ -2333,6 +2331,11 @@ mod tests {
         assert_eq!(entry["socketReused"], true);
         assert_eq!(entry["socketAgeMs"], 42_000);
         assert!(entry["lastEvent"].is_null());
+        assert_eq!(entries[2]["parentId"], recovery_id);
+        assert_ne!(
+            message_id, recovery_id,
+            "resume must not reuse the audit id"
+        );
     }
 
     #[test]

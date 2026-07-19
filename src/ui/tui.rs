@@ -812,6 +812,16 @@ mod tests {
     }
 
     #[test]
+    fn provider_transport_recovery_does_not_add_a_transcript_row() {
+        let mut screen = Screen::new();
+        let rows = screen.transcript.rows.len();
+
+        screen.apply(UiEvent::ProviderTransportRecovery);
+
+        assert_eq!(screen.transcript.rows.len(), rows);
+    }
+
+    #[test]
     fn spawn_subagent_renders_a_delegate_card_not_an_edit_panel() {
         let mut screen = Screen::new();
         screen.set_footer("gpt-5.5".to_string(), None, "~/repo".to_string());

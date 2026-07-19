@@ -845,6 +845,37 @@ fn websocket_close_diagnostics_keep_code_and_only_safe_reason() {
 }
 
 #[test]
+fn only_close_before_any_event_on_a_reused_socket_is_silently_recovered() {
+    assert!(should_recover_stale_reuse(true, None));
+    assert!(!should_recover_stale_reuse(false, None));
+    assert!(!should_recover_stale_reuse(true, Some("response.created")));
+}
+
+#[test]
+fn stale_reuse_recovery_diagnostics_redact_hostile_close_reason() {
+    let safe = stale_reuse_close(
+        Some(CloseFrame {
+            code: CloseCode::Away,
+            reason: "server_restart".into(),
+        }),
+        42,
+    );
+    assert_eq!(safe.close_code, Some(1001));
+    assert_eq!(safe.close_reason.as_deref(), Some("server_restart"));
+    assert_eq!(safe.socket_age_ms, 42);
+
+    let hostile = stale_reuse_close(
+        Some(CloseFrame {
+            code: CloseCode::Error,
+            reason: "leak /home/alice sk-secret prompt".into(),
+        }),
+        43,
+    );
+    assert_eq!(hostile.close_code, Some(1011));
+    assert_eq!(hostile.close_reason, None);
+}
+
+#[test]
 fn websocket_create_frame_omits_stream_and_keeps_store_false() {
     let full = json!({
         "model": "gpt-test",

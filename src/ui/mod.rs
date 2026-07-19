@@ -783,6 +783,26 @@ mod tests {
     }
 
     #[test]
+    fn maps_provider_transport_recovery_to_silent_ui_event() {
+        let mapped = UiEvent::from_agent_event(AgentEvent::ProviderTransportRecovery(
+            crate::nexus::ProviderTransportRecovery {
+                provider: "openai-codex".to_string(),
+                model: "gpt-test".to_string(),
+                transport: "websocket".to_string(),
+                reason: "stale_reused_socket".to_string(),
+                phase: "websocket_read".to_string(),
+                close_code: Some(1000),
+                close_reason: Some("normal".to_string()),
+                socket_reused: true,
+                socket_age_ms: 42,
+                last_event: None,
+            },
+        ));
+
+        assert_eq!(mapped, UiEvent::ProviderTransportRecovery);
+    }
+
+    #[test]
     fn maps_provider_transport_fallback_to_an_actionable_notice() {
         let mapped = UiEvent::from_agent_event(AgentEvent::ProviderTransportFallback(
             crate::nexus::ProviderTransportFallback {

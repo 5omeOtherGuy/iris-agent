@@ -941,6 +941,17 @@ mod tests {
     }
 
     #[test]
+    fn provider_transport_recovery_is_silent() -> Result<()> {
+        let mut ui = TextUi::new("".as_bytes(), Vec::new(), Vec::new());
+
+        ui.emit(UiEvent::ProviderTransportRecovery)?;
+
+        let (_, out, _) = ui.into_parts();
+        assert!(out.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn startup_banner_has_no_fake_timing() -> Result<()> {
         let mut ui = TextUi::new("".as_bytes(), Vec::new(), Vec::new());
         ui.emit(UiEvent::SessionStarted)?;

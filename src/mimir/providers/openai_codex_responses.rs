@@ -1262,23 +1262,15 @@ impl OpenAiCodexResponsesProvider {
                         .map_err(|error| (WsFallback::Fatal, error))?;
                 }
                 Ok(WsMessage::Close(frame)) => {
-                    if socket_reused && parser.last_event_type.is_none() {
-                        let close_code = frame.as_ref().map(|frame| u16::from(frame.code));
-                        let close_reason = frame.as_ref().and_then(|frame| {
-                            safe_error_field(frame.reason.as_ref()).map(str::to_string)
-                        });
+                    if should_recover_stale_reuse(socket_reused, parser.last_event_type.as_deref())
+                    {
                         let socket_age_ms = reusable
                             .opened_at
                             .elapsed()
                             .as_millis()
                             .min(u128::from(u64::MAX))
                             as u64;
-                        let error: anyhow::Error = WsStaleReuseClose {
-                            close_code,
-                            close_reason,
-                            socket_age_ms,
-                        }
-                        .into();
+                        let error: anyhow::Error = stale_reuse_close(frame, socket_age_ms).into();
                         return Err((WsFallback::RetryWebSocket, error));
                     }
                     let close = websocket_close_error(frame, parser.last_event_type.clone());
@@ -2266,6 +2258,23 @@ where
                 error,
             ))
         }
+    }
+}
+
+fn should_recover_stale_reuse(socket_reused: bool, last_event: Option<&str>) -> bool {
+    socket_reused && last_event.is_none()
+}
+
+fn stale_reuse_close(
+    frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+    socket_age_ms: u64,
+) -> WsStaleReuseClose {
+    WsStaleReuseClose {
+        close_code: frame.as_ref().map(|frame| u16::from(frame.code)),
+        close_reason: frame
+            .as_ref()
+            .and_then(|frame| safe_error_field(frame.reason.as_ref()).map(str::to_string)),
+        socket_age_ms,
     }
 }
 
