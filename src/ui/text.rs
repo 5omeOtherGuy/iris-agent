@@ -594,6 +594,7 @@ impl<R: BufRead, W: Write, E: Write> Ui for TextUi<R, W, E> {
                 self.exploring_open = false;
                 writeln!(self.out, "{}", sgr(self.ansi, "1", &format!("> {text}")))?;
             }
+            UiEvent::ProviderTransportRecovery => {}
             UiEvent::Notice(message) => {
                 self.finish_assistant_stream()?;
                 self.in_tool_block = false;
@@ -936,6 +937,17 @@ mod tests {
     fn prompt_returns_single_line_with_newline() -> Result<()> {
         let mut ui = TextUi::new("hello\ny\n".as_bytes(), Vec::new(), Vec::new());
         assert_eq!(ui.next_prompt()?.as_deref(), Some("hello\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_transport_recovery_is_silent() -> Result<()> {
+        let mut ui = TextUi::new("".as_bytes(), Vec::new(), Vec::new());
+
+        ui.emit(UiEvent::ProviderTransportRecovery)?;
+
+        let (_, out, _) = ui.into_parts();
+        assert!(out.is_empty());
         Ok(())
     }
 

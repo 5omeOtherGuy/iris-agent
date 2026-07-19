@@ -304,6 +304,8 @@ pub(crate) enum UiEvent {
     /// matches provider context. See [`AgentEvent::UserMessage`].
     UserMessage(String),
     Notice(String),
+    /// Silent operational metadata consumed by Wayland for session diagnostics.
+    ProviderTransportRecovery,
     /// The task's final net diff (issue #264, `/diff`): a per-file summary plus
     /// the combined unified diff. Rendered through the existing diff colorizer
     /// in the TUI and as plain text on the non-TTY path. A UI-only event -- it
@@ -447,6 +449,7 @@ impl UiEvent {
             AgentEvent::ProviderReconnect(reconnect) => {
                 UiEvent::Notice(provider_reconnect_notice(&reconnect))
             }
+            AgentEvent::ProviderTransportRecovery(_) => UiEvent::ProviderTransportRecovery,
             AgentEvent::ToolLifecycle {
                 provider_turn_id,
                 call_id,
@@ -777,6 +780,26 @@ mod tests {
         assert!(message.contains("4s"), "{message}");
         assert!(message.contains("read_idle"), "{message}");
         assert!(message.contains("awaiting_next_frame"), "{message}");
+    }
+
+    #[test]
+    fn maps_provider_transport_recovery_to_silent_ui_event() {
+        let mapped = UiEvent::from_agent_event(AgentEvent::ProviderTransportRecovery(
+            crate::nexus::ProviderTransportRecovery {
+                provider: "openai-codex".to_string(),
+                model: "gpt-test".to_string(),
+                transport: "websocket".to_string(),
+                reason: "stale_reused_socket".to_string(),
+                phase: "websocket_read".to_string(),
+                close_code: Some(1000),
+                close_reason: Some("normal".to_string()),
+                socket_reused: true,
+                socket_age_ms: 42,
+                last_event: None,
+            },
+        ));
+
+        assert_eq!(mapped, UiEvent::ProviderTransportRecovery);
     }
 
     #[test]

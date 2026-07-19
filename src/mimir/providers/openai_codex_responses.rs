@@ -28,8 +28,9 @@ use crate::mimir::selection::{CodexTransport, PromptCacheRetention, ReasoningEff
 use crate::nexus::{
     AssistantTurn, ChatProvider, Message, ModelOrigin, ProviderCompactionCapability,
     ProviderCompactionFuture, ProviderCompactionOutput, ProviderReconnect, ProviderStream,
-    ProviderTransportFallback, ProviderUsage, ReasoningBlock, Role, StructuredSummaryCapability,
-    StructuredSummaryError, StructuredSummaryFuture, StructuredSummaryMode, ToolCall, Tools,
+    ProviderTransportFallback, ProviderTransportRecovery, ProviderUsage, ReasoningBlock, Role,
+    StructuredSummaryCapability, StructuredSummaryError, StructuredSummaryFuture,
+    StructuredSummaryMode, ToolCall, Tools,
 };
 
 // Transport resilience for Codex requests. Transient failures (network, 429,
@@ -114,6 +115,27 @@ struct ReusableCodexWs {
     opened_at: Instant,
     last_used: Instant,
 }
+
+#[derive(Debug)]
+struct WsStaleReuseClose {
+    close_code: Option<u16>,
+    close_reason: Option<String>,
+    socket_age_ms: u64,
+}
+
+impl std::fmt::Display for WsStaleReuseClose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stale reused Codex WebSocket closed before the next response [classification=stale_reused_socket observed_at=websocket_read close_code={} socket_age_ms={}]",
+            self.close_code
+                .map_or_else(|| "none".to_string(), |code| code.to_string()),
+            self.socket_age_ms,
+        )
+    }
+}
+
+impl std::error::Error for WsStaleReuseClose {}
 
 #[derive(Debug, Clone)]
 struct CodexContinuation {
@@ -1020,6 +1042,68 @@ impl OpenAiCodexResponsesProvider {
         cancel: &CancellationToken,
         attempt: (bool, u32),
     ) -> std::result::Result<AssistantTurn, (WsFallback, anyhow::Error)> {
+        let (mut force_full, ws_attempt) = attempt;
+        let mut recovered_stale_reuse = false;
+        loop {
+            let result = self
+                .run_ws_exchange_once(
+                    ws_url.clone(),
+                    full_request,
+                    token,
+                    sink,
+                    cancel,
+                    (force_full, ws_attempt),
+                )
+                .await;
+            let Err((_, error)) = &result else {
+                return result;
+            };
+            let Some(stale) = error.downcast_ref::<WsStaleReuseClose>() else {
+                return result;
+            };
+            if recovered_stale_reuse {
+                return result;
+            }
+
+            let recovery = ProviderTransportRecovery {
+                provider: PROVIDER_ID.to_string(),
+                model: safe_error_field(&self.model)
+                    .unwrap_or("redacted")
+                    .to_string(),
+                transport: "websocket".to_string(),
+                reason: "stale_reused_socket".to_string(),
+                phase: "websocket_read".to_string(),
+                close_code: stale.close_code,
+                close_reason: stale.close_reason.clone(),
+                socket_reused: true,
+                socket_age_ms: stale.socket_age_ms,
+                last_event: None,
+            };
+            tracing::info!(
+                provider = PROVIDER_ID,
+                transport = "websocket",
+                recovery = "stale_reused_socket",
+                close_code = ?recovery.close_code,
+                socket_age_ms = recovery.socket_age_ms,
+                "replacing stale reusable Codex WebSocket"
+            );
+            self.drop_ws_socket().await;
+            sink.on_transport_recovery(recovery)
+                .map_err(|error| (WsFallback::Fatal, error))?;
+            recovered_stale_reuse = true;
+            force_full = true;
+        }
+    }
+
+    async fn run_ws_exchange_once(
+        &self,
+        ws_url: Url,
+        full_request: &Value,
+        token: &AccessToken,
+        sink: &mut ChannelSink,
+        cancel: &CancellationToken,
+        attempt: (bool, u32),
+    ) -> std::result::Result<AssistantTurn, (WsFallback, anyhow::Error)> {
         let (force_full, _ws_attempt) = attempt;
         // Continuation ids live only on the socket that produced them. Resolve
         // socket reuse before building the frame so a new connection cannot
@@ -1029,22 +1113,25 @@ impl OpenAiCodexResponsesProvider {
             let state = self.ws_state.lock().await;
             build_ws_create_frame(full_request, state.continuation.as_ref(), force_full)
         };
-        let mut reusable = match reusable {
-            Some(socket) => socket,
+        let (mut reusable, socket_reused) = match reusable {
+            Some(socket) => (socket, true),
             None => {
                 sink.set_transport_phase("websocket", "connection_handshake");
-                ReusableCodexWs {
-                    stream: await_ws_setup(
-                        "connect",
-                        WS_CONNECT_TIMEOUT,
-                        cancel,
-                        false,
-                        connect_codex_ws(ws_url, token, &self.prompt_cache_key),
-                    )
-                    .await?,
-                    opened_at: Instant::now(),
-                    last_used: Instant::now(),
-                }
+                (
+                    ReusableCodexWs {
+                        stream: await_ws_setup(
+                            "connect",
+                            WS_CONNECT_TIMEOUT,
+                            cancel,
+                            false,
+                            connect_codex_ws(ws_url, token, &self.prompt_cache_key),
+                        )
+                        .await?,
+                        opened_at: Instant::now(),
+                        last_used: Instant::now(),
+                    },
+                    false,
+                )
             }
         };
         sink.set_transport_phase("websocket", "request_send");
@@ -1108,6 +1195,11 @@ impl OpenAiCodexResponsesProvider {
                 }
             };
             let Some(message) = next else {
+                if should_recover_stale_reuse(socket_reused, parser.last_event_type.as_deref()) {
+                    let error: anyhow::Error =
+                        stale_reuse_close(None, reusable_socket_age_ms(&reusable)).into();
+                    return Err((WsFallback::RetryWebSocket, error));
+                }
                 let error: anyhow::Error = CodexStreamProtocolAnomaly::closed_before_completed(
                     parser.last_event_type.clone(),
                 )
@@ -1175,6 +1267,12 @@ impl OpenAiCodexResponsesProvider {
                         .map_err(|error| (WsFallback::Fatal, error))?;
                 }
                 Ok(WsMessage::Close(frame)) => {
+                    if should_recover_stale_reuse(socket_reused, parser.last_event_type.as_deref())
+                    {
+                        let error: anyhow::Error =
+                            stale_reuse_close(frame, reusable_socket_age_ms(&reusable)).into();
+                        return Err((WsFallback::RetryWebSocket, error));
+                    }
                     let close = websocket_close_error(frame, parser.last_event_type.clone());
                     let model = safe_error_field(&self.model).unwrap_or("redacted");
                     let error = anyhow!("{close} [provider={PROVIDER_ID} model={model}]");
@@ -1185,6 +1283,12 @@ impl OpenAiCodexResponsesProvider {
                 }
                 Ok(WsMessage::Frame(_)) => {}
                 Err(error) => {
+                    if should_recover_stale_reuse(socket_reused, parser.last_event_type.as_deref())
+                    {
+                        let error: anyhow::Error =
+                            stale_reuse_close(None, reusable_socket_age_ms(&reusable)).into();
+                        return Err((WsFallback::RetryWebSocket, error));
+                    }
                     let model = safe_error_field(&self.model).unwrap_or("redacted");
                     let error = anyhow!(
                         "Codex WebSocket read failed [classification=websocket_read_error provider={PROVIDER_ID} model={model} transport=websocket phase={phase} last_event={} error={}]",
@@ -2163,6 +2267,31 @@ where
     }
 }
 
+fn should_recover_stale_reuse(socket_reused: bool, last_event: Option<&str>) -> bool {
+    socket_reused && last_event.is_none()
+}
+
+fn reusable_socket_age_ms(socket: &ReusableCodexWs) -> u64 {
+    socket
+        .opened_at
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn stale_reuse_close(
+    frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+    socket_age_ms: u64,
+) -> WsStaleReuseClose {
+    WsStaleReuseClose {
+        close_code: frame.as_ref().map(|frame| u16::from(frame.code)),
+        close_reason: frame
+            .as_ref()
+            .and_then(|frame| safe_error_field(frame.reason.as_ref()).map(str::to_string)),
+        socket_age_ms,
+    }
+}
+
 fn websocket_close_error(
     frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
     last_event: Option<String>,
@@ -2311,6 +2440,9 @@ fn ws_provider_error(value: &Value, event: &'static str, diagnostics: String) ->
 }
 
 fn websocket_error_class(error: &anyhow::Error) -> &'static str {
+    if error.downcast_ref::<WsStaleReuseClose>().is_some() {
+        return "stale_reused_socket";
+    }
     if error.downcast_ref::<WsReadIdleError>().is_some() {
         return "read_idle";
     }

@@ -1,7 +1,10 @@
 use super::*;
 use crate::mimir::selection::PromptCacheRetention;
-use crate::nexus::ModelOrigin;
+use crate::nexus::{ModelOrigin, ProviderEvent};
 use std::path::Path;
+use tokio::net::TcpListener;
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
 
 #[derive(Default)]
 struct RecordingSink {
@@ -257,6 +260,166 @@ fn codex_ws_headers_use_oauth_metadata_without_content_type() -> Result<()> {
     );
     assert!(headers.get(CONTENT_TYPE.as_str()).is_none());
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum TestStaleTermination {
+    Close,
+    DropWithoutClose,
+}
+
+#[test]
+fn stale_reused_socket_close_reconnects_immediately_without_retry_event() -> Result<()> {
+    assert_stale_reused_socket_reconnects(TestStaleTermination::Close)
+}
+
+#[test]
+fn stale_reused_socket_read_error_reconnects_immediately_without_retry_event() -> Result<()> {
+    assert_stale_reused_socket_reconnects(TestStaleTermination::DropWithoutClose)
+}
+
+fn assert_stale_reused_socket_reconnects(termination: TestStaleTermination) -> Result<()> {
+    let provider = OpenAiCodexResponsesProvider::new(
+        "gpt-test",
+        "http://127.0.0.1/backend-api",
+        None,
+        "test",
+        "session-test",
+        PromptCacheRetention::Short,
+        crate::mimir::retry::RetryPolicy::default(),
+        CodexTransport::Auto,
+        Some(Duration::from_secs(5)),
+    )?;
+    let provider_for_runtime = provider.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let ws_url = Url::parse(&format!(
+            "ws://{}/backend-api/codex/responses",
+            listener.local_addr()?
+        ))?;
+        let (terminated_tx, terminated_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await?;
+            let mut first = accept_async(first).await?;
+            let request = first.next().await.transpose()?;
+            assert!(matches!(request, Some(WsMessage::Text(_))));
+            first
+                .send(WsMessage::Text(
+                    r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"first"}]}}"#.into(),
+                ))
+                .await?;
+            first
+                .send(WsMessage::Text(
+                    r#"{"type":"response.completed","response":{"id":"resp_1"}}"#.into(),
+                ))
+                .await?;
+            match termination {
+                TestStaleTermination::Close => {
+                    first
+                        .send(WsMessage::Close(Some(CloseFrame {
+                            code: CloseCode::Normal,
+                            reason: "normal".into(),
+                        })))
+                        .await?;
+                }
+                TestStaleTermination::DropWithoutClose => drop(first),
+            }
+            let _ = terminated_tx.send(());
+
+            let (second, _) = listener.accept().await?;
+            let mut second = accept_async(second).await?;
+            let request = second.next().await.transpose()?;
+            assert!(matches!(request, Some(WsMessage::Text(_))));
+            second
+                .send(WsMessage::Text(
+                    r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"second"}]}}"#.into(),
+                ))
+                .await?;
+            second
+                .send(WsMessage::Text(
+                    r#"{"type":"response.completed","response":{"id":"resp_2"}}"#.into(),
+                ))
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let request = json!({"model": "gpt-test", "input": []});
+        let token = AccessToken {
+            bearer: "test-token".to_string(),
+            account_id: "test-account".to_string(),
+        };
+        let cancel = CancellationToken::new();
+        let mut stream = spawn_async_stream_without_idle_guard(
+            PROVIDER_ID,
+            "gpt-test",
+            "websocket",
+            "test",
+            move |mut sink, cancel| async move {
+                provider_for_runtime
+                    .run_ws_once(
+                        ws_url.clone(),
+                        &request,
+                        &token,
+                        &mut sink,
+                        &cancel,
+                        (false, 1),
+                    )
+                    .await
+                    .map_err(|(_, error)| error)?;
+                terminated_rx
+                    .await
+                    .map_err(|_| anyhow!("test server dropped termination notification"))?;
+                provider_for_runtime
+                    .run_ws_once(ws_url, &request, &token, &mut sink, &cancel, (false, 1))
+                    .await
+                    .map_err(|(_, error)| error)
+            },
+            cancel,
+        );
+
+        let mut reconnects = Vec::new();
+        let mut recoveries = Vec::new();
+        let mut completed = false;
+        while let Some(event) = stream.next().await {
+            match event? {
+                ProviderEvent::Reconnect(reconnect) => reconnects.push(reconnect),
+                ProviderEvent::TransportRecovery(recovery) => recoveries.push(recovery),
+                ProviderEvent::Completed(_) => completed = true,
+                _ => {}
+            }
+        }
+
+        assert!(completed, "second turn did not complete");
+        assert!(
+            reconnects.is_empty(),
+            "stale reuse consumed normal retry path"
+        );
+        assert_eq!(recoveries.len(), 1);
+        let recovery = &recoveries[0];
+        assert_eq!(recovery.provider, PROVIDER_ID);
+        assert_eq!(recovery.model, "gpt-test");
+        assert_eq!(recovery.transport, "websocket");
+        assert_eq!(recovery.reason, "stale_reused_socket");
+        assert_eq!(recovery.phase, "websocket_read");
+        match termination {
+            TestStaleTermination::Close => {
+                assert_eq!(recovery.close_code, Some(1000));
+                assert_eq!(recovery.close_reason.as_deref(), Some("normal"));
+            }
+            TestStaleTermination::DropWithoutClose => {
+                assert_eq!(recovery.close_code, None);
+                assert_eq!(recovery.close_reason, None);
+            }
+        }
+        assert!(recovery.socket_reused);
+        assert_eq!(recovery.last_event, None);
+        server.await??;
+        Ok(())
+    })
 }
 
 #[test]
@@ -707,6 +870,37 @@ fn websocket_close_diagnostics_keep_code_and_only_safe_reason() {
     assert!(!hostile.contains("/home/alice"), "{hostile}");
     assert!(!hostile.contains("sk-secret"), "{hostile}");
     assert!(!hostile.contains("prompt"), "{hostile}");
+}
+
+#[test]
+fn only_transport_termination_before_any_event_on_a_reused_socket_is_silently_recovered() {
+    assert!(should_recover_stale_reuse(true, None));
+    assert!(!should_recover_stale_reuse(false, None));
+    assert!(!should_recover_stale_reuse(true, Some("response.created")));
+}
+
+#[test]
+fn stale_reuse_recovery_diagnostics_redact_hostile_close_reason() {
+    let safe = stale_reuse_close(
+        Some(CloseFrame {
+            code: CloseCode::Away,
+            reason: "server_restart".into(),
+        }),
+        42,
+    );
+    assert_eq!(safe.close_code, Some(1001));
+    assert_eq!(safe.close_reason.as_deref(), Some("server_restart"));
+    assert_eq!(safe.socket_age_ms, 42);
+
+    let hostile = stale_reuse_close(
+        Some(CloseFrame {
+            code: CloseCode::Error,
+            reason: "leak /home/alice sk-secret prompt".into(),
+        }),
+        43,
+    );
+    assert_eq!(hostile.close_code, Some(1011));
+    assert_eq!(hostile.close_reason, None);
 }
 
 #[test]

@@ -710,6 +710,53 @@ fn provider_transport_fallback_reaches_the_observer() -> Result<()> {
 }
 
 #[test]
+fn provider_transport_recovery_is_persisted_without_reaching_the_frontend() -> Result<()> {
+    let workspace = test_workspace()?;
+    let recovery = ProviderTransportRecovery {
+        provider: "openai-codex".to_string(),
+        model: "gpt-test".to_string(),
+        transport: "websocket".to_string(),
+        reason: "stale_reused_socket".to_string(),
+        phase: "websocket_read".to_string(),
+        close_code: Some(1000),
+        close_reason: Some("normal".to_string()),
+        socket_reused: true,
+        socket_age_ms: 42,
+        last_event: None,
+    };
+    let provider = ScriptedStreamProvider::new(vec![
+        ProviderEvent::TransportRecovery(recovery.clone()),
+        ProviderEvent::Completed(AssistantTurn::text("Answer")),
+    ]);
+    let session_dir = test_workspace()?;
+    let session = SessionLog::create_in(&session_dir.path, &workspace.path)?;
+    let session_path = session.path().to_path_buf();
+    let agent = Agent::new(provider, crate::tools::built_in_tools());
+    let mut harness = Harness::new(
+        agent,
+        workspace.path.clone(),
+        ToolState::new(),
+        Some(session),
+        None,
+    );
+    let frontend = RecordingFrontend::new(ApprovalDecision::Deny);
+
+    block_on(harness.submit_turn("go", &frontend, &frontend, &CancellationToken::new()))?;
+
+    assert!(!frontend.events.borrow().iter().any(
+        |event| matches!(event, AgentEvent::ProviderTransportRecovery(actual) if actual == &recovery)
+    ));
+    let transcript = fs::read_to_string(session_path)?;
+    assert!(
+        transcript
+            .lines()
+            .any(|line| line.contains("\"type\":\"providerTransportRecovery\"")),
+        "silent recovery metadata must be durable"
+    );
+    Ok(())
+}
+
+#[test]
 fn streamed_reasoning_suppresses_final_display_but_persists_once() -> Result<()> {
     // A turn that streams its reasoning summary live: the front-end already
     // showed the thinking block via deltas, so the terminal canonical display
