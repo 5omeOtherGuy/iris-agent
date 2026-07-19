@@ -690,14 +690,13 @@ mod tests {
                 "schema_version": 1,
                 "kind": {"type": "general"},
                 "prompt": description,
+                "system_prompt": "delegated worker",
                 "description": description,
                 "priority": "normal",
                 "policy": {
-                    "capability": "read_only",
-                    "parent_capability": "all",
+                    "tools": null,
                     "isolation": "none",
                     "cwd": null,
-                    "tool_allowlist": [],
                     "allow_outside_workspace": false,
                     "nesting_depth": 0,
                     "max_nesting_depth": 2
@@ -772,20 +771,17 @@ mod tests {
     }
 
     fn arm_background_workers(screen: &mut Screen, ids: &[WorkerId], background: bool) {
-        let content = if ids.len() == 1 {
-            json!({"worker_id": ids[0], "status": "queued"})
-        } else {
-            json!({"worker_ids": ids, "status": "queued"})
-        };
-        screen.apply(UiEvent::ToolResult {
-            call: call_args(
-                "spawn_subagent",
-                json!({"background": background, "description": "worker"}),
-            ),
-            content: content.to_string(),
-            exit_code: Some(0),
-            duration: Some(Duration::from_millis(1)),
-        });
+        for id in ids {
+            screen.apply(UiEvent::ToolResult {
+                call: call_args(
+                    "spawn_subagent",
+                    json!({"background": background, "description": "worker"}),
+                ),
+                content: json!({"worker_id": id, "status": "queued"}).to_string(),
+                exit_code: Some(0),
+                duration: Some(Duration::from_millis(1)),
+            });
+        }
     }
 
     fn apply_lane_snapshot(
@@ -818,20 +814,19 @@ mod tests {
         let call = call_args(
             "spawn_subagent",
             json!({
-                "count": 2,
+                "subagent_type": "review",
                 "model": "sonnet-4-5",
                 "effort": "high",
-                "description": "smoke pair",
-                "prompt": "run the smoke suite"
+                "description": "smoke review",
+                "task": "run the smoke suite"
             }),
         );
         screen.apply(UiEvent::ToolStarted(call.clone()));
-        let ids = [WorkerId::new(), WorkerId::new()];
+        let id = WorkerId::new();
         screen.apply(UiEvent::ToolResult {
             call,
             content: json!({
-                "group_id": "grp_1",
-                "worker_ids": ids,
+                "worker_id": id,
                 "status": "queued"
             })
             .to_string(),
@@ -841,19 +836,17 @@ mod tests {
         let rendered = rendered_text(&mut screen, 120, 30);
         assert!(rendered.contains("DELEGATE"), "{rendered}");
         assert!(
-            rendered.contains("2 workers · sonnet-4-5 · high effort — smoke pair"),
+            rendered.contains("review · sonnet-4-5 · high effort — smoke review"),
             "{rendered}"
         );
         assert!(
             !rendered.contains("EDIT"),
             "dispatch must not render as an EDIT panel: {rendered}"
         );
-        // The card body echoes the worker-lane row grammar: one row per
-        // dispatched worker, state glyph + bold short ID.
-        for id in &ids {
-            let short = format!("wrk_{}", &id.as_str()[4..12]);
-            assert!(rendered.contains(&short), "{rendered}");
-        }
+        // The card body echoes the worker-lane row grammar: state glyph and
+        // bold short ID for the single dispatched worker.
+        let short = format!("wrk_{}", &id.as_str()[4..12]);
+        assert!(rendered.contains(&short), "{rendered}");
     }
 
     #[test]

@@ -135,6 +135,7 @@ impl AnthropicProvider {
     /// owned by `mimir::selection`). `system_prompt` is the harness-assembled
     /// instruction string; the provider prepends the required Claude Code
     /// identity block and forwards the rest.
+    #[allow(dead_code)]
     pub(crate) fn new(
         model: &str,
         base_url: &str,
@@ -156,6 +157,7 @@ impl AnthropicProvider {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_lane(
         model: &str,
         base_url: &str,

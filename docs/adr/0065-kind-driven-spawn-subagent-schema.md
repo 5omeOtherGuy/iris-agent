@@ -1,7 +1,7 @@
 # ADR-0065: Kind-driven `spawn_subagent` schema with enforced tool grants
 
 **Date**: 2026-07-19
-**Status**: proposed
+**Status**: accepted; implemented
 **Deciders**: operator + agent design review (issue [#665](https://github.com/5omeOtherGuy/iris-agent/issues/665))
 
 ## Context

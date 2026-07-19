@@ -164,7 +164,7 @@ Use `recall` when the summary omits an exact path, symbol, value, decision, or t
 
 const SUBAGENT_DELEGATION: &str = r#"Delegate only for clear payoff: an explicit user request, parallel independent work, or context-heavy investigation. Handle focused searches, a few reads, and small visible edits directly.
 
-Give each worker one outcome and the narrowest capability and tools. Run blocking work in the foreground; otherwise continue useful parent work instead of polling. For best-of-N, use one `spawn_subagent` call with `count`, wait until all candidates terminate, inspect every result, then call `select_subagent_candidate`.
+Give each worker one outcome and the narrowest tool grant. Run blocking work in the foreground; otherwise continue useful parent work instead of polling. When using multiple workers, spawn them separately and inspect every result.
 
 Treat worker output as evidence, not completion: review, synthesize, and verify it yourself; cancel obsolete work. Mutable work stays isolated until you plan it with `plan_subagent_apply`, review the immutable plan, and separately invoke approval-gated `apply_subagent`. Never claim parent files changed before apply succeeds."#;
 

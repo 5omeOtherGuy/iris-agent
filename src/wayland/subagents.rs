@@ -127,6 +127,36 @@ pub(crate) fn validate_subagent_type_manifests(manifests: &[SubagentTypeManifest
             );
         }
     }
+
+    fn has_cycle(
+        id: &str,
+        manifests: &[SubagentTypeManifest],
+        states: &mut std::collections::BTreeMap<String, u8>,
+    ) -> bool {
+        match states.get(id) {
+            Some(1) => return true,
+            Some(2) => return false,
+            _ => {}
+        }
+        states.insert(id.to_string(), 1);
+        let Some(manifest) = manifests.iter().find(|manifest| manifest.id == id) else {
+            return false;
+        };
+        if manifest
+            .allowed_children
+            .iter()
+            .any(|child| has_cycle(child, manifests, states))
+        {
+            return true;
+        }
+        states.insert(id.to_string(), 2);
+        false
+    }
+
+    let mut states = std::collections::BTreeMap::new();
+    if ids.iter().any(|id| has_cycle(id, manifests, &mut states)) {
+        anyhow::bail!("subagent manifest allowed_children contains a cycle");
+    }
     Ok(())
 }
 
@@ -290,6 +320,7 @@ impl SubagentBackend {
         )
     }
 
+    #[allow(dead_code)] // Runtime group support remains dormant for future workflow composition.
     pub(crate) fn spawn_group(
         &self,
         factory: ChildProviderFactory,
@@ -453,6 +484,7 @@ impl SubagentBackend {
             .apply(plan, options, &WorktreeCancellation::default())?)
     }
 
+    #[allow(dead_code)] // Runtime group support remains available outside the model-facing tools.
     pub(crate) fn poll_group(
         &self,
         id: &iris_subagent_runtime::GroupId,
@@ -880,6 +912,31 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn subagent_manifest_validation_rejects_unknown_and_cyclical_children() {
+        let defaults = default_subagent_type_manifests();
+        validate_subagent_type_manifests(&defaults).unwrap();
+
+        let mut unknown = defaults.to_vec();
+        unknown[0].allowed_children = vec!["missing".to_string()];
+        assert!(
+            validate_subagent_type_manifests(&unknown)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown child")
+        );
+
+        let mut cyclical = defaults.to_vec();
+        cyclical[0].allowed_children = vec!["explore".to_string()];
+        cyclical[1].allowed_children = vec!["general".to_string()];
+        assert!(
+            validate_subagent_type_manifests(&cyclical)
+                .unwrap_err()
+                .to_string()
+                .contains("cycle")
+        );
+    }
+
+    #[test]
     fn worker_tool_activity_includes_a_bounded_argument_preview() {
         let bash = ToolCall {
             id: "bash-activity".to_string(),
@@ -979,6 +1036,32 @@ mod tests {
             Ok(Box::pin(futures::stream::once(async {
                 Ok(ProviderEvent::Completed(AssistantTurn::text(
                     "finished independently",
+                )))
+            })))
+        }
+    }
+
+    struct FilteredToolsProvider(Rc<()>);
+
+    impl ChatProvider for FilteredToolsProvider {
+        fn respond_stream<'a>(
+            &'a self,
+            _messages: &'a [Message],
+            tools: &'a crate::nexus::Tools,
+            _cancel: &'a CancellationToken,
+        ) -> Result<ProviderStream<'a>> {
+            assert_eq!(
+                tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+                vec!["grep"]
+            );
+            assert!(tools.by_name("grep").is_some());
+            assert!(tools.by_name("read").is_none());
+            assert!(tools.by_name("bash").is_none());
+            assert!(tools.by_name("write").is_none());
+            let _ = &self.0;
+            Ok(Box::pin(futures::stream::once(async {
+                Ok(ProviderEvent::Completed(AssistantTurn::text(
+                    "filtered before first turn",
                 )))
             })))
         }
@@ -1335,6 +1418,34 @@ mod tests {
             iris_subagent_runtime::WorkerStatus::Completed
         );
         assert_eq!(result.summary, "finished independently");
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolved_worker_tools_are_hard_filtered_before_the_first_turn() {
+        let root = std::env::temp_dir().join(format!(
+            "iris-wayland-worker-filtered-tools-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let backend =
+            SubagentBackend::open(workspace, &root.join("state"), root.join("worktrees")).unwrap();
+        let factory: ChildProviderFactory =
+            Arc::new(|_| Ok(Box::new(FilteredToolsProvider(Rc::new(())))));
+        let mut request = WorkerRequest::read_only("run with one tool");
+        request.policy.tools = Some(vec!["grep".to_string()]);
+        let id = backend.spawn(factory, request, None).unwrap();
+
+        let result = wait_worker(&backend, &id);
+
+        assert_eq!(
+            result.status,
+            iris_subagent_runtime::WorkerStatus::Completed
+        );
+        assert_eq!(result.summary, "filtered before first turn");
         drop(backend);
         std::fs::remove_dir_all(root).unwrap();
     }

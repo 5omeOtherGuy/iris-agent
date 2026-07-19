@@ -266,8 +266,9 @@
   before mutating file tools. [Implemented]
 - **Secret redaction** — redact secrets from stored content and summaries.
   [Planned]
-- **Subagent tool permissions** — capability ceilings and per-worker tool
-  allowlists are enforced before inference and execution. [Implemented]
+- **Subagent tool permissions** — manifest defaults and explicit abstract tool
+  grants are clamped to the parent ceiling and hard-filtered before inference.
+  [Implemented]
 
 ## Token and context engine
 
@@ -461,33 +462,37 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   fallback, pristine pooling, lease-based adoption, local restore, and a trusted
   provider-neutral remote restore port. Production cloud transport is excluded.
   [Implemented]
-- **Subagents as tools** — `spawn_subagent`, status/cancel/output, explicit
-  best-of-N selection, and plan/apply tools run through Nexus tool execution.
+- **Subagents as tools** — one manifest-driven `spawn_subagent` tool plus
+  status/cancel/output and plan/apply tools run through Nexus tool execution.
+  Best-of-N controls are not model-facing; runtime group support remains dormant.
   [Implemented]
 - **Delegation dashboard** — bare `/subagents` and `/worktrees` open one live,
   keyboard-driven TUI surface over workers, groups, artifacts, managed worktrees,
   recovery, candidate selection, immutable apply review, and guarded lifecycle
   actions. Typed command forms remain available for scripts and diagnostics. Issue
   [#640](https://github.com/5omeOtherGuy/iris-agent/issues/640). [Implemented]
-- **Worker set** — general, explore, and review kinds ship; user-defined profiles
-  remain deferred. [Partial]
+- **Worker type manifests** — general, explore, and review define their own
+  prompt, tool profile, model fallback chain, child policy, and provider-round
+  default. A config/CLI manifest editor remains deferred. [Partial]
 - **Per-worker model routing** — each worker resolves its own provider/model/
-  thinking level without changing the parent. [Planned]
+  reasoning level without changing the parent; schema choices include only
+  active credential lanes and prefer OAuth. [Implemented]
 - **Isolated worker context by default** — every worker runs a fresh conversation
   with only its delegated instruction. [Implemented]
 - **Curated context forwarding** — forward selected context-ledger entries to a
   worker by reference. [Planned]
 - **Handle-returning workers** — terminal results carry a bounded summary and
   content-addressed artifact handles for oversized output. [Implemented]
-- **Per-worker budgets** — wall-clock, provider/tool-round, token, output, and
-  artifact limits are enforced by the backend or child loop. [Implemented]
-- **Filtered tool access** — every capability mode is narrowed before inference;
-  execution resolves against the same filtered tool set. [Implemented]
+- **Worker budgets** — manifest-defined provider-round limits and host-defined
+  wall-clock/output/artifact limits are enforced or reported by the runtime.
+  Per-spawn token and tool-round knobs are not model-facing. [Implemented]
+- **Filtered tool access** — manifest defaults or explicit abstract tool grants
+  replace one another, clamp to the parent ceiling, and are removed from the
+  child's registered tool set before inference. [Implemented]
 - **Worker workspace confinement** — filesystem tools reject absolute paths and
-  symlink escapes outside the effective worker workspace. A parent-approved
-  `allow_outside_workspace: true` request relaxes read-only tools for one worker;
-  mutation stays confined and delegated shell execution fails closed without a
-  kernel filesystem sandbox. [Implemented]
+  symlink escapes outside the effective worker workspace. A manifest policy may
+  allow read-only external paths; mutation stays confined, and delegated shell
+  execution fails closed without a kernel filesystem sandbox. [Implemented]
 - **Background fleet** — durable workers start independently, run under bounded
   global/per-group concurrency, and expose replayable lifecycle/status events.
   [Implemented]
@@ -495,17 +500,16 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 Model tool examples:
 
 ```json
-{"prompt":"Inspect the parser boundary","kind":"explore","capability":"read_only","background":true}
+{"task":"Inspect the parser boundary","subagent_type":"explore","background":true}
 ```
 
 ```json
-{"prompt":"Implement the reviewed parser fix","kind":"general","capability":"all","isolation":"worktree","background":true}
+{"task":"Implement the reviewed parser fix","subagent_type":"general","tools":["all"],"isolation":"worktree","background":true}
 ```
 
 The mutable result stays outside the parent checkout. Poll with
-`subagent_status`, select a group winner with `select_subagent_candidate`, create
-an immutable review using `plan_subagent_apply`, then call `apply_subagent`; apply
-always enters the parent approval gate.
+`subagent_status`, create an immutable review using `plan_subagent_apply`, then
+call `apply_subagent`; apply always enters the parent approval gate.
 
 ## Edits
 

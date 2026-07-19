@@ -1037,24 +1037,14 @@ impl AmbientWorkerLane {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
             return;
         };
-        let ids = value
+        let Some(id) = value
             .get("worker_id")
             .and_then(serde_json::Value::as_str)
-            .into_iter()
-            .chain(
-                value
-                    .get("worker_ids")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(serde_json::Value::as_str),
-            )
-            .filter_map(|id| WorkerId::parse(id.to_string()).ok())
-            .collect::<Vec<_>>();
-        if ids.is_empty() {
+            .and_then(|id| WorkerId::parse(id.to_string()).ok())
+        else {
             return;
-        }
-        self.known.extend(ids);
+        };
+        self.known.insert(id);
         self.last_refresh = None;
         self.linger_ticks = 0;
     }

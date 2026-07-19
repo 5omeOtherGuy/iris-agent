@@ -1289,6 +1289,7 @@ pub(crate) enum ToolCapability {
 
 /// Effective capability grant used to build a child tool registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WorkerCapabilityGrant {
     ReadOnly,
     ReadWrite,
@@ -1497,9 +1498,8 @@ impl Tools {
         self.into_capability(WorkerCapabilityGrant::ReadOnly)
     }
 
-    /// Keep only tools named in the caller-supplied allowlist. Used after a
-    /// capability filter, so an allowlist can narrow the registry but cannot
-    /// reintroduce tools removed by policy.
+    /// Keep only tools named in the caller-supplied allowlist. This consumes the
+    /// registry, so omitted tools disappear from both inference and execution.
     pub(crate) fn into_allowlist(self, names: &[String]) -> Self {
         let names: BTreeSet<&str> = names.iter().map(String::as_str).collect();
         Self {

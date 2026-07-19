@@ -1935,10 +1935,19 @@ mod tests {
             )
             .unwrap(),
         );
+        let mut schema_catalog = test_catalog();
+        schema_catalog.push(crate::mimir::model_catalog::SubagentCatalogEntry {
+            model: crate::mimir::model_catalog::CatalogModel {
+                provider: crate::mimir::selection::ProviderId::Anthropic,
+                id: "unauthenticated-model".to_string(),
+                ctx_label: None,
+            },
+            lane: None,
+        });
         let config = test_subagent_config(
-            backend,
+            backend.clone(),
             Arc::new(|_| Err(anyhow!("schema contract must not construct a provider"))),
-            test_catalog(),
+            schema_catalog,
             "schema-contract",
         );
         let tools = built_in_tools_with(&ToolsConfig {
@@ -1946,6 +1955,8 @@ mod tests {
             ..ToolsConfig::default()
         });
         let spawn = tools.by_name("spawn_subagent").unwrap();
+        assert!(spawn.requires_approval());
+        assert!(!spawn.supports_allow_always());
         let schema = spawn.parameters();
         let properties = schema["properties"].as_object().unwrap();
         let mut fields = properties.keys().map(String::as_str).collect::<Vec<_>>();
@@ -1966,6 +1977,10 @@ mod tests {
             ]
         );
         assert_eq!(schema["required"], json!(["task"]));
+        assert_eq!(
+            properties["model"]["enum"],
+            json!(["gpt-5.4-mini", "claude-opus-4-6"])
+        );
         assert_eq!(properties["subagent_type"]["default"], "general");
         assert!(spawn.description().contains("general:"));
         assert!(spawn.description().contains("explore:"));
@@ -1980,6 +1995,37 @@ mod tests {
             tools.by_name("cancel_subagent").unwrap().parameters()["properties"]
                 .get("group_id")
                 .is_none()
+        );
+
+        use crate::mimir::model_catalog::{
+            CatalogModel, CredentialLaneKind, ProviderVendor, SubagentCatalogEntry,
+            SubagentCredentialLane,
+        };
+        use crate::mimir::selection::ProviderId;
+        let mut multi_lane_catalog = test_catalog();
+        multi_lane_catalog.push(SubagentCatalogEntry {
+            model: CatalogModel {
+                provider: ProviderId::OpenAi,
+                id: "gpt-5.4-mini".to_string(),
+                ctx_label: None,
+            },
+            lane: Some(SubagentCredentialLane {
+                id: "openai".to_string(),
+                vendor: ProviderVendor::OpenAi,
+                provider: ProviderId::OpenAi,
+                kind: CredentialLaneKind::Api,
+            }),
+        });
+        let multi_lane = SpawnSubagentTool::new(test_subagent_config(
+            backend,
+            Arc::new(|_| Err(anyhow!("schema contract must not construct a provider"))),
+            multi_lane_catalog,
+            "schema-contract-multi-lane",
+        ));
+        let provider = &multi_lane.parameters()["properties"]["provider"];
+        assert_eq!(
+            provider["enum"],
+            json!(["openai-codex", "anthropic-oauth", "openai"])
         );
     }
 
@@ -2138,7 +2184,7 @@ mod tests {
             test_catalog(),
             "tool-override",
         );
-        config.capability_ceiling = iris_subagent_runtime::CapabilityMode::ReadOnly;
+        config.capability_ceiling = iris_subagent_runtime::CapabilityMode::Execute;
         let tool = SpawnSubagentTool::new(config);
         let state = std::cell::RefCell::new(ToolState::new());
         let env = bash_env(&workspace, &state, None);
@@ -2147,7 +2193,8 @@ mod tests {
             .block_on(tool.execute(
                 &json!({
                     "task": "inspect",
-                    "tools": ["grep", "bash"]
+                    "subagent_type": "explore",
+                    "tools": ["grep", "bash", "write"]
                 }),
                 &env,
                 CancellationToken::new(),
@@ -2158,14 +2205,124 @@ mod tests {
             value["worker_id"].as_str().unwrap().parse().unwrap();
         let snapshot = backend.poll(&worker_id).unwrap();
         assert_eq!(
+            snapshot.request.kind,
+            iris_subagent_runtime::WorkerKind::Explore
+        );
+        assert_eq!(
             snapshot.request.policy.tools,
-            Some(vec!["grep".to_string()])
+            Some(vec!["bash".to_string(), "grep".to_string()])
         );
         assert_eq!(
             snapshot.request.policy.isolation,
-            iris_subagent_runtime::IsolationMode::None
+            iris_subagent_runtime::IsolationMode::Worktree
         );
         backend.cancel(&worker_id).unwrap();
+    }
+
+    #[test]
+    fn explicit_api_lane_selection_is_session_sticky() {
+        use crate::mimir::model_catalog::{
+            CatalogModel, CredentialLaneKind, ProviderVendor, SubagentCatalogEntry,
+            SubagentCredentialLane,
+        };
+        use crate::mimir::selection::ProviderId;
+
+        let dir = temp_dir();
+        let workspace = root_of(&dir);
+        let backend = Arc::new(
+            crate::wayland::subagents::SubagentBackend::open(
+                workspace.clone(),
+                &workspace.join("worker-state-api-lane"),
+                workspace.join("worktrees-api-lane"),
+            )
+            .unwrap(),
+        );
+        let catalog = [
+            (
+                "openai-codex",
+                ProviderId::OpenAiCodex,
+                CredentialLaneKind::OAuth,
+                "gpt-oauth",
+            ),
+            (
+                "openai",
+                ProviderId::OpenAi,
+                CredentialLaneKind::Api,
+                "gpt-api",
+            ),
+        ]
+        .into_iter()
+        .map(|(id, provider, kind, model)| SubagentCatalogEntry {
+            model: CatalogModel {
+                provider,
+                id: model.to_string(),
+                ctx_label: None,
+            },
+            lane: Some(SubagentCredentialLane {
+                id: id.to_string(),
+                vendor: ProviderVendor::OpenAi,
+                provider,
+                kind,
+            }),
+        })
+        .collect();
+        let provider_factory: crate::wayland::subagents::ChildProviderFactory =
+            Arc::new(|_| Ok(Box::new(PendingProvider(Rc::new(()))) as Box<dyn ChatProvider>));
+        let mut config =
+            test_subagent_config(backend.clone(), provider_factory, catalog, "api-lane");
+        let mut manifests = config.manifests.to_vec();
+        manifests
+            .iter_mut()
+            .find(|manifest| manifest.id == "general")
+            .unwrap()
+            .model_fallbacks = vec!["gpt-api".to_string()];
+        config.manifests = Arc::from(manifests);
+        let tool = SpawnSubagentTool::new(config);
+        let state = std::cell::RefCell::new(ToolState::new());
+        let env = bash_env(&workspace, &state, None);
+
+        let spawn_route = |args: Value| {
+            let output = current_thread_runtime()
+                .block_on(tool.execute(&args, &env, CancellationToken::new()))
+                .unwrap();
+            let value: Value = serde_json::from_str(&output.content).unwrap();
+            let worker_id: iris_subagent_runtime::WorkerId =
+                value["worker_id"].as_str().unwrap().parse().unwrap();
+            let route = crate::wayland::subagents::route_from_request(
+                &backend.poll(&worker_id).unwrap().request,
+            )
+            .unwrap()
+            .unwrap();
+            (worker_id, route)
+        };
+
+        let (before_id, before) =
+            spawn_route(json!({ "task": "before approval", "tools": ["read"] }));
+        assert_eq!(before.provider, "openai-codex");
+        assert_eq!(before.credential_lane, None);
+        backend.cancel(&before_id).unwrap();
+
+        let (explicit_id, explicit) = spawn_route(json!({
+            "task": "approve API lane",
+            "model": "gpt-api",
+            "provider": "openai",
+            "tools": ["read"]
+        }));
+        assert_eq!(explicit.provider, "openai");
+        assert_eq!(explicit.credential_lane, Some(CredentialLaneKind::Api));
+        assert!(
+            tool.config
+                .approved_api_vendors
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .contains(&ProviderVendor::OpenAi)
+        );
+        backend.cancel(&explicit_id).unwrap();
+
+        let (after_id, after) = spawn_route(json!({ "task": "after approval", "tools": ["read"] }));
+        assert_eq!(after.provider, "openai");
+        assert_eq!(after.credential_lane, Some(CredentialLaneKind::Api));
+        backend.cancel(&after_id).unwrap();
     }
 
     #[test]
@@ -2199,7 +2356,11 @@ mod tests {
 
         let error = current_thread_runtime()
             .block_on(tool.execute(
-                &json!({ "task": "wait", "background": false }),
+                &json!({
+                    "task": "wait",
+                    "tools": ["read_only"],
+                    "background": false
+                }),
                 &env,
                 cancel,
             ))
@@ -2616,7 +2777,6 @@ mod tests {
                         "subagent_status" => (435, 109),
                         "read_subagent_output" => (550, 138),
                         "cancel_subagent" => (430, 108),
-                        "select_subagent_candidate" => (500, 125),
                         "plan_subagent_apply" => (400, 100),
                         "apply_subagent" => (960, 240),
                         _ => panic!("unbudgeted tool: {tool_name}"),
@@ -2714,30 +2874,29 @@ mod tests {
             "subagent_status",
             "read_subagent_output",
             "cancel_subagent",
-            "select_subagent_candidate",
             "plan_subagent_apply",
             "apply_subagent",
         ] {
             assert!(names.contains(&expected), "missing {expected}");
         }
+        assert!(!names.contains(&"select_subagent_candidate"));
         for (name, needles) in [
-            ("spawn_subagent", &["best-of-N", "isolated", "applied"][..]),
-            ("subagent_status", &["worker_id wins", "every member"][..]),
+            (
+                "spawn_subagent",
+                &["one delegated worker", "isolated", "Subagent types"][..],
+            ),
+            ("subagent_status", &["one worker"][..]),
             (
                 "read_subagent_output",
                 &["UTF-8", "artifact", "terminal"][..],
             ),
             (
                 "cancel_subagent",
-                &["worker_id wins", "hard-abort", "grace"][..],
-            ),
-            (
-                "select_subagent_candidate",
-                &["best-of-N", "terminal", "before apply", "never mutates"][..],
+                &["one worker", "hard-abort", "grace"][..],
             ),
             (
                 "plan_subagent_apply",
-                &["immutable", "digest", "Select group", "unchanged"][..],
+                &["immutable", "digest", "unchanged"][..],
             ),
             (
                 "apply_subagent",
@@ -2759,128 +2918,91 @@ mod tests {
             }
         }
         assert!(
-            names
-                .iter()
-                .filter(|name| name.contains("subagent"))
-                .all(|name| !name.contains("task"))
-        );
-        let spawn_schema = subagent_tools
-            .by_name("spawn_subagent")
-            .unwrap()
-            .parameters();
-        // Dispatch is not a mutation: a diff preview would route the call
-        // through the EDIT diff panel and mask the DELEGATE dispatch card.
-        assert!(
-            subagent_tools
-                .by_name("spawn_subagent")
+            !subagent_tools
+                .by_name("plan_subagent_apply")
                 .unwrap()
-                .diff_preview(
-                    Path::new("/ws"),
-                    &serde_json::json!({ "count": 2, "capability": "read_only" })
-                )
+                .description()
+                .contains("Select group")
+        );
+        let spawn = subagent_tools.by_name("spawn_subagent").unwrap();
+        let spawn_schema = spawn.parameters();
+        assert!(
+            spawn
+                .diff_preview(Path::new("/ws"), &json!({ "task": "inspect" }))
                 .is_none(),
             "spawn_subagent must not provide an EDIT diff preview"
         );
         let properties = spawn_schema["properties"].as_object().unwrap();
-        for required_field in [
-            "prompt",
-            "description",
-            "kind",
+        let expected_fields = [
+            "task",
+            "subagent_type",
             "model",
-            "provider",
             "effort",
-            "capability",
-            "isolation",
             "tools",
-            "cwd",
-            "allow_outside_workspace",
+            "system_prompt",
+            "description",
             "background",
-            "max_provider_rounds",
-            "max_tool_rounds",
-            "max_tokens",
-            "count",
-        ] {
-            assert!(
-                properties.contains_key(required_field),
-                "missing {required_field}"
-            );
-        }
-        assert!(
-            !properties.contains_key("resume_from"),
-            "unimplemented resume semantics must not be advertised"
-        );
-        assert!(
-            !properties.contains_key("profile"),
-            "profiles must not be advertised before profile resolution exists"
-        );
-        for field in properties.keys() {
+            "isolation",
+            "cwd",
+        ];
+        assert_eq!(properties.len(), expected_fields.len());
+        for field in expected_fields {
+            assert!(properties.contains_key(field), "missing {field}");
             assert!(
                 properties[field]["description"].is_string(),
                 "spawn_subagent.{field} needs call-time guidance"
             );
         }
-        for (field, needles) in [
-            (
-                "prompt",
-                &["fresh worker", "no parent context", "done criteria"][..],
-            ),
-            ("kind", &["Policy", "not a persona", "force read_only"][..]),
-            (
-                "model",
-                &[
-                    "Exact worker model id",
-                    "listed values",
-                    "spawn-time selection",
-                ][..],
-            ),
-            ("provider", &["Disambiguates", "authenticated provider"][..]),
-            ("effort", &["inherit", "clamped", "selected model"][..]),
-            ("capability", &["Cannot exceed", "parent ceiling"][..]),
-            ("isolation", &["worktree", "incompatible with cwd"][..]),
-            ("tools", &["only narrows", "all granted"][..]),
-            ("cwd", &["parent-workspace", "read_only"][..]),
-            (
-                "allow_outside_workspace",
-                &["read tools", "mutation remains confined"][..],
-            ),
-            ("background", &["immediately", "waits for terminal"][..]),
-            ("count", &["Identical", "best-of-N group"][..]),
+        for removed in [
+            "prompt",
+            "kind",
+            "provider",
+            "capability",
+            "count",
+            "max_provider_rounds",
+            "max_tool_rounds",
+            "max_tokens",
+            "allow_outside_workspace",
+            "resume_from",
+            "profile",
         ] {
-            let description = properties[field]["description"].as_str().unwrap();
-            for needle in needles {
-                assert!(
-                    description.contains(needle),
-                    "{field} missing {needle}: {description}"
-                );
-            }
-        }
-        for (field, default) in [
-            ("kind", json!("general")),
-            ("capability", json!("read_only")),
-            ("allow_outside_workspace", json!(false)),
-            ("background", json!(true)),
-            ("count", json!(1)),
-        ] {
-            assert_eq!(
-                properties[field]["default"], default,
-                "missing spawn_subagent.{field} default"
+            assert!(
+                !properties.contains_key(removed),
+                "removed field {removed} is still advertised"
             );
         }
+        assert_eq!(spawn_schema["required"], json!(["task"]));
+        assert_eq!(properties["subagent_type"]["default"], "general");
+        assert_eq!(properties["background"]["default"], true);
+        assert_eq!(
+            properties["subagent_type"]["enum"],
+            json!(["general", "explore", "review"])
+        );
+        let tool_tokens = properties["tools"]["items"]["enum"].as_array().unwrap();
+        for shorthand in ["read_only", "read_write", "shell", "all"] {
+            assert!(tool_tokens.contains(&json!(shorthand)));
+        }
+        let tools_description = properties["tools"]["description"].as_str().unwrap();
+        assert!(tools_description.contains("replaces"));
+        assert!(tools_description.contains("clamped"));
+        assert!(!tools_description.contains("only narrows"));
 
-        for (tool_name, fields) in [
-            ("subagent_status", &["worker_id", "group_id"][..]),
-            ("cancel_subagent", &["worker_id", "group_id"][..]),
-            ("select_subagent_candidate", &["worker_id", "group_id"][..]),
-            ("plan_subagent_apply", &["worker_id"][..]),
-            ("apply_subagent", &["plan_id"][..]),
+        for tool_name in ["subagent_status", "cancel_subagent"] {
+            let schema = subagent_tools.by_name(tool_name).unwrap().parameters();
+            assert_eq!(schema["required"], json!(["worker_id"]));
+            assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
+            assert_eq!(schema["properties"]["worker_id"]["minLength"], 1);
+            assert!(schema["properties"].get("group_id").is_none());
+        }
+        for (tool_name, field) in [
+            ("plan_subagent_apply", "worker_id"),
+            ("apply_subagent", "plan_id"),
         ] {
             let schema = subagent_tools.by_name(tool_name).unwrap().parameters();
-            for field in fields {
-                assert_eq!(
-                    schema["properties"][field]["minLength"], 1,
-                    "{tool_name}.{field} must reject empty IDs"
-                );
-            }
+            assert_eq!(
+                schema["properties"][field]["minLength"], 1,
+                "{tool_name}.{field} must reject empty IDs"
+            );
         }
         let apply_schema = subagent_tools
             .by_name("apply_subagent")
@@ -2915,90 +3037,49 @@ mod tests {
 
         let state = std::cell::RefCell::new(ToolState::new());
         let env = bash_env(&subagent_workspace, &state, None);
-        let spawn = subagent_tools.by_name("spawn_subagent").unwrap();
-        for invalid in [
-            json!({
-                "task": "invalid",
-                "kind": "review",
-                "capability": "read_write"
-            }),
-            json!({
-                "task": "invalid",
-                "capability": "read_only",
-                "isolation": "worktree",
-                "cwd": "."
-            }),
-            json!({
-                "task": "invalid",
-                "capability": "read_write",
-                "isolation": "none"
-            }),
+        for (args, needle) in [
+            (
+                json!({ "task": "invalid", "subagent_type": "missing" }),
+                "unknown subagent_type",
+            ),
+            (
+                json!({ "task": "invalid", "tools": ["not-a-tool"] }),
+                "unknown delegated tool",
+            ),
+            (
+                json!({ "task": "invalid", "tools": ["write"], "isolation": "none" }),
+                "worktree isolation",
+            ),
+            (
+                json!({ "task": "invalid", "tools": ["read"], "isolation": "worktree", "cwd": "." }),
+                "mutually exclusive",
+            ),
         ] {
             let error = current_thread_runtime()
-                .block_on(spawn.execute(&invalid, &env, CancellationToken::new()))
+                .block_on(spawn.execute(&args, &env, CancellationToken::new()))
                 .unwrap_err();
             assert!(
-                error.to_string().contains("worker")
-                    || error.to_string().contains("worktree")
-                    || error.to_string().contains("capability"),
-                "unexpected validation error: {error:#}"
+                error.to_string().contains(needle),
+                "unexpected validation error for {args}: {error:#}"
             );
         }
         let worker_id = iris_subagent_runtime::WorkerId::new().to_string();
-        let group_id = iris_subagent_runtime::GroupId::new().to_string();
         for tool_name in ["subagent_status", "cancel_subagent"] {
             let tool = subagent_tools.by_name(tool_name).unwrap();
-            // Nothing usable in either field: a guidance error naming both
-            // accepted id shapes.
-            for invalid in [
-                json!({}),
-                json!({ "worker_id": ":invalid", "group_id": " " }),
-            ] {
-                let error = current_thread_runtime()
-                    .block_on(tool.execute(&invalid, &env, CancellationToken::new()))
-                    .unwrap_err();
-                assert!(
-                    error.to_string().contains("worker_id (wrk_"),
-                    "unexpected {tool_name} selector error: {error:#}"
-                );
-            }
-            // Models routinely fill BOTH id fields (live sessions used
-            // placeholders like \":invalid\" or pasted the worker id into
-            // group_id); junk is ignored, valid ids resolve, and worker_id
-            // wins when both parse.
-            for (args, needle) in [
-                (
-                    json!({ "worker_id": worker_id, "group_id": ":invalid" }),
-                    "worker not found",
-                ),
-                (json!({ "group_id": worker_id }), "worker not found"),
-                (
-                    json!({ "worker_id": worker_id, "group_id": group_id }),
-                    "worker not found",
-                ),
-                (
-                    json!({ "worker_id": ":invalid", "group_id": group_id }),
-                    "group not found",
-                ),
-            ] {
-                let error = current_thread_runtime()
-                    .block_on(tool.execute(&args, &env, CancellationToken::new()))
-                    .unwrap_err();
-                assert!(
-                    error.to_string().contains(needle),
-                    "unexpected {tool_name} error for {args}: {error:#}"
-                );
-            }
-            // A full cross-swap -- a group id in worker_id AND a worker id in
-            // group_id -- carries two distinct valid targets with no field to
-            // trust: refuse rather than guess which entity was meant.
-            let swapped = json!({ "worker_id": group_id, "group_id": worker_id });
-            let error = current_thread_runtime()
-                .block_on(tool.execute(&swapped, &env, CancellationToken::new()))
+            let missing = current_thread_runtime()
+                .block_on(tool.execute(&json!({}), &env, CancellationToken::new()))
+                .unwrap_err();
+            assert!(missing.to_string().contains("requires worker_id"));
+            let not_found = current_thread_runtime()
+                .block_on(tool.execute(
+                    &json!({ "worker_id": worker_id }),
+                    &env,
+                    CancellationToken::new(),
+                ))
                 .unwrap_err();
             assert!(
-                error.to_string().contains("named field"),
-                "unexpected {tool_name} cross-swap error: {error:#}"
+                not_found.to_string().contains("worker not found"),
+                "unexpected {tool_name} error: {not_found:#}"
             );
         }
 
@@ -3006,7 +3087,7 @@ mod tests {
             .block_on(spawn.execute(
                 &json!({
                     "task": "must fail before inference",
-                    "capability": "read_write",
+                    "tools": ["read_only"],
                     "background": false
                 }),
                 &env,
