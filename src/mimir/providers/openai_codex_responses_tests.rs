@@ -1,7 +1,10 @@
 use super::*;
 use crate::mimir::selection::PromptCacheRetention;
-use crate::nexus::ModelOrigin;
+use crate::nexus::{ModelOrigin, ProviderEvent};
 use std::path::Path;
+use tokio::net::TcpListener;
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
 
 #[derive(Default)]
 struct RecordingSink {
@@ -257,6 +260,125 @@ fn codex_ws_headers_use_oauth_metadata_without_content_type() -> Result<()> {
     );
     assert!(headers.get(CONTENT_TYPE.as_str()).is_none());
     Ok(())
+}
+
+#[test]
+fn stale_reused_socket_close_reconnects_immediately_without_retry_event() -> Result<()> {
+    let provider = OpenAiCodexResponsesProvider::new(
+        "gpt-test",
+        "http://127.0.0.1/backend-api",
+        None,
+        "test",
+        "session-test",
+        PromptCacheRetention::Short,
+        crate::mimir::retry::RetryPolicy::default(),
+        CodexTransport::Auto,
+        Some(Duration::from_secs(5)),
+    )?;
+    let provider_for_runtime = provider.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let ws_url = Url::parse(&format!(
+            "ws://{}/backend-api/codex/responses",
+            listener.local_addr()?
+        ))?;
+        let (close_sent_tx, close_sent_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await?;
+            let mut first = accept_async(first).await?;
+            let request = first.next().await.transpose()?;
+            assert!(matches!(request, Some(WsMessage::Text(_))));
+            first
+                .send(WsMessage::Text(
+                    r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"first"}]}}"#.into(),
+                ))
+                .await?;
+            first
+                .send(WsMessage::Text(
+                    r#"{"type":"response.completed","response":{"id":"resp_1"}}"#.into(),
+                ))
+                .await?;
+            first
+                .send(WsMessage::Close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "response complete".into(),
+                })))
+                .await?;
+            let _ = close_sent_tx.send(());
+
+            let (second, _) = listener.accept().await?;
+            let mut second = accept_async(second).await?;
+            let request = second.next().await.transpose()?;
+            assert!(matches!(request, Some(WsMessage::Text(_))));
+            second
+                .send(WsMessage::Text(
+                    r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"second"}]}}"#.into(),
+                ))
+                .await?;
+            second
+                .send(WsMessage::Text(
+                    r#"{"type":"response.completed","response":{"id":"resp_2"}}"#.into(),
+                ))
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let request = json!({"model": "gpt-test", "input": []});
+        let token = AccessToken {
+            bearer: "test-token".to_string(),
+            account_id: "test-account".to_string(),
+        };
+        let cancel = CancellationToken::new();
+        let mut stream = spawn_async_stream_without_idle_guard(
+            PROVIDER_ID,
+            "gpt-test",
+            "websocket",
+            "test",
+            move |mut sink, cancel| async move {
+                provider_for_runtime
+                    .run_ws_once(
+                        ws_url.clone(),
+                        &request,
+                        &token,
+                        &mut sink,
+                        &cancel,
+                        (false, 1),
+                    )
+                    .await
+                    .map_err(|(_, error)| error)?;
+                close_sent_rx
+                    .await
+                    .map_err(|_| anyhow!("test server dropped close notification"))?;
+                provider_for_runtime
+                    .run_ws_once(ws_url, &request, &token, &mut sink, &cancel, (false, 1))
+                    .await
+                    .map_err(|(_, error)| error)
+            },
+            cancel,
+        );
+
+        let mut reconnects = Vec::new();
+        let mut completed = false;
+        while let Some(event) = stream.next().await {
+            match event? {
+                ProviderEvent::Reconnect(reconnect) => reconnects.push(reconnect),
+                ProviderEvent::Completed(_) => completed = true,
+                _ => {}
+            }
+        }
+
+        assert!(completed, "second turn did not complete");
+        assert!(
+            reconnects.is_empty(),
+            "stale reuse consumed normal retry path"
+        );
+        server.await??;
+        Ok(())
+    })
 }
 
 #[test]
