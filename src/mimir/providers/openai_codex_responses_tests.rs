@@ -262,8 +262,23 @@ fn codex_ws_headers_use_oauth_metadata_without_content_type() -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum TestStaleTermination {
+    Close,
+    DropWithoutClose,
+}
+
 #[test]
 fn stale_reused_socket_close_reconnects_immediately_without_retry_event() -> Result<()> {
+    assert_stale_reused_socket_reconnects(TestStaleTermination::Close)
+}
+
+#[test]
+fn stale_reused_socket_read_error_reconnects_immediately_without_retry_event() -> Result<()> {
+    assert_stale_reused_socket_reconnects(TestStaleTermination::DropWithoutClose)
+}
+
+fn assert_stale_reused_socket_reconnects(termination: TestStaleTermination) -> Result<()> {
     let provider = OpenAiCodexResponsesProvider::new(
         "gpt-test",
         "http://127.0.0.1/backend-api",
@@ -286,7 +301,7 @@ fn stale_reused_socket_close_reconnects_immediately_without_retry_event() -> Res
             "ws://{}/backend-api/codex/responses",
             listener.local_addr()?
         ))?;
-        let (close_sent_tx, close_sent_rx) = tokio::sync::oneshot::channel();
+        let (terminated_tx, terminated_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (first, _) = listener.accept().await?;
             let mut first = accept_async(first).await?;
@@ -302,13 +317,18 @@ fn stale_reused_socket_close_reconnects_immediately_without_retry_event() -> Res
                     r#"{"type":"response.completed","response":{"id":"resp_1"}}"#.into(),
                 ))
                 .await?;
-            first
-                .send(WsMessage::Close(Some(CloseFrame {
-                    code: CloseCode::Normal,
-                    reason: "normal".into(),
-                })))
-                .await?;
-            let _ = close_sent_tx.send(());
+            match termination {
+                TestStaleTermination::Close => {
+                    first
+                        .send(WsMessage::Close(Some(CloseFrame {
+                            code: CloseCode::Normal,
+                            reason: "normal".into(),
+                        })))
+                        .await?;
+                }
+                TestStaleTermination::DropWithoutClose => drop(first),
+            }
+            let _ = terminated_tx.send(());
 
             let (second, _) = listener.accept().await?;
             let mut second = accept_async(second).await?;
@@ -350,9 +370,9 @@ fn stale_reused_socket_close_reconnects_immediately_without_retry_event() -> Res
                     )
                     .await
                     .map_err(|(_, error)| error)?;
-                close_sent_rx
+                terminated_rx
                     .await
-                    .map_err(|_| anyhow!("test server dropped close notification"))?;
+                    .map_err(|_| anyhow!("test server dropped termination notification"))?;
                 provider_for_runtime
                     .run_ws_once(ws_url, &request, &token, &mut sink, &cancel, (false, 1))
                     .await
@@ -385,8 +405,16 @@ fn stale_reused_socket_close_reconnects_immediately_without_retry_event() -> Res
         assert_eq!(recovery.transport, "websocket");
         assert_eq!(recovery.reason, "stale_reused_socket");
         assert_eq!(recovery.phase, "websocket_read");
-        assert_eq!(recovery.close_code, Some(1000));
-        assert_eq!(recovery.close_reason.as_deref(), Some("normal"));
+        match termination {
+            TestStaleTermination::Close => {
+                assert_eq!(recovery.close_code, Some(1000));
+                assert_eq!(recovery.close_reason.as_deref(), Some("normal"));
+            }
+            TestStaleTermination::DropWithoutClose => {
+                assert_eq!(recovery.close_code, None);
+                assert_eq!(recovery.close_reason, None);
+            }
+        }
         assert!(recovery.socket_reused);
         assert_eq!(recovery.last_event, None);
         server.await??;
