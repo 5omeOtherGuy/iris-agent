@@ -65,7 +65,7 @@ syntect = { version = "5.3", default-features = false, features = ["default-synt
 # Python heredoc display formatting. Ruff is the established Rust-native Python
 # formatter; using its library keeps rendering deterministic and avoids spawning
 # an optional host binary. Invalid/incomplete payloads fall back verbatim.
-ruff_python_formatter = "0.0.4"
+ruff_python_formatter = "0.0.5"
 # Multiline editor widget (undo/redo, kill-ring/yank, word-nav) over the same
 # ratatui buffer. default-features off drops its crossterm/termion/termwiz input
 # backends and the regex search feature: Iris drives edits from its own keymap
