@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.7...iris-agent-v0.3.8) - 2026-07-19
+
+### Added
+
+- *(subagents)* unify manifest-driven spawn API ([#667](https://github.com/5omeOtherGuy/iris-agent/pull/667))
+- *(subagents)* resolve worker model from authenticated catalog ([#663](https://github.com/5omeOtherGuy/iris-agent/pull/663))
+- *(ui)* surface background subagent activity in the TUI ([#652](https://github.com/5omeOtherGuy/iris-agent/pull/652))
+- *(ui)* add delegation dashboard ([#648](https://github.com/5omeOtherGuy/iris-agent/pull/648))
+- optimize model-facing tool contracts ([#649](https://github.com/5omeOtherGuy/iris-agent/pull/649))
+- add portable repository agent guidance ([#647](https://github.com/5omeOtherGuy/iris-agent/pull/647))
+- route subagents by model and effort ([#646](https://github.com/5omeOtherGuy/iris-agent/pull/646))
+- add model-facing subagent guidance ([#644](https://github.com/5omeOtherGuy/iris-agent/pull/644))
+- add durable subagent runtime ([#637](https://github.com/5omeOtherGuy/iris-agent/pull/637))
+- *(goal)* add persistent long-running session goals ([#638](https://github.com/5omeOtherGuy/iris-agent/pull/638))
+- *(tools)* add ignore globs to ls ([#636](https://github.com/5omeOtherGuy/iris-agent/pull/636))
+
+### Fixed
+
+- recover stale reused WebSockets immediately ([#668](https://github.com/5omeOtherGuy/iris-agent/pull/668))
+- *(subagents)* unbreak model-surface cancel/status, outside-cwd spawns, and concurrent token refresh ([#657](https://github.com/5omeOtherGuy/iris-agent/pull/657))
+- *(ui)* stop spawn_subagent masquerading as an EDIT diff panel ([#655](https://github.com/5omeOtherGuy/iris-agent/pull/655))
+- *(ui)* polish subagent dispatch card and worker lane ([#653](https://github.com/5omeOtherGuy/iris-agent/pull/653))
+- *(goal)* require explicit creation and budgets ([#645](https://github.com/5omeOtherGuy/iris-agent/pull/645))
+- *(tui)* show @ search results outside Git worktrees ([#634](https://github.com/5omeOtherGuy/iris-agent/pull/634))
+- align composer text with caret ([#632](https://github.com/5omeOtherGuy/iris-agent/pull/632))
+
+### Other
+
+- add pi-mono-style workspace modularization plan ([#651](https://github.com/5omeOtherGuy/iris-agent/pull/651))
+- define portable agent guidance ([#643](https://github.com/5omeOtherGuy/iris-agent/pull/643))
+- align Iris TUI skill with current design ([#641](https://github.com/5omeOtherGuy/iris-agent/pull/641))
+
 ### Added
 
 - track portable repository agent guidance, canonical skills, local instruction layers, and safe worktree propagation ([#642](https://github.com/5omeOtherGuy/iris-agent/issues/642))
