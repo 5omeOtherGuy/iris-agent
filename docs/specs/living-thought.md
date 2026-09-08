@@ -1,5 +1,10 @@
 # SPEC — The living thought: the thinking block while it thinks
 
+> Historical implementation brief; checked 2026-09-08. The live reasoning tail
+> exists in `src/ui/tui/transcript.rs`. The output-caret requirements below were
+> superseded: current [design language](../TUI_DESIGN_LANGUAGE.md) specifies no
+> model-output caret. Preserve the old checklist as history, not a new mandate.
+
 Status: approved for implementation · Surface: the thinking/reasoning block
 (§7.4), live-preview path in `src/ui/tui/transcript.rs`, header renderer in
 `src/ui/tui/panel.rs`.

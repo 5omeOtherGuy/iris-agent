@@ -1,6 +1,10 @@
 # TUI polish notes
 
-Status: complete. Baseline: `origin/main` at `29a4dff`. Final repository gate: pass.
+Historical polish-task record, not a current-main verification. Counts and gate
+results below belong to baseline `29a4dff` and its task changes. Current rendering
+rules live in [TUI_DESIGN_LANGUAGE.md](docs/TUI_DESIGN_LANGUAGE.md).
+
+Original status: complete. Baseline: `origin/main` at `29a4dff`. Final repository gate: pass.
 
 ## Operating rules
 

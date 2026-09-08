@@ -1,9 +1,10 @@
 # Architecture
 
-Iris is one Rust binary with three internal tiers. Dependencies point inward.
-The core loop emits events and calls hooks; it does not import UI, concrete
-tool implementations, session storage, configuration loading, or
-provider-specific code.
+The Iris agent has three internal tiers. Its Cargo workspace also contains
+`iris-bench` and the host-neutral `iris-subagent-runtime` crate. The core loop
+emits events and calls hooks; UI and session storage remain outside Nexus.
+Concrete state/path helper dependencies remain documented exceptions to the
+inward-dependency target, not evidence of a fully isolated core crate.
 
 ## Tiers
 
@@ -23,6 +24,11 @@ Nexus must not import UI code, concrete tool implementations, session storage,
 configuration loading, or provider-specific transport details. It owns the
 policy decisions around tool scheduling and approval enforcement, while higher
 tiers provide the concrete hooks and implementations.
+
+Current exceptions in `src/nexus.rs` are `ToolEnv`'s `crate::tools::ToolState`,
+`crate::tools::path::workspace_relative`, and
+`crate::display_path::workspace_path`. See
+[Current vs target](../docs/ARCHITECTURE.md#current-vs-target).
 
 ## Runtime loop
 
@@ -57,6 +63,11 @@ Nexus enforces the schedule; tool implementations provide the classification.
 - `src/wayland/git_safety/`: dirty-tree task ownership, checkpoint, rollback,
   final diff settlement.
 - `src/wayland/trust.rs`: per-project permission policy store.
+- `src/wayland/subagents.rs`, `src/wayland/worker_runtime.rs`: manifest-driven
+  worker integration and shared scheduling adapters.
+- `crates/iris-subagent-runtime/`: durable scheduling, artifacts, managed
+  worktrees, recovery and reviewed apply.
+- `src/harness.rs`, `iris-bench/`: benchmark facade and separate executable.
 - `src/wayland/system_prompt/`: prompt assembly from internal fragments and
   project docs.
 - `src/mimir/providers/`: provider adapters.

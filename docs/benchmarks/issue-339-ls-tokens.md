@@ -11,7 +11,7 @@ skill in `.pi/skills/`); the exact table values are regenerated snapshots, not
 asserted figures. Regenerate the tables with:
 
 ```
-cargo test --bin iris ls_benchmark_report -- --nocapture
+cargo test --locked -p iris-agent --lib ls_benchmark_report -- --nocapture
 ```
 
 Three forms of the same directory are compared:

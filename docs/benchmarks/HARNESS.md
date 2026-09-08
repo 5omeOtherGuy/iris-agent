@@ -60,14 +60,18 @@ continues.
 
 - **`anthropic` lane** needs the Claude Code OAuth credential. Run
   `iris login anthropic` (or let Iris bootstrap from
-  `~/.claude/.credentials.json`). This is the only lane that reports cache writes
-  (with the 5m/1h split) and provider-native compaction.
+  `~/.claude/.credentials.json`). This lane supports the 5m/1h cache-write
+  split and exposes the harness's native-compaction rung. A rung being selectable
+  does not prove the provider accepts it; capability failures remain explicit.
 - **`codex` lane** needs the OpenAI Codex OAuth credential. Run
-  `iris login openai-codex`. Since PR #557 the Codex adapter reports cache
-  writes; it has no native-compaction rung.
+  `iris login openai-codex`. The adapter can parse cache-write fields, but the
+  committed sampled Codex campaigns remain write-blind. Preserve actual nonzero
+  reports when present; never infer writes from cache reads or parser tests.
+  This benchmark lane has no native-compaction rung, unlike the separately
+  gated Iris product adapter.
 
-Full credential setup lives in the project README ("Credentials and provider
-selection") and is not duplicated here.
+See [provider authentication](../../README.md#providers-auth-and-model-switching)
+for credential setup.
 
 ## Quickstart
 
@@ -229,7 +233,7 @@ A run writes into `docs/benchmarks/campaigns/<name>/<date>/`:
 | `input_tokens`, `output_tokens` | realized provider usage |
 | `cache_read` | cache-read input tokens |
 | `cache_write_5m`, `cache_write_1h` | Anthropic's write split; on the Codex lane the flat write sits in `5m` with `1h = 0`, or both are `null` when blind |
-| `write_unreported` | `true` only on a Codex row that reported a **zero** cache write. Since #557 Codex reports writes, so a nonzero write sets this `false` and preserves the write. Residual ambiguity: a Codex zero-write cannot distinguish "wrote nothing" from "the endpoint did not surface a write", so it is conservatively flagged. The Anthropic lane is never write-blind. |
+| `write_unreported` | The runner marks Codex rows with zero/unreported cache writes `true` and leaves both write fields null. A nonzero reported write is preserved and sets this `false`; parsing support is not evidence of live reporting. Zero cannot distinguish "wrote nothing" from "not surfaced". Anthropic uses its reported 5m/1h split and sets this flag `false`. |
 | `context_measured_tokens` | provider-reported input for this request |
 | `context_estimate_tokens` | the pure estimator's count of this request's exact payload |
 | `estimate_error` | `measured - estimate`, per request. **Diagnostic only** -- catches estimator drift; never a reported metric. A small consistent drift is the honest residual (estimator does not count system-prompt/tool-schema/framing mass). |

@@ -1,5 +1,10 @@
 # SPEC — The escapement: even beats for the live stream
 
+> Historical implementation brief; checked 2026-09-08. Pacing exists in
+> `src/ui/tui/streaming/escapement.rs`. The caret requirements below are superseded
+> by the no-model-output-caret rule in the [design language](../TUI_DESIGN_LANGUAGE.md).
+> Original line numbers/checklists are not current verification results.
+
 Status: approved for implementation · Surface: the streaming live tails
 (assistant active tail, reasoning stream) — `src/ui/tui/streaming/*`,
 transcript reasoning path, §6/§7.4 amendments.

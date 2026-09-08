@@ -45,6 +45,13 @@ reviewed filesystem paths only; it does not stage, commit, merge, rebase, or che
 - Immutable reviewed apply plans with dirty-parent, base-drift, and symlink checks.
 - Explicit adoption, pristine pooling, local restore, remote restore ports, and best-of-N groups.
 
+## Iris integration boundary
+
+The public crate implements group scheduling (`RuntimeHandle::spawn_group`) and
+best-of-N support for hosts. Iris's own model-facing best-of-N controls were
+removed by ADR-0065; its group adapter remains dormant. Crate capability does not
+imply an available Iris command. See the [Iris inventory](../../docs/FEATURES.md#subagents).
+
 ## Deferred
 
 Overlay mounts, privileged snapshot delegates, production cloud restore transport, and automatic

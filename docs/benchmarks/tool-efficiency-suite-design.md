@@ -1,5 +1,12 @@
 # Tool-efficiency benchmark suite - design
 
+> Historical design; implementation status checked 2026-09-08. T1–T4 scenarios
+> exist in `src/live_harness/tool_scenarios.rs`; new campaign configuration and
+> commands are documented in [HARNESS.md](HARNESS.md). Legacy code remains pending
+> validating migration work (#573). The proposed phases and original measurements
+> below are retained, not a second current runner contract. Issue #210's completed
+> headline evidence is linked from [BENCHMARK_PLAN.md](../BENCHMARK_PLAN.md).
+
 Status: proposed (awaiting operator sign-off on phasing). Supersedes the ad-hoc
 `bench_tokens_per_task.rs` layout; keeps its proven parts. Owner issue: #210.
 

@@ -4,6 +4,14 @@
 **Status**: proposed (extends ADR-0005 and ADR-0010; implements #209)
 **Deciders**: Iris maintainers, Pi agent session
 
+## Implementation status (2026-09-08)
+
+The original decision-status label is retained. Project grants are implemented
+in `src/wayland/trust.rs` and enforced through Nexus; sandbox posture is stored
+but not enforced from that record. Destructive re-prompt is the normal-mode
+floor, not an absolute guarantee after explicit dangerous-skip (ADR-0049).
+See [current permissions](../../README.md#safety-and-permissions).
+
 ## Context
 
 ADR-0010 makes allow-always session-scoped and opts `write`/`edit` and destructive `bash` out of persistence, so every file mutation re-prompts every session, forever. Principled, but a daily grind that pushes users toward less careful agents (#209).

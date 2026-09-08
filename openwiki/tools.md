@@ -17,10 +17,15 @@ state.
 | `ls` | List directory entries or recursive trees. | No |
 | `read_output` | Read oversized tool output stored behind a session handle. | No |
 | `recall` | Recall compacted transcript detail from the session store. | No |
+| `AskUserQuestion` | Collect structured answers from the operator. | Required interaction, even in skip mode |
+| `get_goal`, `create_goal`, `update_goal` | Restricted session-goal controls. | Harness-owned goal lifecycle |
+| `web_search`, `read_web_page` | Bounded search/page extraction. | Opt-in and approval-gated |
+| `request_compaction` | Schedule one safe-boundary compaction. | Opt-in; no direct context mutation |
+| `spawn_subagent` and lifecycle/apply tools | Manifest-driven delegation and reviewed apply. | Spawn/apply gates, tool ceilings and isolated mutation |
 
-When `bashToolMode` is enabled, Iris registers only `bash`, `edit`,
-`read_output`, and `recall`. The model then uses shell commands for file
-inspection, listing, search, and creation.
+`bashToolMode` keeps `bash`, `edit`, `AskUserQuestion`, goal tools, `read_output`
+and `recall`, plus configured web/compaction/delegation tools. It removes ordinary
+file/search tools; the model uses shell commands for those operations.
 
 ## Path safety
 
@@ -36,9 +41,13 @@ carry fail closed for paths that do not resolve inside the workspace.
 previews before the approval decision. Denied calls are recorded as denied tool
 results instead of disappearing from the transcript.
 
-Approval modes are `strict`, `auto`, and `never`. The `auto` mode can silently
-approve in-workspace file targets, but destructive bash commands always prompt.
-`bash`, `write`, and `edit` do not support blanket allow-always grants.
+Approval modes are `strict`, `auto`, `never`, and
+`dangerously-skip-permissions`. Auto only approves file mutations it proves safe;
+normal modes retain destructive-action floors. Dangerous-skip bypasses those
+floors and persists globally when enabled through its CLI flag. It is not a
+sandbox and cannot answer required human questions. Narrow project grants are
+separate from blanket session allow. See the
+[approval contract](../README.md#approval-modes).
 
 ## Bash
 
@@ -66,6 +75,7 @@ Large successful tool outputs can be folded behind session-scoped output handles
 The transcript keeps a compact preview plus handle metadata while the full output
 is stored in a sidecar directory.
 
-Default-on output reductions compact noisy bash, grep, find, and ls output for
-model context. The benchmark harness can disable reductions for measurement, but
-normal CLI sessions always use the reduced form.
+Default reductions compact supported noisy outputs. `bash` accepts `raw:true`
+to bypass filtering for a call; read skim and some search guards are opt-in.
+Benchmark arms can disable reductions without changing normal defaults.
+Per-result reduction is not proof of lower completed-task cost.

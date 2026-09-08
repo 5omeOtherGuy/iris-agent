@@ -1,5 +1,11 @@
 # SPEC — Ask-user-questions: model-driven multiple-choice clarification
 
+> Implementation check (2026-09-08): Iris's `AskUserQuestion` tool and docked/
+> text dialogs exist in `src/tools/ask_user_question.rs`,
+> `src/ui/ask_user_question.rs` and `src/ui/text.rs`. Reference TypeScript paths
+> below belong to the external research tree, not this repository. The original
+> target/checklist is retained; see the [tool manual](../../README.md#tools).
+
 Status: Iris implementation target, informed by the claude-code reference at
 `~/vendor/claude-code` @ `6ba4060` (leaked tree; consult, do not vendor). Reference
 behavior was captured 2026-07-13; the Iris goal and acceptance gate below are

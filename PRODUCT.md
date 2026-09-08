@@ -27,18 +27,20 @@ exactly what it did.*
 
 ## Product Purpose
 
-Iris is a fast, token-efficient coding agent for the terminal. It is a **tool that
-serves the developer's work, not a substitute for it.**
+Iris is a terminal coding agent with explicit context and change controls. It
+serves the developer's work; it is not a substitute for it. The principles below are
+product goals; [FEATURES.md](docs/FEATURES.md) and the
+[v1.0 roadmap](docs/ROADMAP.md) distinguish implementation from intent.
 
 What it does and why it exists:
 
-- **Every token is deliberate.** The core is a context engine that budgets,
-  justifies, caches, and freshness-checks what reaches the model — explicit
-  budgeting and a context ledger over best-effort truncation. Large content lives
-  behind typed handles rather than being dumped into the prompt.
+- **Every token is deliberate.** Aim for budgeted, explainable context inclusion.
+  Accounting, cache controls, compaction and large-output handles exist. A general
+  budget planner, context ledger and file-aware summary freshness remain planned.
 - **The diff is the deliverable.** Iris is judged on the diffs, commits, and PRs
   it ships, not on chat quality. The workflow is built around the change, with
-  approval gates, diff previews, and (planned) checkpoint/rollback.
+  approval gates, diff previews, and opt-in task checkpoints/rollback. Integrated
+  commit and GitHub workflows remain planned.
 - **Honest, not flashy.** No bells and whistles promising agentic autonomy. The
   surface is calm and minimal at first glance — direct feedback, minimal
   distraction — but *all* the detailed information is there in a structured,
@@ -115,5 +117,6 @@ What Iris must **not** look or feel like:
 
 ---
 
-*Visual system of record: [docs/TUI_DESIGN_LANGUAGE.md](docs/TUI_DESIGN_LANGUAGE.md)
-(exhaustive pane grammar) and [DESIGN.md](DESIGN.md) (impeccable-format summary).*
+*Visual system of record: [TUI design language](docs/TUI_DESIGN_LANGUAGE.md).
+[DESIGN_NOTES.md](DESIGN_NOTES.md) preserves the historical polish review, not a
+current implementation specification.*

@@ -1,264 +1,176 @@
 # Iris Current Codemap
 
-**Last Updated:** 2026-07-19
-**Entry Points:** `src/main.rs`
+**Last checked:** 2026-09-08 against `b420985`.
+**Entry points:** `src/main.rs` → `src/lib.rs::run_cli`, `iris-bench/src/main.rs`.
 
-This codemap describes implemented code only. Planned capabilities live in [`../ROADMAP.md`](../ROADMAP.md) and [`../FEATURES.md`](../FEATURES.md).
+This map describes implemented modules and their boundaries. It is navigation,
+not a claim that every code path was rerun. See [audit coverage](../DOCUMENTATION_AUDIT.md),
+[capability status](../FEATURES.md), and [v1.0 gates](../ROADMAP.md).
 
-## Architecture
+## Workspace and dependency direction
 
-╭──────────────╮   ╭──────────────╮   ╭──────────────╮   ╭────────────────────────────╮
-│ Iris CLI     │──▶│ cli.rs       │──▶│ Nexus Agent  │──▶│ Mimir provider adapter     │
-│ main.rs      │   │ run_session  │   │ nexus.rs     │   │ chosen at startup          │
-╰──────┬───────╯   ╰──────┬───────╯   ╰──────┬───────╯   ╰─────────────┬──────────────╯
-       │                  │ Ui trait         │ UiEvent /                │
-       │                  ▼ (events)          │ ProviderEvent           ▼
-       │           ╭──────────────╮   ╭───────┴────────╮     ╭────────────────────────────╮
-       │           │ ui/ (TUI/text)│   ▼                ▼     │ auth store / refresh       │
-       │           │ tool_display │  ╭──────────────╮ ╭─────╮│ OpenAI / Anthropic /       │
-       │           ╰──────────────╯  │ Built-in     │ │ diff││ Antigravity                │
-       │                             │ tools/       │ │ prev│╰────────────────────────────╯
-       ▼                             ╰──────────────╯ ╰─────╯
-╭────────────────────────────╮        ╭────────────────────────────╮
-│ login commands             │        │ provider implementations    │
-│ openai / anthropic /       │        │ Codex / Messages / Gemini   │
-│ antigravity                │        ╰────────────────────────────╯
-╰────────────────────────────╯
+```text
+iris-agent: main.rs -> lib.rs -> cli.rs / print.rs / ui/
+                                  |
+                           wayland::Harness
+                                  |
+                            nexus::Agent <- injected Mimir providers + tools
+                                  ^
+                      neutral events and contracts
 
-Nexus is provider- and UI-neutral: it drives turns and approval policy, consumes
-the provider's async `Stream<ProviderEvent>`, and renders nothing itself. It runs
-on a tokio current-thread runtime (owned by the Tier-3 session driver) with a
-per-turn `CancellationToken`: provider stream reads, tool futures, and approval
-reviews are raced against cancellation via `tokio::select!`. Terminal I/O lives
-behind front-end seams: the raw-mode terminal-surface TUI is used for interactive
-TTYs, and the text UI remains the fallback for pipes/CI or TUI startup failure.
+Wayland -> iris-subagent-runtime (scheduler, artifacts, managed worktrees)
+iris-bench -> iris-agent::harness (benchmark facade)
+```
 
-## Key Modules
+`Cargo.toml` contains the root `iris-agent` package and members `iris-bench` and
+`crates/iris-subagent-runtime`. Nexus/Wayland/Mimir/UI remain in-crate modules.
+The broader [workspace split](../MODULARIZATION.md) is proposed, not implemented.
 
-| Module | Purpose | Public/internal API | Dependencies |
-|---|---|---|---|
-| `src/main.rs` | CLI entrypoint. Initializes telemetry/signals, parses args, assembles the harness-owned system prompt, loads the per-project permission policy into the agent, constructs the bare agent + startup-selected Mimir provider + tools, wraps them in a Tier-2 `wayland::Harness` (with optional session log, output store, and context budget), runs a new session, a resumed session (`resume <session-id>`: loads via `SessionStore::find`, seeds `Agent::resumed`, reopens the same log via `SessionLog::resume`, errors clearly on an unknown id), provider login commands, or `iris update`, and maps typed errors to process exit codes. `defaultProvider` supports `openai-codex`, `anthropic`, and `antigravity`; unset defaults to `openai-codex`. | `main()`, `dispatch()`, `run_agent()`, `resume_agent()`, `build_provider()`, `update_agent()` | `cli`, `nexus::Agent`, `wayland::{Harness, system_prompt}`, `session::{SessionLog, SessionStore}`, Mimir provider/auth/selection modules, `telemetry`, `errors` |
-| `src/cli.rs` | Iris CLI session driver (Tier 3). Selects the terminal-surface TUI for interactive TTYs and falls back to `TextUi` for pipes/CI or TUI startup failure. Owns `ModelSwitch` state and shared slash-command handling for both front-ends: `/model`/`/reasoning` (safe-boundary provider rebuilds, reasoning validation/clamping, model-selection audit events, and a switch-scope context-cost advisory that suggests `/compact` when a model/provider change carries a large context, ADR-0041), read-only `/copy`, `/session`, and `/compaction [generation]` builders, `/subagents` list/show/wait/cancel controls, `/worktrees` lifecycle/recovery controls, the text-path `/compact` driver, and no-op text feedback for TUI-only commands. The text path owns the current-thread runtime, reads prompts through `Ui`, exits through the slash-command registry, arms a per-turn `CancellationToken` with a background Ctrl-C watcher, and submits each turn on the `wayland::Harness` via `UiBridge`; the TUI path hands the same switch/harness state to `ui::tui_loop`. | `ModelSwitch`, `handle_model_command()`, `copy_command_lines()`, `session_info_lines()`, `compaction_lines()`, `run_interactive()`, `run_session()` | `tokio`, `tokio_util::CancellationToken`, `config`, `mimir::{selection, model_capabilities}`, `wayland::Harness`, `nexus::ChatProvider`, `ui::{Ui, UiBridge, UiEvent, slash, tui, text}` |
-| `src/nexus.rs` | Runtime core (Tier 1). Provider-, UI-, persistence-, and workspace-neutral async engine. Owns conversation state, tools, approval and required-interaction policy, provider round trips, cancellation, typed events, and the provider-neutral overflow kind. At a continuing pair-closed boundary it announces the completed message group, consults an optional `ContextGovernor`, atomically applies a whole-context replacement, then injects queued steering/follow-up text. Before visible output, a typed context overflow may invoke one governor rewrite and resend per provider round trip; a second overflow returns the bounded honest error. Governor cancellation races the turn token; governor failure warns and continues. Nexus holds no filesystem, session store, budget, summarizer, or provider-specific compaction policy. | `ChatProvider`, `ProviderEvent`, `ProviderFailure`, `Agent`, `ContextGovernor`, `ContextOverflowRecovery`, `BoundaryContext`, `ContextDirective`, `TurnContextHooks`, `AgentObserver`, `ApprovalGate`, `InteractionOutcome`, `SteeringSource`, `Tool`, `Tools`, `ToolEnv`, `Message` | `anyhow`, `serde_json`, `tracing`, `tokio`, `tokio_util::CancellationToken`, `futures`, `crate::tools` |
-| `src/wayland/mod.rs` | Tier-2 harness. Wraps the bare agent, owns execution/session state, injects `ToolEnv`, refreshes skills, persists complete provider round trips, and supplies `TurnContextController` as both observer and governor. A session-local atomic connects the opt-in `request_compaction` tool to the governor; only the governor consumes it at a pair-closed boundary. The final/error transcript diff remains the persistence backstop. | `Harness`, `Harness::new()`, `Harness::resumed()`, `Harness::submit_turn()`, `Harness::compact_now()` | `anyhow`, `futures`, `tracing`, `crate::{config, handles, nexus, session, tools}` |
-| `src/wayland/worker_runtime.rs` + `src/wayland/subagents.rs` | Iris adapters for the host-neutral worker runtime. `WorkerRuntime` owns the shared scheduler used by delegated agents and compaction. `SubagentBackend` owns manifest-defined worker types, system prompts, tool profiles, hard tool-registry filtering, strict-by-default paths, managed worktrees, reviewed apply, artifacts, and operator controls. Runtime groups remain available but are not model-facing. | `WorkerRuntime`, `SubagentBackend`, `SubagentTypeManifest`, `ChildProviderFactory` | `iris-subagent-runtime`, `nexus`, `tools`, `wayland::Harness` |
-| `crates/iris-subagent-runtime/` | Public host-neutral crate for durable bounded scheduling, `!Send` executor factories, cancellation, provider-round and output budgets, events, dormant groups, artifacts, recovery, detached linked/Btrfs worktrees, registry/leases, pooling, restore ports, and immutable file-level apply plans. | `RuntimeHandle`, `WorkerRequest`, `WorkerPolicy`, `WorkerBudgets`, `ExecutorFactory`, `WorktreeService`, `ApplyPlan`, restore contracts | `tokio`, `tokio-util`, `serde`, `sha2`, filesystem/git process ports |
-| `src/wayland/compaction.rs` + `src/wayland/compaction_governor.rs` + `src/wayland/compaction_background.rs` + `src/wayland/trigger.rs` | Tier-2 compaction policy and lifecycle. Owns durable session/id state, one-job policy, verbatim transcript and read-only investigator inputs, bounded transcript overflow retry, model-aware ladder, hybrid measurement, breaker, pair-aware planning, parent-owned apply, fold freeze, deterministic reactive recovery, and inspectable job/frozen-fold diagnostics. Portable and provider-native summary execution runs as urgent internal jobs on `WorkerRuntime`; compaction retains range planning, stale-result revalidation, safe-boundary application, and fallback selection. | `CompactionEngine`, `CompactionWorkerConfig`, `ApplyContext`, `TriggerLadder`, `ContextDiagnostics`; `ContextGovernor` is implemented by `TurnContextController` | `nexus` contracts, `session`, `handles`, fold/recall helpers, `wayland::WorkerRuntime` |
-| `src/compaction_bench.rs` + `src/compaction_live_bench.rs` | ADR-0045 compaction measurement. Deterministic production-seam arms cover worker mode, start/hard/reactive boundaries, focus steering, repeated generations, recall re-inflation, and policy tuning. Double-gated real-provider loops force two or more applies per session, reconstruct true pre-apply message context, measure G1–G5, record worker and parent-cache economics, then byte-compare live with resumed context. Live parent lanes are Haiku 4.5 and Codex mini; summary workers are Opus 4.6 medium. | ignored live tests; `auto_compaction_v2_*` deterministic reports | production Nexus/Wayland/session/Mimir seams; fake and live providers |
-| `src/wayland/skills/` | Codex-derived native skill subsystem: bounded repo/user/system/admin root discovery, canonical dedupe, tolerant YAML frontmatter, `agents/openai.yaml` metadata, Codex config rules, 2% metadata budgeting, `$name`/linked-path mention resolution, and full-body contextual injection. | `SkillCatalog`, `SkillMetadata`, `SkillScope` | `serde_yaml_ng`, `toml`, filesystem APIs |
-| `src/wayland/system_prompt/mod.rs` + `onboarding.rs` | Harness-owned fragment/slot system prompt assembly from in-binary fragments only (ADR-0026/0064): no `.md` fragment files are discovered, materialized, or loaded. User instructions load from `~/.agents/AGENTS.md`, then `~/.iris/AGENTS.md`. Project instructions load root-to-leaf; each directory selects the first non-empty regular base from `AGENTS.override.md`, `AGENTS.md`, then `CLAUDE.md`, followed by the first non-empty local candidate from `AGENTS.local.md`, then `CLAUDE.local.md`. User paths may resolve symlinks to regular files; project candidates refuse symlinks and non-regular files, cap each read at 32 KiB, and emit deduplicated notices. An active shared hub suppresses redundant first-run copying into the Iris-specific user layer. Generated live-tool blocks follow. | `PromptAssembler`, `assemble()`, `assemble_with_notices()`, `onboarding::maybe_onboard()` | `crate::nexus::Tools`, filesystem APIs |
-| `src/wayland/system_prompt/defaults.rs` | Shipped in-binary prompt fragments: the single source of truth for the system prompt. Generated tool blocks are intentionally excluded from this data file. | `DEFAULTS` | none |
-| `src/wayland/git_safety/` | Tier-2 dirty-tree safety, checkpointing, net diff, and settlement (Milestone 5, epic #261, ADR-0028). `GitSafety` implements the `nexus::MutationGuard` contract: settlement-based task boundaries with lazy baseline capture, a choke-point approval gate for pre-existing dirty edit/write targets, bash detect-and-restore around a protected-set snapshot, an attribution ledger, and honest non-git/`.jj` degrade. Submodules: `checkpoint` (op-log-shaped `refs/iris/checkpoints/<task-id>/` git-object chain, plumbing only), `settlement` (accept/rollback/`/checkpoint`, crash-recovery reconciliation, 30-day expiry, index restore), `net_diff` (ledger-scoped net task diff, `/diff`), `snapshot`/`task_state`/`baseline`/`ledger`/`git` support. | `GitSafety`, `GitSafety::new()`, `note_mutation()`, `unapproved_protected()`, `before_exec()`/`after_exec()`, `task_diff()`, `restore_points()`, `accept()`, `rollback()`, `recover_and_expire()` | `anyhow`, `similar`, `rand`, `git` plumbing, `crate::nexus::MutationGuard` |
-| `src/handles.rs` | Tier-2 session-scoped store for oversized tool outputs. Derives a `<session>.outputs/` sidecar directory, stores full output under truncated SHA-256 handles, validates handle ids on read, and implements Nexus's `ToolOutputStore` contract. | `HandleStore`, `HandleStore::for_session()`, `HandleStore::get()` | `sha2`, filesystem APIs, `crate::nexus::ToolOutputStore` |
-| `src/ui/mod.rs` | Terminal front-end seam (Tier 3). Defines the `Ui` trait, the `UiEvent` render protocol (including the block-level `AssistantReasoning` thinking event mirrored from the Nexus `AgentEvent`), turn-error classification, and `UiBridge` (adapts a `Ui` onto the Nexus observer, approval, and required-interaction seams via `RefCell`). Shared event mapping keeps the TUI and text fallback consistent; the text fallback intentionally ignores reasoning. | `Ui`, `UiEvent`, `UiBridge`, `TurnErrorKind` | `anyhow`, `crate::{nexus, errors}` |
-| `src/ui/text.rs` | Text terminal fallback. Owns stdin/stdout/stderr, prints the `iris>` prompt, supports bracketed-paste/backslash multiline input, renders streamed assistant deltas and final tool lifecycle lines via `tool_display`, ignores live TUI-only deltas, prompts for approval, runs the complete `AskUserQuestion` fallback, and routes auth/provider errors to stderr. Used for pipes/CI or when the TUI cannot start. | `TextUi`, `TextUi::stdio()` | `std::io`, `crate::{approval, nexus, ui, tool_display}` |
-| `src/ui/steering.rs` | Tier-3 mid-run message queue. `SteeringQueue` (FIFO, drain-all) implements the Tier-1 `SteeringSource` seam: the TUI loop enqueues steering (Enter) and follow-up (Alt+Enter) messages the user types while a turn runs, and the turn drains them at its injection points. Shared `Rc` with the harness; interior mutability via `RefCell`. `clear()` on Ctrl-C. | `SteeringQueue`, `enqueue_steering()`, `enqueue_follow_up()`, `len()`, `clear()` | `crate::nexus::SteeringSource` |
-| `src/ui/slash.rs` | Slash-command registry and palette filtering. Registers only backed commands (`/exit`, `/quit`, `/model`, `/reasoning`, `/resume`, `/new`, `/session`, `/copy`, `/compact`, `/context`, `/debug`, `/scoped-models`, `/settings`, `/trust`, `/permissions`, `/subagents`, `/worktrees`, `/login`, `/logout`) and provides shared matching/action helpers for TUI and text paths. The `Palette` state is rendered through `ui::tui::overlay::PaletteView` (a `Component`). | `COMMANDS`, `matches()`, `is_exit()`, `Palette`, `SlashAction` | none |
-| `src/ui/clipboard.rs` | System-clipboard writes for `/copy`. Platform-tool chain mirroring pi-mono (pbcopy; termux/wl-copy/xclip/xsel picked from the display-server env) with an OSC 52 escape fallback for remote (SSH) sessions or missing tools; payload capped for terminal safety. | `copy()`, `CopyMethod` | `base64`, `std::process`, `tracing` |
-| `src/ui/markdown.rs` | Minimal pulldown-cmark to Ratatui `Line` renderer for assistant text. Covers headings, emphasis, strikethrough, inline/fenced code, bullet/ordered/task lists, blockquotes, rules, GFM tables (width-aware box layout), visible link destinations, and literal raw/inline HTML. Styling is injected via `MarkdownTheme` (default reproduces historical hardcoded styles byte-for-byte) with a `base` style for the thinking-block dim+italic and seams for link styling and an optional `highlight_code` fenced-block hook. OSC-8 hyperlink emission, a bundled syntax highlighter, and images remain out of scope (the seams are provided, not their implementations). | `render_markdown_themed()`, `MarkdownTheme`, `HighlightFn` | `pulldown_cmark`, `ratatui`, `unicode_width` |
-| `src/ui/modal.rs` | Reusable modal state machines for provider/model, scoped-models, settings/effort, login/logout, delegation, and required user questions. Produces neutral `ModalOutcome`/`ModalAction` values for the TUI loop to execute. `Modal` implements `ui::tui::Component` so the docked overlay region renders it through the shared render contract. | `Modal`, `ModalOutcome`, selector structs | `ratatui`, `mimir::selection`, `ui::selector`, `ui::tui::Component` |
-| `src/ui/delegation_dashboard.rs` | Tier-3 live `DELEGATION` modal. Owns worker/worktree list and detail state, grouping, filters, stable-ID cursors, bounded artifact/event/apply views, legal-action hints, confirmation postures, refresh coalescing, and stale-response rejection. Backend work crosses typed request/response values; rendering and key handling perform no Git, registry, artifact, or apply I/O. | `DelegationDashboard`, `DelegationScope`, `DelegationRequest`, `DelegationResponse`, `execute_request()` | `iris-subagent-runtime`, `wayland::subagents::SubagentBackend`, `ratatui`, `ui::{modal, textengine}` |
-| `src/ui/ask_user_question.rs` | Docked `AskUserQuestion` dialog state. Owns question navigation, single/multi-select state, automatic `Other` input, focused previews, review, submit, cancel, and conversational hand-back. | `AskUserDialog`, `AskUserDialogOutcome` | `ratatui`, `tools::ask_user_question`, `ui::modal` |
-| `src/ui/selector.rs` | Shared selector-list primitives used by TUI modals: filterable rows, selection movement, toggles, badges, and footer/status text. | `Selector`, `SelectorItem` | `ratatui` |
-| `src/ui/picker.rs` | Model/reasoning picker helpers. Builds authenticated model lists from the Mimir catalog, applies exact-match and scoped-cycle behavior, cycles reasoning effort, and persists default/scoped settings when requested. | picker builders, `cycle_model()`, `cycle_effort()` | `config`, `mimir::{model_catalog, model_capabilities, selection}`, `ui::modal` |
-| `src/ui/login.rs` | `/login` and `/logout` orchestration for the TUI. Builds provider/auth-status selectors, removes stored credentials only, and runs existing blocking OAuth helpers behind a `LoginBackend` seam. | `open_login()`, `provider_select()`, `open_logout()`, `apply_logout()`, `LoginBackend` | `reqwest`, `mimir::auth`, `mimir::model_catalog`, `ui::modal` |
-| `src/ui/screen_mode.rs` | Screen-mode policy (ADR-0029): resolves pager vs inline from `tui.altScreen` (`auto\|always\|never`), `--no-alt-screen`, `IRIS_NO_ALT_SCREEN`, and an environment snapshot (TTY, `TERM=dumb`, tmux control-mode probe, Zellij). Pure `resolve()` table + production detection wrapper; failures degrade to inline. | `AltScreenConfig`, `ScreenMode`, `Resolution`, `resolve_for_startup()` | `crate::config`, `std::process` (tmux probe) |
-| `src/ui/tui/pager.rs` | Alt-screen pager surface (ADR-0029). `AltScreen` guard (enter/leave `?1049h/l`, panic-hook + Drop + force-quit restore arbitrated via one global flag in `signals`), `PagerSurface` (fullscreen ratatui `Terminal` drawing frames in `?2026` sync blocks with stock cell diffing), and `compose_frame` (slices the shared logical document: pinned session bar, bottom-anchored transcript tail, pinned composer). | `AltScreen`, `PagerSurface`, `compose_frame()`, `render_frame()`, `install_panic_hook()` | `ratatui`, `crate::signals`, `ui::tui::screen` |
-| `src/ui/terminal_surface.rs` | Iris-owned terminal surface renderer (inline mode; ADR-0006). Converts Ratatui `Line`s to ANSI, tracks previous rendered lines and terminal size, writes synchronized output, appends/diffs safe changes, and performs full state replay on resize or unsafe shrink without using Ratatui `Terminal`/inline viewport lifecycle. Width/clip math is routed through `ui::textengine`. | `TerminalSurface`, `RenderState`, `RenderKind`, `RenderStats` | `ratatui`, `crate::ui::textengine`, `std::io` |
-| `src/ui/textengine.rs` | Unified text engine: the single source of truth for display width, ANSI/OSC/APC parsing, and width-aware wrap/truncate/slice. Grapheme-cluster width (CJK/emoji ZWJ/VS16/flag/combining), one ANSI/OSC/APC stripper (`strip_ansi`/`clean_text`/`visible_width`), grapheme-safe `truncate_chars`/`truncate_to_width`/`wrap_to_width`, and a reserved `ansi_aware` subsystem (SGR carry + OSC 8 hyperlink preservation across wrapped/truncated lines) for a deferred hyperlink UI feature. Replaces the former divergent helpers in `tui/wrap.rs`, `tui/text.rs`, and `ui/text.rs` (including a `chars().count()` width bug). | `display_width`, `visible_width`, `strip_ansi`, `clean_text`, `truncate_to_width`, `wrap_to_width`, `clip_to_width`, `ansi_aware::{wrap_ansi, truncate_ansi, slice_by_column}` | `unicode-width`, `unicode-segmentation` |
-| `src/ui/tui/component.rs` | Reusable component/container render abstraction (Tier 3), Iris's Rust analogue of pi-mono `tui.ts` `Component`/`Container` with `Line<'static>` as the render unit. Defines the `Component` trait (`render(width) -> Vec<Line>`), `Container` (ordered child compositing), the borrowed `composite()` helper, and the `CURSOR_MARKER`/`take_cursor_position` focus cursor seam. Sits above `terminal_surface`; no terminal I/O. | `Component`, `Container`, `composite()`, `CURSOR_MARKER`, `take_cursor_position()` | `ratatui`, `ui::tui::wrap` |
-| `src/ui/tui/overlay.rs` | Overlay/focus layer for the composer menu region. Defines `FocusTarget` (Editor < Palette < Modal), the single source of truth for input routing and docked-overlay selection; `PaletteView` (the slash palette's `Component` face, windowed to a fixed row budget with a dim position row when the match list scrolls); and `render_menu_lines` (docked menu paint). Iris overlays are docked (reserve space), not floating; a floating anchor/margin compositor is deferred (see ADR-0024). | `FocusTarget`, `PaletteView`, `render_menu_lines()` | `ratatui`, `ui::slash`, `ui::tui::{component, wrap}` |
-| `src/ui/tui.rs` | Terminal-surface TUI state and document rendering. Owns raw mode/paste/key flags/cursor visibility through Crossterm, keeps transcript history in `Screen` state for replay, renders transcript plus textarea editor, spinner state, slash palette, modals, approval display, live exec cells (`ToolStarted`/`ToolOutputDelta`), Markdown, and width-aware layout into Ratatui `Line`s. Transcript rows and overlays render through the `Component`/`Container` abstraction; the composition root assembles the document via a root `Container` and `Screen::focus()` selects the docked overlay. Tool panels are built in `tui/transcript.rs` and dispatched through the `tui/tool_render.rs` registry. Reads no input itself. | `TuiUi`, `Screen`, `Component`, `FocusTarget` | `ratatui`, `ratatui_textarea`, `crate::{approval, tool_display, ui}` |
-| `src/ui/tui/tool_render.rs` | Built-in tool-renderer registry: the single source for the tool-name -> panel mapping on the TUI surface. A `ToolRenderer` trait (title/meta/body + `ToolPanelKind`) with EXPLORE/SHELL/EDIT/generic built-ins, a `resolve()` name lookup with the generic TOOL renderer as fallback for unknown tools, and a `render_body` dispatch that isolates a panicking renderer via `catch_unwind` and falls back to the generic body. `PanelBody` builds flood-capped, fold-aware (ctrl+o) body rows and syntax-highlights tool output when a file or heredoc language can be inferred. Reuses `tool_display` summaries; no extension/registration API (deferred). | `ToolRenderer`, `ToolPanelKind`, `ToolOutcome`, `RenderCtx`, `PanelBody`, `resolve()`, `render_body()` | `ratatui`, `crate::{nexus::ToolCall, tool_display, ui::highlight}` |
-| `src/ui/tui_loop.rs` | Async event loop for the terminal-surface TUI. Multiplexes terminal input, render ticks, agent events, active-turn cancellation, approval and required-interaction requests, slash/modal actions, runtime provider/model/reasoning switches, scoped model cycling, and TUI login flows on the current-thread runtime; Ctrl-C in raw mode cancels the active turn from the input thread. Routes the slash commands: session swaps (`/new`, `/resume`), read-only `/session`/`/copy` (shared `cli` line builders), `/context` (the issue-#400 context-accounting breakdown: budget/headroom, system+tools, raw vs summarized, trigger-tagged fold batches, pending-fold mass), and `/debug` (alias `/dbug`), which writes a pi-mono-style snapshot (rendered lines with widths + context JSONL) to `~/.iris/iris-debug.log`. Input is routed by explicit `Screen::focus()` (`FocusTarget`) instead of ad-hoc modal/palette state checks. During a turn the composer stays live for steering (a shared `SteeringQueue` installed on the harness): Enter queues a steering message, Alt+Enter a follow-up, editing keys are shared with the idle phase via `apply_editor_key`, and Ctrl-C clears the queue. | `run()` | `tokio`, `ratatui::crossterm`, `tokio_util::CancellationToken`, `wayland::Harness`, `nexus` seams, `cli::ModelSwitch`, UI modal/login/picker modules |
-| `src/ui/harness_actor.rs` | Owns the mutable harness while a TUI operation is active. Typed channels park and resume approval and required-interaction requests while input and rendering remain live; cancellation rejects pending responses before stopping the operation. Delegation requests clone the Wayland backend and run blocking scheduler/worktree/apply calls off the actor before returning typed events. | `HarnessActor`, `HarnessCommand`, `HarnessEvent` | `tokio::sync`, `nexus`, `wayland::Harness` |
-| `src/tool_display.rs` | Presentation-only formatter for tool-call lines (proposed/approval/denied/result/error). Returns owned strings, performs no I/O, and never changes what is sent to the model. Reused (not duplicated) by the TUI `tui/tool_render.rs` registry for panel summaries (`summarize`, `run_target`, `exploration_summary`, `display_path`). | `summarize()`, `run_target()`, `is_exploration_tool()`, `exploration_summary()`, `display_path()`, `fold()` | `serde_json`, `crate::nexus::ToolCall` |
-| `src/approval.rs` | Terminal decision parser (Tier 3). Translates a typed line into the Tier-1 `crate::nexus::ApprovalDecision`: `y`/`yes` allow, `a`/`always` allow-session, anything else denies. | `parse_decision()` | `crate::nexus` |
-| `src/errors.rs` | Provider-neutral typed errors carried across runtime boundaries for user-facing handling and exit codes. | `AuthError`, `UsageError`, `exit_code()` | `thiserror` |
-| `src/telemetry.rs` | Operator observability: `RUST_LOG`-driven tracing to stderr, secret-safe fingerprints, and sanitization of external response bodies before they reach logs/errors. | `init()`, `redact_secret()`, `sanitize_external_body()` | `tracing-subscriber`, `sha2`, `serde_json` |
-| `src/config.rs` + `src/config/tool_result_compaction.rs` | Iris settings loader + updater. Project config may tune local compaction thresholds, worker input, instructions, the default-off model compaction tool, and tool-result reducers. Global config alone owns provider routing, including `compaction.worker.model`, provider-native controls, and auth-adjacent settings. Worker input defaults to transcript and validates before provider construction. Unknown keys round-trip through atomic global updates; malformed or unsafe settings fail closed. | `Settings`, `Settings::load()`, `Settings::compaction_worker_config()`, `Settings::compaction_model_tool()`, `Settings::tool_result_compaction()`, `ToolResultCompactionPolicy`, structured save helpers | `serde`, `serde_json`, `anyhow`, env/filesystem APIs |
-| `src/session.rs` | JSONL session store + linear resume + compaction-aware rebuild. Compaction entries retain origin, worker usage, instructions, and optional adapter-owned provider blocks beside mandatory portable text; `read_compaction_inspections()` derives full viewer detail and original range mass from durable raw rows. Rebuild remains summary/carry/task-state based and attaches opaque blocks for Mimir to replay only on a matching selection. Fold entries replace provider-visible tool-result bodies with deterministic stubs while originals remain recoverable. | `SessionLog` (`create`/`resume`/`append`/`append_compaction`/`append_fold_with_reasons`/`append_model_selection`), `SessionStore` (`open_default`/`with_root`/`list`/`find`/`open`), `SessionSpanReader`, `read_tool_call()`, `read_compaction_inspections()` | `serde_json`, `anyhow`, `rand`, filesystem/time APIs, `crate::nexus::{Message, Role}` |
-| `src/signals.rs` | Graceful SIGINT handling for the REPL. First Ctrl-C sets an interrupt flag the tool loop checks between round-trips (ends the turn cleanly); a second reaps tracked process groups via `process_group`, restores the default handler, and re-raises to force-quit. | `install()`, `interrupted()`, `reset()` | `libc`, `crate::process_group`, atomics |
-| `src/process_group.rs` | Single owner of process-group spawn/kill/reap policy for `bash` shells. Puts commands in their own group, kills+reaps groups, and keeps a lock-free registry so the force-quit SIGINT handler can SIGKILL every live group with only async-signal-safe ops. | `in_own_group()`, `kill()`, `kill_and_reap()`, `register()`, `kill_all_from_signal()`, `GroupGuard` | `libc`, atomics, `std::process` |
-| `src/tools/mod.rs` | Built-in tool module root. Declares the per-tool modules, owns `ToolState` (observed files, bash sessions, and the model-compaction request flag) injected via `ToolEnv`, re-exports the Tier-1 `ToolOutput` contract and `built_in_tools()`, and provides shared diff/preview rendering (`Preview`, `render_preview`, `unified_diff`). Per-tool modules fill model-facing `content` plus bounded host metadata; Nexus serializes the enclosing result envelope. | `ToolState`, `ToolOutput` (re-export), `built_in_tools` (re-export), `Preview` | tool submodules, `crate::nexus::ToolOutput`, `similar`, `anyhow` |
-| `src/tools/registry.rs` + `src/tools/request_compaction.rs` + `src/tools/ask_user_question.rs` | Built-in tool adapters (Tier 3). One thin `Tool` impl per tool wraps execution/schema functions and self-classification. `AskUserQuestion` is required interaction. Configured sessions add one manifest-driven `spawn_subagent` surface plus worker status/cancel/output and plan/apply tools. Spawn resolves provider-agnostic tool grants against the parent ceiling, authenticated credential lanes, and manifest prompts/budgets before durable acceptance; best-of-N controls are not registered. | `built_in_tools()`, `built_in_tools_for()`, `SubagentToolsConfig`, `Tool` impls | `crate::nexus::{Tool, ToolEnv, ToolFuture, ToolOutput, Tools}`, `mimir::model_catalog`, `wayland::subagents`, `tokio`, tool submodules |
-| `src/tools/path.rs` | Workspace path resolution and display helpers. Canonicalizes existing paths, normalizes create targets, and rejects workspace escapes. | `workspace_root()`, `resolve_existing()`, `resolve_for_write()`, `relative_display()` | `std::path`, `anyhow` |
-| `src/tools/text.rs` | Shared text, truncation, size-limit, line-ending, and atomic-write helpers. | `atomic_write()`, `truncate_head()`, `truncate_tail()`, line-ending helpers | filesystem APIs, `rand`, `anyhow` |
-| `src/tools/read.rs` | Text-file read tool with offset/limit, line numbers, binary/NUL and invalid UTF-8 rejection. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
-| `src/tools/write.rs` | Create/overwrite tool. Creates parents, writes through symlinks inside the workspace, and uses atomic replacement. | `execute()` | `path`, `text`, filesystem APIs, `serde` |
-| `src/tools/edit.rs` | Claude-compatible exact-string replacement (`file_path`/`old_string`/`new_string`/`replace_all`) with fuzzy fallback matching, BOM/EOL preservation, no-op rejection, stale-file preflight, and atomic replacement. | `execute()` | `path`, `text`, `observe`, filesystem APIs, `serde` |
-| `src/tools/observe.rs` | Session-scoped file observation store for stale-file detection: records `{mtime, content_hash}` per canonical path on read/write/edit and rejects mutating an existing file that was never read or changed since last read. | `ObservedFiles::observe()`, `ObservedFiles::ensure_fresh()` | `sha2`, filesystem APIs |
-| `src/tools/bash/mod.rs` | Shell command tool dispatch and per-agent `BashState`. One-shot runs with cwd confinement, timeout, process-group kill, bounded output drain/truncation, and nonzero-exit reporting; routes `session`/`action` and background-job actions to the submodules. | `execute()`, `BashState`, `parameters()` | `bash::{session, jobs, sandbox}`, `process_group`, process/filesystem APIs, `serde` |
-| `src/tools/bash/sandbox.rs` | Kernel sandbox (Linux Landlock LSM): confines each shell to write only the workspace (plus `/dev/null`) and denies TCP networking, enforced in the child via `pre_exec`. Explicit non-silent fallback with a surfaced notice when Landlock is unavailable. | `confine()`, `SandboxStatus` | `landlock`, `libc`, `std::os::unix` |
-| `src/tools/bash/session.rs` | Persistent shell sessions: a long-lived `bash` co-process where `cd`/`export`/vars survive across calls, delimited by a high-entropy sentinel-marker protocol with exit-code parsing. | `Sessions`, `run`/`reset`/`close` | `process_group`, `sandbox`, process/thread APIs |
-| `src/tools/bash/jobs.rs` | Background jobs: start a detached confined command, poll new output from a bounded byte ring addressed by absolute cursor, finalize (bounded wait) for the exit code, list, and cancel. | `Jobs`, `start`/`poll`/`finalize`/`list`/`cancel` | `process_group`, `sandbox`, threads/condvar |
-| `src/tools/grep.rs` | Library-backed (grep/ignore) content search, grouped by file with context. | `execute()` | `path`, `text`, `grep`, `ignore`, `serde` |
-| `src/tools/find.rs` | Native (ignore + globset) file glob search sorted newest-first. | `execute()` | `path`, `text`, `ignore`, `globset`, `serde` |
-| `src/tools/ls.rs` | Directory listing tool: directories first, dotfiles, directory suffixes, optional recursive tree, optional `long` mode (type marker + human-readable size), entry-count metadata, and output caps with a truncation summary (total, dirs/files split, dominant omitted extensions). | `execute()` | `path`, `text`, filesystem APIs, `serde` |
-| `src/mimir/mod.rs` | Mimir module declaration: Iris's AI/provider package (the pi-ai equivalent), housing provider adapters, auth, model selection, catalog, and capability metadata. The `ChatProvider` contract stays in `nexus`. See [`../NAMING.md`](../NAMING.md). | `auth`, `providers`, `selection`, `model_catalog`, `model_capabilities`, `anthropic_models` modules | mimir submodules |
-| `src/mimir/selection.rs` | Normalized provider/model/reasoning/cache/context-management selection and precedence. Resolves active selections and qualified dedicated compaction-worker selections; centralizes provider defaults and cache profiles; and resolves local/native tool-result compaction without leaking provider names into Wayland or Nexus. | `ProviderId`, `ReasoningEffort`, `PromptCacheRetention`, `ContextManagement`, `ModelSelection`, `ModelSelection::resolve_compaction_worker()`, `cache_profile()` | `config`, `errors`, env APIs |
-| `src/mimir/model_capabilities.rs` | Reasoning capability table and clamp/validation logic for supported provider/model pairs. Drives startup validation, `/reasoning`, effort picker, and Shift+Tab cycling. | `supported_levels()`, `supports_thinking()`, `cycle_effort()`, `validate()`, `clamp()` | `errors`, `mimir::{selection, anthropic_models}` |
-| `src/mimir/model_catalog.rs` | Hand-maintained TUI model catalog and no-secret auth availability view. It filters picker candidates, captures active delegated-worker credential lanes, omits unauthenticated models from `spawn_subagent`, exposes the lane selector only when one vendor has multiple active lanes, prefers OAuth, and resolves explicit model/lane requests. | `CatalogModel`, `SubagentCatalogEntry`, `SubagentCredentialLane`, `subagent_catalog()`, `subagent_schema_choices_from()`, `resolve_subagent_model_in()` | `mimir::{auth, selection}` |
-| `src/mimir/anthropic_models.rs` | Claude Code subscription model matrix: model ids, output caps, manual/adaptive thinking mode, and refusal fallback. Used by Anthropic request construction, catalog sync tests, and reasoning capability checks. | `AnthropicModel`, `ThinkingMode`, `MODELS`, `find()`, `is_subscription_model()` | none |
-| `src/mimir/auth/mod.rs` | Auth module declaration. | `anthropic`, `antigravity`, `device_code`, `openai_codex`, `storage` modules | auth submodules |
-| `src/mimir/auth/storage.rs` | Provider-keyed auth-file storage for OAuth credentials. Reads missing files as empty, validates credential shape, reports stored credential kinds for `/login`/`/logout`, removes individual provider records, and writes atomically with restricted Unix permissions. | `AuthStore`, `OAuthCredentials`, `StoredCredential`, `CredentialKind` | filesystem/env APIs, `anyhow`, `serde`, `serde_json` |
-| `src/mimir/auth/device_code.rs` | Generic polling helper for OAuth device-code flows. | `DeviceCodePoll`, `poll_device_code()` | `std::thread`, `std::time`, `anyhow` |
-| `src/mimir/auth/oauth_callback.rs` | Shared provider-local OAuth browser-login plumbing: PKCE S256, cancel-aware loopback callback server (IPv4 plus best-effort IPv6), manual code/redirect paste parsing, timeout/error callback classification, and safe callback response rendering. | callback helpers and input parsers | TCP/time APIs, `sha2`, `rand`, `anyhow` |
-| `src/mimir/auth/openai_codex.rs` | OpenAI Codex OAuth integration. Supports browser callback login through the shared callback seam, device-code login, token exchange/refresh, and account ID extraction from JWT payloads. | `OpenAiCodexTokenStore`, `AccessToken`, `login_browser()`, `login_device_code()` | `AuthStore`, `oauth_callback`, `poll_device_code`, `base64`, `rand`, `reqwest`, `sha2`, `serde`, `serde_json`, TCP/filesystem/time APIs |
-| `src/mimir/auth/anthropic.rs` | Anthropic Claude Code subscription OAuth integration. Runs browser PKCE login with manual paste fallback, loads credentials from the Iris auth store or bootstraps from Claude Code's `.credentials.json`, supports macOS Claude Code Keychain parity checks/write-back, refreshes via Anthropic OAuth, and writes rotated tokens back to the same source without reshaping/dropping sibling keys. | `AnthropicTokenStore`, `login_browser()`, `AUTH_PROVIDER` | `AuthStore`, `oauth_callback`, filesystem/env APIs, `reqwest`, `serde_json`, `anyhow` |
-| `src/mimir/auth/antigravity.rs` | Antigravity Google OAuth integration. Runs browser PKCE login on `127.0.0.1:51121`, uses a runtime or build-time `ANTIGRAVITY_CLIENT_SECRET` for login/refresh, decodes the public installed-app client ID at runtime, refreshes tokens, and discovers/persists `projectId` via Code Assist (`ANTIGRAVITY_PROJECT_ID` wins over persisted ids; no hard-coded fallback is persisted on discovery failure). | `AntigravityTokenStore`, `login_browser()`, `AUTH_PROVIDER` | `AuthStore`, `base64`, `rand`, `reqwest`, `sha2`, `serde_json`, TCP/filesystem/time APIs |
-| `src/mimir/providers/mod.rs` | Provider module declaration plus shared prompt-cache stable-prefix diagnostics. System-prompt assembly lives in `wayland/system_prompt.rs`; provider constructors receive the assembled prompt from `main.rs`. | `anthropic_messages`, `antigravity`, `openai_codex_responses` modules, `PromptCachePrefix` | provider submodules, Nexus message/tool types |
-| `src/mimir/providers/transport.rs` | Shared blocking-provider glue: spawns reqwest/SSE work on `spawn_blocking`, forwards events over a channel, classifies HTTP status, performs exactly-once reauth, and parses SSE event framing. | `TurnSink`, `ChannelSink`, `spawn_stream()`, `run_with_reauth()`, `for_each_sse_event()`, `classify_http_status()` | `futures`, `tokio`, `tokio_util`, `reqwest`, `anyhow`, Nexus turn/event types |
-| `src/mimir/providers/openai_codex_responses.rs` | Implements `ChatProvider` for the ChatGPT Codex Responses endpoint. Streams ordinary turns, maps reasoning and cache controls, and supports provider-native compaction by pairing one encrypted replay block with a separate portable provider summary. Unsupported native models fall back through the shared compaction ladder. | `OpenAiCodexResponsesProvider` | `OpenAiCodexTokenStore`, shared transport, `ChatProvider`, Nexus message/turn/compaction types, `mimir::selection`, `reqwest`, `serde_json`, `tracing` |
-| `src/mimir/providers/anthropic_messages.rs` | Implements `ChatProvider::respond_stream` for Anthropic Messages on the Claude Code OAuth lane. Builds Claude Code identity/system blocks, enforces role alternation, advertises tools, maps reasoning, replays signed/redacted reasoning, applies default-short cache controls, and serializes explicit context-management clear edits. Native `clear_tool_uses_20250919` mapping includes trigger/keep/minimum thresholds, excluded tools, and tool-input clearing. Parses Anthropic SSE content/usage/cache blocks, redacts external diagnostics, and reauths once on auth rejection. | `AnthropicProvider` | `AnthropicTokenStore`, shared transport, `ChatProvider`, Nexus message/turn/reasoning types, `mimir::{anthropic_models, selection}`, `reqwest`, `serde_json`, `tracing` |
-| `src/mimir/providers/antigravity.rs` | Implements `ChatProvider::respond_stream` for Antigravity/Gemini Code Assist (`v1internal:streamGenerateContent?alt=sse`). Builds the project/model/request envelope, maps Nexus messages/tools to Gemini contents/function declarations, maps normalized reasoning to `generationConfig.thinkingConfig`, captures and replays Gemini tool-call `thoughtSignature` continuity, parses SSE response chunks/text/function calls, and reauths once on auth rejection. Assistant-reasoning rows are skipped on this lane today. | `AntigravityProvider` | `AntigravityTokenStore`, shared transport, `ChatProvider`, Nexus message/turn types, `mimir::selection`, `reqwest`, `serde_json`, `tracing` |
+Nexus renders nothing and owns no session store. Its boundary is not fully
+clean: `ToolEnv` references `crate::tools::ToolState`, and Nexus uses
+`crate::tools::path::workspace_relative` and `crate::display_path::workspace_path`.
+See [current vs target](../ARCHITECTURE.md#current-vs-target).
 
-## Data Flow
+## Process, runtime and storage
 
-1. `main()` calls `telemetry::init()`, installs the SIGINT handler via `signals::install()`, and runs `dispatch()`.
-2. For the default command, `run_agent()` loads `config::Settings` for the cwd, assembles the Wayland-owned system prompt from in-binary fragments + project docs + live tools, loads the per-project permission policy, resolves `defaultProvider`/`defaultModel`/`defaultReasoning`/`promptCacheRetention`/Anthropic context-management config from global/project config and env (unset/blank provider → `openai-codex`; supported: `openai-codex`, `anthropic`, `antigravity`), validates reasoning capabilities, builds the selected Mimir provider, creates an `Agent`, attaches a best-effort `session::SessionLog` (warns and continues in-memory if it cannot be opened), passes the configured context token budget into the harness, initializes `cli::ModelSwitch` with any global `enabledModels`, and calls `cli::run_interactive()`.
-3. `run_interactive()` selects the terminal-surface TUI when stdin/stdout are terminals, otherwise the text fallback. The text fallback uses `run_session()` to create the tokio current-thread runtime, emit `SessionStarted`, loop over `Ui::next_prompt()`, skip blanks, break on slash exit commands, apply `/model` and `/reasoning` at safe turn boundaries, treat TUI-only picker commands as status no-ops, arm a per-turn `CancellationToken` plus a Ctrl-C watcher thread, and `block_on(Harness::submit_turn(prompt, observer, gate, token))`. The TUI path runs `ui::tui_loop::run()` on the same runtime shape and multiplexes input/render/turn/approval channels, slash/modals, scoped model cycling, login/logout, and runtime provider/reasoning switches.
-4. `Harness::submit_turn()` first auto-compacts and refreshes the native skill catalog at a safe turn boundary. It injects `ToolEnv` plus `TurnContextController`, then calls the governed contextual-message entry point on `Agent`.
-5. `complete_turn()` calls `ChatProvider::respond_stream(messages, tools, token)`, which returns a `Stream<Result<ProviderEvent>>`; the loop races each stream read against the turn token via `tokio::select!`.
-6. The selected Mimir provider runs blocking HTTP/SSE work on `spawn_blocking` through `transport.rs`: it reads or refreshes provider credentials, converts Nexus messages/tools to that provider's wire JSON, applies normalized reasoning/thinking fields where supported, applies default-short cache hints and default-off context-management hints where configured, sends a cancellation-aware request (with retry/backoff or one-shot reauth where implemented), and forwards parsed events onto a `futures` channel as `ProviderEvent::TextDelta` / `ProviderEvent::Completed` with usage/cache metadata where available.
-7. Nexus emits `AssistantText`/`AssistantTextEnd` for deltas/final text and appends the final assistant turn to conversation state.
-8. With no tool calls, Nexus emits `TurnComplete` and returns.
-9. Tool calls run via `run_tools()`: consecutive concurrency-safe, ungated, non-interactive calls form one parallel batch (in-order results); every other call runs exclusively. For each call Nexus records the assistant tool call. Required-interaction tools call `ApprovalGate::interact()` regardless of strict/auto/never-ask/skip-permissions; submission supplies populated execution arguments, cancellation records an ordinary denial, and conversational hand-back records bounded feedback beside the denied result. Separately, gated tools (`Tool::requires_approval()`) emit a `DiffPreview` when available and call `ApprovalGate::review()` (raced against cancellation). Ungated tools emit `ToolProposed`.
-10. Allowed or ungated calls run `Tool::execute()` (a future given a child token, raced against cancellation); one-shot bash also streams display-only chunks through `ToolOutputSink` as `ToolOutputDelta` while accumulating the final output. Nexus emits the full/final output to the UI as `ToolResult`/`ToolError` (with exit metadata where present) and records model-facing JSON. Successful outputs over 50 KiB are replaced in the transcript by a compact preview plus `outputHandle` metadata when an output store is attached; otherwise the full output stays inline. On cancellation every emitted call still gets a real or synthetic cancelled/denied result so the next request stays valid.
-11. When another provider request will follow, Nexus announces the pair-closed group for incremental persistence, then consults `ContextGovernor`. Wayland may durably apply a ready/forced compaction and return one whole-context replacement. Nexus installs it atomically, then drains queued steering/follow-up text so user input stays verbatim and post-summary. A typed provider context overflow before visible output may invoke one deterministic governor rewrite and resend for that round trip; a second overflow ends with the measured bounded error. The governor future races turn cancellation; governor errors warn and continue. The loop otherwise repeats until a tool-less response or the configured soft cap.
-12. When a session log is attached, the harness appends each complete provider round trip to the JSONL transcript before the next provider request; the after-turn diff remains the final/error backstop. Every append captures its stable entry id, and failures warn without failing the user turn. On `resume <id>`, `resume_agent()` loads the target session (`SessionStore::find` + `open`), whose read path already rebuilt through compaction summaries, seeds the agent with those messages (`Agent::resumed`), reopens the same file for append (`SessionLog::resume`), and starts the harness persisted cursor past the loaded history so continued turns extend the same log without rewriting it.
-13. Turn errors from `submit_turn()` are classified by `UiEvent::from_turn_error()` into auth vs provider and rendered to stderr; the session continues.
+Paths are repository-relative. API names are navigation hints, not a public SDK
+stability promise.
 
-## Configuration and Inputs
+| Module | Responsibility / seams | Main dependencies |
+| --- | --- | --- |
+| `src/main.rs` | Thin binary shim calling `iris_agent::run_cli()` | `iris-agent` library |
+| `src/lib.rs` | CLI parsing/dispatch, settings/auth, provider/tool construction, print/resume/login/update startup | `cli`, `print`, `mimir`, `wayland`, `config` |
+| `src/cli.rs` | Interactive session driver, `ModelSwitch`, shared command builders, text-path compaction/delegation controls | Nexus/Wayland contracts, `ui`, `mimir` |
+| `src/print.rs` | Headless execution and optional usage report; no rich terminal dependency in output | harness, metrics, tools |
+| `src/nexus.rs` | `Agent`, `ChatProvider`, `Message`, `AgentEvent`, `Tool`, `Tools`, `ToolEnv`, `ApprovalGate`, `ContextGovernor`; scheduling, approvals, cancellation, overflow rewrite and steering boundaries | Tokio/futures, neutral contracts; concrete exceptions above |
+| `src/wayland/mod.rs` | `Harness`, execution/session ownership, contextual input, incremental persistence, `TurnContextController`, turn-edge compaction | Nexus, session, tools, settings |
+| `src/config.rs`, `src/config/tool_result_compaction.rs` | Global/project settings, validation, precedence and atomic updates; typed reducer policy | serde, filesystem, provider selection |
+| `src/session.rs` | `SessionLog`, `SessionStore`, JSONL entries, linear resume, folds/summaries/carry reconstruction, transport/task/goal audit data | Nexus values, filesystem APIs |
+| `src/handles.rs` | `HandleStore`: session sidecars, validated content-addressed output ids, bounded retrieval | Nexus output-store contract, SHA-256 |
+| `src/goal.rs`, `src/goal_tests.rs` | Durable goal state, budgets, accounting and continuation policy | session/harness integration |
+| `src/metrics.rs` | Shared provider-usage, context and rate accounting | Nexus usage/events |
+| `src/errors.rs`, `src/telemetry.rs` | Boundary errors/exit codes, tracing, secret-safe diagnostic helpers | thiserror, tracing, serde |
+| `src/signals.rs`, `src/process_group.rs` | SIGINT state, force-quit cleanup, owned shell process-group kill/reap | atomics, libc |
+| `src/selfupdate.rs` | Stable-release selection, checksum/self-replace for dist builds, Cargo fallback | HTTP/filesystem/process APIs |
 
-| Input | Default | Used by |
-|---|---|---|
-| `~/.iris/settings.json`, `<cwd>/.iris/settings.json` | absent (built-in defaults) | `config::Settings::load()` (project may tune local model/runtime and tool-result-compaction policy; global owns provider/base-url, model-cycle scope, provider cache/context management, and native clearing backends) |
-| `IRIS_TRUST_PATH` | `~/.iris/trust.json` | per-project permission policy store (`wayland::trust`, ADR-0027); overrides must be absolute and outside the project directory |
-| `IRIS_AUTH_PATH` | `~/.iris/auth.json` | Mimir token stores (`AuthStore::from_env()`) |
-| `IRIS_CONFIG_PATH` | `~/.iris/settings.json` | global settings path override (`config::Settings`) |
-| `IRIS_SESSION_DIR` | `~/.iris/sessions` | transcript root (`session::SessionLog`) |
-| `IRIS_MODEL` | `gpt-5.5` | OpenAI Codex model override (`env > settings > default`) |
-| `IRIS_CODEX_BASE_URL` | `https://chatgpt.com/backend-api` | OpenAI Codex base-url override (`env > settings > default`) |
-| `CLAUDE_CONFIG_DIR` | `~/.claude` | Anthropic credential bootstrap path (`CLAUDE_CONFIG_DIR/.credentials.json`) |
-| `ANTIGRAVITY_CLIENT_SECRET` | none unless injected at build time | Antigravity Google OAuth token exchange/refresh |
-| `ANTIGRAVITY_PROJECT_ID` | discovered project | Antigravity project-id override (wins over stored `projectId`) before `loadCodeAssist` discovery |
-| `IRIS_ENABLE_FABLE_5` | unset / hidden | model catalog opt-in for surfacing gated `claude-fable-5` in `/model` |
-| `RUST_LOG` | `warn` | `telemetry::init()` tracing filter |
-| `HOME` | required when the matching path override is unset | auth/settings/session path resolution |
-| `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`, `AGENTS.local.md`, `CLAUDE.local.md` | absent except tracked root base/import | bounded root-to-leaf project instruction discovery in `wayland::system_prompt` |
-| `.agents/skills`, legacy project `.codex/skills`, `~/.agents/skills`, `$CODEX_HOME/skills` and `.system`, `~/.iris/skills`, admin skill roots | absent | `wayland::skills::SkillCatalog` discovery and turn-boundary refresh; `tools::read` grants loaded skill directories read-only access |
+## Context and delegated work
 
-## CLI Commands
+| Module | Responsibility / seams |
+| --- | --- |
+| `src/wayland/compaction.rs` | `CompactionEngine`: range planning, structured summary/carry, durable parent-owned validation and application |
+| `src/wayland/compaction_governor.rs` | Mid-round-trip pressure governance and deterministic reactive overflow recovery |
+| `src/wayland/compaction_background.rs` | One-job lifecycle, polling, async hard wait, native/portable/excerpt fallback; ready summaries remain held until hard pressure or manual drain |
+| `src/wayland/trigger.rs` | `TriggerLadder`: model-aware warn/start/hard thresholds, retained tail, small-window deterministic policy |
+| `src/wayland/fold.rs` | Recoverable spent-tool-result folding and cache-aware flush planning; default-off policy resolved by config |
+| `src/wayland/structured_summary/` | Typed structured-summary validation and repair pipeline |
+| `src/wayland/system_prompt/` | Compiled fragment assembly, generated live-tool blocks, bounded root-to-leaf project instructions and onboarding; no disk fragment loading |
+| `src/wayland/skills/` | Bounded discovery, Codex metadata/config compatibility, progressive disclosure, invocation and resource grants |
+| `src/wayland/trust.rs` | HOME-owned canonical-cwd project permission grants; project files cannot grant permissions |
+| `src/wayland/git_safety/` | Dirty-tree attribution, checkpoints, ownership leases, net diff, settlement/recovery; mutation guard default-on, durable task workflow opt-in |
+| `src/wayland/worker_runtime.rs` | Iris executor adapters for the shared scheduler; `!Send` provider/agent construction on scheduler thread |
+| `src/wayland/subagents.rs` | `SubagentBackend`, `SubagentTypeManifest`, `ChildProviderFactory`; general/explore/review defaults, tool ceilings, strict worker paths, managed mutation worktrees and reviewed apply |
+| `crates/iris-subagent-runtime/` | Host-neutral durable scheduling, cancellation, groups, artifacts, linked/Btrfs worktrees, leases/pooling/adoption/restore and immutable apply plans |
 
-| Command | Purpose |
-|---|---|
-| `iris` | Start a new interactive agent session in the current working directory. |
-| `iris resume <session-id>` | Resume a prior session by id: load its transcript, rebuild provider-visible context, and continue appending future turns to the same log. Errors with exit code `2` on an unknown id. |
-| `iris login openai-codex` | Run browser OAuth login using a local callback server. |
-| `iris login openai-codex --browser` | Explicit browser OAuth login. |
-| `iris login openai-codex --device-code` | Run device-code OAuth login. |
-| `iris login anthropic` | Run Anthropic browser PKCE OAuth with manual paste fallback; Iris can also reuse a Claude Code OAuth token when present. |
-| `iris login antigravity` | Run Google browser PKCE OAuth login (requires `ANTIGRAVITY_CLIENT_SECRET` unless the binary was built with it). |
-| `iris update` | Update the installed binary from the GitHub repository via locked Cargo install. |
-| `iris help` / `--help` / `-h` | Print command help. |
+Runtime group APIs are implemented in the public worker crate. Iris's native
+model-facing best-of-N controls were removed by ADR-0065; the adapter remains
+dormant. A validated manifest child policy does not enable nested delegation.
+Main-session path/shell confinement is opt-in; workers enforce stricter path and
+shell rules. Neither a worktree nor an approval prompt is a general sandbox.
 
-Interactive slash commands: `/exit`, `/quit`, `/model`, `/reasoning`, `/skills`,
-`/resume`, `/new`, `/session`, `/copy`, `/compact`, `/debug` (pi-mono-style debug snapshot;
-`/dbug` is an unlisted alias), `/subagents`, `/worktrees`, `/scoped-models`, `/settings`, `/trust`, `/permissions`,
-`/login`, and `/logout`. The text fallback executes `/model`, `/reasoning`,
-`/copy`, `/session`, and `/compact`, exits on `/exit`/`/quit`, and treats the TUI-only
-commands as status no-ops.
+## Mimir — provider and authentication adapters
 
-Unknown commands print help and exit with code `2` (`UsageError`); auth failures exit `3` (`AuthError`); other errors exit `1`.
+| Module | Responsibility / seams |
+| --- | --- |
+| `src/mimir/selection.rs` | `ModelSelection`, provider defaults, setting/env precedence, reasoning/cache/context policy and worker-route resolution |
+| `src/mimir/model_catalog.rs` | Catalog, credential availability, authenticated worker lanes, OAuth preference and explicit model/lane selection |
+| `src/mimir/model_capabilities.rs`, `src/mimir/anthropic_models.rs` | Model reasoning/window/capability metadata, supported levels and clamp/validation |
+| `src/mimir/auth/storage.rs`, `src/mimir/auth/api_key.rs` | Restricted atomic credential storage, API-key resolution and lane separation |
+| `src/mimir/auth/openai_codex.rs`, `src/mimir/auth/device_code.rs` | Codex OAuth browser/device flows and token refresh |
+| `src/mimir/auth/anthropic.rs`, `src/mimir/auth/antigravity.rs` | Provider OAuth, credential reuse/write-back and project discovery |
+| `src/mimir/auth/oauth_callback.rs` | Shared cancellable loopback PKCE/manual-paste plumbing |
+| `src/mimir/providers/mod.rs`, `src/mimir/providers/transport.rs` | Adapter declarations, stable-prefix diagnostics, blocking transport bridge, SSE framing, reauth and status classification |
+| `src/mimir/providers/openai_codex_responses.rs` | Codex Responses WebSocket/SSE, stale-reuse reconnect, sticky fallback, reasoning/usage, explicitly gated native compaction plus portable summary |
+| `src/mimir/providers/openai_compatible_chat.rs` | OpenAI API and configurable OpenAI-compatible Chat Completions routes |
+| `src/mimir/providers/anthropic_messages.rs` | Anthropic OAuth/API Messages, reasoning continuity, cache/clear controls, capability-gated compact probe |
+| `src/mimir/providers/antigravity.rs` | Gemini Code Assist stream and tool-call thought-signature continuity |
 
-## Built-in Tools
+Five provider ids are implemented: `openai-codex`, `openai`, `anthropic`,
+`antigravity`, `openai-compatible`. Model defaults and env precedence live in
+`selection.rs`; do not infer them from a dated benchmark model name.
 
-| Tool | Purpose | Safety boundary |
-|---|---|---|
-| `read` | Read text files with truncation, offset/limit, and invalid UTF-8/binary rejection. | Existing path must resolve inside the workspace. |
-| `write` | Create or overwrite files, creating parent directories as needed and writing atomically. | Target path and existing ancestors must remain inside the workspace; approval-gated with diff preview. |
-| `edit` | Replace a unique exact-string match (Claude-compatible schema; `replace_all` for every occurrence), with whitespace-normalized fallback matching and atomic writes. | Existing path must resolve inside the workspace; approval-gated with diff preview. |
-| `bash` | Run a shell command in the workspace with captured stdout/stderr, timeout handling, and process-group cleanup. Supports one-shot runs, persistent sessions (`session`/`action`, state carries across calls), and background jobs (start/poll/finalize/list/cancel). | Command cwd is the workspace; kernel-confined via Landlock (workspace-write, TCP-deny) where available; approval-gated. |
-| `grep` | Search workspace content in-process via the ripgrep library crates. | Search path resolves inside the workspace. |
-| `find` | Find workspace files in-process via `ignore` + `globset`. | Search path resolves inside the workspace. |
-| `ls` | List directory entries (directories first, optional recursive tree, optional `long` type+size mode) with a scan limit. | Directory path resolves inside the workspace. |
-| `AskUserQuestion` | Collect 1–4 structured answers through the TUI or text fallback, including multi-select, `Other`, previews, review, cancel, and conversational hand-back. | Required human interaction; permission presets cannot bypass it; feedback is bounded to 8 KiB. |
-| `spawn_subagent` + lifecycle/apply tools | Spawn one manifest-defined worker; poll/cancel/read output and review/apply one immutable plan. | Spawn and apply are separately approval-gated; resolved tool grants are clamped and hard-filtered before inference; mutable workers never write the parent before apply. |
+## Tools and safety
 
-## External Dependencies
+| Module | Responsibility / seams |
+| --- | --- |
+| `src/tools/mod.rs`, `src/tools/registry.rs` | `ToolState`, registry construction, schemas, classification and Nexus adapters; manifest-driven spawn/status/cancel/output/plan/apply surface |
+| `src/tools/path.rs` | Main-session path resolution and opt-in confinement; strict worker-path helpers |
+| `src/tools/observe.rs`, `src/tools/text.rs` | Read-before-mutate observations, content freshness, bounded text and atomic writes |
+| `src/tools/read.rs`, `src/tools/write.rs`, `src/tools/edit.rs` | Text reads/skim, atomic create/replace, exact-string/fallback edits and previews |
+| `src/tools/grep.rs`, `src/tools/find.rs`, `src/tools/ls.rs` | In-process search/discovery/listing with bounds and omission accounting |
+| `src/tools/bash/` | One-shot/persistent/background shells, process cleanup, capture, filtering and Landlock backend |
+| `src/tools/bash/filter/` | Native/declarative output reducers and measured corpus; raw fallback on failure |
+| `src/tools/ask_user_question.rs`, `src/tools/request_compaction.rs` | Required human interaction and opt-in one-shot compaction request flag |
+| `src/tools/web/` | Opt-in approval-gated search/page readers, global egress policy, SSRF boundaries and bounded extraction |
+| `src/tool_display.rs`, `src/tool_summary.rs`, `src/display_path.rs` | Presentation summaries, compact result classification and path display |
 
-- `anyhow` — error propagation and context.
-- `base64` — base64url JWT payload decoding, OAuth PKCE/client-id decoding, and auth-file secret encoding.
-- `futures` — `Stream` trait and the unbounded channel bridging the provider's `spawn_blocking` task to the async loop.
-- `pulldown-cmark` — assistant Markdown parsing for the TUI transcript renderer.
-- `ratatui` / `ratatui-textarea` — TUI text/style/layout primitives, modal selectors, and textarea editing; Iris owns the production terminal surface diff/replay.
-- `tokio` — current-thread async runtime, `spawn_blocking`, and `tokio::select!` cancellation races.
-- `tokio-util` — `CancellationToken` for per-turn and per-tool cancellation.
-- `landlock` — Linux Landlock LSM ruleset construction for the `bash` kernel sandbox.
-- `libc` — Unix process-group spawn/termination/reaping and async-signal-safe SIGINT handling.
-- `rand` — OAuth PKCE/state token generation and unique atomic-write temp names.
-- `reqwest` — blocking HTTP client with JSON and rustls TLS.
-- `serde` — auth-file and request/response serialization.
-- `serde_json` — JSON request/response construction and parsing.
-- `sha2` — OAuth PKCE challenge hashing, telemetry secret fingerprints, and file-observation content hashing.
-- `similar` — diff generation for mutating-tool previews.
-- `thiserror` — typed boundary error definitions (`AuthError`, `UsageError`).
-- `tracing` / `tracing-subscriber` — structured logging to stderr, gated by `RUST_LOG`.
+`read_output` and `recall` are registered read-only tools for output handles and
+current-session transcript originals. File mutation requires freshness and the
+applicable approval policy. Main-session confinement requires
+`IRIS_SECURITY_OPT_IN=1`; Landlock permits workspace/temp writes and constrains
+TCP only on supported Linux kernels. macOS shell execution is unconfined.
+See the [operator safety contract](../../README.md#safety-and-permissions).
 
-## Tests
+## Terminal surfaces
 
-Current unit tests cover:
+| Module | Responsibility / seams |
+| --- | --- |
+| `src/ui/mod.rs`, `src/ui/text.rs` | `Ui`, `UiEvent`, `UiBridge`, plain I/O and approvals; blocking plain approval input is a known cancellation limit |
+| `src/ui/tui_loop.rs`, `src/ui/harness_actor.rs` | Input/render orchestration, typed harness commands/events, live settings/steering and parked approvals |
+| `src/ui/tui.rs`, `src/ui/tui/screen.rs` | TUI composition and `Screen` state; transcript, composer, activity, goals and context |
+| `src/ui/screen_mode.rs`, `src/ui/terminal_surface.rs`, `src/ui/tui/pager.rs` | Pager/inline policy, ANSI serialization/diff, alternate-screen frame ownership |
+| `src/ui/slash.rs`, `src/ui/steering.rs` | Actual slash `COMMANDS` registry and steering/follow-up queues; `/undo` and `/clear` are not commands |
+| `src/ui/modal.rs`, `src/ui/settings_menu.rs`, `src/ui/selector.rs`, `src/ui/picker.rs`, `src/ui/login.rs` | Docked controls, settings hatches, selection, model/effort/auth orchestration |
+| `src/ui/delegation_dashboard.rs`, `src/ui/ask_user_question.rs` | Live worker/worktree review and required-question dialogs |
+| `src/ui/tui/transcript.rs`, `src/ui/tui/tool_render.rs`, `src/ui/tui/streaming/` | Transcript/tool panels, folds, live reasoning, paced streaming and terminal receipts |
+| `src/ui/tui/component.rs`, `src/ui/tui/overlay.rs` | Component/container composition and docked focus routing; general floating overlays remain deferred |
+| `src/ui/markdown.rs`, `src/ui/highlight.rs`, `src/ui/hyperlink.rs` | Markdown, shipped syntax highlighting and sanitized OSC-8 hyperlinks; images remain unsupported |
+| `src/ui/textengine.rs`, `src/ui/clipboard.rs` | Unicode/ANSI width and clipping, marker-safe text handling, clipboard/OSC-52 ladder |
 
-- Host-neutral scheduler and worktree contracts in `crates/iris-subagent-runtime`: independent completion, backpressure/concurrency, cancellation races, provider-round/output budgets, repeated waiters, recovery, dormant groups/artifacts, linked/Btrfs lifecycle, corrupt deletion refusal, leases/adoption/pooling, restore, and review-first apply across regular/binary/mode/delete/rename/symlink/gitlink cases.
-- Iris child-agent integration in `src/wayland/subagents.rs` and `src/tools/registry.rs`: manifest defaults, authenticated credential lanes, hard tool-set filtering, strict path/symlink confinement, independent execution/cancellation, parent immutability, reviewed apply, and preserved runtime group behavior.
-- Session loop, conversation persistence, streamed-delta rendering, TUI/text front-end behavior, slash palette/input handling, modal/model/login selectors, runtime model/reasoning switching, and auth/provider error recovery in `src/nexus.rs`, `src/cli.rs`, and `src/ui/`.
-- Tool-call loop execution, graceful round-trip limiting, diff-preview-before-approval ordering, tool error encoding, approval allow/deny handling, and workspace path/symlink rejection in `src/nexus.rs`.
-- Terminal decision parsing in `src/approval.rs`.
-- Typed-error exit-code classification (including through `context` wrapping) in `src/errors.rs`.
-- Secret redaction and external-body sanitization in `src/telemetry.rs`.
-- Tool-call display formatting in `src/tool_display.rs`.
-- Settings file loading/merge precedence, context-token-budget parsing, global-only prompt-cache/context-management controls, unknown-key tolerance, and malformed-file errors in `src/config.rs`.
-- JSONL transcript header/append/tool-call entries, assistant-reasoning rows, model-selection audit entries, cwd slugging, by-id `find`, token estimates, compaction entries/rebuild, and resume (same-log append with linked ids, resume after a truncated fragment) in `src/session.rs`.
-- Session resume end-to-end (rebuilt prior context reaches the next model turn without duplicating history), dangling-tool-call repair, provider-specific tool-surface planning, large-output handles, and auto-compaction in `src/nexus_tests.rs`.
-- Session-scoped handle storage in `src/handles.rs`.
-- Harness-owned internal-fragment/project-doc system-prompt assembly in `src/wayland/system_prompt/`.
-- Per-project permission policy store/edit application (per-cwd grants, ADR-0027) in `src/wayland/trust.rs` and `wayland::Harness`.
-- SIGINT first-press/repeat flag behavior in `src/signals.rs`.
-- Process-group registration/guard, targeted kill, and backgrounded-grandchild reaping in `src/process_group.rs`.
-- Built-in tool behavior under `src/tools/`, including read/write/edit, atomic writes, `ls`, optional `grep`/`find` integration, bash output/timeout/process-group handling, persistent sessions, background jobs, Landlock sandbox decision/fallback, diff previews, and dispatch/tool-definition coverage.
-- Larger Nexus and Codex-provider suites split into `src/nexus_tests.rs` and `src/mimir/providers/openai_codex_responses_tests.rs`.
-- Auth storage parsing and atomic restricted writes in `src/mimir/auth/storage.rs`.
-- Device-code polling behavior in `src/mimir/auth/device_code.rs`.
-- Shared OAuth callback parsing/cancellation/manual-paste behavior in `src/mimir/auth/oauth_callback.rs`.
-- JWT account extraction, browser OAuth URL/callback parsing, device-code interval parsing, and device-auth error parsing in `src/mimir/auth/openai_codex.rs`.
-- Anthropic Claude Code credential parsing/write-back, browser login, refresh response parsing, subscription model matrix, reasoning request construction/replay, cache/context-management request construction, role alternation, request construction, and Anthropic SSE text/reasoning/tool-call/usage parsing.
-- Antigravity PKCE URL/callback parsing, runtime/build-time client-secret resolution, project-id discovery helpers, request construction, thinking config, tool schema sanitization, Gemini `thoughtSignature` replay, and Gemini SSE text/tool-call parsing.
-- Shared provider transport behavior: SSE framing, exactly-once reauth, HTTP-status classification, and dropped-stream handling.
-- Codex URL resolution, request JSON construction, streamed text/delta parsing, tool-call parsing, and missing-output errors in `src/mimir/providers/openai_codex_responses.rs`.
+The [slash reference](../../README.md#slash-command-reference) documents operator
+commands; `src/ui/slash.rs::COMMANDS` is the registry. The
+[TUI design language](../TUI_DESIGN_LANGUAGE.md) owns rendering rules.
 
-## Known Gaps
+## Tests and benchmarks
 
-Milestone 1, the async-hard runtime, and the Milestone 2 foundations are
-complete: `ChatProvider` is an async streaming contract, each turn owns a
-`CancellationToken`, provider reads / tool futures / approval reviews are raced
-against cancellation, tools receive child tokens, concurrency-safe tools run in
-parallel, large outputs are handle-backed, token estimates persist, and the
-harness auto-compacts at turn boundaries. Documented runtime caveats (see
-[`../ROADMAP.md`](../ROADMAP.md)): the real terminal approval prompt is a
-blocking stdin read, so the first Ctrl-C cannot preempt a *pending* prompt; an
-idle provider socket read and an abandoned `grep`/`find`/`ls` walk are not
-force-aborted mid-flight. Linear session resume is implemented (`resume <id>`
-rebuilds prior context and continues the same log), as are runtime model and
-reasoning switches. The remaining Milestone 2 gate is proof: benchmark that the
-handle/token/compaction path reduces prompt tokens without reducing task success.
-The remaining major gaps are named mode profiles, per-worker provider/model
-routing, richer context-ledger planning, production cloud restore transport, and
-GitHub workflow automation. See the roadmap for sequencing and narrower deferred
-slices.
+| Location | Existing coverage / role |
+| --- | --- |
+| `src/nexus_tests.rs` | Loop, approval/cancellation, steering, transcript validity, handles and Git-workflow acceptance |
+| `src/wayland/background_compaction_tests.rs`, `src/wayland/compaction_property_tests.rs` | Job lifecycle, boundaries, pair safety, repeated summary/fold replay |
+| `src/wayland/incremental_persistence_tests.rs`, `src/wayland/compaction_task_tests.rs` | Round-trip/crash-prefix persistence and open-task carry |
+| `src/wayland/recall_tests.rs`, `src/wayland/microcompaction_tests.rs`, `src/wayland/fold_tests.rs` | Original retrieval, reducer guards and fold timing |
+| `src/mimir/providers/openai_codex_responses_tests.rs` | Transport/reconnect, cancellation, payload/usage and native compaction contracts |
+| `src/session.rs`, `src/tools/`, `src/ui/`, `src/wayland/git_safety/` | Module-local storage, safety, tool, UI/frame and mutation/recovery suites |
+| `crates/iris-subagent-runtime/tests/` | Host-neutral scheduling, recovery, groups, worktrees, reviewed apply and standalone contracts |
+| `src/compaction_bench.rs`, `src/compaction_live_bench.rs` | Deterministic compaction arms and historical double-gated live protocol |
+| `src/live_harness/` | Campaigns, scenarios including migrated T-series, lane configuration, metrics and reporting |
+| `src/harness.rs`, `iris-bench/src/` | Benchmark facade and separate benchmark CLI |
+| `src/bench_tokens/`, `src/bench_tokens_per_task.rs` | Retained legacy suite; retirement awaits validation (#573) |
 
-## Related Areas
+For checks use `bash scripts/gate.sh`. Documentation-only changes get whitespace
+validation, not Rust execution. Code changes run formatting, Clippy, tests and
+maintenance checks; run `cargo test --locked -p iris-subagent-runtime` for the
+independent crate. Live/paid checks are opt-in; commands and evidence scope live
+in [HARNESS.md](../benchmarks/HARNESS.md) and [BENCHMARK_PLAN.md](../BENCHMARK_PLAN.md).
 
-- [`../ROADMAP.md`](../ROADMAP.md) — milestone sequencing and acceptance criteria.
-- [`../FEATURES.md`](../FEATURES.md) — implemented/planned capability inventory.
-- [`../../AGENTS.md`](../../AGENTS.md) — tracked public repository guidance for coding agents.
+## Remaining gaps
+
+Ready summaries still wait until hard pressure/manual drain; the turn-edge hard
+wait is blocking. Provider blocking reads and plain approval input have remaining
+cancellation limits. Planner/ledger, parent mode profiles, branching, multimodal
+reads, patch editing, structured CLI events, Windows, macOS confinement and
+GitHub automation remain planned. Per-worker routing, native skills, terminal
+doctor, task rollback, output dereference and managed reviewed apply already exist.
+
+The headline campaign ran and found baseline cheaper overall; measurement is not
+pending, but a universal savings claim remains unsupported. See the
+[roadmap](../ROADMAP.md) for acceptance gates rather than old milestone numbers.

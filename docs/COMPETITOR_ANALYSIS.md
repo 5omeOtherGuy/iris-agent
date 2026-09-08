@@ -43,9 +43,11 @@
 
 > **Update (2026-07-07): subagent / isolation / safety ranking.** A local
 > reference pass over **Grok Build CLI 0.2.82** materially changes the subagent
-> comparison. See [`.iris-reference/grok-worktree-subsystem-spec.md`](../.iris-reference/grok-worktree-subsystem-spec.md)
-> for the observed CLI/runtime evidence. This addendum scores implementation
-> quality, not model quality or brand reach.
+> comparison. The original evidence was a local-only
+> `grok-worktree-subsystem-spec.md`, not included in this public repository.
+> This historical ranking is not independently reproducible from these sources;
+> re-verify before external use. It scores implementation, not model quality.
+> Current Iris implementation status lives in [FEATURES.md](FEATURES.md).
 
 ### 2026-07 subagent and safe-execution ranking
 

@@ -93,9 +93,15 @@ Reading the numbers honestly:
   half of the Milestone-2 acceptance signal. That needs the real-provider run
   below.
 
-## Headline path (real provider, N >= 3) -- PENDING operator run
+## Headline path (historical pending plan)
 
-Status: **not yet run.** The harness is wired
+> This pending status was superseded by the
+> [90-session July 5 headline run](../legacy-headline-matrix/2026-07-05/headline-matrix-2026-07-05.md):
+> baseline won overall; no universal savings claim shipped. The original plan
+> below is retained for provenance. Current test targets are library-based, not
+> `--bin iris`; see [BENCHMARK_PLAN.md](../../../BENCHMARK_PLAN.md).
+
+Original status: **not yet run.** The harness is wired
 (`bench_tokens_per_task::replay::tokens_per_task_headline`, `#[ignore]`d and
 additionally gated on `IRIS_BENCH_REAL=1`), but a real run spends money against a
 real provider (~18 multi-turn sessions for N=3 x 3 workloads x 2 arms), which is

@@ -4,6 +4,14 @@
 **Status**: proposed
 **Deciders**: Iris maintainers
 
+## Implementation status (2026-09-08)
+
+The original decision-status label is retained. Named themes are implemented:
+`src/ui/theme.rs` defines `Theme`, `TerminalTheme` and fixed palettes;
+`src/config.rs` and `src/ui/settings_menu.rs` expose `tui.theme`. Terminal-depth
+fallback and live application are part of the current UI. See the
+[theme reference](../../README.md#themes); this is not an unimplemented feature.
+
 ## Context
 
 Iris' palette is a fixed set of ANSI-slot constants in `src/ui/palette.rs`, and

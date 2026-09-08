@@ -1,5 +1,11 @@
 # SPEC — Faceplate inline ports: hatches, not doors
 
+> Historical implementation brief; checked 2026-09-08. Settings hatches and the
+> modal consolidation exist in `src/ui/settings_menu.rs`, `src/ui/modal.rs` and
+> `src/ui/tui_loop.rs`. Branch/line references below describe the original task.
+> Use the [current design language](../TUI_DESIGN_LANGUAGE.md) for the contract;
+> this note does not certify every original acceptance item.
+
 Status: approved for implementation · Target branch: `worktree-tui-showcase`
 (worktree `.claude/worktrees/tui-showcase`), on top of `ceea91a`.
 Supersedes the "settings is home" modal-return mechanism landed in `fa93453`.

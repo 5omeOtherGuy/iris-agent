@@ -1,6 +1,9 @@
 # TUI polish bug ledger
 
-Scope: showcase audit and three iteration passes on `feat/tui-polish-showcase-codex`.
+Historical scope: showcase audit and three iteration passes on
+`feat/tui-polish-showcase-codex`. This is a resolved-task ledger, not the current
+open-defect inventory. See the [v1.0 roadmap](docs/ROADMAP.md) and linked issues
+for current hardening work. Test claims below belong to the original task.
 
 | ID | Defect | Cause | Fix and regression |
 |---|---|---|---|

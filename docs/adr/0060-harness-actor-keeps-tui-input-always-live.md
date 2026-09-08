@@ -4,6 +4,14 @@
 **Status**: proposed
 **Deciders**: Iris maintainers, Pi agent session
 
+## Implementation status (2026-09-08)
+
+The original decision-status label is retained. `src/ui/harness_actor.rs`
+implements the actor, and `src/ui/tui_loop.rs` constructs it for live TUI
+operations. Input/settings and parked approvals are no longer merely proposed.
+The original checklist below is not a fresh full verification of every path;
+see the [codemap](../CODEMAPS/INDEX.md#terminal-surfaces).
+
 ## Context
 
 Users must be able to open slash commands and the `/settings` faceplate at all

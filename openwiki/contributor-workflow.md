@@ -1,6 +1,6 @@
 # Contributor Workflow
 
-All code work happens in a per-task worktree. The primary checkout is
+All repository work happens in a per-task worktree. The primary checkout is
 control-only and should stay aligned with `origin/main`.
 
 ## Worktree loop
@@ -8,22 +8,32 @@ control-only and should stay aligned with `origin/main`.
 From the primary checkout:
 
 ```bash
-bash scripts/worktree-preflight.sh
-git worktree add ../iris-<slug> -b <branch> origin/main
+bash scripts/worktree-create.sh ../iris-<slug> <branch>
 ```
 
-Work in the task worktree. Before opening a PR:
+The wrapper runs freshness preflight and copies supported ignored local
+instructions. Raw `git worktree add` does not copy them. Use
+`bash scripts/worktree-preflight.sh` for a check without creation.
+
+Work in the task worktree. Before opening an operator-approved PR:
 
 ```bash
 bash scripts/gate.sh
 ```
 
-The gate runs formatting, clippy, and tests. Green gate should match green CI.
+Code changes run format, Clippy, tests and maintenance checks. Changes
+[classified docs-only](../scripts/change-scope.sh) run whitespace validation,
+not Rust tests or link checking; root agent guidance and nested crate READMEs
+still trigger the full gate. Check documentation links and cited source paths
+separately. A green local gate does not prove live
+providers or distribution artifacts.
 
 For TUI-focused work, `scripts/tui-live.sh` and `scripts/record-demo.sh` support
 manual terminal testing. `docs/TUI_LIVE_TESTING.md` documents the workflow.
 
 ## Merge and cleanup
+
+Only after explicit operator approval for the remote action:
 
 ```bash
 gh pr merge <N> --squash --auto --delete-branch
@@ -62,7 +72,7 @@ files, Cargo metadata, or source code for a docs-only OpenWiki refresh.
 The separate website repo imports this directory:
 
 ```bash
-cd /home/someotherguy/projects/iris-wiki-site
+cd <website-checkout>
 npm run import:openwiki
 npm run build
 ```

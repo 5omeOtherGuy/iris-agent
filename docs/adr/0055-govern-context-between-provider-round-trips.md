@@ -5,6 +5,15 @@
 **Status**: accepted
 **Deciders**: Iris maintainers
 
+## Open follow-up (2026-09-08)
+
+The governor is implemented, but ready summaries still wait until hard pressure
+or manual compaction (`src/wayland/compaction_background.rs`).
+[Overhaul #658](https://github.com/5omeOtherGuy/iris-agent/issues/658) specifies
+apply-on-ready, coverage stamps, unified cancellable waits and safer settings.
+That follow-up is not implemented and does not yet supersede this decision.
+See the [v1.0 compaction gate](../ROADMAP.md#m1--compaction-hardening).
+
 ## Context
 
 The model-aware ladder in ADR-0054 ran only before and after a user turn. A

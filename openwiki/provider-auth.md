@@ -86,7 +86,9 @@ overrides the path. Project settings may override only project-safe values:
 - `defaultReasoning`
 - `contextTokenBudget`
 - `compactionSummarizer`
-- `microcompaction`
+- `microcompaction`, `microcompactionWatermark`
+- `tasks`
+- project-safe fields of `compaction` and `toolResultCompaction` (mixed scopes)
 - `bashToolMode`
 - `maxToolRoundtrips`
 - `verify`
@@ -95,7 +97,9 @@ overrides the path. Project settings may override only project-safe values:
 
 Global-only values include provider selection, base URLs, prompt-cache controls,
 Anthropic context-management controls, scoped model lists, retry settings,
-OpenAI-compatible capability metadata, and startup approval posture.
+OpenAI-compatible capability metadata, startup approval posture, mutation safety,
+compaction worker model, and provider-native reducer/compaction controls. See the
+[setting reference](../README.md#setting-reference) for mixed-scope fields.
 
 Common global keys include `defaultProvider`, `defaultModel`, `baseUrl`,
 `defaultReasoning`, `promptCacheRetention`, `anthropicContextManagement`,

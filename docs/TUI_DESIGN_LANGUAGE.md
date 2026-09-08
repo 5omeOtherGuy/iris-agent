@@ -939,8 +939,10 @@ casing: `Give Iris a task...`. Submit on `↵`; `shift+↵` for newline.
 Typing a leading `/` opens the `SlashMenu` **above** the input: an overlay list
 of `command  —  one-line description`; `↑`/`↓` navigate, `↵`/`Tab` accept,
 `esc` dismisses. The highlighted row uses the `surface` fill (no accent border).
-Canonical commands: `/model` · `/diff` · `/undo` · `/compact` · `/clear` ·
-`/copy`.
+Command examples: `/model` · `/reasoning` · `/diff` · `/compact` · `/context` ·
+`/copy`. The implemented registry is `src/ui/slash.rs::COMMANDS`; see the
+[operator slash reference](../README.md#slash-command-reference) for the full
+surface. `/undo` and `/clear` are not implemented commands.
 
 ### 9.6 File reference (`@`)
 `@` references a workspace file (a path completion). Same overlay idiom.

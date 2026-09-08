@@ -1,5 +1,10 @@
 # SPEC — The job card: the pinned prompt, legible and honest
 
+> Historical implementation brief; checked 2026-09-08. The sticky prompt band
+> exists in `src/ui/tui/pager.rs` with state in `src/ui/tui/screen.rs`. Original
+> line references and acceptance steps are not a fresh validation. The
+> [current design language](../TUI_DESIGN_LANGUAGE.md) owns the live contract.
+
 Status: approved for implementation · Surface: the pager sticky prompt
 (`src/ui/tui/pager.rs` sticky_prompt_band, `src/ui/tui/screen.rs`
 toggle_sticky_prompt, ctrl+o routing in `src/ui/tui_loop.rs`).

@@ -1,5 +1,10 @@
 # SPEC — The flow meter & the exhale
 
+> Historical implementation brief; checked 2026-09-08. `FlowMeter` and byte/tick
+> wiring exist in `src/ui/tui/screen.rs`. Line references below are from the
+> original design, not a current test run. See the
+> [current design language](../TUI_DESIGN_LANGUAGE.md) for rendering rules.
+
 Status: approved for implementation · Surface: the working indicator (§7.7) and
 the context meter's detent acknowledgment (§6 motion 4).
 Complexity: MEDIUM. Iteration passes required after it works: at least 1.

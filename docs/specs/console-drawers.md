@@ -1,5 +1,11 @@
 # SPEC — The console drawers: tree & git console refinement
 
+> Historical implementation brief; checked 2026-09-08. The drawers exist under
+> `src/ui/tui/session_menu/`; a source scan found no `Color::` literals there.
+> This is not a fresh visual acceptance run. Original defect descriptions and
+> line numbers below are history; the [design language](../TUI_DESIGN_LANGUAGE.md)
+> owns the current contract.
+
 Status: approved for implementation · Surface: the session-bar dropdowns
 (§9.1.1), `src/ui/tui/session_menu/{mod,tree_menu,git_menu}.rs`.
 Complexity: MEDIUM-LOW. Iteration passes required after it works: 1.

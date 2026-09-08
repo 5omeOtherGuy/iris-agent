@@ -10,7 +10,7 @@ asserted (as minimum bars and retention needles) by the tests in
 `.pi/skills/`; design: ADR-0045). Regenerate the table with:
 
 ```
-cargo test --bin iris compaction_retention_benchmark_report -- --nocapture
+cargo test --locked -p iris-agent --lib compaction_retention_benchmark_report -- --nocapture
 ```
 
 This is slice A: it fixes the retention-needle contract and the two base

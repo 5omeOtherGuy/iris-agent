@@ -8,9 +8,9 @@ Comment `@codex review` to request a Codex review (auto-review also runs on push
 
 ## Verification
 
-- [ ] `cargo fmt --all --check`
-- [ ] `cargo clippy --all-targets -- -D warnings`
-- [ ] `cargo test`
+- [ ] `bash scripts/gate.sh` — report full-code or docs-only path and exact result.
+- [ ] Relevant focused tests or documentation link/source checks — list commands.
+- [ ] Live-provider, TTY or distribution checks required by this change — report results or explicit skips.
 
 ## Linked issues
 
