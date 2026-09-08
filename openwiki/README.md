@@ -23,9 +23,11 @@ to narrow the investigation.
 
 ## Status and evidence
 
-OpenWiki describes shipped behavior. Planned or research-only designs belong in
-`docs/ROADMAP.md` or an ADR and must be labeled there; do not copy them here as
-working commands.
+Checked against main `b420985` on 2026-09-08. These pages describe implemented
+source behavior, which may be newer than the latest published release `v0.3.7`.
+Planned or research-only designs belong in the [roadmap](../docs/ROADMAP.md) or an
+ADR and must not appear here as working commands. See the
+[audit scope and limits](../docs/DOCUMENTATION_AUDIT.md).
 
 When sources conflict, use this order:
 
@@ -47,8 +49,8 @@ design is implemented. Check code, tests, the codemap, and later amendments.
 - Use exact command, setting, event, type, and file names from current code.
 - Distinguish defaults from examples and implemented behavior from roadmap work.
 - Update this index whenever a page is added, renamed, or removed.
-- Run the repository documentation/link checks through `bash scripts/gate.sh`
-  before presenting an update as complete.
+- Run `bash scripts/gate.sh` before completion. Its docs-only path checks
+  whitespace; validate local links and cited source paths separately.
 
 ## Website boundary
 

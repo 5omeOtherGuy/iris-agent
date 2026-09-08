@@ -1,13 +1,14 @@
 # Iris — Feature List
 
-> Status (2026-07-03): Milestone 2 foundations are implemented. The active gate
-> is the Git-Centered Workflow slice (epic
-> [#261](https://github.com/5omeOtherGuy/iris-agent/issues/261), ADR-0028);
-> the Milestone 2 benchmark proof follows it. Labels:
-> **[Implemented]** · **[Partial]** · **[Planned · MVP]** · **[Planned]** ·
-> **[Research]**. This file is
-> a capability inventory, not a build sequence; use [`ROADMAP.md`](ROADMAP.md) for
-> milestone order.
+> Checked 2026-09-08 against main `b420985`, newer than release `v0.3.7`.
+> The local coding loop, first Git workflow, compaction and delegated workers
+> exist. Current gates are hardening, release-level testing, measured optimization
+> and compatibility; see [`ROADMAP.md`](ROADMAP.md).
+>
+> **[Implemented]** means code exists, not that every release gate has passed.
+> **[Partial]** means implemented with the stated boundary. **[Planned]** is not
+> usable product behavior; **[Research]** is not a commitment. Opt-in/default-off
+> behavior is stated beside the feature. This is an inventory, not build order.
 
 ## Core CLI and agent loop
 
@@ -31,7 +32,8 @@
   Policy: `tui.altScreen = auto|always|never` (default `auto`),
   `--no-alt-screen`, `IRIS_NO_ALT_SCREEN`; tmux control mode, Zellij, dumb
   terminals, and non-TTY stdio degrade to the inline renderer with a notice.
-  The `/terminal-setup` capability doctor is next. [Partial]
+  `/terminal-setup` diagnoses terminal, clipboard and key capabilities.
+  [Implemented]
 - **Conversation state** — in-memory multi-turn user/assistant messages for the
   current process, plus linear session resume from persisted transcripts.
   [Partial]
@@ -62,14 +64,19 @@
   support single- and multi-select choices, automatic `Other` input, option
   previews, multi-question review, cancel, and bounded model-visible
   `Chat about this` feedback. [Implemented]
+- **Persistent session goals** — `/goal` sets/inspects/edits/pauses/resumes/clears
+  one durable objective with token/active-time budgets and automatic continuation.
+  `get_goal`, `create_goal`, and `update_goal` expose restricted model controls;
+  replacing an existing objective requires operator confirmation. [Implemented]
 - **Session transcript persistence** — best-effort JSONL read/write store:
   `SessionLog` appends v2 transcript entries with stable ids, `parentId`, and
   token estimates, plus compaction and model-selection audit entries;
   `SessionStore` lists/finds/opens sessions, rebuilds context through
   compaction summaries, and `iris resume <id>` continues the same log. Complete
   provider round trips flush before the next provider request; a final/error
-  turn-boundary flush remains the backstop. Branching/rollback and an
-  in-session resume picker are planned later. [Partial]
+  turn-boundary flush remains the backstop. `/resume` provides an in-session
+  picker. Conversation branching is planned; task rollback is a separate,
+  implemented opt-in workflow. [Partial]
 
 ## Providers and auth
 
@@ -107,10 +114,11 @@
 - **OpenAI Codex login** — browser OAuth callback flow and device-code OAuth flow
   through `iris login openai-codex`. [Partial]
 - **Provider configuration** — `defaultProvider`, `defaultModel`, and `baseUrl`
-  settings; supported provider ids are `openai-codex`, `anthropic`, and
-  `antigravity`. Project-local settings may override only `defaultModel`,
-  `defaultReasoning`, `contextTokenBudget`, `compactionSummarizer`, and the
-  project-safe fields of `compaction`; global settings own provider, base-url,
+  settings; provider ids are `openai-codex`, `openai`, `anthropic`,
+  `antigravity`, and `openai-compatible`. Project settings accept a restricted
+  subset, including model/reasoning, context, compaction, TUI, task and
+  verification controls; see the [setting reference](../README.md#setting-reference).
+  Global settings own provider, base-url,
   model-cycle scope, compaction worker model, and provider-native mode so a
   cloned repo cannot redirect bearer tokens or silently change which provider
   a session cycles to.
@@ -187,8 +195,13 @@
 - **Model catalog** — hand-maintained provider/model list for picker display and
   authenticated-model filtering, including current Codex, Anthropic subscription,
   and Antigravity entries. [Implemented]
-- **Additional providers** — OpenAI API, local, or OpenAI-compatible backends.
-  [Planned]
+- **OpenAI API and compatible endpoints** — OpenAI Chat Completions via API
+  key and configurable OpenAI-compatible Chat Completions, including local
+  endpoints. Compatible endpoints use dedicated credentials, never implicitly
+  reuse `OPENAI_API_KEY`. [Implemented]
+- **Provider registry/discovery and service tiers** — multi-provider registry,
+  broader discovery/keychain migration and Fast/service-tier routing remain
+  planned (#254, #666). [Planned]
 - **Provider capability matrix** — typed per-model native-reasoning controls are
   implemented and shared by validation, UI, transitions, and request adapters.
   Context window and cache metadata are model-aware; tool-call format, JSON
@@ -238,9 +251,10 @@
 
 ## Safety and approvals
 
-- **Workspace path safety** — keep file tools inside the workspace by default,
-  including policy for absolute paths, `..`, symlinks, binary files, and large
-  files. [Partial]
+- **Workspace path safety** — main-session traversal/absolute/symlink
+  confinement requires `IRIS_SECURITY_OPT_IN=1`; it is not default enforcement.
+  Binary rejection, bounded reads, freshness and approval checks are separate
+  controls. Worker confinement has stricter rules below. [Partial]
 - **Approval gates** — explicit confirmation for `write`, `edit`, and `bash`
   (every mutating file/shell tool), with denied-call handling. [Implemented]
 - **Per-project permission policy** — persistent per-cwd grants (ADR-0027,
@@ -248,15 +262,17 @@
   allows (exact or prefix), stored HOME-owned in `~/.iris/trust.json` keyed by
   canonical directory; `[p]` at the approval prompt persists a grant and
   `/trust` (alias: `/permissions`) lists/toggles/revokes them. Destructive commands always re-prompt
-  and are never grantable; a repo-committed file can never grant. Sandbox
+  and are never grantable in normal modes; explicit dangerous-skip bypasses the
+  gate and its floors. A repo-committed file can never grant. Sandbox
   posture is stored per project but not yet enforced. [Implemented]
 - **Atomic file replacement** — `write` and `edit` write through a
   same-directory temp file, fsync, rename, cleanup-on-error path, and Unix
   permission preservation on overwrite. [Partial]
 - **Bash policy** — cwd, optional per-call timeout, stdout/stderr capture,
   output limits, nonzero-exit handling, process-group cleanup, persistent
-  sessions, background jobs, and Linux Landlock confinement where available.
-  [Partial]
+  sessions and background jobs. Main-session Linux Landlock confinement is
+  opt-in via `IRIS_SECURITY_OPT_IN=1`; unsupported kernels report degradation,
+  and macOS shell execution remains unconfined. [Partial]
 - **File observation / stale mutation preflight** — session-scoped observation
   store records each file's `{mtime, content_hash}` on read/write/edit; `edit`
   and `write` reject mutating an existing file that was never read or has
@@ -272,8 +288,9 @@
 
 ## Token and context engine
 
-These are core to the long-term Iris thesis, but they are not part of the first
-Agent Kernel MVP unless a milestone explicitly pulls them forward.
+Context accounting, output handles and compaction exist. The planner, ledger
+and richer lifecycle below remain planned; smaller output alone does not prove
+lower completed-task cost.
 
 - **Context token estimates and budget trigger** — session entries persist
   conservative token estimates, reopened sessions report rebuilt context tokens,
@@ -297,8 +314,9 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
 - **Handle-returning tool outputs** — large successful tool outputs return a
   compact head/tail preview, structured `outputHandle` metadata, and a handle to
   full content. [Implemented]
-- **Handle dereferencing** — retrieve stored content by handle on demand.
-  [Planned]
+- **Handle dereferencing** — `read_output` retrieves bounded line windows from
+  session-scoped output handles; `recall` retrieves compacted or folded original
+  transcript content. A handle browser/index remains planned. [Implemented]
 - **Micro-summary schema** — deterministic schema for counts, truncation, size,
   and confidence. [Planned]
 - **Handle lifecycle** — session-scoped retention with ref-counting or
@@ -328,12 +346,16 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   a configurable warn/start/hard ladder before, during, and after turns. Between
   provider round trips, Nexus consults a provider-neutral governor only after
   complete tool-call/result groups and before steering injection. Ready workers
-  apply without waiting; hard pressure bounds worker wait and falls back to
-  deterministic excerpts. An explicit `contextTokenBudget` clamps the resolved
+  remain held until hard pressure or manual compaction. Hard pressure bounds
+  worker wait and falls back to deterministic excerpts; the turn-edge wait is
+  still blocking, unlike the async governed wait. An explicit
+  `contextTokenBudget` clamps the resolved
   window. Tuned defaults warn/start/hard at 0.60/0.72/0.90 and retain 8,000
   recent tokens; the committed long-horizon and live evidence separates
   covered-range reduction from total-context reclamation. Active worker ranges
-  freeze overlapping folds. Branch-aware compaction remains planned. (ADR-0054,
+  freeze overlapping folds. Apply-on-ready, coverage/precedence stamps, unified
+  waits and safe settings are specified in [#658](https://github.com/5omeOtherGuy/iris-agent/issues/658)
+  but not implemented. Branch-aware compaction remains planned. (ADR-0054,
   ADR-0055) [Partial]
 - **Reactive overflow recovery** — Mimir classifies adapter-specific context
   overflow responses into one typed failure. Before visible output, Nexus asks
@@ -353,9 +375,10 @@ Agent Kernel MVP unless a milestone explicitly pulls them forward.
   is reported, the provider replaces the background summary worker without
   replacing the parent-owned apply path. Portable text, opaque block, origin,
   and usage persist together; selection changes discard native jobs. Anthropic
-  is implemented but the required Haiku 4.5 live probe is currently rejected by
-  the provider. The OpenAI v2 probe succeeds but returns opaque state only.
-  (ADR-0056) [Partial]
+  probe-only after the recorded Haiku 4.5 route rejected native compaction.
+  OpenAI pairs its opaque block with a separately generated portable summary
+  under the explicit capability/setting gates described above. A successful
+  opaque-only probe is not a portable-summary validation. (ADR-0056) [Partial]
 - **Model-requested compaction** — project-safe `compaction.modelTool=true`
   advertises `request_compaction`. The tool accepts no arguments, sets only a
   session-local one-shot flag, and reports that work is scheduled. Wayland
@@ -547,13 +570,16 @@ task boundaries, checkpoint storage, or approval semantics — they are decided.
 - **Verification loop** — explicit per-project `verify.command` (+
   `verify.maxAttempts`, default 3, capped 10; no auto-detection) run after a turn
   that changed files, as a normal gated shell execution under the unchanged
-  approval policy (no persistent allow-always per ADR-0010; any build artifacts
-  go through the #262 dirty-tree guard). Failure output is fed back to the model
+  approval policy (no blanket shell session allow; narrower project grants may
+  apply under ADR-0027; build artifacts go through the dirty-tree guard).
+  Failure output is fed back to the model
   for a bounded retry — each retry only after the model makes further changes,
   stopping at the cap. Honest pass / fail-after-N / skipped events; a failed loop
   never accepts the task, so it stays rollbackable. Issue
   [#265](https://github.com/5omeOtherGuy/iris-agent/issues/265). [Implemented]
-- **Diff view** — present changes as git diffs. [Planned]
+- **Diff view** — approval previews, Git console and task-scoped `/diff` expose
+  changes; task settlement/rollback requires the durable workflow opt-in.
+  [Implemented]
 - **Auto-commit** — commit changes with generated messages after explicit
   approval. Gated on ADR-0028's still-binding pre-automation gate. Issue
   [#270](https://github.com/5omeOtherGuy/iris-agent/issues/270). [Planned]
@@ -616,8 +642,37 @@ independently of whether plugins ever ship.
   [Implemented]
 - **Tree-sitter repo map** — ranked-symbol map of the codebase. [Planned]
 
-## Out of scope
+## Release testing and optimization
 
-- Pi execution modes as product surface: interactive / print-JSON / RPC over JSONL
-  / SDK surface.
-- SDK / embedding surface for building other agents.
+- **Task-efficiency measurement** — deterministic replay and real-provider
+  campaigns exist. The [90-session headline report](benchmarks/campaigns/legacy-headline-matrix/2026-07-05/headline-matrix-2026-07-05.md)
+  found no success regression but baseline won on token use overall. Issue #210
+  is complete as measurement work; a universal savings claim is unsupported.
+  [Implemented]
+- **Release regression/optimization gates** — cross-subsystem fault injection,
+  supported-platform/live-provider acceptance and measured before/after cost,
+  latency and memory are the [v1.0 roadmap](ROADMAP.md) targets. Existing unit,
+  property, integration and frame tests are foundations, not a claim those
+  release gates are complete. [Partial]
+- **Benchmark migration** — `iris-bench` is a separate workspace package. Retiring
+  legacy `src/bench_tokens*` still requires the validating T-series campaign
+  (#573). [Partial]
+
+## Other planned surfaces
+
+- Conversation export (#214), structured CLI JSON events (#212), configurable
+  keybindings/hotkeys (#213), shell passthrough/external editor (#208). Print mode,
+  file mentions, focus mode and the terminal doctor already exist. [Planned]
+- Native Windows/Git Bash support (#613), macOS Seatbelt (#253), broader network
+  confinement and finer permission controls (#488, #260, #255). [Planned]
+- General hooks (#59), prompt templates (#57), ranked repository map, and deeper
+  workspace modularization (#650). Native skills and the existing benchmark/
+  worker-runtime crate split are implemented separately. [Planned]
+
+## Out of scope for v1.0
+
+- An Iris embedding SDK, RPC platform, MCP integration or extension marketplace.
+- Interactive and headless print modes are already implemented; structured JSON
+  event output is planned, not excluded with the SDK surface.
+- The public `iris-subagent-runtime` crate is a host-neutral worker service, not
+  an embedding API for the Iris agent.

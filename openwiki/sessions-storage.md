@@ -30,9 +30,13 @@ session at a safe turn boundary without restarting the process.
 
 ## Compaction
 
-The harness tracks a context token budget. When context exceeds the budget at a
-safe turn boundary, it can compact history into a summary and persist compaction
-metadata. Manual compaction is exposed through `/compact`.
+The harness resolves model-aware warn/start/hard pressure and checks it at turn
+edges and pair-closed provider boundaries. Defaults are 60%/72%/90%, subject to
+model reserves; the recent-tail default is 8,000 tokens. A worker prepares in the
+background at start pressure. Ready summaries remain held until hard pressure or
+manual `/compact`; they do not currently apply as soon as ready. The turn-edge
+hard wait remains blocking. The [v1.0 roadmap](../docs/ROADMAP.md) tracks the
+apply-on-ready, wait and safe-settings overhaul.
 
 Provider-backed summarization is the default. A deterministic excerpt fallback
 exists for bounded recovery, and `compactionSummarizer` can force excerpts.
@@ -54,8 +58,9 @@ span.
 ## Permission policy
 
 Per-project permission policy lives outside the repository by default. It stores
-per-tool file grants and per-command bash allows. Destructive commands always
-re-prompt and are not grantable.
+per-tool file grants and per-command bash allows. Destructive commands re-prompt
+and are not grantable in normal modes; explicit dangerous-skip bypasses the gate
+and its floors.
 
 The `/trust` and `/permissions` commands expose the policy in the TUI.
 
@@ -65,11 +70,12 @@ fail closed.
 
 ## Task checkpoints
 
-Wayland tracks Iris-authored workspace changes during a task. `/checkpoint`
-saves an explicit restore point and settles the current task state. `/rollback`
-lists restore points; `/rollback <n>` restores Iris's own work at or after that
-point while preserving user-owned paths. `/diff` shows the current task's net
-diff. `/accept` accepts the current Iris changes and settles the task.
+Mutation safety is default-on; durable task records and checkpoint/settlement
+commands require `tasks=true`. `/checkpoint` saves a restore point without
+settling the task. `/rollback` lists/restores task checkpoints while protecting
+user-owned changes. `/diff` shows the task's Iris-attributed net diff; `/accept`
+accepts those changes and settles the task. This file rollback is not
+conversation branching, which remains planned.
 
 If a `verify` settings block is present, the harness runs the configured shell
 command after a task's changes and can retry up to `verify.maxAttempts` (default

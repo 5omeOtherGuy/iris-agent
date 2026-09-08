@@ -1,9 +1,20 @@
 # Release and Update
 
-Iris is a pre-release Rust CLI. Source installs work today. Prebuilt binary
-release plumbing exists and becomes usable when release assets exist.
+Iris is pre-1.0, but published releases and prebuilt archives are available.
+Latest release checked on 2026-09-08: `v0.3.7` (2026-07-14). Main can contain
+newer behavior than the installed release.
 
-## Source install
+## Install
+
+For a published crates.io release:
+
+```bash
+cargo install iris-agent --locked
+```
+
+For checksum-verified Linux/macOS archives, use the
+[installer instructions](../README.md#install). Installing from Git main instead
+selects unreleased source:
 
 ```bash
 cargo install --git https://github.com/5omeOtherGuy/iris-agent.git iris-agent --locked
@@ -39,9 +50,11 @@ Releases require explicit human approval in the current turn. Do not push `v*`
 tags, publish GitHub releases, configure crates.io tokens, or publish to crates.io
 without operator approval.
 
-The release-plz flow opens version/changelog PRs only. The operator pushes the
-version tag by hand so the cargo-dist workflow builds archives, checksums, and
-the installer, then creates the GitHub release.
+Release-plz prepares version/changelog PRs and publishes crates through the
+operator-approved release flow. The operator pushes the version tag separately
+so cargo-dist builds archives, checksums and the installer as a draft GitHub
+release. Follow [RELEASING.md](../docs/RELEASING.md); preparation does not authorize
+publication.
 
 Expected prebuilt assets are:
 

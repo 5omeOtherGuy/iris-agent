@@ -1,6 +1,6 @@
 # Iris
 
-A precise, token-efficient coding agent for the terminal.
+A terminal coding agent with explicit context, tool-output, and change controls.
 
 This is the owner's manual for humans and AI agents evaluating, operating, or
 maintaining Iris. It describes shipped behavior first, names the safety
@@ -20,6 +20,19 @@ boundaries, and separates planned work from working code.
 > [the roadmap](docs/ROADMAP.md) for sequencing. Do not infer that an accepted ADR
 > has shipped unless code or the current implementation snapshot says so.
 
+## Status
+
+Pre-1.0. Documentation checked against main `b420985` on 2026-09-08;
+latest published release checked: `v0.3.7`. Main includes changes newer than that
+release. Linux and macOS are supported; Windows is not.
+
+The coding loop, sessions, compaction, and delegated workers are implemented.
+Current work is compaction lifecycle/configuration hardening, safety and recovery,
+release-level testing, and measured optimization. See the
+[v1.0 milestones](docs/ROADMAP.md) and
+[documentation audit](docs/DOCUMENTATION_AUDIT.md). Main-session confinement is
+opt-in; read [Confinement reality](#confinement-reality) before unattended use.
+
 ---
 
 ## What makes Iris different
@@ -36,10 +49,11 @@ terminal interaction, and recovery:
 2. **Large output remains retrievable.** Successful results over 50 KiB move into
    a session-scoped content-addressed store. The model receives a compact preview
    and an `outputHandle`, then pages the original with `read_output` if needed.
-3. **Compaction does not freeze the main loop.** A background worker summarizes an
-   older closed range while the session continues. Wayland applies the result at
-   a safe provider-round-trip boundary; hard pressure has a bounded wait and a
-   deterministic fallback.
+3. **Compaction prepares in the background.** A worker summarizes an older closed
+   range while the session continues. Ready results are held until hard pressure
+   or manual compaction. Hard pressure has bounded waits and deterministic
+   fallback; unifying the blocking turn-edge wait with the cancellable async
+   path remains planned.
 4. **Spent context can be folded without being destroyed.** Opt-in tool-result
    compaction replaces stale results with deterministic stubs. Originals remain
    in JSONL and are recoverable through `recall` by tool-call id or compaction
@@ -280,11 +294,12 @@ the live registry; disabled tools contribute no prompt cost.
 | `web_search` | Return a ranked, snippet-rich result list through native DuckDuckGo HTML, Brave, Jina, or a trusted SearXNG instance. | **Opt-in, off by default, approval-gated.** Global settings control egress and bounds. |
 | `read_web_page` | Fetch public HTTP(S), extract readable Markdown, and optionally return objective-focused excerpts through native or Jina backends. | **Opt-in, off by default, approval-gated.** Private, loopback, link-local, and internal targets are refused and connections are pinned against DNS rebinding. |
 | `request_compaction` | Let the model schedule one compaction at the next pair-closed boundary. It accepts no authority-bearing arguments. | **Opt-in** through `compaction.modelTool`; it only sets a one-shot flag. |
+| `get_goal`, `create_goal`, `update_goal` | Inspect or update the restricted model-facing session objective. | Goal budgets and lifecycle remain harness-owned; model controls do not replace operator confirmation for goal replacement. |
+| `spawn_subagent` and lifecycle/apply tools | Start a manifest-defined worker, inspect/cancel/read its result, and prepare reviewed application. | Filtered tool grants and worker isolation; spawn/apply use their approval gates. No native model-facing best-of-N. |
 
-`bashToolMode=true` narrows the visible surface to `bash`, `edit`,
-`AskUserQuestion`, `read_output`, and `recall` (plus enabled web/compaction tools).
-It is a prompt/tool-shape preference, not a permission bypass: shell calls still
-use the normal gate.
+`bashToolMode=true` keeps `bash`, `edit`, `AskUserQuestion`, the three goal
+tools, `read_output`, and `recall`; configured web/compaction/delegation tools
+remain available. It removes ordinary file/search tools, not the approval gate.
 
 ### Native output reduction
 
@@ -335,7 +350,11 @@ with `contextTokenBudget`. The default pressure ladder is:
 
 The worker covers only closed provider round trips, preserves complete tool
 call/result pairs, and retains a recent tail (8,000 tokens by default). A ready
-summary applies at the next safe boundary. Under hard pressure Iris can shrink
+summary remains attached to its snapshot until hard pressure or manual compaction
+consumes it. Apply-on-ready, coverage/precedence stamps, unified cancellable waits,
+and safer settings are planned in
+[overhaul #658](https://github.com/5omeOtherGuy/iris-agent/issues/658), not current
+behavior. Under hard pressure Iris can shrink
 the worker range, use provider-native compaction when explicitly enabled and
 compatible, fall back to deterministic excerpts, and perform a final deep cut.
 The parent process alone validates, persists, and applies the result.
@@ -398,10 +417,12 @@ Iris has one arithmetic path for provider turns, input/output tokens, prompt-cac
 reads/writes, hidden reasoning tokens, latest context level, generation timing,
 and output rate. The exit receipt shows only fields actually reported.
 
-The deterministic tokens-per-task replay currently shows lower prompt input on
-its fixtures with identical mechanical success and retained task facts. Real
-provider confirmation remains the gate for an end-to-end headline. Iris therefore
-claims measured render reductions, not a universal “X% cheaper per task.”
+Deterministic replay shows lower prompt input on its scripted fixtures. The
+[90-session real-provider campaign](docs/benchmarks/campaigns/legacy-headline-matrix/2026-07-05/headline-matrix-2026-07-05.md)
+found no task-success regression, but baseline used fewer tokens in six of nine
+cells. The measurement work is complete; a universal savings claim is not
+supported. Per-result render reductions, compaction retention, and completed-task
+cost are separate measurements.
 
 ---
 
@@ -449,9 +470,10 @@ guard is too short for its interactive transport:
 - `codexStreamIdleTimeoutMs` is global-only and defaults to 300,000 ms; `0`
   disables only raw-read idleness.
 - The sliding timeout applies to both WebSocket frames and HTTPS/SSE reads.
-- Before visible output, WebSocket setup/read failures consume the shared retry
-  budget with cancellation-aware backoff. Reconnect classification, count, and
-  delay are shown without leaking provider payloads.
+- A stale reused WebSocket that terminates before the first event gets one
+  immediate reconnect without consuming the normal retry budget. Other retryable
+  setup/read failures before visible output use cancellation-aware backoff.
+  Recovery metadata is persisted without provider payloads.
 - After retries are exhausted, Iris switches once to sticky HTTPS/SSE for that
   session and persists one allow-listed fallback record.
 - After text, reasoning summary, or tool-input output becomes visible, transport
@@ -486,9 +508,9 @@ The durable task workflow (`tasks=true`) is opt-in. When enabled it adds:
 A non-Git workspace uses content snapshots for rollback where possible and
 surfaces degraded guarantees rather than pretending Git semantics. A jj workspace
 requires explicit native-jj consent; without it, mutation safety reports a
-file-only degraded mode. Linked-worktree creation is implemented in the Git
-console, but a complete isolated-worktree-per-task service and apply/settlement
-boundary remain planned.
+file-only degraded mode. The Git console can create linked worktrees. Delegated
+mutation workers use managed detached worktrees with durable ownership and
+reviewed file-level apply; they never silently apply, stage, or commit changes.
 
 `verify` can run a configured project command after a turn changes files. It is a
 normal gated shell call, never auto-detected. Failure output returns to the model
@@ -793,6 +815,7 @@ is treated as ordinary prompt text, not hijacked as a command.
 | `/new` | Start a fresh transcript at an idle boundary. |
 | `/resume` | Pick and resume a prior session for this directory. |
 | `/session` | Show id, transcript path, message count, context estimate, and model. |
+| `/goal` | Set, inspect, edit, pause, resume or clear the durable session objective and its budgets; replacement requires confirmation. `/goooooal` is a typed alias, not a separate palette entry. |
 | `/copy [last|all]` | Copy assistant output. |
 | `/context` | Show system/tools, raw/summarized conversation, folds, worker state, and headroom. |
 | `/compact [focus]` | Run manual compaction with optional focus. |
@@ -852,8 +875,10 @@ pretending an interactive surface exists.
 
 ## Architecture for maintainers and agents
 
-Iris ships as one crate and one product binary, with inward-pointing module
-boundaries:
+The Cargo workspace contains `iris-agent`, `iris-bench`, and
+`crates/iris-subagent-runtime`. The agent retains inward-pointing module
+boundaries; the benchmark executable and host-neutral worker runtime are separate
+packages:
 
 ```text
 ╭────────────────────────────────────────────────────────────────╮
@@ -872,7 +897,9 @@ boundaries:
 ╰────────────────────────────────────────────────────────────────╯
 ```
 
-Nexus imports no terminal, concrete provider, session store, or concrete tool.
+Nexus imports no terminal, concrete provider or session store. Its `ToolEnv`
+still references concrete `ToolState`, and path/display helpers remain
+[known boundary exceptions](docs/ARCHITECTURE.md#current-vs-target).
 Wayland owns the execution environment and durable context. Mimir owns provider
 names, credentials, endpoints, transport policy, and wire translation. The UI
 renders typed events and never decides authorization.
@@ -910,9 +937,10 @@ Read [Architecture](docs/ARCHITECTURE.md), [Naming](docs/NAMING.md), and the
   mutation, dirty-tree protection, diff previews, and opt-in durable task
   checkpoints/rollback/verification.
 - Codex-compatible skills with progressive disclosure and turn-boundary refresh.
-- Durable delegated workers with capability/budget controls, groups, artifacts,
-  managed worktree isolation, recovery, best-of-N selection, reviewed apply, and a
-  live keyboard-driven operator dashboard.
+- Durable delegated workers with `general`/`explore`/`review` manifests,
+  authenticated per-worker routing, filtered tools, artifacts, managed worktree
+  isolation, recovery, reviewed apply, and a live operator dashboard.
+  Best-of-N group support remains dormant in the runtime, not model-facing.
 - Prebuilt install/update flow and a separate `iris-bench` executable for
   real-provider, replay, and report workflows.
 
@@ -928,14 +956,17 @@ Read [Architecture](docs/ARCHITECTURE.md), [Naming](docs/NAMING.md), and the
   against local reducers.
 - Session ids are tree-ready, but the product exposes linear resume rather than
   conversation branching.
-- End-to-end token savings have deterministic replay evidence; real-provider
-  campaign confirmation is not yet a headline claim.
+- Compaction works, but ready-result application, hard-tier waits and settings
+  need the planned overhaul; see the [v1.0 roadmap](docs/ROADMAP.md).
+- End-to-end task economics have real-provider evidence with a negative overall
+  token-savings result; no universal savings headline is supported.
 
 ### Planned — not implemented
 
 The following are roadmap targets, not commands or guarantees:
 
-- named mode profiles and per-worker provider/model routing;
+- named parent-session mode profiles, a worker-manifest editor, and nested
+  delegation (per-worker provider/model routing already exists);
 - conversation branching/fork navigation and richer session search;
 - a full token-budget planner and context ledger with reason-based eviction,
   diff-aware file context, handle indexing/search, lifecycle management, and a
@@ -976,7 +1007,10 @@ Run the full CI-equivalent gate in the task worktree:
 bash scripts/gate.sh
 ```
 
-The gate runs formatting, Clippy, and tests. Focused development can use:
+The gate runs formatting, Clippy, tests, and maintenance checks for code changes.
+Changes [classified docs-only](scripts/change-scope.sh) take a whitespace-only
+fast path; that is not a runtime test result. Root agent guidance and nested
+crate READMEs still trigger the full gate. Focused development can use:
 
 ```bash
 cargo test

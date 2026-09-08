@@ -1,4 +1,20 @@
-# Benchmark Plan: tokens-per-completed-task (Milestone 2, issue #210)
+# Benchmark plans and evidence
+
+## Current status (2026-09-08)
+
+Issue #210 is complete as measurement work. The
+[90-session headline campaign](benchmarks/campaigns/legacy-headline-matrix/2026-07-05/headline-matrix-2026-07-05.md)
+found no success regression, but baseline won on token use overall. No universal
+savings claim is supported. This is distinct from the new
+[v1.0 optimization gate](ROADMAP.md#m4--measured-optimization).
+
+For new campaigns use [HARNESS.md](benchmarks/HARNESS.md) and its committed
+T-series configs. The original plan below is historical; no old pending gate or
+command is evidence that a new campaign has passed. Live runs require explicit
+operator approval. After the library/bin split, retained legacy tests live in
+`iris-agent`'s library, not the thin `iris` binary test target.
+
+## Historical tokens-per-completed-task plan (issue #210)
 
 > **DEPRECATED (2026-07-11): the legacy tool-efficiency suite is being migrated
 > into the live harness.** The tokens-per-task suite below (`src/bench_tokens*`,
@@ -173,9 +189,14 @@ non-headline exploratory run only.
 7. PR open referencing #210 with the table, spend, and repro commands. Not
    merged.
 
-## Repro commands
+## Historical repro sketch
 
-Filled in the report once wired. Sketch:
+Preserved from before the library/bin split. Do not use `--bin iris` for these
+tests on current main: it selects the shim and can run zero matching tests.
+For a current deterministic legacy replay use
+`cargo test --locked -p iris-agent --lib bench_tokens_per_task` and confirm the
+reported test count. Use [HARNESS.md](benchmarks/HARNESS.md) for new campaigns.
+The original sketch was:
 
 ```
 # Replay / regression (CI, no cost):
@@ -218,7 +239,8 @@ probe scoring, scenario shapes) run in-gate; the live path does not.
 One JSONL row per provider request (`metrics.rs::Row`): campaign, cell_id, lane,
 scenario, run_seq, request_seq, kind (`turn|summary|native_compact|probe`), ts,
 wall_ms, input/output tokens, cache_read, cache_write_5m/1h (Anthropic; the
-write-blind Codex lane leaves both null and sets `write_unreported=true`),
+Codex preserves a nonzero flat reported write in the 5m field with 1h zero;
+zero/unreported writes leave both null and set `write_unreported=true`),
 context_measured/estimate tokens, `estimate_error` (diagnostic only),
 boundary_index, tier (`none|warn|start|hard`), a lifecycle delta (compaction
 generation applied, origin, fold flushes, breaker state), the settings

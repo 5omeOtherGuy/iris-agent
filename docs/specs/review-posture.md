@@ -1,5 +1,10 @@
 # SPEC — The REVIEW posture
 
+> Historical implementation brief; checked 2026-09-08. Review-state transcript
+> rendering exists in `src/ui/tui/transcript.rs`; the
+> [current design language](../TUI_DESIGN_LANGUAGE.md) owns the posture grammar.
+> Original line pins and checklists below are not a new passing test report.
+
 Status: approved for implementation · Surface: bottom statusline (§9.3), the
 composer frame (§9.2), the approval moment (§8.5).
 Complexity: MEDIUM-LOW. Iteration passes required after it works: 1.

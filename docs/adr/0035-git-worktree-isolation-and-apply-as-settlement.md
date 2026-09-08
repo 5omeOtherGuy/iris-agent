@@ -17,9 +17,10 @@ restore, and best-of-N slices are activated)
 Milestone 5 (Git-Centered Workflow) needs an isolation primitive: a way to run a
 session, session fork, or subagent against a private working directory whose
 edits never reach the user's checkout until an explicit apply. Grok Build ships
-such a subsystem; its reverse-engineered surface is captured in
-[`.iris-reference/grok-worktree-subsystem-spec.md`](../../.iris-reference/grok-worktree-subsystem-spec.md)
-as a reference, not an Iris decision.
+such a subsystem; the original design cited a local-only
+`grok-worktree-subsystem-spec.md` reference, not an Iris decision. That evidence
+is not included in this public repository; the comparison is historical and
+requires independent re-verification.
 
 [ADR-0028](0028-git-workflow-dirty-tree-safety-and-task-checkpointing.md) already
 settled the in-place safety model: baseline capture, an attribution ledger,
@@ -338,9 +339,9 @@ and the CLI `iris worktree` commands live in Iris (Tier 3).
 
 ## Alignment with Grok Build CLI 0.2.82
 
-Source: the local reference
-[`grok-worktree-subsystem-spec.md`](../../.iris-reference/grok-worktree-subsystem-spec.md).
-This review compares the planned linked-worktree slice, not a future full
+Source: the historical local-only `grok-worktree-subsystem-spec.md` (not shipped
+in this repository). This review compares the then-planned linked-worktree slice,
+not current implementation or a future full
 snapshot/pooling system.
 
 | Area | Grok Build CLI | Iris planned slice | Assessment |

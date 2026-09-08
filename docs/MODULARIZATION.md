@@ -10,6 +10,15 @@
 > Nothing in this document changes runtime behavior; every phase is a
 > behavior-preserving refactor.
 
+## Implementation check (2026-09-08)
+
+The larger tier-per-crate split remains proposed. `Cargo.toml` currently defines
+`iris-agent`, `iris-bench`, and `iris-subagent-runtime`. Target files such as
+`scripts/check-layering.sh` and `crates/iris-agent` below are proposed paths,
+not missing shipped modules. Evidence line numbers are from the original plan;
+recheck them against code before implementation. The [v1.0 roadmap](ROADMAP.md)
+prioritizes hardening and measured optimization, not package count.
+
 ## What this is
 
 A file-complete inventory of `src/` and `crates/`, the target crate graph, the

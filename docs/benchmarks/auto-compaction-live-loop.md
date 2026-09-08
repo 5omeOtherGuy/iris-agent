@@ -1,5 +1,10 @@
 # Auto-compaction live loop
 
+> Historical July compaction-program protocol and results. The dedicated
+> `src/compaction_live_bench.rs` tests remain available; new configurable campaigns
+> use [HARNESS.md](HARNESS.md). Counts, exclusions and measurements below are
+> preserved, not a fresh validation of main or the planned apply-on-ready overhaul.
+
 Real-provider protocol for the auto-compaction program. It uses the production
 session, tool, worker, entry, rebuild, and resume seams. CI never runs it:
 every test is both `#[ignore]` and gated by `IRIS_BENCH_LIVE=1`.

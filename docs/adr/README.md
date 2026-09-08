@@ -25,7 +25,12 @@ Status meanings:
 ## Index
 
 The status column reflects each ADR file, not the current completion state of its
-implementation.
+implementation. The reverse also matters: an old **proposed** label does not
+prove the code is absent. Implementation notes in ADR-0026, ADR-0027, ADR-0042
+and ADR-0060 record compiled fragments, project grants, themes and the harness
+actor already present at `b420985`. Their original decision labels are preserved
+rather than inventing a retroactive acceptance date. Use
+[FEATURES.md](../FEATURES.md) for current capability status.
 
 | ADR | Decision | Status | Date |
 | --- | --- | --- | --- |

@@ -3,7 +3,10 @@
 Iris is a terminal coding agent. The installed binary is `iris`; from a checkout
 use `cargo run -- ...` for the same arguments.
 
-## Install from source
+## Install
+
+Published release: `cargo install iris-agent --locked`, or use the
+[prebuilt installer](../README.md#install). For unreleased Git main:
 
 ```bash
 cargo install --git https://github.com/5omeOtherGuy/iris-agent.git iris-agent --locked
@@ -23,9 +26,10 @@ iris --plain
 iris --no-alt-screen
 ```
 
-Interactive terminals use the TUI. Pipes, CI, `TERM=dumb`, `--plain`,
-`IRIS_PLAIN=1`, `NO_COLOR`, or terminal startup failures use the plain text
-fallback. `--no-alt-screen` or `IRIS_NO_ALT_SCREEN=1` keeps rendering inline
+Interactive terminals use the TUI. Pipes, CI, `--plain`, `IRIS_PLAIN=1`,
+`NO_COLOR`, or a rich-TUI startup failure use the plain text fallback.
+`TERM=dumb` disables the pager; render startup may further degrade to plain.
+`--no-alt-screen` or `IRIS_NO_ALT_SCREEN=1` keeps rendering inline
 instead of using the pager alt screen. `IRIS_REDUCED_MOTION=1` freezes the
 working indicator animation.
 
@@ -88,9 +92,12 @@ binaries fall back to `cargo install`.
 iris --dangerously-skip-permissions
 ```
 
-This session-only flag auto-approves every tool call, including destructive
-commands, and records the mode in the transcript. It is not configurable from
-settings, project files, the trust store, or environment variables.
+This flag bypasses tool approvals and all safety floors, including destructive
+calls, records the mode in the transcript, and persists
+`defaultApproval: "dangerously-skip-permissions"` globally. It is not session-only.
+Use `/approval strict` to leave the mode; verify global settings before restarting.
+Project settings cannot enable it. Required human questions still require human
+input. Use dangerous-skip only inside a trusted external sandbox.
 
 ## Slash commands
 
@@ -100,13 +107,15 @@ Backed interactive commands include:
 - `/model`, `/reasoning`
 - `/resume`, `/new`
 - `/session`, `/sessions`, `/tasks`, `/copy`
-- `/compact`, `/context`
+- `/compact`, `/compaction`, `/context`
+- `/goal` (alias `/goooooal`)
+- `/subagents`, `/worktrees`, `/skills`
 - `/debug`
 - `/scoped-models`, `/settings`
 - `/approval`
 - `/trust`, `/permissions`
 - `/login`, `/logout`
-- `/find`, `/terminal-setup`, `/mouse`
+- `/find`, `/terminal-setup`, `/mouse`, `/focus`
 - `/git`, `/tree`
 - `/diff`, `/rollback`, `/accept`, `/checkpoint`
 

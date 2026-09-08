@@ -26,7 +26,9 @@ The operator pushes the tag by hand on purpose: a tag pushed by release-plz's de
 
 Live. `v0.1.0` shipped 2026-07-09 (GitHub release with all nine assets) and
 `iris-agent 0.1.0` is published on crates.io (the `CARGO_REGISTRY_TOKEN` secret is set,
-`publish = true`).
+`publish = true`). Latest published release checked on 2026-09-08: `v0.3.7`
+(2026-07-14). This is a dated status check; query the current release before
+preparing a candidate.
 
 ## Version policy
 
@@ -113,8 +115,9 @@ Delete rc releases/tags after the stable tag ships to keep the release page clea
 release-plz plays no role here: rc tags are cut from `main` directly, before the release
 PR merges.
 
-Day-to-day iteration needs none of this: `main` is never shipped — users only ever
-receive operator-tagged stable releases, so merging to `main` is always safe.
+The default installer/update channel selects stable releases, not arbitrary
+main commits. Explicit Git source installs can still run unreleased main; a
+merge is not automatically safe and still requires the normal review/gates.
 
 ## Maintaining the cargo-dist pipeline
 

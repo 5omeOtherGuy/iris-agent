@@ -1,19 +1,18 @@
 # Iris — Architecture: Three-Tier Split
 
-> Status (2026-06-22): target architecture, realized in the runtime. Iris
-> ships today as one binary with the tier boundaries enforced in-module, and the
-> async-hard agent loop (below) is shipped. This document defines the ownership
-> tiers Iris is converging on, modeled on pi's
-> `packages/agent` (core) / harness / `packages/coding-agent` layering. It is a
-> design target, not an implementation snapshot; see
-> [`CODEMAPS/INDEX.md`](CODEMAPS/INDEX.md) for what exists now and
-> [`ROADMAP.md`](ROADMAP.md) for build order.
+> Checked 2026-09-08 against `b420985`. This is the ownership target and its
+> current implementation boundary. The async loop and injected contracts exist;
+> the remaining concrete state/path dependencies are listed below. Iris is a
+> Cargo workspace with agent, benchmark and worker-runtime packages, not a full
+> tier-per-crate split. See [`CODEMAPS/INDEX.md`](CODEMAPS/INDEX.md) for source
+> navigation and [`ROADMAP.md`](ROADMAP.md) for v1.0 gates.
 
 ## The one rule
 
-The agent loop **emits events and calls hooks**. It imports no UI, no approval
-UX, and no concrete tool implementations. Dependencies point *inward* toward
-contracts. Everything else is a consequence of this rule.
+The agent loop **emits events and calls hooks**. UI and approval UX stay outside
+Nexus. Dependencies should point *inward* toward contracts. Concrete `ToolState`
+and path/display helper references remain exceptions, not a completed clean
+boundary; see [Current vs target](#current-vs-target).
 
 This mirrors pi's `@earendil-works/pi-agent-core`, which has zero UI dependency
 and ships no tool implementations of its own — it is the engine, not the car.
@@ -57,7 +56,7 @@ Reference split:
 ╭──────────────────────────────────────────────────────────────────────╮
 │ TIER 1 — Nexus (core)               (pi: packages/agent core)          │
 │   model loop, contracts, event stream, tool + approval hook traits     │
-│   imports NOTHING from tiers above                                     │
+│   target: no dependencies on higher tiers                             │
 ╰──────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -69,7 +68,7 @@ tools and approval plug into.
 
 | Owns | Today's file(s) |
 |---|---|
-| Model loop (tokio async: turn → provider stream → tool → repeat, bounded round-trips, per-turn `CancellationToken` raced via `tokio::select!`) | `nexus.rs` |
+| Model loop (tokio async: turn → provider stream → tool → repeat, optional round-trip cap, per-turn `CancellationToken` raced via `tokio::select!`) | `nexus.rs` |
 | Async streaming provider contract `ChatProvider::respond_stream` → `Stream<ProviderEvent>` | `nexus.rs` |
 | Message contracts: `Message`, `Role`, `ToolCall`, `AssistantTurn` | `nexus.rs` |
 | Agent-event stream (`AgentEvent`, `AgentObserver`) | `nexus.rs` |
@@ -95,7 +94,7 @@ environment onto the bare core loop. In pi this is the `AgentHarness` /
 | Session transcript persistence/read store | `session.rs` |
 | Settings / configuration loading, including global-only provider/base-url/scoped-model/cache/context-management controls and project-safe model/reasoning/context-budget overrides | `config.rs` |
 | Workspace path safety (the FS/Shell sandbox surface) | `tools/path.rs`, `tools/bash/sandbox.rs` |
-| Tool execution state (observed files, bash sessions) | `tools/observe.rs`, `tools/bash/session.rs` (`ToolState`) |
+| Tool execution state | `tools/mod.rs` (`ToolState`, injected via `ToolEnv`), `tools/observe.rs` (`ObservedFiles`), `tools/bash/session.rs` (`Sessions`) |
 | Host capabilities, if a plugin system is ever added (`host_read`, `host_ls`, later `host_*_plan`) | _exploratory (issue #18)_ |
 | Oversized tool-output handle storage | `handles.rs`, `wayland/mod.rs` |
 | Context compaction policy, range planning, stale-result revalidation, safe-boundary apply, mid-turn governor, hybrid measurement, and trigger ladder | `wayland/compaction.rs`, `wayland/compaction_governor.rs`, `wayland/compaction_background.rs`, `wayland/trigger.rs`, `wayland/mod.rs`, `session.rs` |
@@ -140,7 +139,7 @@ translate wire formats into the Tier 1 `ChatProvider` contract.
 
 | Owns | Today's file(s) |
 |---|---|
-| CLI entrypoint, command dispatch, session driver | `main.rs`, `cli.rs` |
+| CLI entrypoint, command dispatch, session driver | `main.rs` (shim), `lib.rs` (dispatch/construction), `cli.rs` (sessions) |
 | Terminal I/O behind the `Ui` trait | `ui/`, `tool_display.rs` |
 | Render backends: screen-mode policy (ADR-0029) selects the alt-screen pager (full-frame ratatui `Terminal`) or the inline terminal surface (ADR-0006); both render the same `Screen` state | `ui/screen_mode.rs`, `ui/tui/pager.rs`, `ui/terminal_surface.rs` |
 | Approval prompt UX + `ApprovalGate`/`AgentObserver` adapter (`UiBridge`); decision parsing | `ui/` (`UiBridge`, `request_approval`), `approval.rs` (`parse_decision`) |
@@ -148,7 +147,7 @@ translate wire formats into the Tier 1 `ChatProvider` contract.
 | Subagent/worktree operator commands and apply authorization UX | `cli.rs`, `ui/tui_loop.rs`, `ui/slash.rs` |
 | Plugin runtime + registration, if a plugin system is ever added: executor (WASM/Extism or subprocess), manifest parsing, registry wiring | _exploratory (issue #18)_ |
 | Trusted approval-preview diff rendering | `tools/mod.rs` (`diff_preview`) → Tier 3 |
-| Provider adapters (translate OpenAI Codex Responses, Anthropic Messages, and Antigravity/Gemini wire formats → contracts), packaged as **Mimir** (the AI/provider package; see [`NAMING.md`](NAMING.md)); provider-native prompt-cache/context-management request knobs stay inside these adapters | `mimir/providers/*` |
+| Provider adapters (Codex Responses, OpenAI/OpenAI-compatible Chat Completions, Anthropic Messages, and Antigravity/Gemini → contracts), packaged as **Mimir** (the AI/provider package; see [`NAMING.md`](NAMING.md)); provider-native prompt-cache/context-management request knobs stay inside these adapters | `mimir/providers/*` |
 | Auth flows + token store (Mimir), including shared cancellable loopback OAuth callback plumbing | `mimir/auth/*` |
 
 Depends on Tier 1 (contracts) and Tier 2 (harness).
@@ -158,15 +157,14 @@ provider-abstraction the adapters implement against).
 
 ## Current vs target
 
-The four cuts are done: the bare `Agent` in `nexus.rs` is a provider-, UI-,
-persistence-, and workspace-neutral in-memory engine. It imports no `crate::ui`/
-`crate::approval` (Step A), resolves tools by name over an injected set (Step B),
-and owns no filesystem or session store (Step C) -- the Tier-2 `Harness`
-(`wayland/mod.rs`) owns the execution env and live persistence, while `session.rs`
-also owns the read-side `SessionStore`; Wayland injects a `&ToolEnv`
-into each turn. The only `crate::tools` reference left in core is the `ToolState`
-type borrowed through `ToolEnv` (the type stays in `crate::tools`; the harness
-owns the instance). The cuts that reached this split:
+The original event/hook/tool-injection/persistence cuts landed. `Agent` renders
+nothing and owns no filesystem or session store; Wayland owns the execution
+state and injects `ToolEnv` per turn. The split is not dependency-clean:
+`src/nexus.rs` still carries `crate::tools::ToolState`, calls
+`crate::tools::path::workspace_relative`, and uses
+`crate::display_path::workspace_path`. These are tracked in the
+[modularization proposal](MODULARIZATION.md), not erased by the target diagram.
+The original cuts established:
 
 1. **Loop emits events, not UI calls.** _(done)_ The loop emits a Tier-1
    `AgentEvent` stream to an `AgentObserver`; `crate::ui` is gone from the loop.
@@ -182,7 +180,8 @@ owns the instance). The cuts that reached this split:
    live in Tier 3; the loop still enforces the approval policy. The thin `Tools`
    lookup is justified by modes, subagents, and provider-specific tools; a plugin
    system (issue #18) would be one optional consumer, not the reason for it.
-   Relocating `ToolState` to the harness is Step C. See "Tools across the tiers".
+   The harness owns the `ToolState` instance; its type still lives in `tools`.
+   See "Tools across the tiers".
 4. **Persistence + execution surface are harness-tier.** _(done)_ The bare
    `Agent` holds no `workspace`, `ToolState`, `SessionLog`, or `SessionStore`. The Tier-2
    `Harness` (`wayland/mod.rs`) wraps the agent, owns the workspace + `ToolState`
@@ -246,10 +245,12 @@ enable them.
 
 ## Packaging
 
-Per the project agent guidelines, these tiers are **modules in one crate** for
-the MVP. Do not split into separate crates or processes to satisfy the boundary. The
-discipline is the inward-pointing dependency direction, not the package count.
-Promote `nexus` (core), `wayland` (harness), and `iris` (CLI) to a cargo
-workspace only when a second front-end or published Nexus runtime makes the
-split pay for itself; once the imports point inward, that promotion is
-mechanical.
+`Cargo.toml` defines the root `iris-agent` package plus `iris-bench` and
+`crates/iris-subagent-runtime`. The CLI, Nexus, Wayland, Mimir and concrete tools
+remain modules inside `iris-agent`. `src/main.rs` calls the library entrypoint;
+`iris-bench` uses the harness facade; Wayland hosts the worker-runtime executors.
+
+The [further modularization proposal](MODULARIZATION.md) is not implemented.
+Package extraction must justify its ownership/build benefit and preserve tested
+contracts; adding crates alone does not enforce inward dependencies. It is not
+a prerequisite to the v1.0 hardening gates.

@@ -19,13 +19,13 @@ the gate).
 Regenerate the tables with:
 
 ```
-cargo test --bin iris compaction_slice_b_benchmark_report -- --nocapture
+cargo test --locked -p iris-agent --lib compaction_slice_b_benchmark_report -- --nocapture
 ```
 
 Run the asserting tests (the contract; the tables are the snapshot) with:
 
 ```
-cargo test --bin iris compaction_bench
+cargo test --locked -p iris-agent --lib compaction_bench
 ```
 
 ## The four arms

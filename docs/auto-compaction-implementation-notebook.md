@@ -1,5 +1,11 @@
 # Auto-compaction implementation notebook
 
+> Historical July implementation log; no tests rerun by the September docs audit.
+> Current lifecycle and open overhaul gates live in [ROADMAP.md](ROADMAP.md).
+> For current campaign commands/schema use [HARNESS.md](benchmarks/HARNESS.md).
+> Codex parser support for optional cache-write fields does not establish live
+> write reporting; retain the write-blind observations below as dated evidence.
+
 Running record for the 2026-07-10 auto-compaction specification. Entries are
 append-only by slice. PR descriptions remain the authoritative review summary;
 this file keeps implementation issues and decisions that span slices.

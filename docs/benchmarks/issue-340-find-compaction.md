@@ -9,7 +9,7 @@ the `token-efficiency-benchmark` skill in `.pi/skills/`). Regenerate the table
 with:
 
 ```
-cargo test --bin iris find_benchmark_report -- --nocapture
+cargo test --locked -p iris-agent --lib find_benchmark_report -- --nocapture
 ```
 
 `before` is the flat listing (one path per line, today's output); `after` is

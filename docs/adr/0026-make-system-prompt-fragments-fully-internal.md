@@ -4,6 +4,14 @@
 **Status**: proposed (supersedes the file-loading decision of ADR-0012; amends ADR-0013 and ADR-0015; amended by ADR-0064)
 **Deciders**: Iris maintainers, Pi agent session
 
+## Implementation status (2026-09-08)
+
+The original decision-status label above is retained, but the compiled-fragment
+behavior is implemented in `src/wayland/system_prompt/{mod,defaults}.rs`.
+ADR-0064 extends project-document loading. Named slots and selector-driven
+assembly remain planned; their mention below is not proof they shipped. Current
+status lives in [FEATURES.md](../FEATURES.md#prompt-assembly).
+
 ## Context
 
 ADR-0012 built the system prompt from user-droppable `.md` fragment files discovered from a global dir (`~/.iris/fragments`) and a per-repo dir (`<cwd>/.iris/fragments`). Repo fragments are attacker-controlled: a fragment lands in the system prompt, the highest-authority instruction channel, so cloning a hostile repo and running `iris` is arbitrary system-prompt injection with zero ceremony. ADR-0012's risk section contained this with a bounded, symlink-refusing reader plus the #234 per-cwd trust gate (`~/.iris/trust.json`, `/trust`, a first-run prompt, a TUI modal).

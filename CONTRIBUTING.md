@@ -4,14 +4,14 @@ Thanks for improving Iris.
 
 ## Quick start
 
-1. Fork or branch from `main`.
+1. Create a task worktree using the workflow below; primary `main` is control-only.
 2. Make the smallest focused change.
-3. Add or update deterministic tests for behavior changes (TDD preferred).
-4. Run the checks:
-   - `cargo fmt --all --check` (`cargo fmt` applies fixes)
-   - `cargo clippy --all-targets -- -D warnings`
-   - `cargo test` (focus a single test with `cargo test <name>`)
-5. Open a pull request into `main`.
+3. Write a failing deterministic test before production changes.
+4. Run `bash scripts/gate.sh`. Code changes run format, Clippy, tests and
+   maintenance checks; changes classified docs-only run whitespace checks. Root
+   agent guidance and nested crate READMEs still trigger the full gate. Validate
+   docs links/source references separately. Focus a test with `cargo test --locked <name>`.
+5. Open a pull request into `main` when authorized by the operator.
 
 ## Pull request workflow
 
@@ -23,14 +23,15 @@ Thanks for improving Iris.
 - Use labels to make release notes and triage easier: `bug`, `enhancement`, `documentation`, `security`, `dependencies`, `chore`, `tooling`, or `good first issue`.
 - After checks finish, review failures with `gh pr checks` or `gh run view --log-failed`.
 
-## Worktree workflow (for parallel work or multiple agents)
+## Worktree workflow
 
-When more than one task or agent is active, isolate each in its own git worktree so concurrent work never collides in a shared checkout.
+Use a task-specific worktree for every repository change, including documentation.
+Keep concurrent tasks out of one another's checkouts.
 
-1. Install the repo hooks once per clone: `bash scripts/install-hooks.sh`. They block commits/pushes on a primary `main` that has drifted behind `origin/main` (bypass with `--no-verify` when you know why).
+1. Install the repo hooks once per clone: `bash scripts/install-hooks.sh`. They block commits/pushes on a stale primary `main`. Reconcile drift with operator approval; do not bypass the hooks.
 2. Create a worktree from the control-only primary checkout: `bash scripts/worktree-create.sh ../iris-<slug> <branch>`. The wrapper fetches and checks primary freshness, creates from `origin/main`, and copies only the supported ignored regular instruction files.
 3. Optionally `export CARGO_TARGET_DIR=~/.cache/iris-target` so worktrees share build artifacts instead of each rebuilding `target/`.
-4. Merge with `gh pr merge <N> --squash`, then clean up from outside the worktree: `bash scripts/worktree-cleanup.sh ../iris-<slug>` (removes the worktree, deletes the merged branch, and fast-forwards primary `main`).
+4. Only after explicit operator approval, merge with `gh pr merge <N> --squash`, then clean up from outside the worktree: `bash scripts/worktree-cleanup.sh ../iris-<slug>` (removes the worktree, deletes the merged branch, and fast-forwards primary `main`).
 5. Leave worktrees and branches you do not own untouched.
 
 ## Commit messages
