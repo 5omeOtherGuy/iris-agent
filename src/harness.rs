@@ -13,11 +13,19 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
+use futures::StreamExt;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::mimir::providers::openai_compatible_chat::{
+    OpenAiCompatibleChatConfig, OpenAiCompatibleChatProvider,
+};
+use crate::mimir::retry::RetryPolicy;
+use crate::mimir::selection::{PromptCacheRetention, ProviderId, ReasoningEffort};
 use crate::nexus::{
     Agent, AgentEvent, AgentObserver, ApprovalDecision, ApprovalFuture, ApprovalGate, ApprovalMode,
-    ReviewContext, ToolCall, ToolEnv, ToolEventState,
+    ChatProvider, Message, ProviderEvent, ProviderUsage, ReviewContext, Tool, ToolCall, ToolEnv,
+    ToolEventState, ToolFuture, ToolOutput, Tools as NexusTools,
 };
 use crate::tools::{ToolState, built_in_tools};
 
@@ -357,4 +365,267 @@ impl ApprovalGate for ZeroPromptGate {
         self.consulted.set(true);
         Box::pin(async move { Ok(ApprovalDecision::Deny) })
     }
+}
+
+// ===========================================================================
+// Leaf-consumer API (spike S1). A minimal public seam for an external binary
+// to drive one OpenAI-compatible provider turn and one Nexus tool-loop turn
+// with custom request headers, a custom system prompt, and an injected tool.
+// ===========================================================================
+
+/// Request options for a minimal OpenAI-compatible (`chat/completions`)
+/// provider. `system_prompt` is carried by the provider itself, so an injected
+/// `Agent` uses a custom prompt without the Wayland settings stack.
+#[derive(Clone, Debug, Default)]
+pub struct LeafProviderOptions {
+    pub base_url: String,
+    pub model: String,
+    pub system_prompt: String,
+    /// Bearer API key. Never rendered by this crate.
+    pub api_key: String,
+    /// Extra request headers applied after the adapter defaults, so a caller
+    /// can override `User-Agent` and add e.g. `x-opencode-session`.
+    pub extra_headers: Vec<(String, String)>,
+    /// Optional reasoning effort token (`low`/`medium`/`high`/`xhigh`/`max`).
+    pub reasoning: Option<String>,
+}
+
+/// Token accounting for one leaf turn.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LeafUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl LeafUsage {
+    fn from_usage(usage: &ProviderUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            reasoning_output_tokens: usage.reasoning_output_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            total_tokens: usage.total_tokens,
+        }
+    }
+}
+
+/// A caller-provided tool for [`leaf_tool_turn`]. Synchronous by design: the
+/// adapter runs it inside the Nexus async tool future.
+pub trait LeafTool {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn parameters(&self) -> Value;
+    fn execute(&self, arguments: &Value) -> std::result::Result<String, String>;
+}
+
+struct LeafToolAdapter {
+    inner: Box<dyn LeafTool>,
+}
+
+impl Tool for LeafToolAdapter {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn parameters(&self) -> Value {
+        self.inner.parameters()
+    }
+
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: &'a Value,
+        _env: &'a ToolEnv<'_>,
+        _cancel: CancellationToken,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            self.inner
+                .execute(args)
+                .map(ToolOutput::text)
+                .map_err(|message| anyhow::anyhow!("{message}"))
+        })
+    }
+}
+
+/// One event observed during a leaf tool-loop turn.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LeafEvent {
+    ToolCall { name: String, arguments: Value },
+    ToolResult { name: String, content: String },
+}
+
+/// Outcome of a one-shot provider turn.
+#[derive(Clone, Debug, Default)]
+pub struct LeafOneShot {
+    pub text: String,
+    pub reasoning: String,
+    pub usage: Option<LeafUsage>,
+}
+
+/// Outcome of a leaf tool-loop turn.
+#[derive(Clone, Debug, Default)]
+pub struct LeafToolTurn {
+    pub final_text: String,
+    pub events: Vec<LeafEvent>,
+    pub usage: Option<LeafUsage>,
+}
+
+fn leaf_provider(
+    options: &LeafProviderOptions,
+) -> std::result::Result<OpenAiCompatibleChatProvider, String> {
+    let reasoning = match options.reasoning.as_deref() {
+        None => None,
+        Some(raw) => Some(ReasoningEffort::parse(raw.trim()).map_err(|e| e.to_string())?),
+    };
+    OpenAiCompatibleChatProvider::new(OpenAiCompatibleChatConfig {
+        provider: ProviderId::OpenAiCompatible,
+        model: &options.model,
+        base_url: &options.base_url,
+        reasoning,
+        system_prompt: &options.system_prompt,
+        api_key: Some(options.api_key.clone()),
+        supports_reasoning: true,
+        api_key_required: true,
+        prompt_cache_key: None,
+        cache_retention: PromptCacheRetention::None,
+        retry_policy: RetryPolicy::default(),
+        extra_headers: options.extra_headers.clone(),
+    })
+    .map_err(|e| format!("{e:#}"))
+}
+
+/// Run exactly one user message through the OpenAI-compatible provider and
+/// return its assembled text, reasoning, and usage.
+pub fn leaf_oneshot(
+    options: &LeafProviderOptions,
+    user_message: &str,
+) -> std::result::Result<LeafOneShot, String> {
+    let provider = leaf_provider(options)?;
+    let tools = NexusTools::new(Vec::new());
+    let cancel = CancellationToken::new();
+    let messages = vec![Message::user(user_message)];
+    block_on(async {
+        let mut stream = provider
+            .respond_stream(&messages, &tools, &cancel)
+            .map_err(|e| format!("{e:#}"))?;
+        let mut outcome = LeafOneShot::default();
+        while let Some(item) = stream.next().await {
+            match item.map_err(|e| format!("{e:#}"))? {
+                ProviderEvent::TextDelta(delta) => outcome.text.push_str(&delta),
+                ProviderEvent::ReasoningDelta(delta)
+                | ProviderEvent::RawReasoningDelta(delta) => outcome.reasoning.push_str(&delta),
+                ProviderEvent::Completed(turn) => {
+                    if let Some(text) = turn.text {
+                        outcome.text = text;
+                    }
+                    outcome.usage = turn.usage.as_ref().map(LeafUsage::from_usage);
+                }
+                _ => {}
+            }
+        }
+        Ok(outcome)
+    })
+}
+
+#[derive(Default)]
+struct LeafObserver {
+    final_text: RefCell<String>,
+    events: RefCell<Vec<LeafEvent>>,
+    usage: RefCell<Option<LeafUsage>>,
+}
+
+impl AgentObserver for LeafObserver {
+    fn on_event(&self, event: AgentEvent) -> Result<()> {
+        match event {
+            AgentEvent::AssistantText(text) | AgentEvent::AssistantTextEnd(text)
+                if !text.is_empty() =>
+            {
+                *self.final_text.borrow_mut() = text;
+            }
+            AgentEvent::ToolStarted(call) => self.events.borrow_mut().push(LeafEvent::ToolCall {
+                name: call.name,
+                arguments: call.arguments,
+            }),
+            AgentEvent::ToolResult { call, content, .. } => {
+                self.events.borrow_mut().push(LeafEvent::ToolResult {
+                    name: call.name,
+                    content,
+                });
+            }
+            AgentEvent::ProviderTurnCompleted { usage, .. } => {
+                if let Some(usage) = usage {
+                    *self.usage.borrow_mut() = Some(LeafUsage::from_usage(&usage));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Always-allow approval gate: every gated call is approved for this session.
+struct LeafAlwaysAllowGate;
+
+impl ApprovalGate for LeafAlwaysAllowGate {
+    fn review<'a>(
+        &'a self,
+        _call: &'a ToolCall,
+        _allow_always: bool,
+        _allow_project: bool,
+        _ctx: ReviewContext,
+    ) -> ApprovalFuture<'a> {
+        Box::pin(async { Ok(ApprovalDecision::AllowAlways) })
+    }
+}
+
+/// Run one Nexus agent turn with a custom system prompt (via the provider), the
+/// injected `tools`, and an always-allow approval gate. Returns the final
+/// assistant text and the observed tool-call/tool-result events.
+pub fn leaf_tool_turn(
+    options: &LeafProviderOptions,
+    tools: Vec<Box<dyn LeafTool>>,
+    user_message: &str,
+) -> std::result::Result<LeafToolTurn, String> {
+    let provider = leaf_provider(options)?;
+    let nexus_tools: Vec<Box<dyn Tool>> = tools
+        .into_iter()
+        .map(|inner| Box::new(LeafToolAdapter { inner }) as Box<dyn Tool>)
+        .collect();
+    let mut agent =
+        Agent::new(provider, NexusTools::new(nexus_tools)).with_max_tool_roundtrips(Some(8));
+    agent.set_approval_mode(ApprovalMode::Auto);
+
+    let state = RefCell::new(ToolState::new());
+    let env = ToolEnv {
+        workspace: Path::new("."),
+        state: &state,
+        output_store: None,
+        output_sink: None,
+        mutation_guard: None,
+        session_span: None,
+    };
+    let observer = LeafObserver::default();
+    let gate = LeafAlwaysAllowGate;
+    let cancel = CancellationToken::new();
+    block_on(agent.submit_turn(user_message, &observer, &gate, &env, &cancel, None))
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(LeafToolTurn {
+        final_text: observer.final_text.into_inner(),
+        events: observer.events.into_inner(),
+        usage: observer.usage.into_inner(),
+    })
 }

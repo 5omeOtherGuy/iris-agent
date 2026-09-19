@@ -1385,6 +1385,7 @@ fn build_provider_for_lane(
                         prompt_cache_key: Some(session_id),
                         cache_retention: selection.cache_retention,
                         retry_policy: selection.retry_policy,
+                        extra_headers: Vec::new(),
                     },
                 )?,
             )
@@ -1427,6 +1428,7 @@ fn build_provider_for_lane(
                         prompt_cache_key: None,
                         cache_retention: mimir::selection::PromptCacheRetention::None,
                         retry_policy: selection.retry_policy,
+                        extra_headers: Vec::new(),
                     },
                 )?,
             )
