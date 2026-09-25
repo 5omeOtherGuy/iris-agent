@@ -1817,7 +1817,16 @@ mod tests {
     }
 
     fn session_file(root: &Path) -> PathBuf {
-        let slug_dir = fs::read_dir(root).unwrap().next().unwrap().unwrap().path();
+        // `root` may hold sibling files a test wrote directly (e.g. a
+        // `settings.json` fixture reusing the same tempdir as
+        // `IRIS_SESSION_DIR`); only the per-workspace slug directory the
+        // session store creates is a directory, so filter to that instead of
+        // assuming `read_dir` returns it first.
+        let slug_dir = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .expect("session store slug directory present under root");
         fs::read_dir(slug_dir)
             .unwrap()
             .next()
