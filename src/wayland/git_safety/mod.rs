@@ -664,12 +664,7 @@ impl GitSafety {
     /// the same hard barrier that final diff/rollback already depend on.
     pub(crate) fn drain_external_settlements(&self) -> Vec<Settlement> {
         self.sync_barrier();
-        self.state
-            .lock()
-            .unwrap()
-            .external_settlements
-            .drain(..)
-            .collect()
+        std::mem::take(&mut self.state.lock().unwrap().external_settlements)
     }
 
     /// The captured index (`git ls-files --stage`) of the current baseline
