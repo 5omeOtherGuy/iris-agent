@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Url;
 use reqwest::blocking::Client;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
+};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -42,6 +44,10 @@ pub(crate) struct OpenAiCompatibleChatConfig<'a> {
     pub(crate) prompt_cache_key: Option<&'a str>,
     pub(crate) cache_retention: PromptCacheRetention,
     pub(crate) retry_policy: RetryPolicy,
+    /// Extra request headers applied after the adapter defaults. Lets a
+    /// library consumer add headers such as `x-opencode-session` or override
+    /// the default `User-Agent` without a settings stack.
+    pub(crate) extra_headers: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for OpenAiCompatibleChatConfig<'_> {
@@ -58,6 +64,7 @@ impl std::fmt::Debug for OpenAiCompatibleChatConfig<'_> {
             .field("prompt_cache_key", &self.prompt_cache_key)
             .field("cache_retention", &self.cache_retention)
             .field("retry_policy", &self.retry_policy)
+            .field("extra_headers", &self.extra_headers.len())
             .finish()
     }
 }
@@ -76,6 +83,7 @@ pub(crate) struct OpenAiCompatibleChatProvider {
     cache_retention: PromptCacheRetention,
     cache_prefix: Arc<Mutex<super::PromptCachePrefix>>,
     retry_policy: RetryPolicy,
+    extra_headers: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for OpenAiCompatibleChatProvider {
@@ -91,6 +99,7 @@ impl std::fmt::Debug for OpenAiCompatibleChatProvider {
             .field("prompt_cache_key", &self.prompt_cache_key)
             .field("cache_retention", &self.cache_retention)
             .field("retry_policy", &self.retry_policy)
+            .field("extra_headers", &self.extra_headers.len())
             .finish()
     }
 }
@@ -127,6 +136,7 @@ impl OpenAiCompatibleChatProvider {
             cache_retention: config.cache_retention,
             cache_prefix: Arc::new(Mutex::new(super::PromptCachePrefix::default())),
             retry_policy: config.retry_policy,
+            extra_headers: config.extra_headers,
         })
     }
 }
@@ -199,7 +209,7 @@ impl OpenAiCompatibleChatProvider {
         if cancel.is_cancelled() {
             return Attempt::Fatal(anyhow!("OpenAI-compatible request cancelled"));
         }
-        let headers = match chat_headers(self.api_key.as_deref()) {
+        let headers = match chat_headers(self.api_key.as_deref(), &self.extra_headers) {
             Ok(headers) => headers,
             Err(error) => return Attempt::Fatal(error),
         };
@@ -513,7 +523,7 @@ fn finalize_stream_tool_call(call: StreamingToolCall) -> Result<ToolCall> {
     })
 }
 
-fn chat_headers(api_key: Option<&str>) -> Result<HeaderMap> {
+fn chat_headers(api_key: Option<&str>, extra_headers: &[(String, String)]) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -522,6 +532,14 @@ fn chat_headers(api_key: Option<&str>) -> Result<HeaderMap> {
         headers.insert(
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {key}"))?,
+        );
+    }
+    // Caller-supplied headers are applied last so they can override a default
+    // (e.g. `User-Agent`) and add adapter-specific headers.
+    for (name, value) in extra_headers {
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_str(value)?,
         );
     }
     Ok(headers)
