@@ -2,6 +2,12 @@
 
 A terminal coding agent with explicit context, tool-output, and change controls.
 
+> **Iris is no longer actively developed.** Its successor is
+> [phaseone](https://github.com/5omeOtherGuy/phaseone). `v0.3.7` (crates.io and
+> GitHub Releases) is the last release; the [install script](#install) and
+> `cargo install iris-agent --locked` still work. Issues and pull requests are
+> no longer triaged.
+
 This is the owner's manual for humans and AI agents evaluating, operating, or
 maintaining Iris. It describes shipped behavior first, names the safety
 boundaries, and separates planned work from working code.
@@ -17,21 +23,21 @@ boundaries, and separates planned work from working code.
 > Trust code over prose when they disagree. Use
 > [the codemap](docs/CODEMAPS/INDEX.md) for the implementation map,
 > [the feature inventory](docs/FEATURES.md) for breadth, and
-> [the roadmap](docs/ROADMAP.md) for sequencing. Do not infer that an accepted ADR
-> has shipped unless code or the current implementation snapshot says so.
+> [the historical roadmap](docs/ROADMAP.md) for past sequencing. Do not infer
+> that an accepted ADR has shipped unless code or the current implementation
+> snapshot says so.
 
 ## Status
 
-Pre-1.0. Documentation checked against main `b420985` on 2026-09-08;
-latest published release checked: `v0.3.7`. Main includes changes newer than that
-release. Linux and macOS are supported; Windows is not.
+Status: maintenance. No new features are planned; `v0.3.7` is the last release,
+and `main` receives only dependency and repository upkeep.
 
-The coding loop, sessions, compaction, and delegated workers are implemented.
-Current work is compaction lifecycle/configuration hardening, safety and recovery,
-release-level testing, and measured optimization. See the
-[v1.0 milestones](docs/ROADMAP.md) and
-[documentation audit](docs/DOCUMENTATION_AUDIT.md). Main-session confinement is
-opt-in; read [Confinement reality](#confinement-reality) before unattended use.
+Pre-1.0. Linux and macOS are supported; Windows is not. The coding loop,
+sessions, compaction, and delegated workers are implemented. The v1.0 work in
+[docs/ROADMAP.md](docs/ROADMAP.md) is historical and will not be completed; the
+[documentation audit](docs/DOCUMENTATION_AUDIT.md) records the last evidence
+check. Main-session confinement is opt-in; read
+[Confinement reality](#confinement-reality) before unattended use.
 
 ---
 

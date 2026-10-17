@@ -1,5 +1,8 @@
 # Iris — Roadmap to v1.0
 
+> Historical: Iris is no longer actively developed (successor:
+> [phaseone](https://github.com/5omeOtherGuy/phaseone)); this plan will not be completed.
+
 Status checked 2026-09-08 against `b420985` (main, 2026-08-03).
 Latest published release checked: `v0.3.7` (2026-07-14).
 
