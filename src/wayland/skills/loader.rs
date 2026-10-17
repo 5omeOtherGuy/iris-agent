@@ -394,11 +394,12 @@ fn parse_skill(path: &Path, scope: SkillScope) -> Result<SkillMetadata, String> 
         fs::read_to_string(path).map_err(|error| format!("failed to read file: {error}"))?;
     let frontmatter = extract_frontmatter(&contents)
         .ok_or_else(|| "missing YAML frontmatter delimited by ---".to_string())?;
-    let parsed: SkillFrontmatter = match serde_yaml_ng::from_str(frontmatter) {
+    let parsed: SkillFrontmatter = match parse_yaml(frontmatter) {
         Ok(parsed) => parsed,
         Err(original_error) => match repair_frontmatter_scalar_fields(frontmatter) {
-            Some(repaired) => serde_yaml_ng::from_str(&repaired)
-                .map_err(|_| format!("invalid YAML: {original_error}"))?,
+            Some(repaired) => {
+                parse_yaml(&repaired).map_err(|_| format!("invalid YAML: {original_error}"))?
+            }
             None => return Err(format!("invalid YAML: {original_error}")),
         },
     };
@@ -453,7 +454,7 @@ fn load_metadata(skill_path: &Path) -> LoadedMetadata {
     let Ok(contents) = fs::read_to_string(&path) else {
         return LoadedMetadata::default();
     };
-    match serde_yaml_ng::from_str::<OpenAiMetadataFile>(&contents) {
+    match parse_yaml::<OpenAiMetadataFile>(&contents) {
         Ok(metadata) => resolve_metadata(skill_dir, metadata),
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "ignoring invalid optional skill metadata");
@@ -533,6 +534,22 @@ fn resolve_asset_path(skill_dir: &Path, path: Option<PathBuf>) -> Option<PathBuf
         return None;
     }
     Some(skill_dir.join(normalized))
+}
+
+/// YAML parsing for skill files, matching the previous serde_yaml_ng behavior:
+/// `<<` is an ordinary key, only `true`/`false` are booleans, and non-finite
+/// floats in ignored fields do not invalidate the file. Errors stay one-line
+/// diagnostics instead of multi-line source snippets.
+fn parse_yaml<T: serde::de::DeserializeOwned>(input: &str) -> Result<T, serde_saphyr::Error> {
+    serde_saphyr::from_str_with_options(
+        input,
+        serde_saphyr::options! {
+            with_snippet: false,
+            merge_keys: serde_saphyr::MergeKeyPolicy::AsOrdinary,
+            strict_booleans: true,
+            non_finite_float_policy: serde_saphyr::NonFiniteFloatPolicy::PassThrough,
+        },
+    )
 }
 
 fn extract_frontmatter(contents: &str) -> Option<&str> {
@@ -624,7 +641,7 @@ fn repair_frontmatter_scalar_fields(frontmatter: &str) -> Option<String> {
             }
         }
         let invalid_flow_like_scalar = matches!(first_char, '[' | '{' | '@' | '`')
-            && serde_yaml_ng::from_str::<serde_yaml_ng::Value>(scalar).is_err();
+            && parse_yaml::<serde::de::IgnoredAny>(scalar).is_err();
         if !has_colon_separator && !invalid_flow_like_scalar {
             repaired_lines.push(line.to_string());
             continue;
@@ -749,7 +766,9 @@ mod tests {
         fs::create_dir_all(&metadata_dir).unwrap();
         fs::write(
             metadata_dir.join("openai.yaml"),
-            "policy:\n  allow_implicit_invocation: false\n",
+            // Unknown fields, even ones holding non-finite floats, must not
+            // discard the file and silently re-enable implicit invocation.
+            "policy:\n  allow_implicit_invocation: false\nextension:\n  upper_bound: .inf\n",
         )
         .unwrap();
 
@@ -832,6 +851,49 @@ mod tests {
         assert_eq!(skill.display_description(), "Deploy services");
         assert_eq!(skill.dependencies.as_ref().unwrap().tools[0].kind, "mcp");
         assert_eq!(skill.policy.products, ["codex"]);
+    }
+
+    #[test]
+    fn yaml_edge_cases_repair_flow_like_prose_and_reject_broken_frontmatter() {
+        let dir = temp_dir();
+        let path = write_skill(
+            &dir.path,
+            "flow",
+            "---\nname: flow\ndescription: [WIP] Build it\n---\nBody.\n",
+        );
+        let metadata_dir = path.parent().unwrap().join("agents");
+        fs::create_dir_all(&metadata_dir).unwrap();
+        fs::write(metadata_dir.join("openai.yaml"), "interface: [unclosed\n").unwrap();
+        write_skill(
+            &dir.path,
+            "folded",
+            "---\nname: folded\ndescription: >\n  Two\n  lines.\n---\nBody.\n",
+        );
+        write_skill(
+            &dir.path,
+            "unterminated",
+            "---\nname: unterminated\ndescription: \"never closed\n---\nBody.\n",
+        );
+
+        let outcome = load_from_roots(vec![SkillRoot {
+            path: dir.path.clone(),
+            scope: SkillScope::User,
+        }]);
+
+        let described = outcome
+            .skills
+            .iter()
+            .map(|skill| (skill.name.as_str(), skill.description.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            described,
+            vec![("flow", "[WIP] Build it"), ("folded", "Two lines.")]
+        );
+        assert_eq!(outcome.skills[0].display_name(), "flow");
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(outcome.errors[0].path.ends_with("unterminated/SKILL.md"));
+        assert!(outcome.errors[0].message.starts_with("invalid YAML: "));
+        assert!(!outcome.errors[0].message.contains('\n'));
     }
 
     #[cfg(unix)]
