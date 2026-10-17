@@ -27,3 +27,11 @@ git_release_enable = false
 # through the 0.x version space too fast for Iris's release cadence —
 # changed 2026-07-13 at Simon's direction.
 features_always_increment_minor = false
+# Skip cargo-semver-checks. It builds rustdoc for the published baseline
+# (crates.io 0.3.7) with freshly resolved dependencies, and that build breaks
+# in ruff_python_ast (E0277, `CompactString: GetSize`), failing every release
+# PR run since 2026-09-25. With the check off, breaking bumps rely on
+# conventional-commit markers (`feat!:`, `BREAKING CHANGE:`) and review; an
+# unmarked API break would get only a patch bump. Re-enable once the baseline
+# builds again.
+semver_check = false
