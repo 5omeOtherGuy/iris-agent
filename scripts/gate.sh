@@ -70,15 +70,20 @@ check_untracked_whitespace() {
 }
 
 # Scan tracked and untracked-but-not-ignored files as they are on disk, so
-# build output and ignored local files are not scanned.
+# build output and ignored local files are not scanned. A failed copy fails
+# the scan rather than scanning a partial tree.
 secret_scan() {
   local tmp path code
-  tmp=$(mktemp -d)
-  git ls-files -z --cached --others --exclude-standard \
+  tmp=$(mktemp -d) || return 1
+  if ! git ls-files -z --cached --others --exclude-standard \
     | while IFS= read -r -d '' path; do
         if [ -f "$path" ] || [ -L "$path" ]; then printf '%s\0' "$path"; fi
       done \
-    | tar --null -T - -cf - | tar -xf - -C "$tmp"
+    | tar --null -T - -cf - | tar -xf - -C "$tmp"; then
+    printf 'secret scan: could not copy the checkout for scanning\n'
+    rm -rf "$tmp"
+    return 1
+  fi
   gitleaks dir --no-banner --redact --verbose --exit-code 1 "$tmp"
   code=$?
   rm -rf "$tmp"
