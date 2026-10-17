@@ -1,45 +1,38 @@
 #!/usr/bin/env bash
-# Block pushing the primary checkout's `main` if it is behind
-# `origin/main` (which would mean the push is rejected anyway, or worse,
-# is force-pushing over work that already merged). Belt-and-suspenders
-# with pre-commit; catches the case where the dirty primary was
-# committed elsewhere and someone now tries to push.
+# Refuse every push to `main`: main changes only through a squash-merged PR.
+# Any other branch push runs the gate (`bash scripts/gate.sh`) first, so a
+# branch reaches CI only after the same checks pass locally. Tag pushes and
+# branch deletions skip the gate.
 #
-# Only fires when the local ref being pushed is `refs/heads/main`.
-# Bypassable via `git push --no-verify` for legitimate cases.
+# Only the owner may bypass this hook.
 
 set -eu
 
-REPO_TOP=$(git rev-parse --show-toplevel 2>/dev/null || true)
-[ -n "$REPO_TOP" ] || exit 0
-[ -d "$REPO_TOP/.git" ] || exit 0
+RUN_GATE=0
 
-# Read the push spec on stdin: `<local-ref> <local-sha> <remote-ref> <remote-sha>` per line.
-PUSHING_MAIN=0
-while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
-  if [ "$LOCAL_REF" = "refs/heads/main" ]; then
-    PUSHING_MAIN=1
-    break
+# Push spec on stdin: `<local-ref> <local-sha> <remote-ref> <remote-sha>` per line.
+while read -r LOCAL_REF LOCAL_SHA REMOTE_REF _REMOTE_SHA; do
+  if [ "$LOCAL_REF" = "refs/heads/main" ] || [ "$REMOTE_REF" = "refs/heads/main" ]; then
+    cat >&2 <<EOF
+pre-push: refusing to push 'main'; main changes only through a squash-merged PR.
+
+  Push a task branch instead and open a PR:
+      git push -u origin <type>/<slug>
+
+  Only the owner may bypass this hook.
+EOF
+    exit 1
   fi
+  # A deletion sends an all-zero local sha.
+  case "$REMOTE_REF:$LOCAL_SHA" in
+    refs/heads/*:*[!0]*) RUN_GATE=1 ;;
+  esac
 done
 
-[ "$PUSHING_MAIN" = "1" ] || exit 0
+[ "$RUN_GATE" = "1" ] || exit 0
 
-git show-ref --verify --quiet refs/remotes/origin/main || exit 0
-BEHIND=$(git rev-list --count refs/heads/main..refs/remotes/origin/main 2>/dev/null || echo 0)
-
-if [ "$BEHIND" -gt 0 ]; then
-  cat >&2 <<EOF
-pre-push: refusing to push 'main' (local is behind origin/main by $BEHIND).
-
-  Reconcile first:
-      git fetch origin --prune
-      bash scripts/sync-primary.sh
-
-  Then re-attempt the push, or open a PR through the worktree workflow.
-  Bypass (rare) with: git push --no-verify
-EOF
+REPO_TOP=$(git rev-parse --show-toplevel)
+if ! bash "$REPO_TOP/scripts/gate.sh"; then
+  echo "pre-push: gate failed; fix it before pushing. Only the owner may bypass this hook." >&2
   exit 1
 fi
-
-exit 0
