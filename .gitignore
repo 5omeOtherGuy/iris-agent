@@ -7,3 +7,13 @@
 /system-prompt.md
 /collected-system-prompts.md
 /collected-system-prompts-optimized.md
+
+# Environment files (keep the template), local agent scratch, editor files.
+.env*
+!.env.example
+/.amp/in/
+/.amp/portals/*
+.idea/
+.vscode/
+*.swp
+.DS_Store
