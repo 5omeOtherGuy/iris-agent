@@ -14,7 +14,19 @@ yanked = "deny"
 # loader; the sole input it deserializes is the syntax dump embedded in our
 # own binary at build time -- never attacker-controlled data. Remove the
 # ignore when syntect moves off bincode 1 upstream.
-ignore = ["RUSTSEC-2025-0141"]
+#
+# RUSTSEC-2026-0367, -0368, -0369: zip < 9 extraction (`ZipArchive::extract`,
+# `ZipStreamReader::extract`) keeps SUID bits and follows symlinks. zip 8 is
+# pulled in only by ruff_db (via ruff_python_formatter), which requires
+# `zip ^8` up to ruff_db 0.0.18 and only reads its own vendored archive; it
+# never calls the extract APIs, and Iris uses ruff only for
+# `format_module_source`. Remove the ignores when ruff_db moves to zip 9.
+ignore = [
+  "RUSTSEC-2025-0141",
+  "RUSTSEC-2026-0367",
+  "RUSTSEC-2026-0368",
+  "RUSTSEC-2026-0369",
+]
 
 [bans]
 # Warn (do not fail) on duplicate versions of the same crate; tighten to "deny"
