@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Single pre-PR gate. Documentation-only changes run whitespace validation;
-# all other changes run the required Rust and maintenance-script checks. This
-# mirrors .github/workflows/ci.yml so you validate before pushing and rarely
-# need to read CI logs.
+# Single pre-PR gate; CI runs exactly this in the `gate` job
+# (.github/workflows/ci.yml). Every change gets a secret scan of the files in
+# the checkout. Documentation-only changes then run whitespace validation; all
+# other changes run format, Clippy, tests, build, the package file list, and
+# the maintenance-script checks.
+#
+# The secret scan needs gitleaks on PATH. Without it the scan is reported as
+# NOT RUN locally and fails under CI.
 #
 # On success: one summary line. On the first failure: that step's captured
 # output is printed and the gate stops with the step's exit code.
@@ -16,7 +20,7 @@ VERBOSE=0
 for arg in "$@"; do
   case "$arg" in
     -v|--verbose) VERBOSE=1 ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "gate: unknown argument: $arg" >&2; exit 64 ;;
   esac
 done
@@ -65,24 +69,52 @@ check_untracked_whitespace() {
   return "$failed"
 }
 
+# Scan tracked and untracked-but-not-ignored files as they are on disk, so
+# build output and ignored local files are not scanned.
+secret_scan() {
+  local tmp path code
+  tmp=$(mktemp -d)
+  git ls-files -z --cached --others --exclude-standard \
+    | while IFS= read -r -d '' path; do
+        if [ -f "$path" ] || [ -L "$path" ]; then printf '%s\0' "$path"; fi
+      done \
+    | tar --null -T - -cf - | tar -xf - -C "$tmp"
+  gitleaks dir --no-banner --redact --verbose --exit-code 1 "$tmp"
+  code=$?
+  rm -rf "$tmp"
+  return "$code"
+}
+
+SECRET_SCAN="secret scan OK"
+if command -v gitleaks >/dev/null 2>&1; then
+  run_step "secret scan (gitleaks)" secret_scan || exit $?
+elif [ -n "${CI:-}" ]; then
+  printf 'gate: secret scan FAILED: gitleaks is not installed\n' >&2
+  exit 1
+else
+  SECRET_SCAN="secret scan NOT RUN (gitleaks not installed)"
+fi
+
 # Fast docs-only path; an empty or mixed change set stays on the full gate.
 if [ "$(bash scripts/change-scope.sh "${IRIS_GATE_BASE:-origin/main}" HEAD)" = true ]; then
   run_step "docs whitespace (branch)" git diff --check "${IRIS_GATE_BASE:-origin/main}...HEAD" || exit $?
   run_step "docs whitespace (staged)" git diff --cached --check                           || exit $?
   run_step "docs whitespace (working tree)" git diff --check                             || exit $?
   run_step "docs whitespace (untracked)" check_untracked_whitespace                      || exit $?
-  printf 'gate: PASS — documentation-only; whitespace OK (Rust checks skipped)\n'
+  printf 'gate: PASS — documentation-only; %s, whitespace OK (Rust checks skipped)\n' "$SECRET_SCAN"
   exit 0
 fi
 
 run_step "fmt (cargo fmt --all --check)"           cargo fmt --all --check                  || exit $?
 run_step "clippy (cargo clippy -D warnings)"       cargo clippy --all-targets -- -D warnings || exit $?
 run_step "test (cargo test --locked)"              cargo test --locked                      || exit $?
+run_step "build (cargo build --locked)"            cargo build --locked                     || exit $?
+run_step "package list (cargo package --list)"     cargo package --list --locked            || exit $?
 run_step "script tests (change scope)"             bash scripts/change-scope-tests.sh       || exit $?
 run_step "script tests (sync primary)"             bash scripts/sync-primary-tests.sh        || exit $?
 run_step "repository guidance integrity"           bash scripts/check-repo-guidance.sh       || exit $?
 run_step "script tests (repository guidance)"      bash scripts/repo-guidance-tests.sh       || exit $?
 run_step "script tests (worktree create)"          bash scripts/worktree-create-tests.sh     || exit $?
 
-printf 'gate: PASS — fmt OK, clippy OK, test OK, scripts OK\n'
+printf 'gate: PASS — %s, fmt OK, clippy OK, test OK, build OK, package OK, scripts OK\n' "$SECRET_SCAN"
 exit 0
