@@ -42,11 +42,15 @@ body:
     attributes:
       label: Iris version or commit
       placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
   - type: textarea
     id: environment
     attributes:
       label: Environment
       description: rustc version, OS, provider/model in use.
+    validations:
+      required: true
   - type: textarea
     id: notes
     attributes:

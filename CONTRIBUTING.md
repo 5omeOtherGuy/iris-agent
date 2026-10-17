@@ -2,6 +2,16 @@
 
 Thanks for improving Iris.
 
+Iris is in maintenance and no longer actively developed; its successor is
+[phaseone](https://github.com/5omeOtherGuy/phaseone). Issues and pull requests
+are not triaged on a schedule. Security reports follow [SECURITY.md](SECURITY.md).
+
+- Small fixes are welcome directly as a pull request; larger changes start with
+  an issue.
+- `bash scripts/gate.sh` must pass.
+- Contributions are licensed under the repository's MIT license (see
+  [LICENSE](LICENSE)); there is no CLA.
+
 ## Quick start
 
 1. Create a task worktree using the workflow below; primary `main` is control-only.
