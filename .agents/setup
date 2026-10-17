@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Orb setup: Rust toolchain, locked dependencies, gitleaks for the gate's
+# secret scan, and the repository hooks. Idempotent; never authenticates and
+# never prints credential values.
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$repo_root"
+
+step() { printf 'setup: %s\n' "$*"; }
+
+GITLEAKS_VERSION=8.30.1
+GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+
+if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+  step "installing rustup (stable, minimal profile)"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable -c rustfmt,clippy
+fi
+# The installer cannot update this running script's environment.
+# shellcheck disable=SC1091
+source "$HOME/.cargo/env"
+step "rust toolchain: $(rustc --version)"
+rustup component add rustfmt clippy >/dev/null
+
+step "fetching locked dependencies"
+time cargo fetch --locked
+
+mkdir -p "$HOME/.local/bin"
+if ! "$HOME/.local/bin/gitleaks" version 2>/dev/null | grep -qx "$GITLEAKS_VERSION"; then
+  step "installing gitleaks $GITLEAKS_VERSION"
+  tmp=$(mktemp -d)
+  archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+  curl -fsSL -o "$tmp/$archive" \
+    "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$archive"
+  echo "$GITLEAKS_SHA256  $tmp/$archive" | sha256sum -c - >/dev/null
+  tar -xzf "$tmp/$archive" -C "$HOME/.local/bin" gitleaks
+  rm -rf "$tmp"
+fi
+
+step "enabling repository hooks (.githooks)"
+git config core.hooksPath .githooks
+
+for name in GH_TOKEN GITHUB_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY CARGO_REGISTRY_TOKEN; do
+  if [ -n "${!name:-}" ]; then state=present; else state=absent; fi
+  step "credential $name: $state"
+done
+step "done"
