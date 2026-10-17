@@ -12,9 +12,10 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: lint-${{ github.ref }}
-  # Cancel superseded PR runs; every push to main runs to completion.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # A new push to a PR cancels its superseded run; other runs get their own
+  # group, so pushes to main are never cancelled or dropped from the queue.
+  group: lint-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
