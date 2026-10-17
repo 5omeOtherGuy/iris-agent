@@ -2,11 +2,15 @@
 
 ## Supported versions
 
-Iris is currently pre-1.0. Security fixes target the default branch and the next published version.
+Security fixes target the latest minor release line (currently `0.3.x`) and
+the default branch. Older lines receive no fixes.
 
 ## Reporting a vulnerability
 
-Please report suspected vulnerabilities privately through GitHub Security Advisories for this repository. If that is not available, open a minimal issue that says a private security report is needed and do not include exploit details, credentials, tokens, logs, or private session data.
+Report suspected vulnerabilities privately through
+[GitHub private vulnerability reporting](https://github.com/5omeOtherGuy/iris-agent/security/advisories/new).
+Do not open a public issue with exploit details, credentials, tokens, logs, or
+private session data.
 
 Helpful report details:
 
@@ -15,6 +19,12 @@ Helpful report details:
 - reproduction steps using non-secret sample data
 - affected version, commit, or installation source
 
-## Handling expectations
+## What happens next
 
-Security reports are prioritized over routine feature work. Iris enforces workspace path safety and shell-command policy in Nexus; reports about sandbox escape, path traversal, or approval bypass are especially welcome. Fixes should include deterministic tests when practical and should avoid publishing sensitive reproduction data.
+- Reports are acknowledged within 7 days.
+- Fixes go through a private security advisory: fix, release, publish the
+  advisory, and credit the reporter.
+- Iris enforces workspace path safety and shell-command policy in Nexus;
+  reports about sandbox escape, path traversal, or approval bypass are
+  especially welcome. Fixes include deterministic tests when practical and
+  avoid publishing sensitive reproduction data.
