@@ -14,7 +14,9 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - dependencies
-      - cargo
+    # Wait a few days before adopting a new release.
+    cooldown:
+      default-days: 4
     commit-message:
       prefix: deps
       include: scope
@@ -36,7 +38,14 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - dependencies
-      - github-actions
+    cooldown:
+      default-days: 4
     commit-message:
       prefix: ci
       include: scope
+    # One PR per week for minor and patch action updates; majors stay separate.
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch
