@@ -25,30 +25,35 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   DIST_VERSION: "0.28.0"
 
 jobs:
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       manifest: ${{ steps.plan.outputs.manifest }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Install dist
         run: cargo install cargo-dist --locked --version "${DIST_VERSION}"
       - name: Plan
         id: plan
         run: dist plan --output-format=json > dist-manifest.json
       - name: Upload plan
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifacts-plan-dist-manifest
           path: dist-manifest.json
@@ -60,13 +65,13 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - target: x86_64-apple-darwin
-            runner: macos-latest
+            runner: macos-26
           - target: aarch64-apple-darwin
-            runner: macos-latest
+            runner: macos-26
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     # Build prebuilt release binaries with the dist marker so `iris update`
@@ -74,11 +79,12 @@ jobs:
     env:
       IRIS_DIST: "1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
       - name: Install dist
@@ -93,7 +99,7 @@ jobs:
       - name: Build artifacts
         run: dist build --artifacts=local --target=${{ matrix.target }} --output-format=json > dist-manifest.json
       - name: Upload artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifacts-build-${{ matrix.target }}
           # The shell installer is a cargo-dist "global" artifact; it is built in
@@ -110,18 +116,21 @@ jobs:
   # release (git_release_enable = false) and no crates.io token is required.
   host:
     needs: [plan, build-local-artifacts]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Install dist
         run: cargo install cargo-dist --locked --version "${DIST_VERSION}"
       - name: Download per-target artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: artifacts-build-*
           path: target/distrib
