@@ -7,8 +7,9 @@ Iris is in maintenance and no longer actively developed; its successor is
 accepted; issues and pull requests are triaged within 7 days, and anything else
 is closed as out of scope. Security reports follow [SECURITY.md](SECURITY.md).
 
-- Small fixes are welcome directly as a pull request; larger changes start with
-  an issue.
+- Small security fixes that disclose nothing new, such as a dependency update
+  for a published advisory, are welcome directly as a pull request. Report any
+  undisclosed vulnerability privately through [SECURITY.md](SECURITY.md) first.
 - `bash scripts/gate.sh` must pass.
 - Contributions are licensed under the repository's MIT license (see
   [LICENSE](LICENSE)); there is no CLA.
@@ -26,7 +27,8 @@ is closed as out of scope. Security reports follow [SECURITY.md](SECURITY.md).
 
 ## Pull request workflow
 
-- Use GitHub issues for planned work when the scope is more than a small fix.
+- Use GitHub issues for planned work when the scope is more than a small fix;
+  never file an undisclosed vulnerability as an issue.
 - Name branches after the work, for example `fix/cancel-race` or `docs/update-readme`.
 - Keep the PR focused on one behavior or documentation change.
 - Fill in the PR template: intent, changed behavior, constraints touched,

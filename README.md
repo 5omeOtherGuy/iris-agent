@@ -31,7 +31,8 @@ boundaries, and separates planned work from working code.
 ## Status
 
 Status: maintenance. No new features are planned; `v0.3.7` is the last release,
-and `main` receives only dependency and repository upkeep.
+and `main` receives only security fixes, dependency updates and repository
+upkeep.
 
 Pre-1.0. Linux and macOS are supported; Windows is not. The coding loop,
 sessions, compaction, and delegated workers are implemented. The v1.0 work in
