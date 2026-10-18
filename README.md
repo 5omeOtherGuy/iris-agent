@@ -5,8 +5,9 @@ A terminal coding agent with explicit context, tool-output, and change controls.
 > **Iris is no longer actively developed.** Its successor is
 > [phaseone](https://github.com/5omeOtherGuy/phaseone). `v0.3.7` (crates.io and
 > GitHub Releases) is the last release; the [install script](#install) and
-> `cargo install iris-agent --locked` still work. Issues and pull requests are
-> no longer triaged.
+> `cargo install iris-agent --locked` still work. Only security fixes are
+> accepted; issues and pull requests are triaged within 7 days, and anything
+> else is closed as out of scope.
 
 This is the owner's manual for humans and AI agents evaluating, operating, or
 maintaining Iris. It describes shipped behavior first, names the safety
@@ -30,7 +31,8 @@ boundaries, and separates planned work from working code.
 ## Status
 
 Status: maintenance. No new features are planned; `v0.3.7` is the last release,
-and `main` receives only dependency and repository upkeep.
+and `main` receives only security fixes, dependency updates and repository
+upkeep.
 
 Pre-1.0. Linux and macOS are supported; Windows is not. The coding loop,
 sessions, compaction, and delegated workers are implemented. The v1.0 work in
