@@ -497,6 +497,14 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let ws = workspace();
         let policy = SandboxPolicy::for_workspace(&ws);
+        // TCP restriction needs Landlock ABI 4. Older kernels confine only the
+        // filesystem and must report that instead of claiming network enforcement.
+        if abi < Some(NET_ABI) {
+            let mut cmd = Command::new("/bin/true");
+            assert_eq!(apply(&mut cmd, &policy, abi), SandboxStatus::FilesystemOnly);
+            std::fs::remove_dir_all(&ws).ok();
+            return;
+        }
         let script = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo connected || echo refused");
 
         // Unconfined first: proves /dev/tcp + listener actually work here.
