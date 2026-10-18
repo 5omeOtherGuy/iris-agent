@@ -42,9 +42,8 @@ bash "$CHECK" "$ROOT" >/dev/null
 grep -q 'check-repo-guidance.sh' "$ROOT/scripts/gate.sh"
 grep -q 'repo-guidance-tests.sh' "$ROOT/scripts/gate.sh"
 grep -q 'worktree-create-tests.sh' "$ROOT/scripts/gate.sh"
-grep -q 'check-repo-guidance.sh' "$ROOT/.github/workflows/ci.yml"
-grep -q 'repo-guidance-tests.sh' "$ROOT/.github/workflows/ci.yml"
-grep -q 'worktree-create-tests.sh' "$ROOT/.github/workflows/ci.yml"
+# CI runs these checks through the gate job.
+grep -q 'run: bash scripts/gate.sh' "$ROOT/.github/workflows/ci.yml"
 
 valid="$TMP/valid"
 make_valid "$valid"
