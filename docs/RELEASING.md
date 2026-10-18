@@ -111,7 +111,7 @@ never becomes `releases/latest` — `install.sh` and `iris update` both resolve 
 cannot see it. `iris update` additionally refuses any tag with a semver prerelease
 component (`decide_update`), a second, client-side gate. Acceptance-test an rc explicitly
 with `IRIS_VERSION=v0.3.0-rc.1 ... install.sh` or by downloading its assets directly.
-Delete rc releases/tags after the stable tag ships to keep the release page clean. Note
+Keep rc tags and their prerelease GitHub releases; they never become `releases/latest`. Note
 release-plz plays no role here: rc tags are cut from `main` directly, before the release
 PR merges.
 

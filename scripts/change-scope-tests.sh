@@ -67,12 +67,44 @@ printf '\nMore docs.\n' >>"$GATE_REPO/README.md"
 git -C "$GATE_REPO" add README.md
 git -C "$GATE_REPO" commit --quiet -m docs
 (cd "$GATE_REPO" && IRIS_GATE_BASE=base bash scripts/gate.sh) \
-  | grep -q 'documentation-only; whitespace OK (Rust checks skipped)'
+  | grep -Eq 'documentation-only; secret scan (OK|NOT RUN \(gitleaks not installed\)), whitespace OK \(Rust checks skipped\)'
 git -C "$GATE_REPO" reset --hard --quiet base
 printf '# trailing whitespace \n' >"$GATE_REPO/untracked.md"
 if (cd "$GATE_REPO" && IRIS_GATE_BASE=base bash scripts/gate.sh >/dev/null 2>&1); then
   printf 'change-scope-tests: untracked Markdown whitespace was not rejected\n' >&2
   exit 1
+fi
+
+# Secret scan, on a docs-only change: a credential-shaped string fails the
+# gate, and a failed copy of the checkout fails it instead of scanning a
+# partial tree.
+if command -v gitleaks >/dev/null 2>&1; then
+  git -C "$GATE_REPO" clean -fdq
+  printf '\nMore docs.\n' >>"$GATE_REPO/README.md"
+  git -C "$GATE_REPO" commit --quiet -am docs
+  (cd "$GATE_REPO" && IRIS_GATE_BASE=base bash scripts/gate.sh >/dev/null 2>&1) || {
+    printf 'change-scope-tests: clean docs-only change failed the gate\n' >&2
+    exit 1
+  }
+  printf 'aws_access_key_id = "%s%s"\n' AKIA QYLPMN5HHHFPZAM2 >"$GATE_REPO/leak.md"
+  if (cd "$GATE_REPO" && IRIS_GATE_BASE=base bash scripts/gate.sh >/dev/null 2>&1); then
+    printf 'change-scope-tests: secret in a docs-only change was not rejected\n' >&2
+    exit 1
+  fi
+  rm "$GATE_REPO/leak.md"
+  SHIM=$(mktemp -d)
+  printf '#!/bin/sh\nexit 1\n' >"$SHIM/tar"
+  chmod +x "$SHIM/tar"
+  if (cd "$GATE_REPO" && PATH="$SHIM:$PATH" IRIS_GATE_BASE=base bash scripts/gate.sh >/dev/null 2>&1); then
+    printf 'change-scope-tests: a failed checkout copy did not fail the secret scan\n' >&2
+    exit 1
+  fi
+  rm -rf "$SHIM"
+elif [ -n "${CI:-}" ]; then
+  printf 'change-scope-tests: gitleaks is required under CI\n' >&2
+  exit 1
+else
+  printf 'change-scope-tests: secret scan cases NOT RUN (gitleaks not installed)\n' >&2
 fi
 
 WORKFLOW="$ROOT/.github/workflows/ci.yml"

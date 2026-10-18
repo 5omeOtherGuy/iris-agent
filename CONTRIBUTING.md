@@ -21,7 +21,7 @@ are not triaged on a schedule. Security reports follow [SECURITY.md](SECURITY.md
    maintenance checks; changes classified docs-only run whitespace checks. Root
    agent guidance and nested crate READMEs still trigger the full gate. Validate
    docs links/source references separately. Focus a test with `cargo test --locked <name>`.
-5. Open a pull request into `main` when authorized by the operator.
+5. Open a pull request into `main`.
 
 ## Pull request workflow
 
@@ -30,7 +30,7 @@ are not triaged on a schedule. Security reports follow [SECURITY.md](SECURITY.md
 - Keep the PR focused on one behavior or documentation change.
 - Use the PR body to list summary bullets, verification commands, and follow-up work.
 - Link related issues with `Closes #123` when the PR should close an issue on merge.
-- Use labels to make release notes and triage easier: `bug`, `enhancement`, `documentation`, `security`, `dependencies`, `chore`, `tooling`, or `good first issue`.
+- Use labels to make release notes and triage easier: `bug`, `enhancement`, `docs`, `question`, `needs-info`, `needs-owner`, `accepted`, `P0`, `P1`, `P2`, `good first issue`, `duplicate`, `wontfix`, `dependencies`, `security`.
 - After checks finish, review failures with `gh pr checks` or `gh run view --log-failed`.
 
 ## Worktree workflow
@@ -38,10 +38,10 @@ are not triaged on a schedule. Security reports follow [SECURITY.md](SECURITY.md
 Use a task-specific worktree for every repository change, including documentation.
 Keep concurrent tasks out of one another's checkouts.
 
-1. Install the repo hooks once per clone: `bash scripts/install-hooks.sh`. They block commits/pushes on a stale primary `main`. Reconcile drift with operator approval; do not bypass the hooks.
+1. Install the repo hooks once per clone: `bash scripts/install-hooks.sh`. They block commits/pushes on a stale primary `main`. Reconcile drift; do not bypass the hooks.
 2. Create a worktree from the control-only primary checkout: `bash scripts/worktree-create.sh ../iris-<slug> <branch>`. The wrapper fetches and checks primary freshness, creates from `origin/main`, and copies only the supported ignored regular instruction files.
 3. Optionally `export CARGO_TARGET_DIR=~/.cache/iris-target` so worktrees share build artifacts instead of each rebuilding `target/`.
-4. Only after explicit operator approval, merge with `gh pr merge <N> --squash`, then clean up from outside the worktree: `bash scripts/worktree-cleanup.sh ../iris-<slug>` (removes the worktree, deletes the merged branch, and fast-forwards primary `main`).
+4. Merge with `gh pr merge <N> --squash --match-head-commit <sha>` once `gate` is green, then clean up from outside the worktree: `bash scripts/worktree-cleanup.sh ../iris-<slug>` (removes the worktree, deletes the merged branch, and fast-forwards primary `main`).
 5. Leave worktrees and branches you do not own untouched.
 
 ## Commit messages

@@ -3,6 +3,31 @@
 This file is the public repository instruction source for coding agents. It is
 project guidance, not a security boundary.
 
+## Profile
+
+- Purpose: terminal coding agent in Rust; superseded by phaseone and kept for
+  upkeep only.
+- Stage: maintenance (repository standard 2026-10-17)
+- Gate: `bash scripts/gate.sh` (CI job `gate`)
+- Landing: PR, squash-merged on a green gate; agents land: yes
+- Release: release-plz; agents release: no
+- Outside issues and PRs: agents triage; outside PRs merge: owner approves
+- Deliberate deviations from the standard:
+  - `CLAUDE.md` is a regular one-line import, not a symlink, because Iris's
+    project discovery refuses symlinks.
+  - Runtime changes start with a failing test; security changes need explicit
+    negative tests (Testing and completion).
+  - No emoji anywhere (Code standards).
+  - Canonical skills live under `.agents/skills` with `.claude/skills`
+    symlinks, checked by `scripts/check-repo-guidance.sh`.
+  - Task worktrees only; the primary `main` checkout is control-only.
+  - Ignored local instruction layers (Git and worktrees).
+  - Release PR merges and version tags need the owner's approval, because
+    merging publishes to crates.io (Release policy).
+  - release-plz opens the release PR and the owner pushes the version tag by
+    hand: a `GITHUB_TOKEN` tag would not trigger `release.yml`. Build and
+    publish still run in CI.
+
 ## Commands
 
 - Create an isolated task worktree: `bash scripts/worktree-create.sh ../iris-<slug> <branch>`
@@ -10,7 +35,7 @@ project guidance, not a security boundary.
 - Run a focused test: `cargo test --locked <test-name>`
 - Run the CI-equivalent gate: `bash scripts/gate.sh`
 - Validate distribution artifacts: `bash scripts/validate-dist.sh`
-- Clean up after an operator-approved merge, from outside the task worktree:
+- Clean up after the merge, from outside the task worktree:
   `bash scripts/worktree-cleanup.sh ../iris-<slug>`
 - Reconcile a drifted primary checkout: `bash scripts/sync-primary.sh`
 - Install repository hooks once per clone: `bash scripts/install-hooks.sh`
@@ -117,8 +142,9 @@ project guidance, not a security boundary.
   first non-empty regular base from `AGENTS.override.md`, `AGENTS.md`, then
   `CLAUDE.md`, followed by the first non-empty local file from
   `AGENTS.local.md`, then `CLAUDE.local.md`.
-- Pushes, pull requests, reviews, merges, issue updates, and other shared remote
-  changes require explicit operator direction.
+- Push your task branch and open a PR. Land it per the Profile
+  (`agents land: yes`): squash-merge once `gate` is green on the head commit
+  with `--match-head-commit`. Release PRs and tags follow Release policy below.
 
 ## Release policy
 

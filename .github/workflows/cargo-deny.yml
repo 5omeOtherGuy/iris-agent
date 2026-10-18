@@ -16,7 +16,9 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: cargo-deny-${{ github.ref }}
+  # A new push to a PR cancels its superseded run; other runs get their own
+  # group, so pushes to main are never cancelled or dropped from the queue.
+  group: cargo-deny-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -25,13 +27,15 @@ permissions:
 jobs:
   cargo-deny:
     name: Audit dependencies
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Run cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories bans sources

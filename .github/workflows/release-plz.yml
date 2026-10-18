@@ -15,9 +15,11 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
+# Serialized so two runs never edit the release PR at once. A running job is
+# never cancelled; a queued run may be replaced by a newer push, which is safe
+# because each run works from the latest main.
 concurrency:
   group: release-plz-${{ github.ref }}
   cancel-in-progress: false
@@ -25,19 +27,23 @@ concurrency:
 jobs:
   release-plz-pr:
     name: Release PR
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
     timeout-minutes: 15
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Run release-plz
-        uses: release-plz/action@v0.5
+        uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.5.142
         with:
           command: release-pr
         env:
@@ -45,7 +51,10 @@ jobs:
 
   release-plz-release:
     name: Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
     timeout-minutes: 15
     # Skip entirely until an operator configures the crates.io token, so no
     # publish is attempted before the registry credential exists.
@@ -54,17 +63,18 @@ jobs:
     steps:
       - name: Checkout repository
         if: env.HAS_REGISTRY_TOKEN == 'true'
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Install Rust toolchain
         if: env.HAS_REGISTRY_TOKEN == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Run release-plz release
         if: env.HAS_REGISTRY_TOKEN == 'true'
-        uses: release-plz/action@v0.5
+        uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.5.142
         with:
           command: release
         env:
