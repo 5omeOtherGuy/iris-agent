@@ -7,11 +7,21 @@ project guidance, not a security boundary.
 
 - Purpose: terminal coding agent in Rust; superseded by phaseone and kept for
   upkeep only.
-- Stage: maintenance (repository standard 2026-10-17)
+- Stage: maintenance (repository standard 2026-10-18)
 - Gate: `bash scripts/gate.sh` (CI job `gate`)
 - Landing: PR, squash-merged on a green gate; agents land: yes
 - Release: release-plz; agents release: no
 - Outside issues and PRs: agents triage; outside PRs merge: owner approves
+- Sensitive paths: `src/mimir/auth/`, `src/config.rs`, `src/nexus.rs`,
+  `src/approval.rs`, `src/lib.rs`, `src/cli.rs`, `src/wayland/trust.rs`,
+  `src/wayland/git_safety/`, `src/wayland/subagents.rs`, `src/tools/path.rs`,
+  `src/tools/bash/`, `src/tools/web/`, `src/selfupdate.rs`,
+  `crates/iris-subagent-runtime/`, `install.sh`, `.agents/`, `.claude/`,
+  `.githooks/`, `.github/`, `scripts/gate.sh`, `scripts/change-scope.sh`,
+  `scripts/check-repo-guidance.sh`, `scripts/install-hooks.sh`,
+  `scripts/worktree-create.sh`, `scripts/validate-dist.sh`, `.worktreeinclude`,
+  `Cargo.toml`, `deny.toml`, `release-plz.toml`, `SECURITY.md`, `AGENTS.md`,
+  `CLAUDE.md`
 - Deliberate deviations from the standard:
   - `CLAUDE.md` is a regular one-line import, not a symlink, because Iris's
     project discovery refuses symlinks.
@@ -145,6 +155,10 @@ project guidance, not a security boundary.
 - Push your task branch and open a PR. Land it per the Profile
   (`agents land: yes`): squash-merge once `gate` is green on the head commit
   with `--match-head-commit`. Release PRs and tags follow Release policy below.
+- A change to a sensitive path (Profile), or to security-sensitive code
+  elsewhere, needs an independent review (another agent or the owner) recorded
+  on the PR against the reviewed head before merge; a later push needs a new
+  one.
 
 ## Release policy
 
