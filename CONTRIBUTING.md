@@ -28,7 +28,10 @@ are not triaged on a schedule. Security reports follow [SECURITY.md](SECURITY.md
 - Use GitHub issues for planned work when the scope is more than a small fix.
 - Name branches after the work, for example `fix/cancel-race` or `docs/update-readme`.
 - Keep the PR focused on one behavior or documentation change.
-- Use the PR body to list summary bullets, verification commands, and follow-up work.
+- Fill in the PR template: intent, changed behavior, constraints touched,
+  evidence, and whether a sensitive path or security-sensitive code changed.
+  If either changed, record an independent review on the PR against the
+  reviewed head before merge.
 - Link related issues with `Closes #123` when the PR should close an issue on merge.
 - Use labels to make release notes and triage easier: `bug`, `enhancement`, `docs`, `question`, `needs-info`, `needs-owner`, `accepted`, `P0`, `P1`, `P2`, `good first issue`, `duplicate`, `wontfix`, `dependencies`, `security`.
 - After checks finish, review failures with `gh pr checks` or `gh run view --log-failed`.
