@@ -1013,7 +1013,11 @@ Run the full CI-equivalent gate in the task worktree:
 bash scripts/gate.sh
 ```
 
-The gate runs formatting, Clippy, tests, and maintenance checks for code changes.
+CI runs the same command in the `gate` job. The gate first scans the checkout
+for secrets with [gitleaks](https://github.com/gitleaks/gitleaks) (reported as
+NOT RUN when gitleaks is not installed locally; required in CI), then runs
+formatting, Clippy, tests, build, the `cargo package` file list, and
+maintenance checks for code changes.
 Changes [classified docs-only](scripts/change-scope.sh) take a whitespace-only
 fast path; that is not a runtime test result. Root agent guidance and nested
 crate READMEs still trigger the full gate. Focused development can use:
