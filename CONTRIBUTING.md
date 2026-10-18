@@ -3,8 +3,9 @@
 Thanks for improving Iris.
 
 Iris is in maintenance and no longer actively developed; its successor is
-[phaseone](https://github.com/5omeOtherGuy/phaseone). Issues and pull requests
-are not triaged on a schedule. Security reports follow [SECURITY.md](SECURITY.md).
+[phaseone](https://github.com/5omeOtherGuy/phaseone). Only security fixes are
+accepted; issues and pull requests are triaged within 7 days, and anything else
+is closed as out of scope. Security reports follow [SECURITY.md](SECURITY.md).
 
 - Small fixes are welcome directly as a pull request; larger changes start with
   an issue.
