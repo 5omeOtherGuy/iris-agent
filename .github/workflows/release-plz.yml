@@ -17,6 +17,9 @@ on:
 permissions:
   contents: read
 
+# Serialized so two runs never edit the release PR at once. A running job is
+# never cancelled; a queued run may be replaced by a newer push, which is safe
+# because each run works from the latest main.
 concurrency:
   group: release-plz-${{ github.ref }}
   cancel-in-progress: false

@@ -16,10 +16,10 @@ on:
     - cron: "24 5 * * 1"
   workflow_dispatch:
 
-# Cancel previous CodeQL runs on the same ref when a new commit arrives.
+# One group per run: every landed commit on main is scanned, never cancelled.
 concurrency:
-  group: codeql-${{ github.ref }}
-  cancel-in-progress: true
+  group: codeql-${{ github.run_id }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
