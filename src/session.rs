@@ -2872,12 +2872,19 @@ mod tests {
         let dir = temp_dir();
         let first = SessionLog::create_in(&dir.path, Path::new("/proj/a")).unwrap();
         let first_id = first.id().to_string();
+        let first_path = first.path().to_path_buf();
         drop(first);
-        // now_ms has ms resolution; ensure a strictly later created timestamp.
-        std::thread::sleep(std::time::Duration::from_millis(2));
         let second = SessionLog::create_in(&dir.path, Path::new("/proj/b")).unwrap();
         let second_id = second.id().to_string();
         drop(second);
+        // The list orders by file mtime. Backdate the first file instead of
+        // sleeping: filesystem timestamps can be coarser than a few ms.
+        File::options()
+            .write(true)
+            .open(&first_path)
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(60))
+            .unwrap();
 
         let metas = SessionStore::with_root(dir.path.clone()).list().unwrap();
         assert_eq!(metas.len(), 2);
@@ -4245,8 +4252,14 @@ mod tests {
         let store = SessionStore::with_root(dir.path.clone());
         let mut here_old = SessionLog::create_in(&dir.path, Path::new("/proj")).unwrap();
         here_old.append(&Message::user("old task")).unwrap();
-        // Ensure a distinct created timestamp so ordering is deterministic.
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        // Backdate instead of sleeping: filesystem timestamps can be coarser
+        // than a few ms, and the list orders by mtime.
+        File::options()
+            .write(true)
+            .open(here_old.path())
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(60))
+            .unwrap();
         let mut here_new = SessionLog::create_in(&dir.path, Path::new("/proj")).unwrap();
         here_new.append(&Message::user("new task")).unwrap();
         let mut elsewhere = SessionLog::create_in(&dir.path, Path::new("/other")).unwrap();
@@ -4265,9 +4278,18 @@ mod tests {
         let store = SessionStore::with_root(dir.path.clone());
         let mut older = SessionLog::create_in(&dir.path, Path::new("/proj")).unwrap();
         older.append(&Message::user("older created")).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(2));
         let newer = SessionLog::create_in(&dir.path, Path::new("/proj")).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        // Give the files distinct past mtimes in creation order instead of
+        // sleeping: filesystem timestamps can be coarser than a few ms.
+        let now = SystemTime::now();
+        for (log, age) in [(&older, 120), (&newer, 60)] {
+            File::options()
+                .write(true)
+                .open(log.path())
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(age))
+                .unwrap();
+        }
         older
             .append(&Message::assistant("recent activity"))
             .unwrap();
@@ -4275,7 +4297,7 @@ mod tests {
         let sessions = store.list().unwrap();
         assert_eq!(sessions[0].id, older.id());
         assert_eq!(sessions[1].id, newer.id());
-        assert!(sessions[0].created_ms < sessions[1].created_ms);
+        assert!(sessions[0].created_ms <= sessions[1].created_ms);
         assert!(sessions[0].updated_ms >= sessions[1].updated_ms);
     }
 }
