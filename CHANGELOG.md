@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8](https://github.com/5omeOtherGuy/iris-agent/compare/iris-agent-v0.3.7...iris-agent-v0.3.8) - 2026-10-18
+
+### Added
+
+- public leaf API for library consumers (brain) ([#684](https://github.com/5omeOtherGuy/iris-agent/pull/684))
+- *(subagents)* unify manifest-driven spawn API ([#667](https://github.com/5omeOtherGuy/iris-agent/pull/667))
+- *(subagents)* resolve worker model from authenticated catalog ([#663](https://github.com/5omeOtherGuy/iris-agent/pull/663))
+- *(ui)* surface background subagent activity in the TUI ([#652](https://github.com/5omeOtherGuy/iris-agent/pull/652))
+- *(ui)* add delegation dashboard ([#648](https://github.com/5omeOtherGuy/iris-agent/pull/648))
+- optimize model-facing tool contracts ([#649](https://github.com/5omeOtherGuy/iris-agent/pull/649))
+- add portable repository agent guidance ([#647](https://github.com/5omeOtherGuy/iris-agent/pull/647))
+- route subagents by model and effort ([#646](https://github.com/5omeOtherGuy/iris-agent/pull/646))
+- add model-facing subagent guidance ([#644](https://github.com/5omeOtherGuy/iris-agent/pull/644))
+- add durable subagent runtime ([#637](https://github.com/5omeOtherGuy/iris-agent/pull/637))
+- *(goal)* add persistent long-running session goals ([#638](https://github.com/5omeOtherGuy/iris-agent/pull/638))
+- *(tools)* add ignore globs to ls ([#636](https://github.com/5omeOtherGuy/iris-agent/pull/636))
+
+### Fixed
+
+- *(deps)* clear cargo-deny advisories and patch quinn-proto ([#689](https://github.com/5omeOtherGuy/iris-agent/pull/689))
+- recover stale reused WebSockets immediately ([#668](https://github.com/5omeOtherGuy/iris-agent/pull/668))
+- *(subagents)* unbreak model-surface cancel/status, outside-cwd spawns, and concurrent token refresh ([#657](https://github.com/5omeOtherGuy/iris-agent/pull/657))
+- *(ui)* stop spawn_subagent masquerading as an EDIT diff panel ([#655](https://github.com/5omeOtherGuy/iris-agent/pull/655))
+- *(ui)* polish subagent dispatch card and worker lane ([#653](https://github.com/5omeOtherGuy/iris-agent/pull/653))
+- *(goal)* require explicit creation and budgets ([#645](https://github.com/5omeOtherGuy/iris-agent/pull/645))
+- *(tui)* show @ search results outside Git worktrees ([#634](https://github.com/5omeOtherGuy/iris-agent/pull/634))
+- align composer text with caret ([#632](https://github.com/5omeOtherGuy/iris-agent/pull/632))
+
+### Other
+
+- state security-only scope and 7-day triage ([#705](https://github.com/5omeOtherGuy/iris-agent/pull/705))
+- *(deps)* bump actions/labeler from 6.2.0 to 7.0.0 ([#672](https://github.com/5omeOtherGuy/iris-agent/pull/672))
+- *(github)* ask PRs for intent, constraints and sensitive-path review ([#703](https://github.com/5omeOtherGuy/iris-agent/pull/703))
+- *(agents)* adopt standard 2026-10-18 and list sensitive paths ([#704](https://github.com/5omeOtherGuy/iris-agent/pull/704))
+- *(hooks)* refuse pushes to main and run the gate before branch pushes ([#699](https://github.com/5omeOtherGuy/iris-agent/pull/699))
+- make sandbox and session-order tests deterministic outside CI ([#702](https://github.com/5omeOtherGuy/iris-agent/pull/702))
+- add standard profile and agent landing rules ([#698](https://github.com/5omeOtherGuy/iris-agent/pull/698))
+- pin actions, fix runner images and tighten workflow permissions ([#700](https://github.com/5omeOtherGuy/iris-agent/pull/700))
+- run scripts/gate.sh in a job named gate ([#697](https://github.com/5omeOtherGuy/iris-agent/pull/697))
+- add .agents/setup for orbs ([#694](https://github.com/5omeOtherGuy/iris-agent/pull/694))
+- ignore env files, local agent scratch and editor files ([#693](https://github.com/5omeOtherGuy/iris-agent/pull/693))
+- state contribution terms and security response times ([#692](https://github.com/5omeOtherGuy/iris-agent/pull/692))
+- *(deps)* add Dependabot cooldown and group action updates ([#691](https://github.com/5omeOtherGuy/iris-agent/pull/691))
+- *(release)* skip cargo-semver-checks in release-plz ([#690](https://github.com/5omeOtherGuy/iris-agent/pull/690))
+- mark Iris as superseded by phaseone ([#688](https://github.com/5omeOtherGuy/iris-agent/pull/688))
+- *(deps)* bump the cargo-minor-and-patch group across 1 directory with 7 updates ([#695](https://github.com/5omeOtherGuy/iris-agent/pull/695))
+- *(deps)* bump ruff_python_formatter from 0.0.7 to 0.0.15 ([#686](https://github.com/5omeOtherGuy/iris-agent/pull/686))
+- *(deps)* bump the cargo-minor-and-patch group across 1 directory with 11 updates ([#685](https://github.com/5omeOtherGuy/iris-agent/pull/685))
+- reconcile documentation and add v1.0 roadmap with audit ([#682](https://github.com/5omeOtherGuy/iris-agent/pull/682))
+- *(deps)* bump ruff_python_formatter from 0.0.6 to 0.0.7 ([#678](https://github.com/5omeOtherGuy/iris-agent/pull/678))
+- *(deps)* bump the cargo-minor-and-patch group with 2 updates ([#677](https://github.com/5omeOtherGuy/iris-agent/pull/677))
+- *(deps)* bump base64 from 0.22.1 to 0.23.0 ([#675](https://github.com/5omeOtherGuy/iris-agent/pull/675))
+- *(deps)* bump the cargo-minor-and-patch group with 7 updates ([#673](https://github.com/5omeOtherGuy/iris-agent/pull/673))
+- *(deps)* bump ruff_python_formatter from 0.0.5 to 0.0.6 ([#674](https://github.com/5omeOtherGuy/iris-agent/pull/674))
+- *(deps)* bump the cargo-minor-and-patch group with 9 updates ([#670](https://github.com/5omeOtherGuy/iris-agent/pull/670))
+- *(deps)* bump ruff_python_formatter from 0.0.4 to 0.0.5 ([#671](https://github.com/5omeOtherGuy/iris-agent/pull/671))
+- *(deps)* bump EmbarkStudios/cargo-deny-action from 2.0.20 to 2.1.1 ([#669](https://github.com/5omeOtherGuy/iris-agent/pull/669))
+- add pi-mono-style workspace modularization plan ([#651](https://github.com/5omeOtherGuy/iris-agent/pull/651))
+- define portable agent guidance ([#643](https://github.com/5omeOtherGuy/iris-agent/pull/643))
+- align Iris TUI skill with current design ([#641](https://github.com/5omeOtherGuy/iris-agent/pull/641))
+
 ### Added
 
 - track portable repository agent guidance, canonical skills, local instruction layers, and safe worktree propagation ([#642](https://github.com/5omeOtherGuy/iris-agent/issues/642))
