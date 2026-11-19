@@ -7,7 +7,7 @@ project guidance, not a security boundary.
 
 - Purpose: terminal coding agent in Rust; superseded by phaseone and kept for
   upkeep only.
-- Stage: maintenance (repository standard 2026-10-18)
+- Stage: maintenance (repository standard)
 - Gate: `bash scripts/gate.sh` (CI job `gate`)
 - Landing: PR, squash-merged on a green gate; agents land: yes
 - Release: release-plz; agents release: no
@@ -40,30 +40,15 @@ project guidance, not a security boundary.
 
 ## Commands
 
-- Create an isolated task worktree: `bash scripts/worktree-create.sh ../iris-<slug> <branch>`
+- Create an isolated task worktree: `bash scripts/worktree-create.sh ~/Work/.worktrees/iris-agent/<slug> <branch>`
 - Check primary freshness only: `bash scripts/worktree-preflight.sh`
 - Run a focused test: `cargo test --locked <test-name>`
 - Run the CI-equivalent gate: `bash scripts/gate.sh`
 - Validate distribution artifacts: `bash scripts/validate-dist.sh`
 - Clean up after the merge, from outside the task worktree:
-  `bash scripts/worktree-cleanup.sh ../iris-<slug>`
+  `bash scripts/worktree-cleanup.sh ~/Work/.worktrees/iris-agent/<slug>`
 - Reconcile a drifted primary checkout: `bash scripts/sync-primary.sh`
 - Install repository hooks once per clone: `bash scripts/install-hooks.sh`
-
-## Project map
-
-- `src/nexus.rs`: provider-neutral agent loop and contracts.
-- `src/wayland/`: harness state, sessions, compaction, skills, project
-  instructions, permissions, and worker integration.
-- `src/mimir/`: provider adapters, authentication, model selection, and
-  capabilities.
-- `src/ui/` and `src/cli.rs`: terminal UI and command/session drivers.
-- `src/tools/`: built-in tool implementations and workspace safety.
-- `crates/iris-subagent-runtime/`: host-neutral worker scheduler and worktree
-  infrastructure.
-- `docs/ARCHITECTURE.md`: tier ownership and runtime mechanics.
-- `docs/CODEMAPS/INDEX.md`: implemented source map.
-- `docs/ROADMAP.md`: build sequence; `docs/FEATURES.md` is an inventory.
 
 ## Architecture boundaries
 
@@ -93,7 +78,6 @@ project guidance, not a security boundary.
   and user-visible diagnostics.
 - Never place credentials or private machine paths in tracked instructions,
   skills, fixtures, logs, or examples.
-- Do not weaken checks, hide failures, hard-code test outcomes, or bypass hooks.
 
 ## Testing and completion
 
@@ -140,8 +124,6 @@ project guidance, not a security boundary.
   control-only and must match `origin/main`.
 - Use `scripts/worktree-create.sh`; plain `git worktree add` receives tracked
   files but does not copy ignored local instructions.
-- Preserve unfamiliar changes and leave worktrees and branches you do not own
-  untouched. Never reset, clean, or force-delete someone else's work.
 - Tracked `AGENTS.md` is the public base. Tracked `CLAUDE.md` imports it.
 - Ignored local layers have harness-specific semantics:
   - `AGENTS.override.md` replaces the same-directory base in Codex and Iris.
@@ -152,9 +134,6 @@ project guidance, not a security boundary.
   first non-empty regular base from `AGENTS.override.md`, `AGENTS.md`, then
   `CLAUDE.md`, followed by the first non-empty local file from
   `AGENTS.local.md`, then `CLAUDE.local.md`.
-- Push your task branch and open a PR. Land it per the Profile
-  (`agents land: yes`): squash-merge once `gate` is green on the head commit
-  with `--match-head-commit`. Release PRs and tags follow Release policy below.
 - A change to a sensitive path (Profile), or to security-sensitive code
   elsewhere, needs an independent review (another agent or the owner) recorded
   on the PR against the reviewed head before merge; a later push needs a new
