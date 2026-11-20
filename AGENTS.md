@@ -7,7 +7,7 @@ project guidance, not a security boundary.
 
 - Purpose: terminal coding agent in Rust; superseded by phaseone and kept for
   upkeep only.
-- Stage: maintenance (repository standard 2026-10-18)
+- Stage: archived (repository standard)
 - Gate: `bash scripts/gate.sh` (CI job `gate`)
 - Landing: PR, squash-merged on a green gate; agents land: yes
 - Release: release-plz; agents release: no
